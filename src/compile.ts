@@ -93,7 +93,7 @@ export async function compileModule<M extends Module>(
 ): Promise<CompiledRuntime & { ir: CompiledIR; uploadInitialParams: () => void }> {
   const inputDecls = opts.inputs ?? []
   const model = modelFactory()
-  let materialized: ReturnType<typeof materializeParams> = { tensors: {}, initFns: {} }
+  let materialized: ReturnType<typeof materializeParams> = { tensors: {}, initFns: {}, decayFlags: {} }
   const graph = trace(() => {
     materialized = materializeParams(model)
     const inputTensors = inputDecls.map(d => tensorInput(d.name, d.shape, d.dtype ?? 'f32'))
@@ -104,7 +104,7 @@ export async function compileModule<M extends Module>(
 
   let adamResult: ReturnType<typeof appendAdam> | undefined
   if (opts.adam) {
-    adamResult = appendAdam(graph, paramGrads, materialized.tensors, opts.adam)
+    adamResult = appendAdam(graph, paramGrads, materialized.tensors, opts.adam, materialized.decayFlags)
   }
 
   const plan = planBuffers(graph, paramGrads, adamResult?.writebacks ?? [])
@@ -187,7 +187,7 @@ export async function compileForward<M extends Module>(
 ): Promise<CompiledForward & { ir: CompiledIR; uploadInitialParams: () => void }> {
   const inputDecls = opts.inputs ?? []
   const model = modelFactory()
-  let materialized: ReturnType<typeof materializeParams> = { tensors: {}, initFns: {} }
+  let materialized: ReturnType<typeof materializeParams> = { tensors: {}, initFns: {}, decayFlags: {} }
   const graph = trace(() => {
     materialized = materializeParams(model)
     const inputTensors = inputDecls.map(d => tensorInput(d.name, d.shape, d.dtype ?? 'f32'))

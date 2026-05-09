@@ -48,6 +48,10 @@ export interface CompiledRuntime {
    *  via `sharedParams` to share without copies — every step on this runtime
    *  is immediately visible to anyone reading these buffers. */
   params: Map<string, GPUBuffer>
+  /** Shape of each tensor registered via `capture(name, t)`, keyed by name.
+   *  Static after compile — the user can reshape the flat Float32Array from
+   *  step({ withCaptures: true }).captures without recomputing strides. */
+  captureShapes: Record<string, number[]>
   /** Upload parameter Float32Arrays to their GPU buffers. By default, requires
    *  *all* params to be present; throws on any unknown or missing key. Pass
    *  `{ partial: true }` to skip the missing-key check. */
@@ -85,6 +89,12 @@ export interface CompiledRuntime {
  *  no backward. Returns the output tensor (not just a scalar) per `run()` call. */
 export interface CompiledForward {
   params: Map<string, GPUBuffer>
+  /** Shape of each tensor registered via `capture(name, t)`, keyed by name.
+   *  Static after compile — the user can reshape the flat Float32Array from
+   *  run({ withCaptures: true }) without recomputing strides. */
+  captureShapes: Record<string, number[]>
+  /** Shape of the graph's output tensor (whatever `forward` returned). */
+  outputShape: number[]
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): void
   downloadParams(): Promise<Record<string, Float32Array>>
   /** Forward-only dispatch. Returns the graph's output tensor as a Float32Array
@@ -421,6 +431,13 @@ export async function createRuntime(
   for (const [name, bufId] of plan.paramsByName) {
     params.set(name, buffers.get(bufId)!)
   }
+  // Static-after-compile shape metadata so users don't have to recompute
+  // strides to interpret a flat capture readback.
+  const captureShapes: Record<string, number[]> = {}
+  for (const [name, bufId] of plan.capturesByName) {
+    captureShapes[name] = [...plan.buffers[bufId]!.shape]
+  }
+  const outputShape = [...plan.buffers[lossBufferId]!.shape]
 
   const destroy = () => {
     for (const [id, b] of buffers) {
@@ -432,6 +449,7 @@ export async function createRuntime(
 
   return {
     params,
+    captureShapes,
     uploadParams,
     downloadParams: () => downloadFromMap(plan.paramsByName),
     downloadParamGrads: () => downloadFromMap(plan.paramGradsByName),
@@ -439,7 +457,9 @@ export async function createRuntime(
     run,
     resetOptimizerState,
     destroy,
-  }
+    /** Internal: outputShape is exposed via createForwardRuntime's wrapper. */
+    _outputShape: outputShape,
+  } as CompiledRuntime & { _outputShape: number[] }
 }
 
 /** Same machinery as `createRuntime`, narrower public API: no step,
@@ -453,6 +473,8 @@ export async function createForwardRuntime(
   const full = await createRuntime(plan, kernels, outputBufferId, opts)
   return {
     params: full.params,
+    captureShapes: full.captureShapes,
+    outputShape: (full as CompiledRuntime & { _outputShape: number[] })._outputShape,
     uploadParams: full.uploadParams,
     downloadParams: full.downloadParams,
     run: full.run,

@@ -52,6 +52,11 @@ export interface ParamOptions {
   init?: InitSpec
   /** Std dev for `'randn'`. Default 0.02. Ignored for non-randn init. */
   scale?: number
+  /** Whether AdamW (when `weightDecay > 0`) should apply decoupled weight
+   *  decay to this param. Default: `true` for `'randn'` init (weight matrices,
+   *  embeddings), `false` for `'zeros'` / `'ones'` (biases, LN gains). Override
+   *  to force or skip. Replaces `adam.decayFilter` for the common case. */
+  decay?: boolean
 }
 
 type InitFn = (size: number, shape: readonly number[]) => Float32Array
@@ -76,6 +81,17 @@ function resolveInit(opts: ParamOptions | undefined): InitFn {
   throw new Error(`Unknown init: ${String(init)}`)
 }
 
+/** Resolve the decay default for a param. Decay weight matrices and
+ *  embedding tables (randn-initialized); skip biases (zeros) and LN gains
+ *  (ones). Custom init functions default to "decay" — most user-supplied
+ *  inits are weight-shaped (Kaiming etc.). Explicit `decay: false` overrides. */
+function resolveDecay(opts: ParamOptions | undefined): boolean {
+  if (opts?.decay !== undefined) return opts.decay
+  const init = opts?.init ?? 'randn'
+  if (init === 'zeros' || init === 'ones') return false
+  return true   // 'randn' or function
+}
+
 // ============================================================================
 // Internals: param sentinel
 // ============================================================================
@@ -90,6 +106,7 @@ class ParamSentinel {
     public readonly shape: Shape,
     public readonly dtype: Dtype,
     public readonly initFn: InitFn,
+    public readonly decay: boolean,
   ) {}
 }
 
@@ -110,7 +127,7 @@ export abstract class Module {
   protected param(shape: Shape, opts?: ParamOptions): Tensor {
     const dtype = opts?.dtype ?? 'f32'
     // Lie to TypeScript: the sentinel becomes a Tensor at materialize time.
-    return new ParamSentinel(shape, dtype, resolveInit(opts)) as unknown as Tensor
+    return new ParamSentinel(shape, dtype, resolveInit(opts), resolveDecay(opts)) as unknown as Tensor
   }
 }
 
@@ -123,6 +140,9 @@ export interface MaterializedParams {
   tensors: Record<string, Tensor>
   /** Init function per param path. Used by `uploadInitialParams`. */
   initFns: Record<string, InitFn>
+  /** Whether this param should receive AdamW weight decay. Resolved at
+   *  `param()` time from `ParamOptions.decay` (with init-based default). */
+  decayFlags: Record<string, boolean>
 }
 
 /**
@@ -136,15 +156,17 @@ export interface MaterializedParams {
 export function materializeParams(root: Module): MaterializedParams {
   const tensors: Record<string, Tensor> = {}
   const initFns: Record<string, InitFn> = {}
+  const decayFlags: Record<string, boolean> = {}
   visit(root, '', (path, val, owner, key) => {
     if (val instanceof ParamSentinel) {
       const t = paramInput(path, val.shape, val.dtype)
       ;(owner as any)[key] = t
       tensors[path] = t
       initFns[path] = val.initFn
+      decayFlags[path] = val.decay
     }
   })
-  return { tensors, initFns }
+  return { tensors, initFns, decayFlags }
 }
 
 // ----------------------------------------------------------------------------

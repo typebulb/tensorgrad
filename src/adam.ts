@@ -95,6 +95,11 @@ export function appendAdam(
   paramGrads: Record<string, Tensor>,
   paramTensors: Record<string, Tensor>,
   config: AdamConfig,
+  /** Per-param decay flags from `materializeParams`. When supplied, overrides
+   *  `config.decayFilter` for any name in the map; falls back to `decayFilter`
+   *  for names not present (e.g., for low-level callers using `compile()`
+   *  directly without a Module). */
+  decayFlags?: Record<string, boolean>,
 ): AdamResult {
   const lrIsScheduled = typeof config.lr === 'function'
   const lrFn = lrIsScheduled
@@ -119,11 +124,20 @@ export function appendAdam(
   return traceInto(graph, () => {
     const lrt = tensorInput(lrtInputName, [], 'f32')
 
+    // Resolve per-param decay decision: decayFlags (per-param metadata from
+    // Module.param's options) wins; fall back to decayFilter for names not in
+    // the map. Captured here so the dynamic-shrink check below and the loop
+    // below agree on what's decayed.
+    const isParamDecayed = (name: string): boolean => {
+      if (decayFlags && name in decayFlags) return decayFlags[name]!
+      return fullConfig.decayFilter(name)
+    }
+
     // Decide up-front whether we need a runtime decayShrink scalar. Only does
     // something when both (a) lr varies per step and (b) some param is decayed.
     const needsDynamicShrink = lrIsScheduled
       && fullConfig.weightDecay > 0
-      && Object.keys(paramGrads).some(name => fullConfig.decayFilter(name))
+      && Object.keys(paramGrads).some(isParamDecayed)
     let decayShrinkScalar: Tensor | null = null
     if (needsDynamicShrink) {
       decayShrinkInputName = '_adam_decay_shrink'
@@ -143,7 +157,7 @@ export function appendAdam(
       //   - non-decayed params: literal 1 (kernel multiply folds out).
       //   - decayed + static lr: literal `1 - lr * wd` baked at compile.
       //   - decayed + scheduled lr: tensor input updated per step.
-      const isDecayed = fullConfig.weightDecay > 0 && fullConfig.decayFilter(name)
+      const isDecayed = fullConfig.weightDecay > 0 && isParamDecayed(name)
       let decayShrink: number | Tensor
       if (!isDecayed) {
         decayShrink = 1
