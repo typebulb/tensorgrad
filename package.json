@@ -1,0 +1,63 @@
+{
+  "name": "tensorgrad",
+  "version": "0.0.1",
+  "description": "Tiny TypeScript-native tensor library with autograd, compiling to WebGPU. Train small models in the browser without hand-writing kernels.",
+  "license": "MIT",
+  "author": "Ben Albahari",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/typebulb/tensorgrad.git"
+  },
+  "homepage": "https://github.com/typebulb/tensorgrad#readme",
+  "bugs": {
+    "url": "https://github.com/typebulb/tensorgrad/issues"
+  },
+  "keywords": [
+    "webgpu",
+    "machine-learning",
+    "autograd",
+    "tensor",
+    "neural-network",
+    "transformer",
+    "browser",
+    "typescript"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "//": "Source-only exports for monorepo dev. publishConfig flips to dist/*.js for npm publish.",
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "SPEC.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx test/smoke.ts",
+    "prepublishOnly": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@webgpu/types": "*",
+    "tsx": "*",
+    "typescript": "*"
+  }
+}

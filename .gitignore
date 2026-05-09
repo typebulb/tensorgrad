@@ -1,0 +1,19 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.vscode/
+.idea/
+*.tsbuildinfo
+.env
+.env.local
+
+# Temporarily excluded from the initial cautious push.
+# Re-include incrementally as samples/tests/CI are validated for public consumption.
+samples/
+test/
+.github/
+.claude/
+HANDOFF.md
+pnpm-workspace.yaml
+pnpm-lock.yaml
