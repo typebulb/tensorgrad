@@ -27,8 +27,8 @@ class Linear extends Module {
   W: Tensor; b: Tensor
   constructor(public inDim: number, public outDim: number) {
     super()
-    this.W = this.param([inDim, outDim])
-    this.b = this.param([outDim])
+    this.W = this.param([inDim, outDim])              // randn, scale 0.02
+    this.b = this.param([outDim], { init: 'zeros' })
   }
 }
 
@@ -50,8 +50,7 @@ function loss(m: MLP, x: Tensor, y: Tensor): Tensor {
 }
 
 const B = 256
-const model = new MLP()
-const compiled = await compileModule(model, loss, {
+const compiled = await compileModule(() => new MLP(), loss, {
   adam: { lr: 0.005 },
   inputs: [
     { name: 'x', shape: [B, 1], dtype: 'f32' },
@@ -59,8 +58,8 @@ const compiled = await compileModule(model, loss, {
   ],
 })
 
-// Initialize params however you like (random, etc), then upload + train.
-compiled.uploadParams(initialParams)
+compiled.uploadInitialParams()  // applies the per-param init declared above
+
 for (let step = 0; step < 1000; step++) {
   const { x, y } = generateBatch()
   const lossVal = await compiled.step({ x, y })

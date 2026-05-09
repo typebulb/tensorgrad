@@ -115,7 +115,9 @@ time, with call-site capture, are good enough.
 **D6. Adam state in the IR.** Optimizer state (m, v, plus a per-step `lrt`
 scalar for bias correction) lives in dedicated `state_input` buffers that
 persist across `step()` calls. Writebacks at the end of each step copy new
-values into their persistent homes. No CPU↔GPU round-trip per step.
+values into their persistent homes. No CPU↔GPU round-trip per step. AdamW
+(decoupled weight decay) is supported by setting `weightDecay > 0` on the
+adam config; an optional `decayFilter` selects which params receive decay.
 
 **D7. Module separates from forward.** Mutable parameter storage lives in
 `Module` subclasses. Forward functions are pure, take the materialized
@@ -201,18 +203,32 @@ class Linear extends Module {
   W: Tensor; b: Tensor
   constructor(public inDim: number, public outDim: number) {
     super()
-    this.W = this.param([inDim, outDim])  // returns ParamSentinel cast to Tensor
-    this.b = this.param([outDim])
+    this.W = this.param([inDim, outDim])                    // randn, scale 0.02
+    this.b = this.param([outDim], { init: 'zeros' })        // common patterns are first-class
   }
 }
 ```
 
-`this.param(shape)` returns a `ParamSentinel` typed as `Tensor`. At compile
-time, `materializeParams(root)` walks enumerable properties of the model
-tree (recursing into nested `Module` instances and arrays of modules),
-replaces every sentinel with a real `paramInput` tensor whose name is the
-property path (`layers.0.attn.q.W`), and returns a flat `Record<path,
-Tensor>` for autograd to use.
+`this.param(shape, opts?)` returns a `ParamSentinel` typed as `Tensor`. The
+optional `opts` carries init metadata: `init: 'randn' | 'zeros' | 'ones' |
+((size, shape) => Float32Array)` and (for randn) `scale: number`. Default
+is `'randn'` with `scale: 0.02` — the common case for weight matrices and
+embeddings. At compile time, `materializeParams(root)` walks enumerable
+properties of the model tree (recursing into nested `Module` instances and
+arrays of modules), replaces every sentinel with a real `paramInput` tensor
+whose name is the property path (`layers.0.attn.q.W`), and returns the
+tensors plus per-param init functions.
+
+`compileModule` takes a *factory* `() => new Model()` rather than a model
+instance (compilation mutates the tree, so the instance is consumed). The
+returned runtime exposes `uploadInitialParams()` to apply the init metadata
+in one call, and `resetOptimizerState()` to zero Adam's m/v plus the
+bias-correction step counter for in-place training resets.
+
+The standard layers (`nn.Linear`, `nn.LayerNorm`) and their forward helpers
+(`nn.linearFwd`, `nn.layerNormFwd`) live behind a single `nn` namespace
+import, so user code starts at "model + forward" instead of "redeclare
+Linear and LayerNorm first."
 
 This is the JAX/Equinox separation: parameter storage is mutable
 (state-bearing components), forward computation is pure (functions over

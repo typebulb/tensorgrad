@@ -66,9 +66,13 @@ export interface CompileModuleOptions extends RuntimeOpts {
 }
 
 /**
- * Compile a Module-based model. The forward function takes the materialized
- * model and returns the loss tensor (typically by also calling tensorInput
- * for tokens/targets/masks inside).
+ * Compile a Module-based model. Pass a *factory* `() => new Model()`, not the
+ * model instance itself: compilation mutates the tree (every `ParamSentinel`
+ * field becomes a real `Tensor`), so the instance is consumed and shouldn't be
+ * referenced afterwards. Re-call the factory if you need a fresh tree.
+ *
+ * The forward function takes the materialized model and returns the loss
+ * tensor.
  *
  * Walks the module tree to materialize params with auto-derived names, then
  * runs trace → grad → adam → buffer plan → codegen → runtime.
@@ -78,14 +82,15 @@ export interface CompileModuleOptions extends RuntimeOpts {
  * users don't need to provide it themselves.
  */
 export async function compileModule<M extends Module>(
-  model: M,
+  modelFactory: () => M,
   forward: (m: M, ...inputs: Tensor[]) => Tensor,
   opts: CompileModuleOptions = {},
-): Promise<CompiledRuntime & { ir: CompiledIR }> {
+): Promise<CompiledRuntime & { ir: CompiledIR; uploadInitialParams: () => void }> {
   const inputDecls = opts.inputs ?? []
-  let paramTensors: Record<string, Tensor> = {}
+  const model = modelFactory()
+  let materialized: ReturnType<typeof materializeParams> = { tensors: {}, initFns: {} }
   const graph = trace(() => {
-    paramTensors = materializeParams(model)
+    materialized = materializeParams(model)
     const inputTensors = inputDecls.map(d => tensorInput(d.name, d.shape, d.dtype ?? 'f32'))
     return forward(model, ...inputTensors)
   })
@@ -94,7 +99,7 @@ export async function compileModule<M extends Module>(
 
   let adamResult: ReturnType<typeof appendAdam> | undefined
   if (opts.adam) {
-    adamResult = appendAdam(graph, paramGrads, paramTensors, opts.adam)
+    adamResult = appendAdam(graph, paramGrads, materialized.tensors, opts.adam)
   }
 
   const plan = planBuffers(graph, paramGrads, adamResult?.writebacks ?? [])
@@ -103,18 +108,38 @@ export async function compileModule<M extends Module>(
   const runtime = await createRuntime(plan, kernels, lossBufferId, opts)
 
   // If Adam is enabled, wrap step() to track the step count and supply lrt.
+  // Wrap resetOptimizerState() too, so a reset zeros m/v *and* the bias-correction
+  // counter — otherwise the next step would skip Adam's warmup phase.
   if (adamResult) {
     const { lrtInputName, config } = adamResult
     let t = 0
     const lrtBuf = new Float32Array(1)
     const innerStep = runtime.step.bind(runtime)
+    const innerReset = runtime.resetOptimizerState.bind(runtime)
     runtime.step = async (inputs) => {
       t++
       lrtBuf[0] = config.lr * Math.sqrt(1 - Math.pow(config.b2, t)) / (1 - Math.pow(config.b1, t))
       return innerStep({ ...inputs, [lrtInputName]: lrtBuf })
     }
+    runtime.resetOptimizerState = () => {
+      t = 0
+      innerReset()
+    }
+  }
+
+  const { initFns } = materialized
+  const uploadInitialParams = () => {
+    const out: Record<string, Float32Array> = {}
+    for (const [name, bufId] of plan.paramsByName) {
+      const shape = plan.buffers[bufId]!.shape
+      const size = shape.reduce((a, b) => a * b, 1)
+      const initFn = initFns[name]
+      if (!initFn) throw new Error(`uploadInitialParams: no init for param '${name}'`)
+      out[name] = initFn(size, shape)
+    }
+    runtime.uploadParams(out)
   }
 
   const ir: CompiledIR = { graph, paramGrads, loss, plan, kernels }
-  return Object.assign(runtime, { ir })
+  return Object.assign(runtime, { ir, uploadInitialParams })
 }

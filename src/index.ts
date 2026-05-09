@@ -37,4 +37,5 @@ export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type Wri
 export { emitKernels, type KernelSpec } from './codegen.js'
 export { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
 export { compile, compileToIR, compileModule, type CompiledIR, type CompileModuleOptions, type InputDecl } from './compile.js'
-export { Module, materializeParams } from './module.js'
+export { Module, materializeParams, type InitSpec, type ParamOptions, type MaterializedParams } from './module.js'
+export * as nn from './nn.js'

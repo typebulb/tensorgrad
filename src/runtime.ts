@@ -11,9 +11,18 @@ import type { KernelSpec } from './codegen.js'
 // Provided by the browser per WebGPU spec; declare just what we use.
 declare const GPUMapMode: { readonly READ: number; readonly WRITE: number }
 
+export interface UploadParamsOptions {
+  /** Skip the "missing param" check, allowing the caller to update only some
+   *  params and leave the rest at their current GPU values. Extra (unknown)
+   *  keys are still rejected — that's always a typo. Default: false. */
+  partial?: boolean
+}
+
 export interface CompiledRuntime {
-  /** Upload one or more parameter Float32Arrays to their GPU buffers. */
-  uploadParams(params: Record<string, Float32Array>): void
+  /** Upload parameter Float32Arrays to their GPU buffers. By default, requires
+   *  *all* params to be present; throws on any unknown or missing key. Pass
+   *  `{ partial: true }` to skip the missing-key check. */
+  uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): void
   /** Read all parameters back as Float32Arrays — used for UI panels. */
   downloadParams(): Promise<Record<string, Float32Array>>
   /** Read all parameter gradients back. Mostly for verification / debugging. */
@@ -26,6 +35,9 @@ export interface CompiledRuntime {
    * Returns the loss as a JS number.
    */
   step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
+  /** Re-zero all optimizer state buffers (Adam's m/v) in place. Pair with
+   *  `uploadInitialParams()` for a full training reset without recompile. */
+  resetOptimizerState(): void
   /** Free GPU resources. */
   destroy(): void
 }
@@ -181,10 +193,33 @@ export async function createRuntime(
   }
 
   // ---- uploadParams ---------------------------------------------------------
-  function uploadParams(params: Record<string, Float32Array>) {
+  function uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions) {
+    const partial = opts?.partial ?? false
+    for (const name of Object.keys(params)) {
+      if (!plan.paramsByName.has(name)) {
+        throw new Error(
+          `uploadParams: unknown param '${name}'. ` +
+          `Known: ${[...plan.paramsByName.keys()].sort().join(', ')}`,
+        )
+      }
+    }
+    if (!partial) {
+      for (const name of plan.paramsByName.keys()) {
+        if (!(name in params)) {
+          throw new Error(
+            `uploadParams: missing param '${name}'. ` +
+            `Pass { partial: true } if you mean to update only some params.`,
+          )
+        }
+      }
+    }
     for (const [name, bufId] of plan.paramsByName) {
       const data = params[name]
       if (!data) continue
+      const expected = plan.buffers[bufId]!.byteSize / 4
+      if (data.length !== expected) {
+        throw new Error(`uploadParams: '${name}' has ${data.length} elements, expected ${expected}`)
+      }
       queue.writeBuffer(buffers.get(bufId)!, 0, data as unknown as BufferSource)
     }
   }
@@ -210,11 +245,23 @@ export async function createRuntime(
     return out
   }
 
+  function resetOptimizerState() {
+    for (const spec of plan.buffers) {
+      if (spec.kind !== 'state') continue
+      const elements = spec.byteSize / 4
+      const init = spec.dtype === 'f32'
+        ? new Float32Array(elements).fill(spec.initValue ?? 0)
+        : new Int32Array(elements).fill(Math.trunc(spec.initValue ?? 0))
+      queue.writeBuffer(buffers.get(spec.id)!, 0, init as unknown as BufferSource)
+    }
+  }
+
   return {
     uploadParams,
     downloadParams: () => downloadFromMap(plan.paramsByName),
     downloadParamGrads: () => downloadFromMap(plan.paramGradsByName),
     step,
+    resetOptimizerState,
     destroy: () => {
       for (const b of buffers.values()) b.destroy()
       lossReadback.destroy()

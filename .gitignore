@@ -16,5 +16,8 @@ test/
 .github/
 .claude/
 HANDOFF.md
+API-IMPROVEMENTS.md
+ACTIVATION-CAPTURE.md
+Simplify.md
 pnpm-workspace.yaml
 pnpm-lock.yaml
