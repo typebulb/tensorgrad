@@ -15,6 +15,12 @@
 // `sqrt(1-b2^t)/(1-b1^t)`; that's why convergence isn't affected by the
 // first-step warmup that bias-correction-free Adam suffers.
 //
+// **Static vs scheduled lr.** When `config.lr` is a number, decayShrink is
+// baked into the kernel as a literal. When it's a function `(step) => lr`,
+// decayShrink for decayed params becomes a per-step scalar input that the
+// runtime updates each call (computed from the current step's lr). lrt is
+// always per-step; the bias-correction factor changes every step regardless.
+//
 // Returns writeback declarations the buffer planner uses to wire up the
 // "after step, copy the new value into the persistent home" path. m and v
 // are state_inputs (zero-initialized, persistent across steps); the param
@@ -27,7 +33,11 @@ import { traceInto, stateInput, tensorInput } from './trace.js'
 import { adamUpdateM, adamUpdateV, adamUpdateP } from './ops.js'
 
 export interface AdamConfig {
-  lr: number
+  /** Constant scalar (e.g., `0.005`) or a per-step schedule function
+   *  `(step) => lr`. Schedule fn lets the user implement linear/cosine decay
+   *  or warmup; first call passes `step=1`. Decay-shrink (AdamW) updates
+   *  per-step automatically when this is a function. */
+  lr: number | ((step: number) => number)
   b1?: number   // default 0.9
   b2?: number   // default 0.999
   eps?: number  // default 1e-8
@@ -42,14 +52,30 @@ export interface AdamConfig {
   decayFilter?: (paramName: string) => boolean
 }
 
+/** Resolved hyperparameters: lr is the schedule fn (constants are wrapped). */
+export interface AdamResolvedConfig {
+  lr: (step: number) => number
+  b1: number
+  b2: number
+  eps: number
+  weightDecay: number
+  decayFilter: (name: string) => boolean
+  /** True iff the user supplied an lr function (vs a constant). When false,
+   *  decayShrink is baked at compile time and never updated. */
+  lrIsScheduled: boolean
+}
+
 export interface AdamResult {
   /** Writebacks the buffer planner should wire into the runtime. */
   writebacks: WritebackDecl[]
   /** Name of the per-step scalar tensor_input. The runtime fills this each call
    * with `lr * sqrt(1-b2^t)/(1-b1^t)` (Adam's bias-corrected effective LR). */
   lrtInputName: string
-  /** Hyperparameters as captured (so the runtime can compute lrt). */
-  config: Required<Omit<AdamConfig, 'decayFilter'>> & { decayFilter: (name: string) => boolean }
+  /** Name of the per-step decayShrink scalar tensor_input, or null when lr is
+   *  static (decayShrink baked into the kernel) or no params are decayed. */
+  decayShrinkInputName: string | null
+  /** Hyperparameters as captured (so the runtime can compute lrt and decayShrink). */
+  config: AdamResolvedConfig
 }
 
 /**
@@ -70,21 +96,39 @@ export function appendAdam(
   paramTensors: Record<string, Tensor>,
   config: AdamConfig,
 ): AdamResult {
-  const fullConfig = {
-    lr: config.lr,
+  const lrIsScheduled = typeof config.lr === 'function'
+  const lrFn = lrIsScheduled
+    ? config.lr as (step: number) => number
+    : (() => config.lr as number)
+  const initialLr = lrFn(1)
+  const fullConfig: AdamResolvedConfig = {
+    lr: lrFn,
     b1: config.b1 ?? 0.9,
     b2: config.b2 ?? 0.999,
     eps: config.eps ?? 1e-8,
     weightDecay: config.weightDecay ?? 0,
     decayFilter: config.decayFilter ?? (() => true),
+    lrIsScheduled,
   }
   const writebacks: WritebackDecl[] = []
   const lrtInputName = '_adam_lrt'
+  // Tensor input for runtime-updated decayShrink (only created when lr is a
+  // schedule fn AND at least one param will receive weight decay).
+  let decayShrinkInputName: string | null = null
 
   return traceInto(graph, () => {
-    // One scalar lrt input shared by every adam_update_p call. Runtime supplies
-    // it per step as `lr * sqrt(1-b2^t) / (1-b1^t)`.
     const lrt = tensorInput(lrtInputName, [], 'f32')
+
+    // Decide up-front whether we need a runtime decayShrink scalar. Only does
+    // something when both (a) lr varies per step and (b) some param is decayed.
+    const needsDynamicShrink = lrIsScheduled
+      && fullConfig.weightDecay > 0
+      && Object.keys(paramGrads).some(name => fullConfig.decayFilter(name))
+    let decayShrinkScalar: Tensor | null = null
+    if (needsDynamicShrink) {
+      decayShrinkInputName = '_adam_decay_shrink'
+      decayShrinkScalar = tensorInput(decayShrinkInputName, [], 'f32')
+    }
 
     for (const name of Object.keys(paramGrads)) {
       const p = paramTensors[name]
@@ -95,12 +139,19 @@ export function appendAdam(
       const mState = stateInput(`adam_m_${name}`, p.shape, 'f32', 0)
       const vState = stateInput(`adam_v_${name}`, p.shape, 'f32', 0)
 
-      // decayShrink baked at compile time. 1.0 for plain Adam (no extra cost
-      // — the WGSL compiler folds the constant multiply); 1 - lr * weightDecay
-      // for the params the filter selects.
-      const decayShrink = (fullConfig.weightDecay > 0 && fullConfig.decayFilter(name))
-        ? 1 - fullConfig.lr * fullConfig.weightDecay
-        : 1
+      // Choose the decayShrink form per param:
+      //   - non-decayed params: literal 1 (kernel multiply folds out).
+      //   - decayed + static lr: literal `1 - lr * wd` baked at compile.
+      //   - decayed + scheduled lr: tensor input updated per step.
+      const isDecayed = fullConfig.weightDecay > 0 && fullConfig.decayFilter(name)
+      let decayShrink: number | Tensor
+      if (!isDecayed) {
+        decayShrink = 1
+      } else if (decayShrinkScalar !== null) {
+        decayShrink = decayShrinkScalar
+      } else {
+        decayShrink = 1 - initialLr * fullConfig.weightDecay
+      }
 
       // Three fused kernels per parameter — one for each of m_new / v_new / p_new.
       const newM = adamUpdateM(mState, g, fullConfig.b1)
@@ -111,6 +162,6 @@ export function appendAdam(
       writebacks.push({ source: newV, destName: `adam_v_${name}`, destKind: 'state' })
       writebacks.push({ source: newP, destName: name,             destKind: 'param' })
     }
-    return { writebacks, lrtInputName, config: fullConfig }
+    return { writebacks, lrtInputName, decayShrinkInputName, config: fullConfig }
   })
 }

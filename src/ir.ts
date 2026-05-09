@@ -113,9 +113,21 @@ export type OpNode =
   // `lrt` is a scalar tensor (provided as a tensor_input updated per step) that
   // already includes Adam's bias-correction factor: lrt = lr * sqrt(1-b2^t) / (1-b1^t).
   // `decayShrink` is the decoupled-weight-decay factor (Loshchilov & Hutter,
-  // "AdamW") baked at compile time: 1 - lr * weightDecay when the param is being
-  // decayed, 1 otherwise. eps and decayShrink are both baked into the kernel.
-  | { kind: 'adam_update_p'; out: number; p: number; mNew: number; vNew: number; lrt: number; eps: number; decayShrink: number }
+  // "AdamW"): 1 - lr * weightDecay when the param is being decayed, 1 otherwise.
+  // It can be either a compile-time literal (number) for fixed-lr training, or a
+  // tensor id pointing at a scalar input that the runtime updates per step (used
+  // when the user supplies an lr schedule via `adam: { lr: (step) => ... }`).
+  | {
+      kind: 'adam_update_p'
+      out: number
+      p: number
+      mNew: number
+      vNew: number
+      lrt: number
+      eps: number
+      decayShrink: number               // literal (used when decayShrinkTensor is null)
+      decayShrinkTensor: number | null  // tensor id of a scalar input; takes precedence when set
+    }
 
   // ---- Slicing / broadcasting / autograd infrastructure -------------------
   // Slice [start, end) along the last axis. Output shape: input shape with

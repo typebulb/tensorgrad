@@ -557,23 +557,34 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     case 'adam_update_p': {
       // p_new = decayShrink * p - lrt[0] * m_new / (sqrt(v_new) + eps).
       // lrt is supplied per-step from CPU (already includes bias correction).
-      // decayShrink encodes AdamW's decoupled weight decay; when no decay is
-      // requested it's exactly 1.0 and the WGSL compiler folds the multiply away.
+      // decayShrink is either baked as a literal (no schedule, fixed lr) or
+      // bound as a per-step scalar input (when the user supplies an lr
+      // schedule via `adam: { lr: (step) => ... }`). When literal=1 the WGSL
+      // compiler folds the multiply away.
       const out = tof(op.out)
       const total = shapeSize(out.shape)
+      const dynamicShrink = op.decayShrinkTensor !== null
+      const shrinkExpr = dynamicShrink ? 'decayShrink[0]' : wgslLiteral(op.decayShrink, 'f32')
+      const shrinkBinding = dynamicShrink
+        ? `@group(0) @binding(4) var<storage, read> decayShrink : array<f32>;\n` +
+          `@group(0) @binding(5) var<storage, read_write> out : array<f32>;`
+        : `@group(0) @binding(4) var<storage, read_write> out : array<f32>;`
       const wgsl = `
 @group(0) @binding(0) var<storage, read> p : array<f32>;
 @group(0) @binding(1) var<storage, read> mNew : array<f32>;
 @group(0) @binding(2) var<storage, read> vNew : array<f32>;
 @group(0) @binding(3) var<storage, read> lrt : array<f32>;
-@group(0) @binding(4) var<storage, read_write> out : array<f32>;
+${shrinkBinding}
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x + gid.y * 16776960u;
   if (i >= ${total}u) { return; }
-  out[i] = ${wgslLiteral(op.decayShrink, 'f32')} * p[i] - lrt[0] * mNew[i] / (sqrt(vNew[i]) + ${wgslLiteral(op.eps, 'f32')});
+  out[i] = ${shrinkExpr} * p[i] - lrt[0] * mNew[i] / (sqrt(vNew[i]) + ${wgslLiteral(op.eps, 'f32')});
 }`.trim()
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.p), buf(op.mNew), buf(op.vNew), buf(op.lrt), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+      const bindings = dynamicShrink
+        ? [buf(op.p), buf(op.mNew), buf(op.vNew), buf(op.lrt), buf(op.decayShrinkTensor!), buf(op.out)]
+        : [buf(op.p), buf(op.mNew), buf(op.vNew), buf(op.lrt), buf(op.out)]
+      return { opIndex, opKind: op.kind, wgsl, bindings, threads: total, workgroupSize: WG_SIZE }
     }
 
     case 'sum_to_shape': {

@@ -112,13 +112,15 @@ export async function compileModule<M extends Module>(
   const lossBufferId = plan.tensorToBuffer.get(loss.id)!
   const runtime = await createRuntime(plan, kernels, lossBufferId, opts)
 
-  // If Adam is enabled, wrap step() to track the step count and supply lrt.
+  // If Adam is enabled, wrap step() to track the step count and supply lrt
+  // (and optionally decayShrink, when the user passed a per-step lr schedule).
   // Wrap resetOptimizerState() too, so a reset zeros m/v *and* the bias-correction
   // counter — otherwise the next step would skip Adam's warmup phase.
   if (adamResult) {
-    const { lrtInputName, config } = adamResult
+    const { lrtInputName, decayShrinkInputName, config } = adamResult
     let t = 0
     const lrtBuf = new Float32Array(1)
+    const decayShrinkBuf = decayShrinkInputName ? new Float32Array(1) : null
     const innerStep = runtime.step.bind(runtime) as CompiledRuntime['step']
     const innerReset = runtime.resetOptimizerState.bind(runtime)
     const wrappedStep = (
@@ -126,8 +128,13 @@ export async function compileModule<M extends Module>(
       opts?: { withCaptures?: boolean },
     ): Promise<number | { loss: number; captures: Record<string, Float32Array> }> => {
       t++
-      lrtBuf[0] = config.lr * Math.sqrt(1 - Math.pow(config.b2, t)) / (1 - Math.pow(config.b1, t))
-      const merged = { ...inputs, [lrtInputName]: lrtBuf }
+      const lrNow = config.lr(t)
+      lrtBuf[0] = lrNow * Math.sqrt(1 - Math.pow(config.b2, t)) / (1 - Math.pow(config.b1, t))
+      const merged: Record<string, Int32Array | Float32Array> = { ...inputs, [lrtInputName]: lrtBuf }
+      if (decayShrinkBuf && decayShrinkInputName) {
+        decayShrinkBuf[0] = 1 - lrNow * config.weightDecay
+        merged[decayShrinkInputName] = decayShrinkBuf
+      }
       return opts?.withCaptures ? innerStep(merged, { withCaptures: true }) : innerStep(merged)
     }
     runtime.step = wrappedStep as CompiledRuntime['step']

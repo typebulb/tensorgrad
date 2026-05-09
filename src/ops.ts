@@ -297,7 +297,14 @@ export function adamUpdateV(v: Tensor, g: Tensor, b2: number): Tensor {
   return addOp(currentGraph(), 'adam_update_v', v.shape, 'f32', site, { v: v.id, g: g.id, b2 })
 }
 
-export function adamUpdateP(p: Tensor, mNew: Tensor, vNew: Tensor, lrt: Tensor, eps: number, decayShrink: number = 1): Tensor {
+export function adamUpdateP(
+  p: Tensor,
+  mNew: Tensor,
+  vNew: Tensor,
+  lrt: Tensor,
+  eps: number,
+  decayShrink: number | Tensor = 1,
+): Tensor {
   const site = captureSite('adamUpdateP')
   if (p.dtype !== 'f32') throw new ShapeError(`adamUpdateP: requires f32`, site)
   if (lrt.dtype !== 'f32' || lrt.shape.length !== 0) {
@@ -306,6 +313,22 @@ export function adamUpdateP(p: Tensor, mNew: Tensor, vNew: Tensor, lrt: Tensor, 
   if (p.shape.length !== mNew.shape.length || p.shape.some((d, i) => d !== mNew.shape[i])) {
     throw new ShapeError(`adamUpdateP: p/mNew shape mismatch`, site)
   }
-  return addOp(currentGraph(), 'adam_update_p', p.shape, 'f32', site,
-    { p: p.id, mNew: mNew.id, vNew: vNew.id, lrt: lrt.id, eps, decayShrink })
+  // decayShrink is either a literal (baked into the kernel) or a 0-d scalar
+  // tensor input the runtime updates per step. The kernel binds at most one,
+  // chosen by whichever the caller provided.
+  const isTensor = typeof decayShrink === 'object'
+  if (isTensor) {
+    if (decayShrink.dtype !== 'f32' || decayShrink.shape.length !== 0) {
+      throw new ShapeError(`adamUpdateP: decayShrink tensor must be a 0-d f32 scalar`, site)
+    }
+  }
+  return addOp(currentGraph(), 'adam_update_p', p.shape, 'f32', site, {
+    p: p.id,
+    mNew: mNew.id,
+    vNew: vNew.id,
+    lrt: lrt.id,
+    eps,
+    decayShrink: isTensor ? 1 : decayShrink,
+    decayShrinkTensor: isTensor ? decayShrink.id : null,
+  })
 }
