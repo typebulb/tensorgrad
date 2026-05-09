@@ -7,6 +7,7 @@ dist/
 *.tsbuildinfo
 .env
 .env.local
+typebulbs
 
 # Temporarily excluded from the initial cautious push.
 # Re-include incrementally as samples/tests/CI are validated for public consumption.
