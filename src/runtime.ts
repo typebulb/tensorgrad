@@ -18,7 +18,36 @@ export interface UploadParamsOptions {
   partial?: boolean
 }
 
+export interface StepOptions {
+  /** Read back tensors registered via `capture(name, t)` during the trace.
+   *  When false/unset, `step()` returns just the loss number; staging buffers
+   *  for captures are not allocated. When true, returns `{ loss, captures }`
+   *  and lazily allocates one staging buffer per capture on first use. */
+  withCaptures?: boolean
+}
+
+export interface StepWithCaptures {
+  loss: number
+  captures: Record<string, Float32Array>
+}
+
+export interface RunOptions {
+  /** Read back tensors registered via `capture(name, t)` during the trace.
+   *  When false/unset, `run()` returns just the output Float32Array.
+   *  When true, returns `{ output, captures }`. */
+  withCaptures?: boolean
+}
+
+export interface RunWithCaptures {
+  output: Float32Array
+  captures: Record<string, Float32Array>
+}
+
 export interface CompiledRuntime {
+  /** Map of param name -> the underlying GPUBuffer. Pass to a sibling compile
+   *  via `sharedParams` to share without copies — every step on this runtime
+   *  is immediately visible to anyone reading these buffers. */
+  params: Map<string, GPUBuffer>
   /** Upload parameter Float32Arrays to their GPU buffers. By default, requires
    *  *all* params to be present; throws on any unknown or missing key. Pass
    *  `{ partial: true }` to skip the missing-key check. */
@@ -31,10 +60,20 @@ export interface CompiledRuntime {
    * One full forward+backward step.
    *   1. Uploads `inputs` (tokens, targets, masks) to input buffers.
    *   2. Dispatches every kernel in order.
-   *   3. Reads back the loss scalar.
-   * Returns the loss as a JS number.
+   *   3. Reads back the loss scalar (and any registered captures, if requested).
+   * Default returns the loss as a JS number; with `{ withCaptures: true }`
+   * returns `{ loss, captures }` where `captures` is keyed by the names passed
+   * to `capture(...)` during the trace.
    */
   step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
+  step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepWithCaptures>
+  step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepWithCaptures>
+  /** Like `step()` but returns the full output Float32Array instead of just
+   *  its first element. For training graphs this is rarely useful (the output
+   *  *is* a scalar loss); it's the primary API for forward-only compiles. */
+  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunWithCaptures>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunWithCaptures>
   /** Re-zero all optimizer state buffers (Adam's m/v) in place. Pair with
    *  `uploadInitialParams()` for a full training reset without recompile. */
   resetOptimizerState(): void
@@ -42,9 +81,30 @@ export interface CompiledRuntime {
   destroy(): void
 }
 
+/** Forward-only compiled runtime — produced by `compileForward`. No optimizer,
+ *  no backward. Returns the output tensor (not just a scalar) per `run()` call. */
+export interface CompiledForward {
+  params: Map<string, GPUBuffer>
+  uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): void
+  downloadParams(): Promise<Record<string, Float32Array>>
+  /** Forward-only dispatch. Returns the graph's output tensor as a Float32Array
+   *  (the user's returned tensor from the forward function, in row-major order).
+   *  With `{ withCaptures: true }`, returns `{ output, captures }`. */
+  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunWithCaptures>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunWithCaptures>
+  destroy(): void
+}
+
 export interface RuntimeOpts {
   /** Pre-acquired GPUDevice. If omitted, runtime requests its own. */
   device?: GPUDevice
+  /** External param buffers to bind in place of allocating fresh ones, keyed
+   *  by param name. Used to share params between a training compile and a
+   *  sibling forward-only compile (e.g., a B=1 inference graph). When a name
+   *  is in this map, the runtime reuses the provided GPUBuffer; otherwise it
+   *  allocates as usual. */
+  sharedParams?: Map<string, GPUBuffer>
 }
 
 // Inlined numeric values (per WebGPU spec) so this module is importable in Node
@@ -64,8 +124,23 @@ export async function createRuntime(
 
   // ---- Allocate one GPUBuffer per BufferSpec --------------------------------
   // State buffers also get filled with their initValue at allocation time.
+  // Param buffers may be supplied externally via opts.sharedParams; in that
+  // case we reuse the provided GPUBuffer instead of allocating, and the
+  // sibling compile that owns it is responsible for upload + lifetime.
   const buffers = new Map<number, GPUBuffer>()
+  const sharedParams = opts.sharedParams
   for (const spec of plan.buffers) {
+    if (spec.kind === 'param' && sharedParams?.has(spec.name!)) {
+      const shared = sharedParams.get(spec.name!)!
+      if (shared.size !== spec.byteSize) {
+        throw new Error(
+          `sharedParams: size mismatch for '${spec.name}' — supplied ${shared.size} bytes, ` +
+          `compiled graph expects ${spec.byteSize}.`,
+        )
+      }
+      buffers.set(spec.id, shared)
+      continue
+    }
     const buf = device.createBuffer({
       size: spec.byteSize,
       usage: STORAGE_RW,
@@ -79,6 +154,13 @@ export async function createRuntime(
         ? new Float32Array(elements).fill(spec.initValue ?? 0)
         : new Int32Array(elements).fill(Math.trunc(spec.initValue ?? 0))
       queue.writeBuffer(buf, 0, init as unknown as BufferSource)
+    }
+  }
+  // Track which params are externally owned — those are skipped on destroy().
+  const ownedBufferIds = new Set<number>()
+  for (const spec of plan.buffers) {
+    if (!(spec.kind === 'param' && sharedParams?.has(spec.name!))) {
+      ownedBufferIds.add(spec.id)
     }
   }
 
@@ -139,12 +221,45 @@ export async function createRuntime(
     })
   })
 
-  // ---- Loss readback staging buffer -----------------------------------------
-  const lossSpec = plan.buffers[lossBufferId]!
-  const lossReadback = device.createBuffer({ size: lossSpec.byteSize, usage: READBACK })
+  // ---- Output readback staging buffer ---------------------------------------
+  // `outputBufferId` is the graph's main output (loss for training, the user's
+  // returned tensor for forward-only). step() reads back its first element;
+  // run() reads back the full Float32Array.
+  const outputSpec = plan.buffers[lossBufferId]!
+  const outputReadback = device.createBuffer({ size: outputSpec.byteSize, usage: READBACK })
 
-  // ---- step() ---------------------------------------------------------------
-  async function step(inputs: Record<string, Int32Array | Float32Array>): Promise<number> {
+  // ---- Capture readback staging buffers (lazy) ------------------------------
+  // Allocated on first `step({ withCaptures: true })` call and reused across
+  // subsequent calls. When the graph has no captures registered or when the
+  // caller never opts in, no extra GPU memory is allocated.
+  let captureStagings: Map<string, GPUBuffer> | null = null
+  function ensureCaptureStagings(): Map<string, GPUBuffer> {
+    if (captureStagings) return captureStagings
+    captureStagings = new Map()
+    for (const [name, bufId] of plan.capturesByName) {
+      const spec = plan.buffers[bufId]!
+      const staging = device.createBuffer({ size: spec.byteSize, usage: READBACK, label: `cap-${name}` })
+      captureStagings.set(name, staging)
+    }
+    return captureStagings
+  }
+
+  // ---- dispatch() — shared core for step() and run() -----------------------
+  // Uploads inputs, dispatches all kernels (in order), queues writebacks, copies
+  // the output buffer into its staging, optionally copies captures into theirs,
+  // submits, and reads back. Returns the full output Float32Array; step() takes
+  // [0] for scalar loss, run() returns it whole.
+  async function dispatch(
+    inputs: Record<string, Int32Array | Float32Array>,
+    wantCaptures: boolean,
+  ): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
+    if (wantCaptures && plan.capturesByName.size === 0) {
+      throw new Error(
+        `withCaptures=true but no capture(...) calls were registered during ` +
+        `the trace. Add capture('name', tensor) inside your forward pass for ` +
+        `the intermediates you want read back.`,
+      )
+    }
     for (const [name, bufId] of plan.inputsByName) {
       const data = inputs[name]
       if (!data) throw new Error(`tensorgrad: missing input '${name}'`)
@@ -177,19 +292,63 @@ export async function createRuntime(
       pass.dispatchWorkgroups(wgX, wgY, 1)
       pass.end()
     }
-    // After all dispatches: writebacks (Adam state, updated params).
-    // copyBufferToBuffer is queued onto the same encoder so it's ordered after
-    // all kernel dispatches.
+    // After all dispatches: writebacks (Adam state, updated params). Empty for
+    // forward-only compiles.
     for (const wb of plan.writebacks) {
       encoder.copyBufferToBuffer(buffers.get(wb.source)!, 0, buffers.get(wb.dest)!, 0, wb.bytes)
     }
-    encoder.copyBufferToBuffer(buffers.get(lossBufferId)!, 0, lossReadback, 0, lossSpec.byteSize)
+    encoder.copyBufferToBuffer(buffers.get(lossBufferId)!, 0, outputReadback, 0, outputSpec.byteSize)
+    // Capture readbacks (only when opted in). Queued before submit so they
+    // observe the same kernel outputs as the main output.
+    let stagings: Map<string, GPUBuffer> | null = null
+    if (wantCaptures) {
+      stagings = ensureCaptureStagings()
+      for (const [name, bufId] of plan.capturesByName) {
+        const spec = plan.buffers[bufId]!
+        encoder.copyBufferToBuffer(buffers.get(bufId)!, 0, stagings.get(name)!, 0, spec.byteSize)
+      }
+    }
     queue.submit([encoder.finish()])
 
-    await lossReadback.mapAsync(GPUMapMode.READ)
-    const view = new Float32Array(lossReadback.getMappedRange().slice(0))
-    lossReadback.unmap()
-    return view[0]!
+    await outputReadback.mapAsync(GPUMapMode.READ)
+    const output = new Float32Array(outputReadback.getMappedRange().slice(0))
+    outputReadback.unmap()
+
+    if (!wantCaptures) return { output, captures: null }
+
+    const captures: Record<string, Float32Array> = {}
+    for (const [name, staging] of stagings!) {
+      await staging.mapAsync(GPUMapMode.READ)
+      captures[name] = new Float32Array(staging.getMappedRange().slice(0))
+      staging.unmap()
+    }
+    return { output, captures }
+  }
+
+  // ---- step() — training-mode wrapper, returns scalar [0] of output ---------
+  function step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
+  function step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepWithCaptures>
+  function step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepWithCaptures>
+  async function step(
+    inputs: Record<string, Int32Array | Float32Array>,
+    opts?: StepOptions,
+  ): Promise<number | StepWithCaptures> {
+    const r = await dispatch(inputs, opts?.withCaptures === true)
+    if (opts?.withCaptures) return { loss: r.output[0]!, captures: r.captures! }
+    return r.output[0]!
+  }
+
+  // ---- run() — forward-mode wrapper, returns full output Float32Array -------
+  function run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  function run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunWithCaptures>
+  function run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunWithCaptures>
+  async function run(
+    inputs: Record<string, Int32Array | Float32Array>,
+    opts?: RunOptions,
+  ): Promise<Float32Array | RunWithCaptures> {
+    const r = await dispatch(inputs, opts?.withCaptures === true)
+    if (opts?.withCaptures) return { output: r.output, captures: r.captures! }
+    return r.output
   }
 
   // ---- uploadParams ---------------------------------------------------------
@@ -256,16 +415,48 @@ export async function createRuntime(
     }
   }
 
+  // Build the params map AFTER buffer allocation so it points at the actual
+  // GPUBuffers (shared or freshly allocated).
+  const params = new Map<string, GPUBuffer>()
+  for (const [name, bufId] of plan.paramsByName) {
+    params.set(name, buffers.get(bufId)!)
+  }
+
+  const destroy = () => {
+    for (const [id, b] of buffers) {
+      if (ownedBufferIds.has(id)) b.destroy()
+    }
+    outputReadback.destroy()
+    if (captureStagings) for (const b of captureStagings.values()) b.destroy()
+  }
+
   return {
+    params,
     uploadParams,
     downloadParams: () => downloadFromMap(plan.paramsByName),
     downloadParamGrads: () => downloadFromMap(plan.paramGradsByName),
     step,
+    run,
     resetOptimizerState,
-    destroy: () => {
-      for (const b of buffers.values()) b.destroy()
-      lossReadback.destroy()
-    },
+    destroy,
+  }
+}
+
+/** Same machinery as `createRuntime`, narrower public API: no step,
+ *  no resetOptimizerState, no downloadParamGrads. Used by `compileForward`. */
+export async function createForwardRuntime(
+  plan: BufferPlan,
+  kernels: KernelSpec[],
+  outputBufferId: number,
+  opts: RuntimeOpts = {},
+): Promise<CompiledForward> {
+  const full = await createRuntime(plan, kernels, outputBufferId, opts)
+  return {
+    params: full.params,
+    uploadParams: full.uploadParams,
+    downloadParams: full.downloadParams,
+    run: full.run,
+    destroy: full.destroy,
   }
 }
 

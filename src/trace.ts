@@ -19,6 +19,10 @@ import { makeGraph, addOp, captureSite } from './ir.js'
 
 // Module-local: the graph being built right now, or null if no trace is active.
 let _current: Graph | null = null
+// Module-local: whether `capture(name, t)` calls should register on the current
+// graph. True only during the user's forward trace; false during `traceInto`
+// (autograd / optimizer ops shouldn't accidentally publish gradient tensors).
+let _captureEnabled = false
 
 export function currentGraph(): Graph {
   if (!_current) {
@@ -30,6 +34,10 @@ export function currentGraph(): Graph {
   return _current
 }
 
+export function isCaptureEnabled(): boolean {
+  return _captureEnabled
+}
+
 // Run `fn` with a fresh graph as the current one; capture and return the graph.
 // `fn` must return the tensor (or array of tensors) to mark as graph outputs.
 export function trace(fn: () => Tensor | Tensor[]): Graph {
@@ -38,6 +46,7 @@ export function trace(fn: () => Tensor | Tensor[]): Graph {
   }
   const g = makeGraph()
   _current = g
+  _captureEnabled = true
   try {
     const result = fn()
     const outputs = Array.isArray(result) ? result : [result]
@@ -46,6 +55,7 @@ export function trace(fn: () => Tensor | Tensor[]): Graph {
     }
   } finally {
     _current = null
+    _captureEnabled = false
   }
   return g
 }
@@ -53,12 +63,15 @@ export function trace(fn: () => Tensor | Tensor[]): Graph {
 // Re-enter an existing graph to append more ops. Used by autograd to add
 // backward ops to a graph that's already been traced. `fn` runs with the
 // supplied graph as the current one; any ops it calls append to that graph.
+// Capture is intentionally disabled here — backward / optimizer rules
+// shouldn't publish their internal tensors via `capture()`.
 // Returns whatever `fn` returns.
 export function traceInto<T>(g: Graph, fn: () => T): T {
   if (_current) {
     throw new Error('tensorgrad: traceInto() called while another trace is active')
   }
   _current = g
+  // _captureEnabled stays false (default) — explicit, but not toggled.
   try {
     return fn()
   } finally {

@@ -14,7 +14,7 @@ import { appendGrad, type GradResult } from './grad.js'
 import { appendAdam, type AdamConfig } from './adam.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
-import { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
+import { createRuntime, createForwardRuntime, type CompiledRuntime, type CompiledForward, type RuntimeOpts } from './runtime.js'
 import { Module, materializeParams } from './module.js'
 
 /** Declares one input tensor of the model's forward function. Order matches
@@ -63,6 +63,11 @@ export interface CompileModuleOptions extends RuntimeOpts {
   inputs?: InputDecl[]
   /** Adam hyperparameters. If omitted, no optimizer is appended (forward-only). */
   adam?: AdamConfig
+}
+
+export interface CompileForwardOptions extends RuntimeOpts {
+  /** Per-step data inputs to the forward function. */
+  inputs?: InputDecl[]
 }
 
 /**
@@ -114,13 +119,18 @@ export async function compileModule<M extends Module>(
     const { lrtInputName, config } = adamResult
     let t = 0
     const lrtBuf = new Float32Array(1)
-    const innerStep = runtime.step.bind(runtime)
+    const innerStep = runtime.step.bind(runtime) as CompiledRuntime['step']
     const innerReset = runtime.resetOptimizerState.bind(runtime)
-    runtime.step = async (inputs) => {
+    const wrappedStep = (
+      inputs: Record<string, Int32Array | Float32Array>,
+      opts?: { withCaptures?: boolean },
+    ): Promise<number | { loss: number; captures: Record<string, Float32Array> }> => {
       t++
       lrtBuf[0] = config.lr * Math.sqrt(1 - Math.pow(config.b2, t)) / (1 - Math.pow(config.b1, t))
-      return innerStep({ ...inputs, [lrtInputName]: lrtBuf })
+      const merged = { ...inputs, [lrtInputName]: lrtBuf }
+      return opts?.withCaptures ? innerStep(merged, { withCaptures: true }) : innerStep(merged)
     }
+    runtime.step = wrappedStep as CompiledRuntime['step']
     runtime.resetOptimizerState = () => {
       t = 0
       innerReset()
@@ -141,5 +151,69 @@ export async function compileModule<M extends Module>(
   }
 
   const ir: CompiledIR = { graph, paramGrads, loss, plan, kernels }
+  return Object.assign(runtime, { ir, uploadInitialParams })
+}
+
+// ============================================================================
+// Forward-only compile
+// ============================================================================
+
+/**
+ * Compile a Module-based model in forward-only mode (no autograd, no Adam).
+ * The forward function returns the output tensor (e.g., logits) instead of a
+ * scalar loss; runtime exposes `run(inputs)` returning the full output as a
+ * `Float32Array`.
+ *
+ * **Sharing params with a training compile.** Pass `opts.sharedParams =
+ * trainCompiled.params` to bind this graph's param buffers to an existing
+ * training runtime's GPU buffers — every train step is then immediately
+ * visible to `run()` calls here, no copies. The forward graph's
+ * `uploadInitialParams()` skips any param covered by `sharedParams`.
+ *
+ * Typical use: a B=1 inference graph alongside a B=512 training graph,
+ * built from the same `Module` factory.
+ */
+export async function compileForward<M extends Module>(
+  modelFactory: () => M,
+  forward: (m: M, ...inputs: Tensor[]) => Tensor,
+  opts: CompileForwardOptions = {},
+): Promise<CompiledForward & { ir: CompiledIR; uploadInitialParams: () => void }> {
+  const inputDecls = opts.inputs ?? []
+  const model = modelFactory()
+  let materialized: ReturnType<typeof materializeParams> = { tensors: {}, initFns: {} }
+  const graph = trace(() => {
+    materialized = materializeParams(model)
+    const inputTensors = inputDecls.map(d => tensorInput(d.name, d.shape, d.dtype ?? 'f32'))
+    return forward(model, ...inputTensors)
+  })
+
+  const plan = planBuffers(graph, /* paramGrads */ {})
+  const kernels = emitKernels(graph, plan)
+  const outputTensor = graph.tensors[graph.outputs[0]!]!
+  const outputBufferId = plan.tensorToBuffer.get(outputTensor.id)!
+  const runtime = await createForwardRuntime(plan, kernels, outputBufferId, opts)
+
+  const sharedParams = opts.sharedParams
+  const { initFns } = materialized
+  const uploadInitialParams = () => {
+    const out: Record<string, Float32Array> = {}
+    let needsUpload = false
+    for (const [name, bufId] of plan.paramsByName) {
+      // Skip params covered by sharedParams — those are owned by the providing
+      // compile and already initialized there.
+      if (sharedParams?.has(name)) continue
+      const shape = plan.buffers[bufId]!.shape
+      const size = shape.reduce((a, b) => a * b, 1)
+      const initFn = initFns[name]
+      if (!initFn) throw new Error(`uploadInitialParams: no init for param '${name}'`)
+      out[name] = initFn(size, shape)
+      needsUpload = true
+    }
+    if (needsUpload) runtime.uploadParams(out, { partial: !!sharedParams })
+  }
+
+  // CompiledIR.loss is the field name; for forward-only, it carries the user's
+  // returned tensor (e.g., logits). Same shape conceptually; just no autograd.
+  const ir: CompiledIR = { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
   return Object.assign(runtime, { ir, uploadInitialParams })
 }

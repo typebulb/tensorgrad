@@ -6,6 +6,7 @@
 export type { Tensor, Shape, Dtype, OpNode, Graph, CallSite } from './ir.js'
 export { ShapeError } from './shape.js'
 export { trace, traceInto, paramInput, tensorInput, stateInput } from './trace.js'
+export { capture } from './capture.js'
 export {
   // Element-wise arithmetic. The binops accept Tensor or JS-number for the second arg.
   add, sub, mul, div,
@@ -35,7 +36,7 @@ export { appendGrad, type GradResult } from './grad.js'
 export { appendAdam, type AdamConfig, type AdamResult } from './adam.js'
 export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
 export { emitKernels, type KernelSpec } from './codegen.js'
-export { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
-export { compile, compileToIR, compileModule, type CompiledIR, type CompileModuleOptions, type InputDecl } from './compile.js'
+export { createRuntime, createForwardRuntime, type CompiledRuntime, type CompiledForward, type RuntimeOpts, type StepOptions, type StepWithCaptures, type RunOptions, type RunWithCaptures } from './runtime.js'
+export { compile, compileToIR, compileModule, compileForward, type CompiledIR, type CompileModuleOptions, type CompileForwardOptions, type InputDecl } from './compile.js'
 export { Module, materializeParams, type InitSpec, type ParamOptions, type MaterializedParams } from './module.js'
 export * as nn from './nn.js'

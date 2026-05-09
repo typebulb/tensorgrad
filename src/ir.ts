@@ -141,10 +141,14 @@ export interface Graph {
   // Names of tensors that should be exposed as outputs of the compiled function.
   // Set by the trace driver; for a loss function, this is `[lossTensor]`.
   readonly outputs: number[]
+  // Tensors registered for activation readback via `capture(name, t)`.
+  // Keyed by user-supplied name; insertion order preserved. Empty when no
+  // captures registered (the common training case — zero overhead).
+  readonly captures: Map<string, number>
 }
 
 export function makeGraph(): Graph {
-  return { ops: [], tensors: [], outputs: [] }
+  return { ops: [], tensors: [], outputs: [], captures: new Map() }
 }
 
 // Internal: register a fresh tensor in the graph and return its id.

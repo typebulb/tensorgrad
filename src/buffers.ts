@@ -47,6 +47,7 @@ export interface BufferPlan {
   inputsByName: Map<string, number>           // name -> buffer id
   paramGradsByName: Map<string, number>       // name -> buffer id
   statesByName: Map<string, number>           // name -> buffer id (persistent state homes)
+  capturesByName: Map<string, number>         // name -> buffer id (activation captures)
   outputBufferIds: number[]                   // graph.outputs mapped through
   /** End-of-step writebacks (Adam updates for params, m, v, etc.) */
   writebacks: Writeback[]
@@ -169,5 +170,17 @@ export function planBuffers(
     return { source: sourceBufId, dest: destBufId, bytes: sourceSpec.byteSize }
   })
 
-  return { buffers, tensorToBuffer, paramsByName, inputsByName, paramGradsByName, statesByName, outputBufferIds, writebacks }
+  // Resolve graph.captures (name -> tensor id) to (name -> buffer id).
+  // No pinning needed at the planner level: each tensor already has its own
+  // buffer (see "v1 strategy" comment at top — no pooling yet).
+  const capturesByName = new Map<string, number>()
+  for (const [name, tensorId] of graph.captures) {
+    const bufId = tensorToBuffer.get(tensorId)
+    if (bufId === undefined) {
+      throw new Error(`planBuffers: capture '${name}' references unknown tensor #${tensorId}`)
+    }
+    capturesByName.set(name, bufId)
+  }
+
+  return { buffers, tensorToBuffer, paramsByName, inputsByName, paramGradsByName, statesByName, capturesByName, outputBufferIds, writebacks }
 }
