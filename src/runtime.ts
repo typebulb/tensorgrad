@@ -7,6 +7,10 @@
 import type { BufferPlan } from './buffers.js'
 import type { KernelSpec } from './codegen.js'
 
+// TS lib.dom defines WebGPU types but not the GPUMapMode runtime constant.
+// Provided by the browser per WebGPU spec; declare just what we use.
+declare const GPUMapMode: { readonly READ: number; readonly WRITE: number }
+
 export interface CompiledRuntime {
   /** Upload one or more parameter Float32Arrays to their GPU buffers. */
   uploadParams(params: Record<string, Float32Array>): void

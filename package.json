@@ -56,7 +56,6 @@
     "prepublishOnly": "tsc -p tsconfig.json"
   },
   "devDependencies": {
-    "@webgpu/types": "*",
     "tsx": "*",
     "typescript": "*"
   }
