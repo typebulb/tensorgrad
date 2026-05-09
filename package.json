@@ -45,7 +45,7 @@
   "files": [
     "dist",
     "src",
-    "SPEC.md",
+    "specs/SPEC.md",
     "README.md",
     "LICENSE"
   ],

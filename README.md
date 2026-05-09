@@ -94,7 +94,7 @@ If you need full JAX (vmap / pmap / dynamic shapes / multi-backend), use
 ## Scope (deliberately small)
 
 The library only does what it does because of what it doesn't do.
-[`SPEC.md`](./SPEC.md) has the full design notes; the load-bearing
+[`SPEC.md`](./specs/SPEC.md) has the full design notes; the load-bearing
 "out of scope" decisions are:
 
 - **WebGPU only** — no Wasm or WebGL fallback.
