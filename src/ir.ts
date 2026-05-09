@@ -109,11 +109,13 @@ export type OpNode =
   // update into ~12 element-wise dispatches per param.
   | { kind: 'adam_update_m'; out: number; m: number; g: number; b1: number }
   | { kind: 'adam_update_v'; out: number; v: number; g: number; b2: number }
-  // adam_update_p: p_new = p - lrt[0] * m_new / (sqrt(v_new) + eps).
+  // adam_update_p: p_new = decayShrink * p - lrt[0] * m_new / (sqrt(v_new) + eps).
   // `lrt` is a scalar tensor (provided as a tensor_input updated per step) that
   // already includes Adam's bias-correction factor: lrt = lr * sqrt(1-b2^t) / (1-b1^t).
-  // Only `eps` is baked in.
-  | { kind: 'adam_update_p'; out: number; p: number; mNew: number; vNew: number; lrt: number; eps: number }
+  // `decayShrink` is the decoupled-weight-decay factor (Loshchilov & Hutter,
+  // "AdamW") baked at compile time: 1 - lr * weightDecay when the param is being
+  // decayed, 1 otherwise. eps and decayShrink are both baked into the kernel.
+  | { kind: 'adam_update_p'; out: number; p: number; mNew: number; vNew: number; lrt: number; eps: number; decayShrink: number }
 
   // ---- Slicing / broadcasting / autograd infrastructure -------------------
   // Slice [start, end) along the last axis. Output shape: input shape with

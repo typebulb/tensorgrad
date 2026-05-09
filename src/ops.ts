@@ -297,7 +297,7 @@ export function adamUpdateV(v: Tensor, g: Tensor, b2: number): Tensor {
   return addOp(currentGraph(), 'adam_update_v', v.shape, 'f32', site, { v: v.id, g: g.id, b2 })
 }
 
-export function adamUpdateP(p: Tensor, mNew: Tensor, vNew: Tensor, lrt: Tensor, eps: number): Tensor {
+export function adamUpdateP(p: Tensor, mNew: Tensor, vNew: Tensor, lrt: Tensor, eps: number, decayShrink: number = 1): Tensor {
   const site = captureSite('adamUpdateP')
   if (p.dtype !== 'f32') throw new ShapeError(`adamUpdateP: requires f32`, site)
   if (lrt.dtype !== 'f32' || lrt.shape.length !== 0) {
@@ -307,5 +307,5 @@ export function adamUpdateP(p: Tensor, mNew: Tensor, vNew: Tensor, lrt: Tensor, 
     throw new ShapeError(`adamUpdateP: p/mNew shape mismatch`, site)
   }
   return addOp(currentGraph(), 'adam_update_p', p.shape, 'f32', site,
-    { p: p.id, mNew: mNew.id, vNew: vNew.id, lrt: lrt.id, eps })
+    { p: p.id, mNew: mNew.id, vNew: vNew.id, lrt: lrt.id, eps, decayShrink })
 }

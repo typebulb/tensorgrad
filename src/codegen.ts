@@ -555,8 +555,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.v), buf(op.g), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
     case 'adam_update_p': {
-      // p_new = p - lrt[0] * m_new / (sqrt(v_new) + eps).
+      // p_new = decayShrink * p - lrt[0] * m_new / (sqrt(v_new) + eps).
       // lrt is supplied per-step from CPU (already includes bias correction).
+      // decayShrink encodes AdamW's decoupled weight decay; when no decay is
+      // requested it's exactly 1.0 and the WGSL compiler folds the multiply away.
       const out = tof(op.out)
       const total = shapeSize(out.shape)
       const wgsl = `
@@ -569,7 +571,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x + gid.y * 16776960u;
   if (i >= ${total}u) { return; }
-  out[i] = p[i] - lrt[0] * mNew[i] / (sqrt(vNew[i]) + ${wgslLiteral(op.eps, 'f32')});
+  out[i] = ${wgslLiteral(op.decayShrink, 'f32')} * p[i] - lrt[0] * mNew[i] / (sqrt(vNew[i]) + ${wgslLiteral(op.eps, 'f32')});
 }`.trim()
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.p), buf(op.mNew), buf(op.vNew), buf(op.lrt), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
