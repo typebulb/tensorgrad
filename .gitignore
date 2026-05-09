@@ -15,8 +15,6 @@ samples/
 test/
 .github/
 .claude/
-specs/HANDOFF.md
-specs/API-IMPROVEMENTS.md
-specs/Simplify.md
+specs/
 pnpm-workspace.yaml
 pnpm-lock.yaml
