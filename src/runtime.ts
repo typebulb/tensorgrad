@@ -250,20 +250,33 @@ export async function createRuntime(
   const outputSpec = plan.buffers[lossBufferId]!
   const outputReadback = device.createBuffer({ size: outputSpec.byteSize, usage: READBACK })
 
-  // ---- Capture readback staging buffers (lazy) ------------------------------
-  // Allocated on first `step({ withCaptures: true })` call and reused across
-  // subsequent calls. When the graph has no captures registered or when the
-  // caller never opts in, no extra GPU memory is allocated.
-  let captureStagings: Map<string, GPUBuffer> | null = null
-  function ensureCaptureStagings(): Map<string, GPUBuffer> {
-    if (captureStagings) return captureStagings
-    captureStagings = new Map()
+  // ---- Capture readback staging buffer (lazy, single concatenated) ---------
+  // One buffer for ALL captures, with each capture occupying a slice. Matters
+  // on mobile: each `mapAsync` round-trip on Android Chrome adds significant
+  // GPU-fence latency (~10–30 ms vs ~1 ms on desktop). With N captures, the
+  // per-call mobile cost is N × that latency on the main thread. Concatenating
+  // and reading back via one `mapAsync` collapses N stalls into one. Allocated
+  // on first `step({ withCaptures: true })` call.
+  type CaptureLayout = {
+    buffer: GPUBuffer
+    slices: { name: string; bufId: number; offset: number; byteSize: number }[]
+  }
+  let captureStaging: CaptureLayout | null = null
+  function ensureCaptureStaging(): CaptureLayout {
+    if (captureStaging) return captureStaging
+    let totalBytes = 0
+    const slices: CaptureLayout['slices'] = []
     for (const [name, bufId] of plan.capturesByName) {
       const spec = plan.buffers[bufId]!
-      const staging = device.createBuffer({ size: spec.byteSize, usage: READBACK, label: `cap-${name}` })
-      captureStagings.set(name, staging)
+      // copyBufferToBuffer offsets must be 4-aligned. Capture byteSizes are
+      // always shape-product × 4 (f32/i32/bool all 4 bytes), so cumulative
+      // offsets stay aligned.
+      slices.push({ name, bufId, offset: totalBytes, byteSize: spec.byteSize })
+      totalBytes += spec.byteSize
     }
-    return captureStagings
+    const buffer = device.createBuffer({ size: totalBytes, usage: READBACK, label: 'captures-staging' })
+    captureStaging = { buffer, slices }
+    return captureStaging
   }
 
   // ---- dispatch() — shared core for step() and run() -----------------------
@@ -336,14 +349,13 @@ export async function createRuntime(
       encoder.copyBufferToBuffer(buffers.get(wb.source)!, 0, buffers.get(wb.dest)!, 0, wb.bytes)
     }
     encoder.copyBufferToBuffer(buffers.get(lossBufferId)!, 0, outputReadback, 0, outputSpec.byteSize)
-    // Capture readbacks (only when opted in). Queued before submit so they
-    // observe the same kernel outputs as the main output.
-    let stagings: Map<string, GPUBuffer> | null = null
+    // Capture readbacks (only when opted in). All captures concatenate into
+    // a single staging buffer so we mapAsync once instead of N times.
+    let layout: CaptureLayout | null = null
     if (wantCaptures) {
-      stagings = ensureCaptureStagings()
-      for (const [name, bufId] of plan.capturesByName) {
-        const spec = plan.buffers[bufId]!
-        encoder.copyBufferToBuffer(buffers.get(bufId)!, 0, stagings.get(name)!, 0, spec.byteSize)
+      layout = ensureCaptureStaging()
+      for (const s of layout.slices) {
+        encoder.copyBufferToBuffer(buffers.get(s.bufId)!, 0, layout.buffer, s.offset, s.byteSize)
       }
     }
     queue.submit([encoder.finish()])
@@ -353,12 +365,15 @@ export async function createRuntime(
     outputReadback.unmap()
 
     const captures = new Map<string, Float32Array>()
-    if (wantCaptures) {
-      for (const [name, staging] of stagings!) {
-        await staging.mapAsync(GPUMapMode.READ)
-        captures.set(name, new Float32Array(staging.getMappedRange().slice(0)))
-        staging.unmap()
+    if (layout) {
+      await layout.buffer.mapAsync(GPUMapMode.READ)
+      const range = layout.buffer.getMappedRange()
+      for (const s of layout.slices) {
+        // Copy out (slice) before unmap — the underlying ArrayBuffer is
+        // detached when the buffer unmaps.
+        captures.set(s.name, new Float32Array(range, s.offset, s.byteSize / 4).slice())
       }
+      layout.buffer.unmap()
     }
     return { output, captures }
   }
@@ -480,7 +495,7 @@ export async function createRuntime(
       if (ownedBufferIds.has(id)) b.destroy()
     }
     outputReadback.destroy()
-    if (captureStagings) for (const b of captureStagings.values()) b.destroy()
+    if (captureStaging) captureStaging.buffer.destroy()
   }
 
   return {
