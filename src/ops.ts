@@ -17,7 +17,7 @@ import {
   inferReshape, inferTranspose, inferMatmul, inferMatmulBatched,
   inferOneHot, inferWhereCausal, inferSliceLastRange,
   inferBroadcastTo, inferSumToShape, inferReluGrad, inferWhere,
-  ShapeError,
+  ShapeError, showShape,
 } from './shape.js'
 
 // ----------------------------------------------------------------------------
@@ -112,6 +112,11 @@ export function sumLast(a: Tensor): Tensor {
   return addOp(currentGraph(), 'sum_last', outShape, a.dtype, site, { a: a.id })
 }
 
+/** Reduce all elements to a 0-d scalar. Composes `reshape` + `sumLast`. */
+export function sumAll(a: Tensor): Tensor {
+  return sumLast(reshape(a, [-1]))
+}
+
 // ----------------------------------------------------------------------------
 // Shape ops.
 // ----------------------------------------------------------------------------
@@ -126,6 +131,26 @@ export function transpose(a: Tensor, perm: readonly number[]): Tensor {
   const site = captureSite('transpose')
   const outShape = inferTranspose('transpose', a.shape, perm, site)
   return addOp(currentGraph(), 'transpose', outShape, a.dtype, site, { a: a.id, perm })
+}
+
+/** Swap two axes of a tensor. Negative indices count from the end (so
+ *  `swapAxes(x, -1, -2)` swaps the last two — the common attention pattern).
+ *  All other axes keep their position. Implemented as `transpose` with the
+ *  permutation `[0, 1, ..., axis2, ..., axis1, ..., n-1]`. */
+export function swapAxes(a: Tensor, axis1: number, axis2: number): Tensor {
+  const r = a.shape.length
+  const norm = (axis: number): number => axis < 0 ? r + axis : axis
+  const i1 = norm(axis1)
+  const i2 = norm(axis2)
+  const site = captureSite('swapAxes')
+  if (i1 < 0 || i1 >= r || i2 < 0 || i2 >= r) {
+    throw new ShapeError(`swapAxes: axis out of range — got (${axis1}, ${axis2}) for rank-${r} tensor`, site)
+  }
+  if (i1 === i2) return a
+  const perm = Array.from({ length: r }, (_, k) => k)
+  perm[i1] = i2
+  perm[i2] = i1
+  return transpose(a, perm)
 }
 
 // ----------------------------------------------------------------------------
@@ -161,6 +186,22 @@ export function oneHot(indices: Tensor, depth: number, dtype: Dtype = 'f32'): Te
   }
   const outShape = inferOneHot('oneHot', indices.shape, depth, site)
   return addOp(currentGraph(), 'one_hot', outShape, dtype, site, { indices: indices.id, depth, dtype })
+}
+
+/** Embedding lookup: pull rows from `table` indexed by `indices`. Decomposes
+ *  to `oneHot(indices, vocab) @ table` so autograd works without a dedicated
+ *  scatter-with-atomic-add backward — the matmul transpose rule handles it.
+ *  `table` is `[vocab, dim]`; `indices` is any shape `[...]` of i32; result
+ *  is `[..., dim]`. The vocab size is taken from `table.shape[0]`. */
+export function embedding(table: Tensor, indices: Tensor): Tensor {
+  const site = captureSite('embedding')
+  if (table.shape.length !== 2) {
+    throw new ShapeError(`embedding: table must be 2-d [vocab, dim], got ${showShape(table.shape)}`, site)
+  }
+  if (indices.dtype !== 'i32') {
+    throw new ShapeError(`embedding: indices must be i32, got ${indices.dtype}`, site)
+  }
+  return matmul(oneHot(indices, table.shape[0]!, 'f32'), table)
 }
 
 // arange(n) → [n] of values [0, 1, ..., n-1]. Used for position embeddings.

@@ -15,13 +15,13 @@ export {
   // Comparisons + select
   less, greater, where,
   // Reductions over the last axis (other axes via reshape/transpose first)
-  meanLast, sumLast,
+  meanLast, sumLast, sumAll,
   // Shape ops
-  reshape, transpose,
+  reshape, transpose, swapAxes,
   // Linear algebra
   matmul, matmulBatched,
   // Indexing / casting
-  oneHot, arange,
+  oneHot, arange, embedding,
   // ML primitives — fused for the transformer
   softmaxCausalLast, logSoftmaxLast, whereCausal,
   // Slicing

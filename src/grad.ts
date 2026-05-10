@@ -18,7 +18,7 @@
 import type { Graph, OpNode, Tensor, Shape } from './ir.js'
 import {
   add, sub, mul, div, mulScalar,
-  matmul, matmulBatched, transpose, reshape,
+  matmul, matmulBatched, transpose, swapAxes, reshape,
   exp,
   broadcastTo, sumToShape,
   constScalar, reluGrad,
@@ -280,14 +280,10 @@ function runTransposeRule(
       // leading batch dims to get [K, N].
       const a = tensorOf(op.a), b = tensorOf(op.b)
       // dA = dC @ B^T
-      const bT = transpose(b, [1, 0])
-      accumulate(cotangents, op.a, matmul(outCotan, bT))
+      accumulate(cotangents, op.a, matmul(outCotan, swapAxes(b, -1, -2)))
       // dB: per-batch A^T @ dC, then sum over batch dims.
       // A is [..., M, K]; transpose last two axes.
-      const aTPerm = identityPerm(a.shape.length)
-      ;[aTPerm[a.shape.length - 1], aTPerm[a.shape.length - 2]] =
-        [aTPerm[a.shape.length - 2]!, aTPerm[a.shape.length - 1]!]
-      const aT = transpose(a, aTPerm)  // [..., K, M]
+      const aT = swapAxes(a, -1, -2)  // [..., K, M]
       // matmul_batched needs same rank on both sides. dC has rank `a.rank`;
       // aT has rank `a.rank`; use matmul_batched if rank > 2, else matmul.
       let perBatchDb: Tensor
@@ -305,15 +301,8 @@ function runTransposeRule(
       // dA = dC @ B^T   (per-batch, all batch dims preserved)
       // dB = A^T @ dC   (per-batch)
       const a = tensorOf(op.a), b = tensorOf(op.b)
-      const lastTwoSwap = (rank: number) => {
-        const p = identityPerm(rank)
-        ;[p[rank - 1], p[rank - 2]] = [p[rank - 2]!, p[rank - 1]!]
-        return p
-      }
-      const bT = transpose(b, lastTwoSwap(b.shape.length))
-      const aT = transpose(a, lastTwoSwap(a.shape.length))
-      accumulate(cotangents, op.a, matmulBatched(outCotan, bT))
-      accumulate(cotangents, op.b, matmulBatched(aT, outCotan))
+      accumulate(cotangents, op.a, matmulBatched(outCotan, swapAxes(b, -1, -2)))
+      accumulate(cotangents, op.b, matmulBatched(swapAxes(a, -1, -2), outCotan))
       return
     }
 

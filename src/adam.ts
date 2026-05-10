@@ -124,22 +124,22 @@ export function appendAdam(
   return traceInto(graph, () => {
     const lrt = tensorInput(lrtInputName, [], 'f32')
 
-    // Resolve per-param decay decision: decayFlags (per-param metadata from
-    // Module.param's options) wins; fall back to decayFilter for names not in
-    // the map. Captured here so the dynamic-shrink check below and the loop
-    // below agree on what's decayed.
-    const isParamDecayed = (name: string): boolean => {
-      if (decayFlags && name in decayFlags) return decayFlags[name]!
-      return fullConfig.decayFilter(name)
-    }
+    // Up-front: which params receive weight decay? Per-param decayFlags (set
+    // by Module.param's options) wins; falls back to decayFilter for names
+    // not in the map. Empty when weightDecay = 0 so the rest of the function
+    // can just ask "is this name in the set?".
+    const decayedNames = new Set<string>(
+      fullConfig.weightDecay > 0
+        ? Object.keys(paramGrads).filter(name =>
+            (decayFlags && name in decayFlags) ? decayFlags[name]! : fullConfig.decayFilter(name))
+        : [],
+    )
 
-    // Decide up-front whether we need a runtime decayShrink scalar. Only does
-    // something when both (a) lr varies per step and (b) some param is decayed.
-    const needsDynamicShrink = lrIsScheduled
-      && fullConfig.weightDecay > 0
-      && Object.keys(paramGrads).some(isParamDecayed)
+    // We only need a runtime decayShrink scalar when lr varies per step AND
+    // at least one param is being decayed. Otherwise the value is constant
+    // and bakes into the kernel as a literal.
     let decayShrinkScalar: Tensor | null = null
-    if (needsDynamicShrink) {
+    if (lrIsScheduled && decayedNames.size > 0) {
       decayShrinkInputName = '_adam_decay_shrink'
       decayShrinkScalar = tensorInput(decayShrinkInputName, [], 'f32')
     }
@@ -155,17 +155,12 @@ export function appendAdam(
 
       // Choose the decayShrink form per param:
       //   - non-decayed params: literal 1 (kernel multiply folds out).
-      //   - decayed + static lr: literal `1 - lr * wd` baked at compile.
       //   - decayed + scheduled lr: tensor input updated per step.
-      const isDecayed = fullConfig.weightDecay > 0 && isParamDecayed(name)
-      let decayShrink: number | Tensor
-      if (!isDecayed) {
-        decayShrink = 1
-      } else if (decayShrinkScalar !== null) {
-        decayShrink = decayShrinkScalar
-      } else {
-        decayShrink = 1 - initialLr * fullConfig.weightDecay
-      }
+      //   - decayed + static lr: literal `1 - lr * wd` baked at compile.
+      const decayShrink: number | Tensor =
+        !decayedNames.has(name) ? 1
+        : decayShrinkScalar !== null ? decayShrinkScalar
+        : 1 - initialLr * fullConfig.weightDecay
 
       // Three fused kernels per parameter — one for each of m_new / v_new / p_new.
       const newM = adamUpdateM(mState, g, fullConfig.b1)

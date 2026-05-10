@@ -144,21 +144,35 @@ export async function compileModule<M extends Module>(
     }
   }
 
-  const { initFns } = materialized
   const uploadInitialParams = () => {
-    const out: Record<string, Float32Array> = {}
-    for (const [name, bufId] of plan.paramsByName) {
-      const shape = plan.buffers[bufId]!.shape
-      const size = shape.reduce((a, b) => a * b, 1)
-      const initFn = initFns[name]
-      if (!initFn) throw new Error(`uploadInitialParams: no init for param '${name}'`)
-      out[name] = initFn(size, shape)
-    }
+    const out = buildInitialParamUploads(plan, materialized.initFns)
     runtime.uploadParams(out)
   }
 
   const ir: CompiledIR = { graph, paramGrads, loss, plan, kernels }
   return Object.assign(runtime, { ir, uploadInitialParams })
+}
+
+// Build a Record<paramName, Float32Array> by running each param's init
+// function against its shape. Shared by compileModule and compileForward.
+// `sharedParams`, when supplied, skips any name it covers (those are owned
+// by the sibling compile and already initialized there).
+type InitFn = (size: number, shape: readonly number[]) => Float32Array
+function buildInitialParamUploads(
+  plan: BufferPlan,
+  initFns: Record<string, InitFn>,
+  sharedParams?: Map<string, GPUBuffer>,
+): Record<string, Float32Array> {
+  const out: Record<string, Float32Array> = {}
+  for (const [name, bufId] of plan.paramsByName) {
+    if (sharedParams?.has(name)) continue
+    const shape = plan.buffers[bufId]!.shape
+    const size = shape.reduce((a, b) => a * b, 1)
+    const initFn = initFns[name]
+    if (!initFn) throw new Error(`uploadInitialParams: no init for param '${name}'`)
+    out[name] = initFn(size, shape)
+  }
+  return out
 }
 
 // ============================================================================
@@ -201,22 +215,9 @@ export async function compileForward<M extends Module>(
   const runtime = await createForwardRuntime(plan, kernels, outputBufferId, opts)
 
   const sharedParams = opts.sharedParams
-  const { initFns } = materialized
   const uploadInitialParams = () => {
-    const out: Record<string, Float32Array> = {}
-    let needsUpload = false
-    for (const [name, bufId] of plan.paramsByName) {
-      // Skip params covered by sharedParams — those are owned by the providing
-      // compile and already initialized there.
-      if (sharedParams?.has(name)) continue
-      const shape = plan.buffers[bufId]!.shape
-      const size = shape.reduce((a, b) => a * b, 1)
-      const initFn = initFns[name]
-      if (!initFn) throw new Error(`uploadInitialParams: no init for param '${name}'`)
-      out[name] = initFn(size, shape)
-      needsUpload = true
-    }
-    if (needsUpload) runtime.uploadParams(out, { partial: !!sharedParams })
+    const out = buildInitialParamUploads(plan, materialized.initFns, sharedParams)
+    if (Object.keys(out).length > 0) runtime.uploadParams(out, { partial: !!sharedParams })
   }
 
   // CompiledIR.loss is the field name; for forward-only, it carries the user's

@@ -43,21 +43,38 @@ export interface RunWithCaptures {
   captures: Record<string, Float32Array>
 }
 
-export interface CompiledRuntime {
-  /** Map of param name -> the underlying GPUBuffer. Pass to a sibling compile
-   *  via `sharedParams` to share without copies — every step on this runtime
-   *  is immediately visible to anyone reading these buffers. */
+/** Common surface for both training and forward-only compiled runtimes. */
+export interface CompiledBase {
+  /** Param name -> the underlying GPUBuffer. Pass to a sibling compile via
+   *  `sharedParams` to share without copies. */
   params: Map<string, GPUBuffer>
-  /** Shape of each tensor registered via `capture(name, t)`, keyed by name.
-   *  Static after compile — the user can reshape the flat Float32Array from
-   *  step({ withCaptures: true }).captures without recomputing strides. */
+  /** Shape of each tensor registered via `capture(name, t)`. Static after
+   *  compile — reshape readbacks without recomputing strides. */
   captureShapes: Record<string, number[]>
+  /** Shape of the graph's output (loss scalar `[]` for training; the user's
+   *  returned tensor for forward-only compiles). */
+  outputShape: number[]
   /** Upload parameter Float32Arrays to their GPU buffers. By default, requires
    *  *all* params to be present; throws on any unknown or missing key. Pass
    *  `{ partial: true }` to skip the missing-key check. */
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): void
   /** Read all parameters back as Float32Arrays — used for UI panels. */
   downloadParams(): Promise<Record<string, Float32Array>>
+  /** Free GPU resources. */
+  destroy(): void
+}
+
+/** Run a dispatch and read back the full output tensor (and any registered
+ *  captures if requested). Forward-only compiles use this as their primary
+ *  surface; training compiles also expose it but `step()` is more convenient
+ *  there because the output is a scalar loss. */
+export interface RunFn {
+  (inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  (inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunWithCaptures>
+  (inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunWithCaptures>
+}
+
+export interface CompiledRuntime extends CompiledBase {
   /** Read all parameter gradients back. Mostly for verification / debugging. */
   downloadParamGrads(): Promise<Record<string, Float32Array>>
   /**
@@ -72,38 +89,19 @@ export interface CompiledRuntime {
   step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
   step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepWithCaptures>
   step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepWithCaptures>
-  /** Like `step()` but returns the full output Float32Array instead of just
-   *  its first element. For training graphs this is rarely useful (the output
-   *  *is* a scalar loss); it's the primary API for forward-only compiles. */
-  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunWithCaptures>
-  run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunWithCaptures>
+  /** Same dispatch as step() but returns the full output Float32Array — for
+   *  training graphs the output is a scalar loss, so step() is usually more
+   *  convenient. Provided for parity with `compileForward`. */
+  run: RunFn
   /** Re-zero all optimizer state buffers (Adam's m/v) in place. Pair with
    *  `uploadInitialParams()` for a full training reset without recompile. */
   resetOptimizerState(): void
-  /** Free GPU resources. */
-  destroy(): void
 }
 
 /** Forward-only compiled runtime — produced by `compileForward`. No optimizer,
  *  no backward. Returns the output tensor (not just a scalar) per `run()` call. */
-export interface CompiledForward {
-  params: Map<string, GPUBuffer>
-  /** Shape of each tensor registered via `capture(name, t)`, keyed by name.
-   *  Static after compile — the user can reshape the flat Float32Array from
-   *  run({ withCaptures: true }) without recomputing strides. */
-  captureShapes: Record<string, number[]>
-  /** Shape of the graph's output tensor (whatever `forward` returned). */
-  outputShape: number[]
-  uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): void
-  downloadParams(): Promise<Record<string, Float32Array>>
-  /** Forward-only dispatch. Returns the graph's output tensor as a Float32Array
-   *  (the user's returned tensor from the forward function, in row-major order).
-   *  With `{ withCaptures: true }`, returns `{ output, captures }`. */
-  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunWithCaptures>
-  run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunWithCaptures>
-  destroy(): void
+export interface CompiledForward extends CompiledBase {
+  run: RunFn
 }
 
 export interface RuntimeOpts {
@@ -157,14 +155,7 @@ export async function createRuntime(
       label: spec.name ?? `t${spec.id}-${spec.kind}`,
     })
     buffers.set(spec.id, buf)
-    if (spec.kind === 'state') {
-      // Fill with initValue (typically 0). Float and int both 4 bytes per element.
-      const elements = spec.byteSize / 4
-      const init = spec.dtype === 'f32'
-        ? new Float32Array(elements).fill(spec.initValue ?? 0)
-        : new Int32Array(elements).fill(Math.trunc(spec.initValue ?? 0))
-      queue.writeBuffer(buf, 0, init as unknown as BufferSource)
-    }
+    if (spec.kind === 'state') fillStateBuffer(spec, buf)
   }
   // Track which params are externally owned — those are skipped on destroy().
   const ownedBufferIds = new Set<number>()
@@ -414,14 +405,20 @@ export async function createRuntime(
     return out
   }
 
+  // Fill a state buffer with its declared initValue (typically 0). Float and
+  // int both serialize to 4 bytes per element. Used at allocation time and on
+  // resetOptimizerState() — same logic, two callers.
+  function fillStateBuffer(spec: { byteSize: number; dtype: 'f32' | 'i32' | 'bool'; initValue?: number }, target: GPUBuffer): void {
+    const elements = spec.byteSize / 4
+    const init = spec.dtype === 'f32'
+      ? new Float32Array(elements).fill(spec.initValue ?? 0)
+      : new Int32Array(elements).fill(Math.trunc(spec.initValue ?? 0))
+    queue.writeBuffer(target, 0, init as unknown as BufferSource)
+  }
+
   function resetOptimizerState() {
     for (const spec of plan.buffers) {
-      if (spec.kind !== 'state') continue
-      const elements = spec.byteSize / 4
-      const init = spec.dtype === 'f32'
-        ? new Float32Array(elements).fill(spec.initValue ?? 0)
-        : new Int32Array(elements).fill(Math.trunc(spec.initValue ?? 0))
-      queue.writeBuffer(buffers.get(spec.id)!, 0, init as unknown as BufferSource)
+      if (spec.kind === 'state') fillStateBuffer(spec, buffers.get(spec.id)!)
     }
   }
 
@@ -450,6 +447,7 @@ export async function createRuntime(
   return {
     params,
     captureShapes,
+    outputShape,
     uploadParams,
     downloadParams: () => downloadFromMap(plan.paramsByName),
     downloadParamGrads: () => downloadFromMap(plan.paramGradsByName),
@@ -457,29 +455,20 @@ export async function createRuntime(
     run,
     resetOptimizerState,
     destroy,
-    /** Internal: outputShape is exposed via createForwardRuntime's wrapper. */
-    _outputShape: outputShape,
-  } as CompiledRuntime & { _outputShape: number[] }
+  }
 }
 
-/** Same machinery as `createRuntime`, narrower public API: no step,
- *  no resetOptimizerState, no downloadParamGrads. Used by `compileForward`. */
+/** Same machinery as `createRuntime`, narrower public type: a forward-only
+ *  graph exposes `run()` instead of `step()` (no optimizer state, no scalar-
+ *  loss readback). The full runtime object is built once and projected by
+ *  `compileForward` to the public shape. */
 export async function createForwardRuntime(
   plan: BufferPlan,
   kernels: KernelSpec[],
   outputBufferId: number,
   opts: RuntimeOpts = {},
 ): Promise<CompiledForward> {
-  const full = await createRuntime(plan, kernels, outputBufferId, opts)
-  return {
-    params: full.params,
-    captureShapes: full.captureShapes,
-    outputShape: (full as CompiledRuntime & { _outputShape: number[] })._outputShape,
-    uploadParams: full.uploadParams,
-    downloadParams: full.downloadParams,
-    run: full.run,
-    destroy: full.destroy,
-  }
+  return await createRuntime(plan, kernels, outputBufferId, opts)
 }
 
 async function acquireDevice(): Promise<GPUDevice> {
