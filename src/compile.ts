@@ -123,10 +123,10 @@ export async function compileModule<M extends Module>(
     const decayShrinkBuf = decayShrinkInputName ? new Float32Array(1) : null
     const innerStep = runtime.step.bind(runtime) as CompiledRuntime['step']
     const innerReset = runtime.resetOptimizerState.bind(runtime)
-    const wrappedStep = (
+    const wrappedStep = ((
       inputs: Record<string, Int32Array | Float32Array>,
       opts?: { withCaptures?: boolean },
-    ): Promise<number | { loss: number; captures: Record<string, Float32Array> }> => {
+    ) => {
       t++
       const lrNow = config.lr(t)
       lrtBuf[0] = lrNow * Math.sqrt(1 - Math.pow(config.b2, t)) / (1 - Math.pow(config.b1, t))
@@ -136,8 +136,8 @@ export async function compileModule<M extends Module>(
         merged[decayShrinkInputName] = decayShrinkBuf
       }
       return opts?.withCaptures ? innerStep(merged, { withCaptures: true }) : innerStep(merged)
-    }
-    runtime.step = wrappedStep as CompiledRuntime['step']
+    }) as CompiledRuntime['step']
+    runtime.step = wrappedStep
     runtime.resetOptimizerState = () => {
       t = 0
       innerReset()

@@ -1,41 +1,44 @@
 // Standard "batteries-included" Module subclasses for the most common layers.
 //
-// JAX-style: each class declares its params (and their init); the forward is a
-// plain function the user calls with `(module, x)`. No subclassing, no method
-// dispatch — keeps the autograd-traced computation visible at the call site.
-//
-// Import as a namespace:
+// Each class declares its params and a `.fwd(x)` method that runs the forward
+// computation. Forward methods are pure tensorgrad ops — autograd traces
+// through them just like any other call.
 //
 //   import { nn } from 'tensorgrad'
 //   class Block extends Module {
 //     ln  = new nn.LayerNorm(D)
 //     ffn = new nn.Linear(D, 4 * D)
 //   }
-//   const y = nn.linearFwd(p.ffn, nn.layerNormFwd(p.ln, x))
+//   const y = p.ffn.fwd(p.ln.fwd(x))
 
 import { Module } from './module.js'
 import type { Tensor } from './ir.js'
 import { add, matmul, sub, mul, div, sqrt, meanLast, sumLast, reshape, swapAxes, oneHot, logSoftmaxLast } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
+import type { Captures } from './runtime.js'
 
 // ----------------------------------------------------------------------------
 // Linear: y = x @ W (+ b)
 // ----------------------------------------------------------------------------
 
+export interface LinearOptions {
+  /** Include a bias term (default true). */
+  bias?: boolean
+}
+
 export class Linear extends Module {
   W: Tensor
   b: Tensor | null
-  constructor(public readonly inDim: number, public readonly outDim: number, withBias = true) {
+  constructor(public readonly inDim: number, public readonly outDim: number, opts: LinearOptions = {}) {
     super()
     this.W = this.param([inDim, outDim])                      // randn, scale 0.02
-    this.b = withBias ? this.param([outDim], { init: 'zeros' }) : null
+    this.b = opts.bias === false ? null : this.param([outDim], { init: 'zeros' })
   }
-}
-
-export function linearFwd(p: Linear, x: Tensor): Tensor {
-  const out = matmul(x, p.W)
-  return p.b ? add(out, p.b) : out
+  fwd(x: Tensor): Tensor {
+    const out = matmul(x, this.W)
+    return this.b ? add(out, this.b) : out
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -50,14 +53,13 @@ export class LayerNorm extends Module {
     this.g = this.param([d], { init: 'ones' })
     this.b = this.param([d], { init: 'zeros' })
   }
-}
-
-export function layerNormFwd(p: LayerNorm, x: Tensor): Tensor {
-  const m = meanLast(x)
-  const c = sub(x, m)
-  const v = meanLast(mul(c, c))
-  const stdev = sqrt(add(v, p.eps))
-  return add(mul(div(c, stdev), p.g), p.b)
+  fwd(x: Tensor): Tensor {
+    const m = meanLast(x)
+    const c = sub(x, m)
+    const v = meanLast(mul(c, c))
+    const stdev = sqrt(add(v, this.eps))
+    return add(mul(div(c, stdev), this.g), this.b)
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -97,26 +99,26 @@ export function mergeHeads(x: Tensor): Tensor {
   return reshape(swapped, [...lead, T, H * d])
 }
 
-/** Slice a flat capture readback of shape `[H, ..., ...]` into one
- *  Float32Array per head. The leading axis is treated as the head axis;
- *  pass the shape from `compiled.captureShapes[name]`. Result: `H` arrays,
- *  each holding the row-major data for that head (size = product of trailing
- *  axes). For B>1 graphs, prefix the result by the batch — this helper
- *  assumes the leading axis is heads, which matches how `splitHeads` lays
- *  out captures at B=1 (the typical capture-readback shape). */
-export function unsplitHeads(flat: Float32Array, shape: readonly number[]): Float32Array[] {
+/** Slice a captured tensor named `name` into one Float32Array per head, using
+ *  the static shape registered at compile time. The leading axis is treated as
+ *  heads (matching `splitHeads` layout at B=1); a leading singleton batch is
+ *  stripped if present so callers can pass capture names directly. Throws if
+ *  the capture isn't registered or wasn't read back this call. */
+export function unsplitHeads(captures: Captures, name: string): Float32Array[] {
+  const flat = captures.get(name)
+  const shape = captures.shapeOf(name)
   if (shape.length < 2) {
-    throw new Error(`unsplitHeads: shape needs >= 2 dims, got [${shape.join(', ')}]`)
+    throw new Error(`unsplitHeads: '${name}' shape needs >= 2 dims, got [${shape.join(', ')}]`)
   }
   // For inference graphs at B=1, captures have shape [1, H, ..., ...]. Strip
-  // the leading 1 if present so callers can pass captureShapes[name] directly.
+  // the leading 1 if present so the next axis is heads.
   const s = shape[0] === 1 ? shape.slice(1) : shape
   const H = s[0]!
   let stride = 1
   for (let i = 1; i < s.length; i++) stride *= s[i]!
   const expected = H * stride
   if (flat.length !== expected) {
-    throw new Error(`unsplitHeads: flat length ${flat.length} doesn't match shape product ${expected}`)
+    throw new Error(`unsplitHeads: '${name}' length ${flat.length} doesn't match shape product ${expected}`)
   }
   return Array.from({ length: H }, (_, h) => flat.slice(h * stride, (h + 1) * stride))
 }

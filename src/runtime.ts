@@ -18,29 +18,55 @@ export interface UploadParamsOptions {
   partial?: boolean
 }
 
-export interface StepOptions {
-  /** Read back tensors registered via `capture(name, t)` during the trace.
-   *  When false/unset, `step()` returns just the loss number; staging buffers
-   *  for captures are not allocated. When true, returns `{ loss, captures }`
-   *  and lazily allocates one staging buffer per capture on first use. */
-  withCaptures?: boolean
+/**
+ * Activation readbacks for one `step()`/`run()` call. Keyed by the names
+ * passed to `capture(name, t)` during the trace. `get(name)` throws if the
+ * name isn't registered or wasn't read back this call (i.e., the call was
+ * made without `{ withCaptures: true }`); use `has(name)` if you need to
+ * branch. `shapeOf(name)` returns the static-after-compile shape and works
+ * regardless of whether captures were read back.
+ */
+export class Captures {
+  constructor(
+    private readonly shapes: Record<string, readonly number[]>,
+    private readonly data: Map<string, Float32Array>,
+  ) {}
+  get(name: string): Float32Array {
+    const d = this.data.get(name)
+    if (!d) {
+      const known = [...this.data.keys()].sort().join(', ')
+      const detail = known ? `Known this call: ${known}` : `(call run/step with { withCaptures: true } to populate)`
+      throw new Error(`Captures.get: '${name}' not present. ${detail}`)
+    }
+    return d
+  }
+  shapeOf(name: string): readonly number[] {
+    const s = this.shapes[name]
+    if (!s) {
+      const known = Object.keys(this.shapes).sort().join(', ') || '(none registered)'
+      throw new Error(`Captures.shapeOf: '${name}' not registered. Known: ${known}`)
+    }
+    return s
+  }
+  has(name: string): boolean { return this.data.has(name) }
+  names(): string[] { return [...this.data.keys()].sort() }
 }
 
-export interface StepWithCaptures {
+export interface RunResult {
+  output: Float32Array
+  captures: Captures
+}
+
+export interface StepResult {
   loss: number
-  captures: Record<string, Float32Array>
+  captures: Captures
 }
 
 export interface RunOptions {
   /** Read back tensors registered via `capture(name, t)` during the trace.
-   *  When false/unset, `run()` returns just the output Float32Array.
-   *  When true, returns `{ output, captures }`. */
+   *  Default false. When false, the returned `captures` is empty (calling
+   *  `.get` throws); when true, captures are read back and accessible. */
   withCaptures?: boolean
-}
-
-export interface RunWithCaptures {
-  output: Float32Array
-  captures: Record<string, Float32Array>
 }
 
 /** Common surface for both training and forward-only compiled runtimes. */
@@ -48,9 +74,6 @@ export interface CompiledBase {
   /** Param name -> the underlying GPUBuffer. Pass to a sibling compile via
    *  `sharedParams` to share without copies. */
   params: Map<string, GPUBuffer>
-  /** Shape of each tensor registered via `capture(name, t)`. Static after
-   *  compile — reshape readbacks without recomputing strides. */
-  captureShapes: Record<string, number[]>
   /** Shape of the graph's output (loss scalar `[]` for training; the user's
    *  returned tensor for forward-only compiles). */
   outputShape: number[]
@@ -64,15 +87,12 @@ export interface CompiledBase {
   destroy(): void
 }
 
-/** Run a dispatch and read back the full output tensor (and any registered
- *  captures if requested). Forward-only compiles use this as their primary
- *  surface; training compiles also expose it but `step()` is more convenient
- *  there because the output is a scalar loss. */
-export interface RunFn {
-  (inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  (inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunWithCaptures>
-  (inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunWithCaptures>
-}
+/** Run a dispatch and read back the full output tensor. Captures are always
+ *  returned; their data is empty unless `{ withCaptures: true }` is passed. */
+export type RunFn = (
+  inputs: Record<string, Int32Array | Float32Array>,
+  opts?: RunOptions,
+) => Promise<RunResult>
 
 export interface CompiledRuntime extends CompiledBase {
   /** Read all parameter gradients back. Mostly for verification / debugging. */
@@ -83,12 +103,11 @@ export interface CompiledRuntime extends CompiledBase {
    *   2. Dispatches every kernel in order.
    *   3. Reads back the loss scalar (and any registered captures, if requested).
    * Default returns the loss as a JS number; with `{ withCaptures: true }`
-   * returns `{ loss, captures }` where `captures` is keyed by the names passed
-   * to `capture(...)` during the trace.
+   * returns `{ loss, captures }`.
    */
   step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
-  step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepWithCaptures>
-  step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepWithCaptures>
+  step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
+  step(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<number | StepResult>
   /** Same dispatch as step() but returns the full output Float32Array — for
    *  training graphs the output is a scalar loss, so step() is usually more
    *  convenient. Provided for parity with `compileForward`. */
@@ -261,7 +280,7 @@ export async function createRuntime(
   async function dispatch(
     inputs: Record<string, Int32Array | Float32Array>,
     wantCaptures: boolean,
-  ): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
+  ): Promise<{ output: Float32Array; captures: Map<string, Float32Array> }> {
     const turn = pending.catch(() => {}).then(() => dispatchUnsynchronized(inputs, wantCaptures))
     pending = turn
     return turn
@@ -269,7 +288,7 @@ export async function createRuntime(
   async function dispatchUnsynchronized(
     inputs: Record<string, Int32Array | Float32Array>,
     wantCaptures: boolean,
-  ): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
+  ): Promise<{ output: Float32Array; captures: Map<string, Float32Array> }> {
     if (wantCaptures && plan.capturesByName.size === 0) {
       throw new Error(
         `withCaptures=true but no capture(...) calls were registered during ` +
@@ -331,41 +350,37 @@ export async function createRuntime(
     const output = new Float32Array(outputReadback.getMappedRange().slice(0))
     outputReadback.unmap()
 
-    if (!wantCaptures) return { output, captures: null }
-
-    const captures: Record<string, Float32Array> = {}
-    for (const [name, staging] of stagings!) {
-      await staging.mapAsync(GPUMapMode.READ)
-      captures[name] = new Float32Array(staging.getMappedRange().slice(0))
-      staging.unmap()
+    const captures = new Map<string, Float32Array>()
+    if (wantCaptures) {
+      for (const [name, staging] of stagings!) {
+        await staging.mapAsync(GPUMapMode.READ)
+        captures.set(name, new Float32Array(staging.getMappedRange().slice(0)))
+        staging.unmap()
+      }
     }
     return { output, captures }
   }
 
   // ---- step() — training-mode wrapper, returns scalar [0] of output ---------
   function step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
-  function step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepWithCaptures>
-  function step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepWithCaptures>
+  function step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
+  function step(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<number | StepResult>
   async function step(
     inputs: Record<string, Int32Array | Float32Array>,
-    opts?: StepOptions,
-  ): Promise<number | StepWithCaptures> {
+    opts?: RunOptions,
+  ): Promise<number | StepResult> {
     const r = await dispatch(inputs, opts?.withCaptures === true)
-    if (opts?.withCaptures) return { loss: r.output[0]!, captures: r.captures! }
+    if (opts?.withCaptures) return { loss: r.output[0]!, captures: new Captures(captureShapes, r.captures) }
     return r.output[0]!
   }
 
-  // ---- run() — forward-mode wrapper, returns full output Float32Array -------
-  function run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  function run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunWithCaptures>
-  function run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunWithCaptures>
+  // ---- run() — forward-mode wrapper, returns { output, captures } ----------
   async function run(
     inputs: Record<string, Int32Array | Float32Array>,
     opts?: RunOptions,
-  ): Promise<Float32Array | RunWithCaptures> {
+  ): Promise<RunResult> {
     const r = await dispatch(inputs, opts?.withCaptures === true)
-    if (opts?.withCaptures) return { output: r.output, captures: r.captures! }
-    return r.output
+    return { output: r.output, captures: new Captures(captureShapes, r.captures) }
   }
 
   // ---- uploadParams ---------------------------------------------------------
@@ -462,7 +477,6 @@ export async function createRuntime(
 
   return {
     params,
-    captureShapes,
     outputShape,
     uploadParams,
     downloadParams: () => downloadFromMap(plan.paramsByName),
