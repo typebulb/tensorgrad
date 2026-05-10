@@ -25,6 +25,7 @@ import {
   sumLast, where,
 } from './ops.js'
 import { traceInto } from './trace.js'
+import { shapesEqual } from './shape.js'
 
 // ============================================================================
 // Public API
@@ -121,11 +122,6 @@ function unbroadcast(cotan: Tensor, toShape: Shape): Tensor {
   return sumToShape(cotan, toShape)
 }
 
-function shapesEqual(a: Shape, b: Shape): boolean {
-  if (a.length !== b.length) return false
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
-  return true
-}
 
 // ============================================================================
 // Transpose rules
@@ -434,12 +430,6 @@ function runTransposeRule(
 // ============================================================================
 // Helpers
 // ============================================================================
-
-function identityPerm(rank: number): number[] {
-  const p: number[] = new Array(rank)
-  for (let i = 0; i < rank; i++) p[i] = i
-  return p
-}
 
 function invertPerm(perm: readonly number[]): number[] {
   const inv: number[] = new Array(perm.length)

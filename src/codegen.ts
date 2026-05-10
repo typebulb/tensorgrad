@@ -12,11 +12,20 @@
 
 import type { Graph, OpNode, Tensor, Shape } from './ir.js'
 import type { BufferPlan } from './buffers.js'
+import { shapeSize } from './shape.js'
 
 // Workgroup size of 256 means even our biggest kernel (~8M threads in
 // matmul_bwd_dW) needs only ~32K workgroups, well under WebGPU's 65535-per-dim
 // dispatch cap. Smaller WG_SIZE forced 2D dispatch with significant over-dispatch.
 const WG_SIZE = 256
+
+// Global thread index, packed across the 2D dispatch grid that lets us route
+// past WebGPU's 65535-per-dim cap. Every kernel uses this exact line — keep
+// the formula consistent with the dispatch-stride math in runtime.ts (MAX_X
+// = 65535, so per-row stride = 65535 * WG_SIZE = 16776960). Inlined into
+// each WGSL string via interpolation rather than a function so the WGSL
+// compiler still sees a literal constant.
+const GID_LINE = 'let i = gid.x + gid.y * 16776960u;'
 
 export interface KernelSpec {
   /** Index into graph.ops. */
@@ -52,12 +61,6 @@ export function emitKernels(graph: Graph, plan: BufferPlan): KernelSpec[] {
   return out
 }
 
-function shapeSize(shape: Shape): number {
-  let n = 1
-  for (const d of shape) n *= d
-  return n
-}
-
 function emitKernel(op: OpNode, graph: Graph, plan: BufferPlan, opIndex: number): KernelSpec {
   const tof = (id: number) => graph.tensors[id]!
   const buf = (tensorId: number) => plan.tensorToBuffer.get(tensorId)!
@@ -77,7 +80,7 @@ function emitKernel(op: OpNode, graph: Graph, plan: BufferPlan, opIndex: number)
 @group(0) @binding(0) var<storage, read_write> buf : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${op.n}u) { return; }
   buf[i] = ${castFromI32('i32(i)', out.dtype)};
 }`.trim()
@@ -109,7 +112,7 @@ fn main() {
 @group(0) @binding(2) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${broadcastIndexBlock('i', out.shape, a.shape, 'aIdx')}
 ${broadcastIndexBlock('i', out.shape, b.shape, 'bIdx')}
@@ -131,7 +134,7 @@ ${broadcastIndexBlock('i', out.shape, b.shape, 'bIdx')}
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   out[i] = a[i] ${opStr} ${lit};
 }`.trim()
@@ -158,7 +161,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   let x = a[i];
   out[i] = ${expr};
@@ -181,7 +184,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(2) var<storage, read_write> out : array<u32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${broadcastIndexBlock('i', out.shape, a.shape, 'aIdx')}
 ${broadcastIndexBlock('i', out.shape, b.shape, 'bIdx')}
@@ -202,7 +205,7 @@ ${broadcastIndexBlock('i', out.shape, b.shape, 'bIdx')}
 @group(0) @binding(3) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${broadcastIndexBlock('i', out.shape, cond.shape, 'cIdx')}
 ${broadcastIndexBlock('i', out.shape, a.shape, 'aIdx')}
@@ -221,7 +224,7 @@ ${broadcastIndexBlock('i', out.shape, b.shape, 'bIdx')}
 @group(0) @binding(2) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   out[i] = select(0.0, dy[i], x[i] > 0.0);
 }`.trim()
@@ -240,7 +243,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${outerSize}u) { return; }
   let base = i * ${D}u;
   var s : f32 = 0.0;
@@ -265,7 +268,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   out[i] = a[i];
 }`.trim()
@@ -291,7 +294,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${outDimDecls}
   let srcIdx = ${srcExpr.join(' + ')};
@@ -317,7 +320,7 @@ ${outDimDecls}
 @group(0) @binding(2) var<storage, read_write> c : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   let bi = i / ${M * N}u;          // batch index
   let mn = i % ${M * N}u;
@@ -348,7 +351,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(2) var<storage, read_write> c : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   let bi = i / ${M * N}u;
   let mn = i % ${M * N}u;
@@ -378,7 +381,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   let outerIdx = i / ${depth}u;
   let depthIdx = i % ${depth}u;
@@ -398,7 +401,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${outerSize}u) { return; }
   let base = i * ${D}u;
   var m : f32 = -1.0e30;
@@ -429,7 +432,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   // Each thread handles one (..., qpos)-row, softmaxing over kpos∈[0..qpos].
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${outerSize}u) { return; }
   let qpos = i % ${T}u;
   let base = i * ${T}u;
@@ -464,7 +467,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   let kpos = i % ${T}u;
   let qpos = (i / ${T}u) % ${T}u;
@@ -489,7 +492,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   let outer = i / ${D_out}u;
   let inner = i % ${D_out}u;
@@ -508,7 +511,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${broadcastIndexBlock('i', out.shape, a.shape, 'srcIdx')}
   out[i] = a[srcIdx];
@@ -529,7 +532,7 @@ ${broadcastIndexBlock('i', out.shape, a.shape, 'srcIdx')}
 @group(0) @binding(2) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   out[i] = ${wgslLiteral(b1, 'f32')} * m[i] + ${wgslLiteral(oneMinusB1, 'f32')} * g[i];
 }`.trim()
@@ -547,7 +550,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 @group(0) @binding(2) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   let gv = g[i];
   out[i] = ${wgslLiteral(b2, 'f32')} * v[i] + ${wgslLiteral(oneMinusB2, 'f32')} * gv * gv;
@@ -577,7 +580,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 ${shrinkBinding}
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
   out[i] = ${shrinkExpr} * p[i] - lrt[0] * mNew[i] / (sqrt(vNew[i]) + ${wgslLiteral(op.eps, 'f32')});
 }`.trim()
@@ -761,7 +764,7 @@ function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' |
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x + gid.y * 16776960u;
+  ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${decompose}
   var s : ${wgslDtype(dtype)} = ${dtype === 'f32' ? '0.0f' : (dtype === 'i32' ? '0i' : '0u')};

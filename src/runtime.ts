@@ -159,11 +159,14 @@ export async function createRuntime(
   // Param buffers may be supplied externally via opts.sharedParams; in that
   // case we reuse the provided GPUBuffer instead of allocating, and the
   // sibling compile that owns it is responsible for upload + lifetime.
+  // ownedBufferIds tracks which buffers we allocated ourselves (and so must
+  // destroy on .destroy()) vs which were handed in by a sibling compile.
   const buffers = new Map<number, GPUBuffer>()
+  const ownedBufferIds = new Set<number>()
   const sharedParams = opts.sharedParams
   for (const spec of plan.buffers) {
-    if (spec.kind === 'param' && sharedParams?.has(spec.name!)) {
-      const shared = sharedParams.get(spec.name!)!
+    const shared = spec.kind === 'param' ? sharedParams?.get(spec.name!) : undefined
+    if (shared) {
       if (shared.size !== spec.byteSize) {
         throw new Error(
           `sharedParams: size mismatch for '${spec.name}' — supplied ${shared.size} bytes, ` +
@@ -179,14 +182,8 @@ export async function createRuntime(
       label: spec.name ?? `t${spec.id}-${spec.kind}`,
     })
     buffers.set(spec.id, buf)
+    ownedBufferIds.add(spec.id)
     if (spec.kind === 'state') fillStateBuffer(spec, buf)
-  }
-  // Track which params are externally owned — those are skipped on destroy().
-  const ownedBufferIds = new Set<number>()
-  for (const spec of plan.buffers) {
-    if (!(spec.kind === 'param' && sharedParams?.has(spec.name!))) {
-      ownedBufferIds.add(spec.id)
-    }
   }
 
   // ---- Compile pipelines per kernel; cache by WGSL source -------------------

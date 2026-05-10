@@ -11,11 +11,11 @@
 import type { Tensor, Shape, Dtype } from './ir.js'
 import { trace, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
-import { appendAdam, type AdamConfig } from './adam.js'
+import { appendAdam, type AdamConfig, type AdamResult } from './adam.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
 import { createRuntime, createForwardRuntime, type CompiledRuntime, type CompiledForward, type RuntimeOpts } from './runtime.js'
-import { Module, materializeParams } from './module.js'
+import { Module, materializeParams, type MaterializedParams } from './module.js'
 
 /** Declares one input tensor of the model's forward function. The name is the
  *  key in the `inputs:` Record at compile time and the key on the `step()`/
@@ -150,46 +150,39 @@ export async function compileModule<M extends Module, I extends InputDecls = Inp
   forward: ForwardFn<M, I>,
   opts: CompileModuleOptions<I> = {},
 ): Promise<CompiledModule<M>> {
-  const { runtime, materialized, plan, kernels, ir } = await buildModuleRuntime(
-    modelFactory, forward, opts, /* sharedParams */ undefined, /* withGrad */ true,
-  )
+  const { graph, materialized } = traceModule(modelFactory, forward, opts.inputs ?? {})
+  const { paramGrads, loss } = appendGrad(graph)
+  const adamResult = opts.adam
+    ? appendAdam(graph, paramGrads, materialized.tensors, opts.adam, materialized.decayFlags)
+    : undefined
 
-  // If Adam is enabled, wrap step() to track the step count and supply lrt
-  // (and optionally decayShrink, when the user passed a per-step lr schedule).
-  // Wrap resetOptimizerState() too, so a reset zeros m/v *and* the bias-correction
-  // counter — otherwise the next step would skip Adam's warmup phase.
-  if (opts.adam) {
-    wrapStepForAdam(runtime, opts.adam, ir)
-  }
+  const plan = planBuffers(graph, paramGrads, adamResult?.writebacks ?? [])
+  const kernels = emitKernels(graph, plan)
+  const lossBufferId = plan.tensorToBuffer.get(loss.id)!
+  const runtime = await createRuntime(plan, kernels, lossBufferId, opts)
 
-  // Auto-upload initial param values. Always wanted at this entry point —
-  // training runtimes own their params and need them randomized before step 1.
+  if (adamResult) wrapStepForAdam(runtime, adamResult)
   uploadInitialParams(plan, materialized.initFns, runtime, /* sharedParams */ undefined)
 
-  const kernelCount = kernels.filter(k => k.wgsl).length
+  const ir: CompiledIR = { graph, paramGrads, loss, plan, kernels }
+  const kernelCount = countKernels(kernels)
 
   const reset = () => {
     uploadInitialParams(plan, materialized.initFns, runtime, undefined)
     runtime.resetOptimizerState()
   }
 
-  const compileForwardMethod = async <J extends InputDecls>(
+  const compileForwardMethod = <J extends InputDecls>(
     forwardFn: ForwardFn<M, J>,
     fOpts: CompileForwardMethodOptions<J> = {},
-  ): Promise<CompiledForwardModule> => {
-    return compileForward<M, J>(modelFactory, forwardFn, {
+  ): Promise<CompiledForwardModule> =>
+    compileForward<M, J>(modelFactory, forwardFn, {
       ...fOpts,
       device: runtime.device,
       sharedParams: runtime.params,
     })
-  }
 
-  return Object.assign(runtime, {
-    ir,
-    kernelCount,
-    reset,
-    compileForward: compileForwardMethod,
-  })
+  return Object.assign(runtime, { ir, kernelCount, reset, compileForward: compileForwardMethod })
 }
 
 // ============================================================================
@@ -220,47 +213,37 @@ export async function compileForward<M extends Module, I extends InputDecls = In
   forward: ForwardFn<M, I>,
   opts: CompileForwardOptions<I> = {},
 ): Promise<CompiledForwardModule> {
-  const sharedParams = opts.sharedParams
-  const { runtime, materialized, plan, kernels, ir } = await buildModuleRuntime(
-    modelFactory, forward, opts, sharedParams, /* withGrad */ false,
-  )
+  const { graph, materialized } = traceModule(modelFactory, forward, opts.inputs ?? {})
+  const outputTensor = graph.tensors[graph.outputs[0]!]!
 
-  // Auto-upload initial values for any params this graph owns. With
-  // `sharedParams` covering everything, this is a no-op.
-  uploadInitialParams(plan, materialized.initFns, runtime, sharedParams)
+  const plan = planBuffers(graph, /* paramGrads */ {})
+  const kernels = emitKernels(graph, plan)
+  const outputBufferId = plan.tensorToBuffer.get(outputTensor.id)!
+  const runtime = await createForwardRuntime(plan, kernels, outputBufferId, opts)
 
-  const kernelCount = kernels.filter(k => k.wgsl).length
-  return Object.assign(runtime, { ir, kernelCount })
+  uploadInitialParams(plan, materialized.initFns, runtime, opts.sharedParams)
+
+  const ir: CompiledIR = { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
+  return Object.assign(runtime, { ir, kernelCount: countKernels(kernels) })
 }
 
 // ============================================================================
 // Internals
 // ============================================================================
 
+type Graph = ReturnType<typeof trace>
 type InitFn = (size: number, shape: readonly number[]) => Float32Array
 
-interface BuiltRuntime {
-  runtime: CompiledRuntime
-  materialized: ReturnType<typeof materializeParams>
-  plan: BufferPlan
-  kernels: KernelSpec[]
-  ir: CompiledIR
-}
-
-/** Shared body of compileModule + compileForward. The training and forward
- *  pipelines diverge only in (a) whether grad/Adam are appended and (b)
- *  whether the output buffer is the loss scalar or the user's returned
- *  tensor — both come out of the same trace and codegen path. */
-async function buildModuleRuntime<M extends Module, I extends InputDecls>(
+/** Trace the forward function with a fresh model + tensor inputs and capture
+ *  the materialized params. Shared by both compile entry points; everything
+ *  past this point (grad/adam/buffer plan/runtime) diverges. */
+function traceModule<M extends Module, I extends InputDecls>(
   modelFactory: () => M,
   forward: ForwardFn<M, I>,
-  opts: CompileModuleOptions<I> | CompileForwardOptions<I>,
-  sharedParams: Map<string, GPUBuffer> | undefined,
-  withGrad: boolean,
-): Promise<BuiltRuntime> {
-  const inputDecls: InputDecls = opts.inputs ?? {}
+  inputDecls: InputDecls,
+): { graph: Graph; materialized: MaterializedParams } {
   const model = modelFactory()
-  let materialized: ReturnType<typeof materializeParams> = { tensors: {}, initFns: {}, decayFlags: {} }
+  let materialized: MaterializedParams = { tensors: {}, initFns: {}, decayFlags: {} }
   const graph = trace(() => {
     materialized = materializeParams(model)
     const inputTensors: Record<string, Tensor> = {}
@@ -269,45 +252,17 @@ async function buildModuleRuntime<M extends Module, I extends InputDecls>(
     }
     return forward(model, inputTensors as InputsTensors<I>)
   })
-
-  let paramGrads: GradResult['paramGrads'] = {}
-  let outputTensor: Tensor
-  let adamWritebacks: ReturnType<typeof appendAdam>['writebacks'] = []
-
-  if (withGrad) {
-    const gradResult = appendGrad(graph)
-    paramGrads = gradResult.paramGrads
-    outputTensor = gradResult.loss
-    const adamCfg = (opts as CompileModuleOptions).adam
-    if (adamCfg) {
-      const adamResult = appendAdam(graph, paramGrads, materialized.tensors, adamCfg, materialized.decayFlags)
-      adamWritebacks = adamResult.writebacks
-      // Stash adam result on the graph so wrapStepForAdam can find it.
-      ;(graph as Graph & { __adam?: ReturnType<typeof appendAdam> }).__adam = adamResult
-    }
-  } else {
-    outputTensor = graph.tensors[graph.outputs[0]!]!
-  }
-
-  const plan = planBuffers(graph, paramGrads, adamWritebacks)
-  const kernels = emitKernels(graph, plan)
-  const outputBufferId = plan.tensorToBuffer.get(outputTensor.id)!
-  // exactOptionalPropertyTypes: only include sharedParams when defined.
-  const runtimeOpts: RuntimeOpts = sharedParams
-    ? { ...opts, sharedParams }
-    : { ...opts }
-  const runtime = withGrad
-    ? await createRuntime(plan, kernels, outputBufferId, runtimeOpts)
-    : await createForwardRuntime(plan, kernels, outputBufferId, runtimeOpts)
-
-  const ir: CompiledIR = { graph, paramGrads, loss: outputTensor, plan, kernels }
-  return { runtime: runtime as CompiledRuntime, materialized, plan, kernels, ir }
+  return { graph, materialized }
 }
 
-type Graph = ReturnType<typeof trace>
+const countKernels = (kernels: KernelSpec[]): number => kernels.filter(k => k.wgsl).length
 
-function wrapStepForAdam(runtime: CompiledRuntime, adamCfg: AdamConfig, ir: CompiledIR): void {
-  const adamResult = (ir.graph as Graph & { __adam?: ReturnType<typeof appendAdam> }).__adam!
+/** Wrap the runtime's step() to inject Adam's per-step `lrt` (bias-corrected
+ *  effective LR) and, when the user supplied a per-step lr schedule, the
+ *  decayShrink scalar. Also wraps resetOptimizerState() so a reset zeros
+ *  Adam's m/v *and* the bias-correction step counter — otherwise the next
+ *  step would skip Adam's warmup phase. */
+function wrapStepForAdam(runtime: CompiledRuntime, adamResult: AdamResult): void {
   const { lrtInputName, decayShrinkInputName, config } = adamResult
   let t = 0
   const lrtBuf = new Float32Array(1)
@@ -333,7 +288,6 @@ function wrapStepForAdam(runtime: CompiledRuntime, adamCfg: AdamConfig, ir: Comp
     t = 0
     innerReset()
   }
-  void adamCfg
 }
 
 /** Build a Record<paramName, Float32Array> by running each param's init

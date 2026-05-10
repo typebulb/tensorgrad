@@ -13,6 +13,7 @@
 //   * output       — special intermediate that should be made readable (loss)
 
 import type { Graph, Tensor, Dtype, Shape, OpNode } from './ir.js'
+import { shapeSize } from './shape.js'
 
 export interface BufferSpec {
   /** Matches tensor.id. */
@@ -54,12 +55,6 @@ export interface BufferPlan {
 }
 
 const dtypeBytes: Record<Dtype, number> = { f32: 4, i32: 4, bool: 4 }
-
-function shapeSize(shape: Shape): number {
-  let n = 1
-  for (const d of shape) n *= d
-  return n
-}
 
 /**
  * Caller-supplied writeback declarations: "after each step, copy this Tensor's

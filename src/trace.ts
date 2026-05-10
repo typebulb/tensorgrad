@@ -84,20 +84,25 @@ export function traceInto<T>(g: Graph, fn: () => T): T {
 // Their .source on the Tensor points at that node so codegen knows where to
 // bind external data.
 
+// Param/tensor inputs share a namespace (a step() call passes both as keys in
+// the same dispatch object); state inputs have their own namespace.
+type NamedInputKind = 'param_input' | 'tensor_input' | 'state_input'
+function assertNameUnused(g: Graph, name: string, kinds: NamedInputKind[], label: string): void {
+  if (g.ops.some(op => kinds.includes(op.kind as NamedInputKind) && (op as { name?: string }).name === name)) {
+    throw new Error(`tensorgrad: ${label} name '${name}' already used in this trace`)
+  }
+}
+
 export function paramInput(name: string, shape: Shape, dtype: Dtype = 'f32'): Tensor {
   const g = currentGraph()
-  if (g.ops.some(op => (op.kind === 'param_input' || op.kind === 'tensor_input') && op.name === name)) {
-    throw new Error(`tensorgrad: input name '${name}' already used in this trace`)
-  }
+  assertNameUnused(g, name, ['param_input', 'tensor_input'], 'input')
   const site = captureSite('paramInput')
   return addOp(g, 'param_input', shape, dtype, site, { name } as any)
 }
 
 export function tensorInput(name: string, shape: Shape, dtype: Dtype = 'f32'): Tensor {
   const g = currentGraph()
-  if (g.ops.some(op => (op.kind === 'param_input' || op.kind === 'tensor_input') && op.name === name)) {
-    throw new Error(`tensorgrad: input name '${name}' already used in this trace`)
-  }
+  assertNameUnused(g, name, ['param_input', 'tensor_input'], 'input')
   const site = captureSite('tensorInput')
   return addOp(g, 'tensor_input', shape, dtype, site, { name } as any)
 }
@@ -106,9 +111,7 @@ export function tensorInput(name: string, shape: Shape, dtype: Dtype = 'f32'): T
 // and updated across step() calls via writebacks declared by the optimizer helper.
 export function stateInput(name: string, shape: Shape, dtype: Dtype = 'f32', initValue = 0): Tensor {
   const g = currentGraph()
-  if (g.ops.some(op => op.kind === 'state_input' && op.name === name)) {
-    throw new Error(`tensorgrad: state name '${name}' already used in this trace`)
-  }
+  assertNameUnused(g, name, ['state_input'], 'state')
   const site = captureSite('stateInput')
   return addOp(g, 'state_input', shape, dtype, site, { name, initValue } as any)
 }
