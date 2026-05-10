@@ -1,6 +1,6 @@
 {
   "name": "tensorgrad",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "description": "Tiny TypeScript-native tensor library with autograd, compiling to WebGPU. Train small models in the browser without hand-writing kernels.",
   "license": "MIT",
   "author": "Ben Albahari",
@@ -23,25 +23,16 @@
     "typescript"
   ],
   "type": "module",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./src/index.ts",
-      "default": "./src/index.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
-  "//": "Source-only exports for monorepo dev. publishConfig flips to dist/*.js for npm publish.",
-  "publishConfig": {
-    "main": "./dist/index.js",
-    "types": "./dist/index.d.ts",
-    "exports": {
-      ".": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
-      }
-    }
-  },
+  "sideEffects": false,
   "files": [
     "dist",
     "src",
@@ -51,11 +42,11 @@
   "scripts": {
     "build:js": "tsc -p tsconfig.json",
     "build:types": "tsc -p tsconfig.types.json && rollup -c rollup.dts.config.mjs && rimraf dist/types-temp",
-    "build": "pnpm run build:js && pnpm run build:types",
+    "build": "npm run build:js && npm run build:types",
     "clean": "rimraf dist",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx test/smoke.ts",
-    "prepublishOnly": "pnpm run clean && pnpm run build"
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "devDependencies": {
     "rimraf": "^6.0.1",
