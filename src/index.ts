@@ -37,6 +37,11 @@ export { appendAdam, type AdamConfig, type AdamResult } from './adam.js'
 export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
 export { emitKernels, type KernelSpec } from './codegen.js'
 export { createRuntime, createForwardRuntime, Captures, type CompiledRuntime, type CompiledForward, type RuntimeOpts, type RunOptions, type StepResult, type RunResult } from './runtime.js'
-export { compile, compileToIR, compileModule, compileForward, type CompiledIR, type CompileModuleOptions, type CompileForwardOptions, type InputDecl } from './compile.js'
+export {
+  compile, compileToIR, compileModule, compileForward,
+  type CompiledIR, type CompileModuleOptions, type CompileForwardOptions, type CompileForwardMethodOptions,
+  type CompiledModule, type CompiledForwardModule,
+  type InputDecl, type InputDecls, type InputsTensors, type ForwardFn,
+} from './compile.js'
 export { Module, materializeParams, type InitSpec, type ParamOptions, type MaterializedParams } from './module.js'
 export * as nn from './nn.js'

@@ -71,6 +71,9 @@ export interface RunOptions {
 
 /** Common surface for both training and forward-only compiled runtimes. */
 export interface CompiledBase {
+  /** The GPUDevice this runtime is bound to. Pass to sibling compiles to
+   *  share the device, or use directly for other GPU work. */
+  device: GPUDevice
   /** Param name -> the underlying GPUBuffer. Pass to a sibling compile via
    *  `sharedParams` to share without copies. */
   params: Map<string, GPUBuffer>
@@ -476,6 +479,7 @@ export async function createRuntime(
   }
 
   return {
+    device,
     params,
     outputShape,
     uploadParams,

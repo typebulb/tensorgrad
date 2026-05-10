@@ -44,7 +44,7 @@ function forward(m: MLP, x: Tensor): Tensor {
   return linear(m.l3, relu(linear(m.l2, relu(linear(m.l1, x)))))
 }
 
-function loss(m: MLP, x: Tensor, y: Tensor): Tensor {
+function loss(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   const diff = sub(forward(m, x), y)
   return mul(sumLast(reshape(mul(diff, diff), [B])), 1 / B)
 }
@@ -52,13 +52,13 @@ function loss(m: MLP, x: Tensor, y: Tensor): Tensor {
 const B = 256
 const compiled = await compileModule(() => new MLP(), loss, {
   adam: { lr: 0.005 },
-  inputs: [
-    { name: 'x', shape: [B, 1], dtype: 'f32' },
-    { name: 'y', shape: [B, 1], dtype: 'f32' },
-  ],
+  inputs: {
+    x: { shape: [B, 1], dtype: 'f32' },
+    y: { shape: [B, 1], dtype: 'f32' },
+  },
 })
 
-compiled.uploadInitialParams()  // applies the per-param init declared above
+// Initial params are uploaded automatically — no manual step needed.
 
 for (let step = 0; step < 1000; step++) {
   const { x, y } = generateBatch()
