@@ -69,6 +69,23 @@ export interface RunOptions {
   withCaptures?: boolean
 }
 
+export interface StepOptions extends RunOptions {
+  /** If false, the training submit is queued but the JS thread does not
+   *  await `mapAsync` of the loss buffer. Returns `void` immediately.
+   *  Use `runtime.readLoss()` to read the latest loss explicitly when
+   *  you want it (e.g., every Nth step for UI display).
+   *
+   *  Why: each `mapAsync` round-trip is ~1 ms on desktop but 10–30 ms on
+   *  Android Chrome. A training loop that awaits per step pays N × that
+   *  on the main thread, which on mobile starves the OS compositor and
+   *  causes visible UI sluggishness. With `readLoss: false` plus a
+   *  `requestAnimationFrame` yield between steps, the main thread stays
+   *  responsive while training runs at GPU speed.
+   *
+   *  Implies `withCaptures: false`. Default: true. */
+  readLoss?: boolean
+}
+
 /** Common surface for both training and forward-only compiled runtimes. */
 export interface CompiledBase {
   /** The GPUDevice this runtime is bound to. Pass to sibling compiles to
@@ -112,11 +129,16 @@ export interface CompiledRuntime extends CompiledBase {
    */
   step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
   step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
-  step(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<number | StepResult>
+  step(inputs: Record<string, Int32Array | Float32Array>, opts: { readLoss: false }): Promise<void>
+  step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepResult | void>
   /** Same dispatch as step() but returns the full output Float32Array — for
    *  training graphs the output is a scalar loss, so step() is usually more
    *  convenient. Provided for parity with `compileForward`. */
   run: RunFn
+  /** Read the latest loss value from the GPU. Pair with `step({ readLoss: false })`
+   *  fire-and-forget training: every Nth iteration, call `readLoss()` for the
+   *  UI, but most iterations don't pay the `mapAsync` cost. */
+  readLoss(): Promise<number>
   /** Re-zero all optimizer state buffers (Adam's m/v) in place. Pair with
    *  `uploadInitialParams()` for a full training reset without recompile. */
   resetOptimizerState(): void
@@ -292,18 +314,21 @@ export async function createRuntime(
   // run sequentially even when fired from independent async paths (e.g., a
   // training loop's auxiliary `refreshPrediction()` + `writeDiagnostic()`).
   let pending: Promise<unknown> = Promise.resolve()
+  type DispatchOpts = { wantCaptures: boolean; readback: boolean }
+  type DispatchResult = { output: Float32Array; captures: Map<string, Float32Array> } | null
   async function dispatch(
     inputs: Record<string, Int32Array | Float32Array>,
-    wantCaptures: boolean,
-  ): Promise<{ output: Float32Array; captures: Map<string, Float32Array> }> {
-    const turn = pending.catch(() => {}).then(() => dispatchUnsynchronized(inputs, wantCaptures))
+    opts: DispatchOpts,
+  ): Promise<DispatchResult> {
+    const turn = pending.catch(() => {}).then(() => dispatchUnsynchronized(inputs, opts))
     pending = turn
     return turn
   }
   async function dispatchUnsynchronized(
     inputs: Record<string, Int32Array | Float32Array>,
-    wantCaptures: boolean,
-  ): Promise<{ output: Float32Array; captures: Map<string, Float32Array> }> {
+    opts: DispatchOpts,
+  ): Promise<DispatchResult> {
+    const wantCaptures = opts.wantCaptures
     if (wantCaptures && plan.capturesByName.size === 0) {
       throw new Error(
         `withCaptures=true but no capture(...) calls were registered during ` +
@@ -360,6 +385,12 @@ export async function createRuntime(
     }
     queue.submit([encoder.finish()])
 
+    // readback=false: training fire-and-forget. The encoder still copied
+    // loss → outputReadback (and captures → staging), but we don't await
+    // mapAsync. The caller can read the latest loss later via readLoss()
+    // when it actually wants to display it.
+    if (!opts.readback) return null
+
     await outputReadback.mapAsync(GPUMapMode.READ)
     const output = new Float32Array(outputReadback.getMappedRange().slice(0))
     outputReadback.unmap()
@@ -381,14 +412,35 @@ export async function createRuntime(
   // ---- step() — training-mode wrapper, returns scalar [0] of output ---------
   function step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
   function step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
-  function step(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<number | StepResult>
+  function step(inputs: Record<string, Int32Array | Float32Array>, opts: { readLoss: false }): Promise<void>
+  function step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepResult | void>
   async function step(
     inputs: Record<string, Int32Array | Float32Array>,
-    opts?: RunOptions,
-  ): Promise<number | StepResult> {
-    const r = await dispatch(inputs, opts?.withCaptures === true)
+    opts?: StepOptions,
+  ): Promise<number | StepResult | void> {
+    if (opts?.readLoss === false) {
+      await dispatch(inputs, { wantCaptures: false, readback: false })
+      return
+    }
+    const r = (await dispatch(inputs, { wantCaptures: opts?.withCaptures === true, readback: true }))!
     if (opts?.withCaptures) return { loss: r.output[0]!, captures: new Captures(captureShapes, r.captures) }
     return r.output[0]!
+  }
+
+  // ---- readLoss() — explicit late readback for fire-and-forget training -----
+  // Maps the output buffer (which step() always copies the latest loss into,
+  // even when readLoss:false) and returns the value. Goes through the same
+  // serialization chain as step()/run() so two readLoss() calls don't both
+  // try to mapAsync the same buffer.
+  async function readLoss(): Promise<number> {
+    const turn = pending.catch(() => {}).then(async () => {
+      await outputReadback.mapAsync(GPUMapMode.READ)
+      const v = new Float32Array(outputReadback.getMappedRange())[0]!
+      outputReadback.unmap()
+      return v
+    })
+    pending = turn
+    return turn
   }
 
   // ---- run() — forward-mode wrapper, returns Float32Array by default -------
@@ -401,7 +453,7 @@ export async function createRuntime(
     inputs: Record<string, Int32Array | Float32Array>,
     opts?: RunOptions,
   ): Promise<Float32Array | RunResult> {
-    const r = await dispatch(inputs, opts?.withCaptures === true)
+    const r = (await dispatch(inputs, { wantCaptures: opts?.withCaptures === true, readback: true }))!
     if (opts?.withCaptures) return { output: r.output, captures: new Captures(captureShapes, r.captures) }
     return r.output
   }
@@ -507,6 +559,7 @@ export async function createRuntime(
     downloadParamGrads: () => downloadFromMap(plan.paramGradsByName),
     step,
     run,
+    readLoss,
     resetOptimizerState,
     destroy,
   }

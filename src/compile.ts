@@ -271,7 +271,7 @@ function wrapStepForAdam(runtime: CompiledRuntime, adamResult: AdamResult): void
   const innerReset = runtime.resetOptimizerState.bind(runtime)
   const wrappedStep = ((
     inputs: Record<string, Int32Array | Float32Array>,
-    opts?: { withCaptures?: boolean },
+    opts?: { withCaptures?: boolean; readLoss?: boolean },
   ) => {
     t++
     const lrNow = config.lr(t)
@@ -281,7 +281,9 @@ function wrapStepForAdam(runtime: CompiledRuntime, adamResult: AdamResult): void
       decayShrinkBuf[0] = 1 - lrNow * config.weightDecay
       merged[decayShrinkInputName] = decayShrinkBuf
     }
-    return opts?.withCaptures ? innerStep(merged, { withCaptures: true }) : innerStep(merged)
+    if (opts?.readLoss === false) return innerStep(merged, { readLoss: false })
+    if (opts?.withCaptures) return innerStep(merged, { withCaptures: true })
+    return innerStep(merged)
   }) as CompiledRuntime['step']
   runtime.step = wrappedStep
   runtime.resetOptimizerState = () => {
