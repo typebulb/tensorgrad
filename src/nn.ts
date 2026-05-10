@@ -97,6 +97,30 @@ export function mergeHeads(x: Tensor): Tensor {
   return reshape(swapped, [...lead, T, H * d])
 }
 
+/** Slice a flat capture readback of shape `[H, ..., ...]` into one
+ *  Float32Array per head. The leading axis is treated as the head axis;
+ *  pass the shape from `compiled.captureShapes[name]`. Result: `H` arrays,
+ *  each holding the row-major data for that head (size = product of trailing
+ *  axes). For B>1 graphs, prefix the result by the batch — this helper
+ *  assumes the leading axis is heads, which matches how `splitHeads` lays
+ *  out captures at B=1 (the typical capture-readback shape). */
+export function unsplitHeads(flat: Float32Array, shape: readonly number[]): Float32Array[] {
+  if (shape.length < 2) {
+    throw new Error(`unsplitHeads: shape needs >= 2 dims, got [${shape.join(', ')}]`)
+  }
+  // For inference graphs at B=1, captures have shape [1, H, ..., ...]. Strip
+  // the leading 1 if present so callers can pass captureShapes[name] directly.
+  const s = shape[0] === 1 ? shape.slice(1) : shape
+  const H = s[0]!
+  let stride = 1
+  for (let i = 1; i < s.length; i++) stride *= s[i]!
+  const expected = H * stride
+  if (flat.length !== expected) {
+    throw new Error(`unsplitHeads: flat length ${flat.length} doesn't match shape product ${expected}`)
+  }
+  return Array.from({ length: H }, (_, h) => flat.slice(h * stride, (h + 1) * stride))
+}
+
 // ----------------------------------------------------------------------------
 // Loss helpers
 // ----------------------------------------------------------------------------
