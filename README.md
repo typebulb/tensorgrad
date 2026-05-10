@@ -213,14 +213,33 @@ The library is small because of what it doesn't do. Plan accordingly:
 - **`f32` only.** No mixed precision. Inputs may be `i32` for indices.
 - **One transformation: `grad`.** No `vmap`, `pmap`, `jvp`, `custom_vjp`.
   Batch your data explicitly.
-- **One optimizer: Adam (with optional AdamW decay).** No SGD, RMSProp, Lion,
-  etc. exposed in the public API.
 - **Loss must be a scalar.** `compileModule`'s forward returns a rank-0 tensor.
 - **Closures don't cross the worker boundary.** LR schedules and inits are
-  shape unions. Custom optimizers / activations would similarly need shape
-  forms (not currently exposed).
+  serializable shapes, not functions. Anything per-step you write into a
+  user-defined optimizer (see *Extending* below) follows the same rule.
 - **One model per `compileModule` call.** Sibling forward graphs share params
   via the method form; otherwise each compile spawns its own worker.
+
+## Extending
+
+The IR is open. Adam is built in only because it's the most common starting
+point — other optimizers, custom losses, or extra ops are user code following
+the same pattern as `appendAdam`:
+
+```ts
+import { appendAdam, appendGrad, compileToIR } from 'tensorgrad'
+```
+
+A custom optimizer is a function that takes the autograd output (graph +
+`paramGrads`) and the materialized param tensors, appends its update ops
+to the graph, and returns writeback declarations the buffer planner uses
+to wire each new value back into its persistent home. SGD, Lion, RMSProp
+all fit this shape; see `src/adam.ts` for the canonical example.
+
+The same applies to ops: anything missing from the built-in set can be
+expressed as a composition of existing ops (GELU, RMSNorm, etc. are a few
+lines), or — if you need a new primitive — added to the IR with a
+forward + backward + WGSL emit.
 
 ## When not to use this
 
