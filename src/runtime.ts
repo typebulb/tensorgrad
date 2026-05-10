@@ -348,67 +348,42 @@ export async function createRuntime(
       queue.writeBuffer(buffers.get(bufId)!, 0, data as unknown as BufferSource)
     }
 
-    // Chunked submit. One queue.submit() of all 240 kernels monopolizes the
-    // GPU for the full step duration, blocking compositor frames the entire
-    // time. Splitting into chunks with an explicit GPU-drain await between
-    // them gives the compositor a slot at each chunk boundary. On graphs
-    // smaller than CHUNK_SIZE this collapses to a single submit (no
-    // overhead). See specs/WorkerArchitecture.md / mobile-jank investigation.
-    const CHUNK_SIZE = 32
+    const encoder = device.createCommandEncoder({ label: 'tensorgrad-step' })
+    for (let i = 0; i < kernels.length; i++) {
+      const k = kernels[i]!
+      if (!k.wgsl || k.threads === 0) continue
+      const pipeline = pipelines[i]!
+      const bindGroup = bindGroups[i]!
+      const pass = encoder.beginComputePass({ label: k.opKind })
+      pass.setPipeline(pipeline)
+      pass.setBindGroup(0, bindGroup)
+      // WebGPU caps each dispatch dimension at 65535 workgroups. Split into 2D
+      // when a kernel needs more than that on the X axis. Kernels compute their
+      // global index as `gid.x + gid.y * (65535 * workgroup_size)`, matching the
+      // stride we set here. For dispatches that fit in one row, gid.y is 0.
+      const wgCount = Math.max(1, Math.ceil(k.threads / k.workgroupSize))
+      const MAX_X = 65535
+      const wgX = Math.min(wgCount, MAX_X)
+      const wgY = Math.ceil(wgCount / MAX_X)
+      pass.dispatchWorkgroups(wgX, wgY, 1)
+      pass.end()
+    }
+    // After all dispatches: writebacks (Adam state, updated params). Empty for
+    // forward-only compiles.
+    for (const wb of plan.writebacks) {
+      encoder.copyBufferToBuffer(buffers.get(wb.source)!, 0, buffers.get(wb.dest)!, 0, wb.bytes)
+    }
+    encoder.copyBufferToBuffer(buffers.get(lossBufferId)!, 0, outputReadback, 0, outputSpec.byteSize)
+    // Capture readbacks (only when opted in). All captures concatenate into
+    // a single staging buffer so we mapAsync once instead of N times.
     let layout: CaptureLayout | null = null
     if (wantCaptures) {
-      // Compute layout up front so the last chunk can append capture copies.
       layout = ensureCaptureStaging()
+      for (const s of layout.slices) {
+        encoder.copyBufferToBuffer(buffers.get(s.bufId)!, 0, layout.buffer, s.offset, s.byteSize)
+      }
     }
-
-    let kernelIdx = 0
-    while (kernelIdx < kernels.length) {
-      const chunkEnd = Math.min(kernelIdx + CHUNK_SIZE, kernels.length)
-      const isLast = chunkEnd === kernels.length
-      const encoder = device.createCommandEncoder({
-        label: kernels.length > CHUNK_SIZE ? `tensorgrad-chunk-${kernelIdx}` : 'tensorgrad-step',
-      })
-      for (let i = kernelIdx; i < chunkEnd; i++) {
-        const k = kernels[i]!
-        if (!k.wgsl || k.threads === 0) continue
-        const pipeline = pipelines[i]!
-        const bindGroup = bindGroups[i]!
-        const pass = encoder.beginComputePass({ label: k.opKind })
-        pass.setPipeline(pipeline)
-        pass.setBindGroup(0, bindGroup)
-        // WebGPU caps each dispatch dimension at 65535 workgroups. Split into 2D
-        // when a kernel needs more than that on the X axis. Kernels compute their
-        // global index as `gid.x + gid.y * (65535 * workgroup_size)`, matching the
-        // stride we set here. For dispatches that fit in one row, gid.y is 0.
-        const wgCount = Math.max(1, Math.ceil(k.threads / k.workgroupSize))
-        const MAX_X = 65535
-        const wgX = Math.min(wgCount, MAX_X)
-        const wgY = Math.ceil(wgCount / MAX_X)
-        pass.dispatchWorkgroups(wgX, wgY, 1)
-        pass.end()
-      }
-      if (isLast) {
-        // Writebacks (Adam state, updated params; empty for forward-only) +
-        // output readback copy + capture readback copies all go into the
-        // final chunk so a single mapAsync below sees everything.
-        for (const wb of plan.writebacks) {
-          encoder.copyBufferToBuffer(buffers.get(wb.source)!, 0, buffers.get(wb.dest)!, 0, wb.bytes)
-        }
-        encoder.copyBufferToBuffer(buffers.get(lossBufferId)!, 0, outputReadback, 0, outputSpec.byteSize)
-        if (layout) {
-          for (const s of layout.slices) {
-            encoder.copyBufferToBuffer(buffers.get(s.bufId)!, 0, layout.buffer, s.offset, s.byteSize)
-          }
-        }
-      }
-      queue.submit([encoder.finish()])
-      if (!isLast) {
-        // Drain the chunk before queuing the next one. This is the moment
-        // the compositor can interleave its own frame work onto the GPU.
-        await queue.onSubmittedWorkDone()
-      }
-      kernelIdx = chunkEnd
-    }
+    queue.submit([encoder.finish()])
 
     // readback=false: training fire-and-forget. The encoder still copied
     // loss → outputReadback (and captures → staging), but we don't await
