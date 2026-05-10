@@ -250,7 +250,23 @@ export async function createRuntime(
   // the output buffer into its staging, optionally copies captures into theirs,
   // submits, and reads back. Returns the full output Float32Array; step() takes
   // [0] for scalar loss, run() returns it whole.
+  //
+  // **Concurrent calls auto-serialize.** Two `step()`/`run()` calls on the same
+  // runtime would otherwise both try to `mapAsync` the shared output staging
+  // buffer at the same time and trip "Buffer already has an outstanding map
+  // pending." We chain each new dispatch onto the prior one's promise so they
+  // run sequentially even when fired from independent async paths (e.g., a
+  // training loop's auxiliary `refreshPrediction()` + `writeDiagnostic()`).
+  let pending: Promise<unknown> = Promise.resolve()
   async function dispatch(
+    inputs: Record<string, Int32Array | Float32Array>,
+    wantCaptures: boolean,
+  ): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
+    const turn = pending.catch(() => {}).then(() => dispatchUnsynchronized(inputs, wantCaptures))
+    pending = turn
+    return turn
+  }
+  async function dispatchUnsynchronized(
     inputs: Record<string, Int32Array | Float32Array>,
     wantCaptures: boolean,
   ): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
