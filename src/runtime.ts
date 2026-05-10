@@ -90,12 +90,14 @@ export interface CompiledBase {
   destroy(): void
 }
 
-/** Run a dispatch and read back the full output tensor. Captures are always
- *  returned; their data is empty unless `{ withCaptures: true }` is passed. */
-export type RunFn = (
-  inputs: Record<string, Int32Array | Float32Array>,
-  opts?: RunOptions,
-) => Promise<RunResult>
+/** Run a dispatch and read back the full output tensor. Default returns the
+ *  output as a `Float32Array`; with `{ withCaptures: true }` returns
+ *  `{ output, captures }`. Same shape as `step()`'s overloads. */
+export interface RunFn {
+  (inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  (inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  (inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunResult>
+}
 
 export interface CompiledRuntime extends CompiledBase {
   /** Read all parameter gradients back. Mostly for verification / debugging. */
@@ -377,13 +379,19 @@ export async function createRuntime(
     return r.output[0]!
   }
 
-  // ---- run() — forward-mode wrapper, returns { output, captures } ----------
+  // ---- run() — forward-mode wrapper, returns Float32Array by default -------
+  // Same overloaded shape as step(): scalar-shaped result (here Float32Array,
+  // there a JS number) is the default; { ..., captures } is the opt-in form.
+  function run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  function run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  function run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunResult>
   async function run(
     inputs: Record<string, Int32Array | Float32Array>,
     opts?: RunOptions,
-  ): Promise<RunResult> {
+  ): Promise<Float32Array | RunResult> {
     const r = await dispatch(inputs, opts?.withCaptures === true)
-    return { output: r.output, captures: new Captures(captureShapes, r.captures) }
+    if (opts?.withCaptures) return { output: r.output, captures: new Captures(captureShapes, r.captures) }
+    return r.output
   }
 
   // ---- uploadParams ---------------------------------------------------------
