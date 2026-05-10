@@ -7,15 +7,43 @@
 //                                 Module tree; the library auto-discovers
 //                                 params, traces the forward, appends grad
 //                                 and Adam, and returns a runtime.
+//
+// As of the worker-architecture refactor: compile-time work (trace, autograd,
+// buffer planning, codegen) runs on the main thread. createRuntime and all
+// dispatch/mapAsync work runs in a Web Worker spawned per top-level compile;
+// the returned `CompiledModule` is a thin proxy over the worker channel.
+// See specs/WorkerArchitecture.md.
 
 import type { Tensor, Shape, Dtype } from './ir.js'
 import { trace, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
-import { appendAdam, type AdamConfig, type AdamResult } from './adam.js'
+import {
+  appendAdam, resolveLR,
+  type AdamConfig, type AdamResult, type AdamResolvedConfig,
+} from './adam.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
-import { createRuntime, createForwardRuntime, type CompiledRuntime, type CompiledForward, type RuntimeOpts } from './runtime.js'
+import {
+  Captures, type RunResult, type StepResult, type RunOptions, type UploadParamsOptions,
+} from './runtime.js'
 import { Module, materializeParams, type MaterializedParams } from './module.js'
+import { WorkerProxy } from './worker-proxy.js'
+import {
+  transferablesOfRecord,
+  type Req, type WireIR, type WireAdamConfig,
+  type CreateRuntimeResult, type CompileForwardResult,
+  type StepResultWire, type RunResultWire, type DownloadParamsResult,
+} from './worker-protocol.js'
+
+// `__WORKER_SOURCE__` is replaced at build time by scripts/build.mjs with the
+// stringified contents of the bundled src/worker.ts. Declared here so TS is
+// happy; substituted as a string literal by esbuild's `define` during
+// `npm run build:js`. See scripts/build.mjs.
+declare const __WORKER_SOURCE__: string
+
+// ============================================================================
+// Public types
+// ============================================================================
 
 /** Declares one input tensor of the model's forward function. The name is the
  *  key in the `inputs:` Record at compile time and the key on the `step()`/
@@ -25,21 +53,14 @@ export interface InputDecl {
   dtype?: Dtype
 }
 
-/** Inputs declaration: a Record from input name to its shape/dtype. The name
- *  doubles as the key the forward fn destructures and the key the runtime
- *  expects in `step({...})` / `run({...})`. */
+/** Inputs declaration: a Record from input name to its shape/dtype. */
 export type InputDecls = Record<string, InputDecl>
 
 /** Maps an `InputDecls` Record to its forward-time tensor counterpart —
- *  same keys, each value is a Tensor. Used to type the forward function's
- *  `inputs` argument from the declared shape Record. */
+ *  same keys, each value is a Tensor. */
 export type InputsTensors<I extends InputDecls> = { [K in keyof I]: Tensor }
 
-/** Forward function shape: takes the materialized model and a Record of
- *  named input tensors (matching the declared `inputs:` keys), returns the
- *  output tensor (loss for compileModule; logits/etc. for compileForward).
- *  The second generic flows from the inputs declaration so destructuring
- *  the input record stays typed. */
+/** Forward function shape. */
 export type ForwardFn<M extends Module, I extends InputDecls = InputDecls> =
   (m: M, inputs: InputsTensors<I>) => Tensor
 
@@ -60,75 +81,86 @@ export function compileToIR(traceFn: () => Tensor): CompiledIR {
   return { graph, paramGrads, loss, plan, kernels }
 }
 
-/** Full compile pipeline. Browser-only because it creates a GPUDevice. */
-export async function compile(traceFn: () => Tensor, opts: RuntimeOpts = {}): Promise<CompiledRuntime & { ir: CompiledIR }> {
-  const ir = compileToIR(traceFn)
-  const lossBufferId = ir.plan.tensorToBuffer.get(ir.loss.id)!
-  const runtime = await createRuntime(ir.plan, ir.kernels, lossBufferId, opts)
-  return Object.assign(runtime, { ir })
-}
-
 // ============================================================================
-// Module-aware compile
+// CompiledModule / CompiledForwardModule — main-thread proxy surface
 // ============================================================================
 
-export interface CompileModuleOptions<I extends InputDecls = InputDecls> extends RuntimeOpts {
-  /** Per-step data inputs to the forward function, keyed by name. The forward
-   *  fn destructures these out of its second argument; runtime calls to
-   *  `step()` / `run()` pass typed arrays under the same keys. */
+export interface CompileModuleOptions<I extends InputDecls = InputDecls> {
   inputs?: I
-  /** Adam hyperparameters. If omitted, no optimizer is appended (forward-only). */
   adam?: AdamConfig
 }
 
-export interface CompileForwardOptions<I extends InputDecls = InputDecls> extends RuntimeOpts {
-  /** Per-step data inputs to the forward function, keyed by name. */
+export interface CompileForwardOptions<I extends InputDecls = InputDecls> {
   inputs?: I
 }
 
-/** Forward-only compile options as taken by the `compileForward` *method* on
- *  a training runtime — no `device` (inherited) and no `sharedParams`
- *  (auto-supplied from the train graph's params). */
 export interface CompileForwardMethodOptions<I extends InputDecls = InputDecls> {
   inputs?: I
 }
 
-/** Returned by `compileModule`. Adds training-graph extras (auto-init, reset,
- *  sibling-graph compile) on top of the base runtime. */
-export interface CompiledModule<M extends Module> extends CompiledRuntime {
-  ir: CompiledIR
-  /** Number of dispatchable kernels (excludes leaf no-ops). */
-  kernelCount: number
-  /** Re-initialize all params from their declared init specs and zero the
-   *  optimizer state. Use to start training over without recompiling. */
-  reset(): void
-  /** Compile a sibling forward-only graph (e.g., a B=1 inference graph or a
-   *  B=N held-out eval graph) that shares this runtime's device and param
-   *  buffers. Pass the forward fn (typically distinct from your loss fn —
-   *  it returns logits, not a scalar) and any shape changes via `inputs`.
-   *  Auto-initialization is a no-op since params are shared. */
+/** Returned by `compileModule`. Proxies all GPU work to a worker held
+ *  internally; user code awaits Promises and never sees the worker. */
+export interface CompiledModule<M extends Module> {
+  readonly ir: CompiledIR
+  readonly kernelCount: number
+  readonly outputShape: readonly number[]
+  /** Names of the model's parameters, in materialization order. The actual
+   *  GPUBuffers live in the worker; use `downloadParams()` for values. */
+  readonly paramNames: readonly string[]
+
+  step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
+  step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
+
+  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+
+  uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
+  downloadParams(): Promise<Record<string, Float32Array>>
+  downloadParamGrads(): Promise<Record<string, Float32Array>>
+
+  /** Re-initialize all params + zero optimizer state. */
+  reset(): Promise<void>
+  resetOptimizerState(): Promise<void>
+
+  /** Compile a sibling forward-only graph that shares this runtime's worker
+   *  (and therefore its param GPUBuffers). */
   compileForward<I extends InputDecls>(
     forward: ForwardFn<M, I>,
     opts?: CompileForwardMethodOptions<I>,
   ): Promise<CompiledForwardModule>
+
+  /** Free the runtime's GPU resources and terminate the worker. */
+  destroy(): void
 }
 
 /** Returned by `compileForward` (and by the `compileForward` method). */
-export interface CompiledForwardModule extends CompiledForward {
-  ir: CompiledIR
-  /** Number of dispatchable kernels (excludes leaf no-ops). */
-  kernelCount: number
+export interface CompiledForwardModule {
+  readonly ir: CompiledIR
+  readonly kernelCount: number
+  readonly outputShape: readonly number[]
+  readonly paramNames: readonly string[]
+
+  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+
+  uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
+  downloadParams(): Promise<Record<string, Float32Array>>
+
+  destroy(): void
 }
+
+// ============================================================================
+// compileModule / compileForward
+// ============================================================================
 
 /**
  * Compile a Module-based model. Pass a *factory* `() => new Model()`, not the
  * model instance itself: compilation mutates the tree (every `ParamSentinel`
  * field becomes a real `Tensor`), so the instance is consumed and shouldn't be
- * referenced afterwards. Re-call the factory if you need a fresh tree.
+ * referenced afterwards.
  *
  * The forward function takes the materialized model and a Record of named
- * input tensors, returns the loss tensor. Inputs are matched by name with the
- * `inputs:` declaration:
+ * input tensors, returns the loss tensor:
  *
  *   inputs: {
  *     tokens:  { shape: [B, T], dtype: 'i32' },
@@ -136,20 +168,16 @@ export interface CompiledForwardModule extends CompiledForward {
  *   }
  *   forward: (m, { tokens, targets }) => …
  *
- * Walks the module tree to materialize params with auto-derived names, then
- * runs trace → grad → adam → buffer plan → codegen → runtime. Initial
- * parameter values are uploaded automatically before this function returns;
- * call `reset()` later to re-randomize.
- *
- * If `opts.adam` is set, the runtime's `step()` automatically tracks an
- * internal step count and injects the bias-corrected `lrt` scalar each call;
- * users don't need to provide it themselves.
+ * Returns a `CompiledModule` proxy. All GPU work (createRuntime, step, run,
+ * mapAsync) happens in an internal worker; calls return Promises that resolve
+ * when the worker replies.
  */
 export async function compileModule<M extends Module, I extends InputDecls = InputDecls>(
   modelFactory: () => M,
   forward: ForwardFn<M, I>,
   opts: CompileModuleOptions<I> = {},
 ): Promise<CompiledModule<M>> {
+  // ---- Compile-time work (main thread) ------------------------------------
   const { graph, materialized } = traceModule(modelFactory, forward, opts.inputs ?? {})
   const { paramGrads, loss } = appendGrad(graph)
   const adamResult = opts.adam
@@ -158,55 +186,40 @@ export async function compileModule<M extends Module, I extends InputDecls = Inp
 
   const plan = planBuffers(graph, paramGrads, adamResult?.writebacks ?? [])
   const kernels = emitKernels(graph, plan)
-  const lossBufferId = plan.tensorToBuffer.get(loss.id)!
-  const runtime = await createRuntime(plan, kernels, lossBufferId, opts)
-
-  if (adamResult) wrapStepForAdam(runtime, adamResult)
-  uploadInitialParams(plan, materialized.initFns, runtime, /* sharedParams */ undefined)
-
   const ir: CompiledIR = { graph, paramGrads, loss, plan, kernels }
-  const kernelCount = countKernels(kernels)
 
-  const reset = () => {
-    uploadInitialParams(plan, materialized.initFns, runtime, undefined)
-    runtime.resetOptimizerState()
+  // Initial params: resolve init shapes to Float32Arrays now (main thread).
+  // These transfer (zero-copy) to the worker as part of createRuntime.
+  const initialParams = buildInitialParams(plan, materialized.initFns)
+
+  // ---- Spawn worker, send IR + initial params -----------------------------
+  const proxy = new WorkerProxy(__WORKER_SOURCE__)
+  const wireIR: WireIR = { graph, plan, kernels }
+  const wireAdam = adamResult ? wireAdamConfig(adamResult) : null
+  const transfers = transferablesOfRecord(initialParams)
+
+  let meta: CreateRuntimeResult
+  try {
+    meta = await proxy.request<CreateRuntimeResult>(
+      { kind: 'createRuntime', payload: { graphId: 0, ir: wireIR, initialParams, adam: wireAdam } },
+      transfers,
+    )
+  } catch (e) {
+    proxy.terminate()
+    throw e
   }
 
-  const compileForwardMethod = <J extends InputDecls>(
-    forwardFn: ForwardFn<M, J>,
-    fOpts: CompileForwardMethodOptions<J> = {},
-  ): Promise<CompiledForwardModule> =>
-    compileForward<M, J>(modelFactory, forwardFn, {
-      ...fOpts,
-      device: runtime.device,
-      sharedParams: runtime.params,
-    })
-
-  return Object.assign(runtime, { ir, kernelCount, reset, compileForward: compileForwardMethod })
+  return new CompiledModuleProxy<M>(
+    proxy, /* graphId */ 0, ir, meta, modelFactory,
+    /* initFns */ materialized.initFns,
+    /* nextGraphId */ { v: 1 },
+  )
 }
 
-// ============================================================================
-// Forward-only compile
-// ============================================================================
-
 /**
- * Compile a Module-based model in forward-only mode (no autograd, no Adam).
- * The forward function returns the output tensor (e.g., logits) instead of a
- * scalar loss; runtime exposes `run(inputs)` returning the full output as a
- * `Float32Array`.
- *
- * **Prefer the `compileForward` method on a training runtime** when both
- * graphs use the same Module class — it auto-supplies `device` and
- * `sharedParams`. This standalone form is for forward-only models with no
- * training graph at all, or for sharing params across a different model.
- *
- * **Sharing params with a training compile.** Pass `opts.sharedParams =
- * trainCompiled.params` to bind this graph's param buffers to an existing
- * training runtime's GPU buffers — every train step is then immediately
- * visible to `run()` calls here, no copies.
- *
- * Initial param values are uploaded automatically for params *not* covered
- * by `sharedParams` (those are owned by the sibling compile).
+ * Forward-only compile. Spawns its own worker. For sibling graphs that share
+ * params with a training graph, prefer the `compileForward` method on the
+ * CompiledModule returned by `compileModule()`.
  */
 export async function compileForward<M extends Module, I extends InputDecls = InputDecls>(
   modelFactory: () => M,
@@ -215,16 +228,195 @@ export async function compileForward<M extends Module, I extends InputDecls = In
 ): Promise<CompiledForwardModule> {
   const { graph, materialized } = traceModule(modelFactory, forward, opts.inputs ?? {})
   const outputTensor = graph.tensors[graph.outputs[0]!]!
-
   const plan = planBuffers(graph, /* paramGrads */ {})
   const kernels = emitKernels(graph, plan)
-  const outputBufferId = plan.tensorToBuffer.get(outputTensor.id)!
-  const runtime = await createForwardRuntime(plan, kernels, outputBufferId, opts)
-
-  uploadInitialParams(plan, materialized.initFns, runtime, opts.sharedParams)
-
   const ir: CompiledIR = { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
-  return Object.assign(runtime, { ir, kernelCount: countKernels(kernels) })
+
+  const initialParams = buildInitialParams(plan, materialized.initFns)
+  const proxy = new WorkerProxy(__WORKER_SOURCE__)
+  const wireIR: WireIR = { graph, plan, kernels }
+  const transfers = transferablesOfRecord(initialParams)
+
+  let meta: CreateRuntimeResult
+  try {
+    meta = await proxy.request<CreateRuntimeResult>(
+      { kind: 'createRuntime', payload: { graphId: 0, ir: wireIR, initialParams, adam: null } },
+      transfers,
+    )
+  } catch (e) {
+    proxy.terminate()
+    throw e
+  }
+
+  return new CompiledForwardModuleProxy(proxy, /* graphId */ 0, ir, meta, /* ownsWorker */ true)
+}
+
+// ============================================================================
+// Proxy implementations
+// ============================================================================
+
+class CompiledModuleProxy<M extends Module> implements CompiledModule<M> {
+  constructor(
+    private readonly proxy: WorkerProxy,
+    private readonly graphId: number,
+    public readonly ir: CompiledIR,
+    private readonly meta: CreateRuntimeResult,
+    private readonly modelFactory: () => M,
+    /** Init closures captured from materializeParams at compile time. Used
+     *  by reset() to regenerate initial param values. */
+    private readonly initFns: Record<string, InitFn>,
+    private readonly nextGraphId: { v: number },
+  ) {}
+
+  get kernelCount(): number { return this.meta.kernelCount }
+  get outputShape(): readonly number[] { return this.meta.outputShape }
+  get paramNames(): readonly string[] { return this.meta.paramNames }
+
+  step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
+  step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
+  async step(
+    inputs: Record<string, Int32Array | Float32Array>,
+    opts?: { withCaptures?: boolean },
+  ): Promise<number | StepResult> {
+    // Note: inputs are copied (not transferred) into the worker. Callers
+    // commonly reuse the same TypedArray as a scratch buffer across step()
+    // calls; transferring would detach it. The copy cost is small relative
+    // to a training step's GPU work.
+    const r = await this.proxy.request<StepResultWire>(
+      { kind: 'step', payload: { graphId: this.graphId, inputs, withCaptures: opts?.withCaptures === true } },
+    )
+    if (opts?.withCaptures) {
+      return { loss: r.loss, captures: makeCaptures(r.captures, this.meta.captureShapes) }
+    }
+    return r.loss
+  }
+
+  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  async run(
+    inputs: Record<string, Int32Array | Float32Array>,
+    opts?: { withCaptures?: boolean },
+  ): Promise<Float32Array | RunResult> {
+    // Inputs copied (see note in step()).
+    const r = await this.proxy.request<RunResultWire>(
+      { kind: 'run', payload: { graphId: this.graphId, inputs, withCaptures: opts?.withCaptures === true } },
+    )
+    if (opts?.withCaptures) {
+      return { output: r.output, captures: makeCaptures(r.captures, this.meta.captureShapes) }
+    }
+    return r.output
+  }
+
+  uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void> {
+    // Params copied (see note in step()) — caller's Float32Arrays stay valid.
+    return this.proxy.request<null>(
+      { kind: 'uploadParams', payload: { graphId: this.graphId, params, partial: !!opts?.partial } },
+    ).then(() => undefined)
+  }
+
+  async downloadParams(): Promise<Record<string, Float32Array>> {
+    const r = await this.proxy.request<DownloadParamsResult>(
+      { kind: 'downloadParams', payload: { graphId: this.graphId } },
+    )
+    return r.params
+  }
+
+  async downloadParamGrads(): Promise<Record<string, Float32Array>> {
+    const r = await this.proxy.request<DownloadParamsResult>(
+      { kind: 'downloadParamGrads', payload: { graphId: this.graphId } },
+    )
+    return r.params
+  }
+
+  async reset(): Promise<void> {
+    // Re-init main-thread, upload, then reset Adam state on worker. Two
+    // round-trips but reset() is rare. The init closures were captured at
+    // compile time and stashed on the proxy.
+    const initialParams = buildInitialParams(this.ir.plan, this.initFns)
+    await this.uploadParams(initialParams)
+    await this.resetOptimizerState()
+  }
+
+  resetOptimizerState(): Promise<void> {
+    return this.proxy.request<null>(
+      { kind: 'resetOptimizer', payload: { graphId: this.graphId } },
+    ).then(() => undefined)
+  }
+
+  async compileForward<I extends InputDecls>(
+    forward: ForwardFn<M, I>,
+    opts: CompileForwardMethodOptions<I> = {},
+  ): Promise<CompiledForwardModule> {
+    const { graph, materialized: _materialized } = traceModule(this.modelFactory, forward, opts.inputs ?? {})
+    const outputTensor = graph.tensors[graph.outputs[0]!]!
+    const plan = planBuffers(graph, /* paramGrads */ {})
+    const kernels = emitKernels(graph, plan)
+    const ir: CompiledIR = { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
+
+    const childGraphId = this.nextGraphId.v++
+    const wireIR: WireIR = { graph, plan, kernels }
+
+    const meta = await this.proxy.request<CompileForwardResult>(
+      { kind: 'compileForward', payload: { graphId: childGraphId, parentGraphId: this.graphId, ir: wireIR } },
+    )
+
+    return new CompiledForwardModuleProxy(this.proxy, childGraphId, ir, meta, /* ownsWorker */ false)
+  }
+
+  destroy(): void {
+    // Fire-and-forget destroy; postMessage ordering ensures the worker
+    // processes any in-flight requests before we terminate it.
+    this.proxy.send({ kind: 'destroy', payload: { graphId: this.graphId } })
+    this.proxy.terminate()
+  }
+}
+
+class CompiledForwardModuleProxy implements CompiledForwardModule {
+  constructor(
+    private readonly proxy: WorkerProxy,
+    private readonly graphId: number,
+    public readonly ir: CompiledIR,
+    private readonly meta: CompileForwardResult | CreateRuntimeResult,
+    private readonly ownsWorker: boolean,
+  ) {}
+
+  get kernelCount(): number { return this.meta.kernelCount }
+  get outputShape(): readonly number[] { return this.meta.outputShape }
+  get paramNames(): readonly string[] { return this.meta.paramNames }
+
+  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  async run(
+    inputs: Record<string, Int32Array | Float32Array>,
+    opts?: { withCaptures?: boolean },
+  ): Promise<Float32Array | RunResult> {
+    // Inputs copied; caller's TypedArrays stay valid.
+    const r = await this.proxy.request<RunResultWire>(
+      { kind: 'run', payload: { graphId: this.graphId, inputs, withCaptures: opts?.withCaptures === true } },
+    )
+    if (opts?.withCaptures) {
+      return { output: r.output, captures: makeCaptures(r.captures, this.meta.captureShapes) }
+    }
+    return r.output
+  }
+
+  uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void> {
+    return this.proxy.request<null>(
+      { kind: 'uploadParams', payload: { graphId: this.graphId, params, partial: !!opts?.partial } },
+    ).then(() => undefined)
+  }
+
+  async downloadParams(): Promise<Record<string, Float32Array>> {
+    const r = await this.proxy.request<DownloadParamsResult>(
+      { kind: 'downloadParams', payload: { graphId: this.graphId } },
+    )
+    return r.params
+  }
+
+  destroy(): void {
+    this.proxy.send({ kind: 'destroy', payload: { graphId: this.graphId } })
+    if (this.ownsWorker) this.proxy.terminate()
+  }
 }
 
 // ============================================================================
@@ -255,60 +447,46 @@ function traceModule<M extends Module, I extends InputDecls>(
   return { graph, materialized }
 }
 
-const countKernels = (kernels: KernelSpec[]): number => kernels.filter(k => k.wgsl).length
-
-/** Wrap the runtime's step() to inject Adam's per-step `lrt` (bias-corrected
- *  effective LR) and, when the user supplied a per-step lr schedule, the
- *  decayShrink scalar. Also wraps resetOptimizerState() so a reset zeros
- *  Adam's m/v *and* the bias-correction step counter — otherwise the next
- *  step would skip Adam's warmup phase. */
-function wrapStepForAdam(runtime: CompiledRuntime, adamResult: AdamResult): void {
-  const { lrtInputName, decayShrinkInputName, config } = adamResult
-  let t = 0
-  const lrtBuf = new Float32Array(1)
-  const decayShrinkBuf = decayShrinkInputName ? new Float32Array(1) : null
-  const innerStep = runtime.step.bind(runtime) as CompiledRuntime['step']
-  const innerReset = runtime.resetOptimizerState.bind(runtime)
-  const wrappedStep = ((
-    inputs: Record<string, Int32Array | Float32Array>,
-    opts?: { withCaptures?: boolean; readLoss?: boolean },
-  ) => {
-    t++
-    const lrNow = config.lr(t)
-    lrtBuf[0] = lrNow * Math.sqrt(1 - Math.pow(config.b2, t)) / (1 - Math.pow(config.b1, t))
-    const merged: Record<string, Int32Array | Float32Array> = { ...inputs, [lrtInputName]: lrtBuf }
-    if (decayShrinkBuf && decayShrinkInputName) {
-      decayShrinkBuf[0] = 1 - lrNow * config.weightDecay
-      merged[decayShrinkInputName] = decayShrinkBuf
-    }
-    if (opts?.readLoss === false) return innerStep(merged, { readLoss: false })
-    if (opts?.withCaptures) return innerStep(merged, { withCaptures: true })
-    return innerStep(merged)
-  }) as CompiledRuntime['step']
-  runtime.step = wrappedStep
-  runtime.resetOptimizerState = () => {
-    t = 0
-    innerReset()
-  }
-}
-
-/** Build a Record<paramName, Float32Array> by running each param's init
- *  function against its shape and uploading them to the runtime. Skips any
- *  param covered by `sharedParams` (those are owned by a sibling compile). */
-function uploadInitialParams(
-  plan: BufferPlan,
-  initFns: Record<string, InitFn>,
-  runtime: CompiledRuntime | CompiledForward,
-  sharedParams: Map<string, GPUBuffer> | undefined,
-): void {
+/** Run each param's init function against its declared shape to produce the
+ *  initial Float32Arrays. Runs main-thread before transfer to the worker. */
+function buildInitialParams(plan: BufferPlan, initFns: Record<string, InitFn>): Record<string, Float32Array> {
   const out: Record<string, Float32Array> = {}
   for (const [name, bufId] of plan.paramsByName) {
-    if (sharedParams?.has(name)) continue
     const shape = plan.buffers[bufId]!.shape
     const size = shape.reduce((a, b) => a * b, 1)
     const initFn = initFns[name]
     if (!initFn) throw new Error(`compile: no init for param '${name}'`)
     out[name] = initFn(size, shape)
   }
-  if (Object.keys(out).length > 0) runtime.uploadParams(out, { partial: !!sharedParams })
+  return out
 }
+
+/** Subset of AdamResolvedConfig that crosses the wire (drops decayFilter,
+ *  which is only used at compile time). */
+function wireAdamConfig(r: AdamResult): WireAdamConfig {
+  const c: AdamResolvedConfig = r.config
+  return {
+    lr: c.lr,
+    b1: c.b1,
+    b2: c.b2,
+    eps: c.eps,
+    weightDecay: c.weightDecay,
+    lrIsScheduled: c.lrIsScheduled,
+    lrtInputName: r.lrtInputName,
+    decayShrinkInputName: r.decayShrinkInputName,
+  }
+}
+
+/** Wrap a worker-returned `Record<name, Float32Array>` in a Captures instance
+ *  using the static capture shapes captured at compile time. */
+function makeCaptures(
+  captures: Record<string, Float32Array> | null,
+  captureShapes: Record<string, number[]>,
+): Captures {
+  const data = new Map<string, Float32Array>()
+  if (captures) {
+    for (const [name, arr] of Object.entries(captures)) data.set(name, arr)
+  }
+  return new Captures(captureShapes, data)
+}
+

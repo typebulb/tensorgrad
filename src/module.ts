@@ -32,30 +32,47 @@ import { paramInput } from './trace.js'
 // Init metadata
 // ============================================================================
 
-/** How a parameter's initial values are produced.
- *  - `'randn'` — Gaussian, with `scale` (default 0.02). The common case for
- *    weight matrices and embeddings.
- *  - `'zeros'` — fill with 0. Common for biases and LayerNorm beta.
- *  - `'ones'`  — fill with 1. Common for LayerNorm gain.
- *  - Custom function — receives total element count and shape, returns the
- *    Float32Array. Use for fan-in scaling or any non-standard scheme.
+/** How a parameter's initial values are produced. Serializable shape — no
+ *  closures, since the initial values cross the worker boundary at compile
+ *  time. Use the `init` helpers for ergonomic construction.
+ *
+ *  String shorthands:
+ *  - `'randn'` — Gaussian with std 0.02 (the common weight-matrix init).
+ *  - `'zeros'` — fill with 0 (biases, LayerNorm beta).
+ *  - `'ones'`  — fill with 1 (LayerNorm gain).
+ *
+ *  Object shapes:
+ *  - `{ kind: 'randn', scale }` — randn with explicit std.
+ *  - `{ kind: 'kaiming', gain? }` — `std = gain / sqrt(fan_in)`. Default
+ *    gain `sqrt(2)` (good for ReLU). `fan_in = shape[0]`.
+ *  - `{ kind: 'literal', data }` — explicit Float32Array; length must
+ *    match the parameter's element count.
  */
 export type InitSpec =
   | 'randn'
   | 'zeros'
   | 'ones'
-  | ((size: number, shape: readonly number[]) => Float32Array)
+  | { readonly kind: 'randn'; readonly scale: number }
+  | { readonly kind: 'kaiming'; readonly gain?: number }
+  | { readonly kind: 'literal'; readonly data: Float32Array }
+
+/** Ergonomic constructors for InitSpec object shapes. */
+export const init = {
+  randn: (opts: { scale?: number } = {}): InitSpec => ({ kind: 'randn', scale: opts.scale ?? 0.02 }),
+  kaiming: (opts: { gain?: number } = {}): InitSpec =>
+    opts.gain !== undefined ? { kind: 'kaiming', gain: opts.gain } : { kind: 'kaiming' },
+  literal: (data: Float32Array): InitSpec => ({ kind: 'literal', data }),
+}
 
 export interface ParamOptions {
   dtype?: Dtype
-  /** Init kind. Default: `'randn'`. */
+  /** Init shape. Default: `'randn'` (std 0.02). */
   init?: InitSpec
-  /** Std dev for `'randn'`. Default 0.02. Ignored for non-randn init. */
-  scale?: number
   /** Whether AdamW (when `weightDecay > 0`) should apply decoupled weight
-   *  decay to this param. Default: `true` for `'randn'` init (weight matrices,
-   *  embeddings), `false` for `'zeros'` / `'ones'` (biases, LN gains). Override
-   *  to force or skip. Replaces `adam.decayFilter` for the common case. */
+   *  decay to this param. Default: `true` for randn/kaiming/literal init
+   *  (weight matrices, embeddings); `false` for zeros/ones (biases, LN
+   *  gains). Override to force or skip. Replaces `adam.decayFilter` for
+   *  the common case. */
   decay?: boolean
 }
 
@@ -65,31 +82,52 @@ function boxMuller(): number {
   return Math.sqrt(-2 * Math.log(Math.max(1e-10, Math.random()))) * Math.cos(2 * Math.PI * Math.random())
 }
 
-function resolveInit(opts: ParamOptions | undefined): InitFn {
-  const init = opts?.init ?? 'randn'
-  if (init === 'randn') {
-    const scale = opts?.scale ?? 0.02
-    return (size) => {
-      const arr = new Float32Array(size)
-      for (let i = 0; i < size; i++) arr[i] = boxMuller() * scale
-      return arr
-    }
+function randnFn(scale: number): InitFn {
+  return (size) => {
+    const arr = new Float32Array(size)
+    for (let i = 0; i < size; i++) arr[i] = boxMuller() * scale
+    return arr
   }
-  if (init === 'zeros') return (size) => new Float32Array(size)
-  if (init === 'ones') return (size) => { const a = new Float32Array(size); a.fill(1); return a }
-  if (typeof init === 'function') return init
-  throw new Error(`Unknown init: ${String(init)}`)
 }
 
-/** Resolve the decay default for a param. Decay weight matrices and
- *  embedding tables (randn-initialized); skip biases (zeros) and LN gains
- *  (ones). Custom init functions default to "decay" — most user-supplied
- *  inits are weight-shaped (Kaiming etc.). Explicit `decay: false` overrides. */
+/** Compile-time-only: resolve an InitSpec shape into the closure that
+ *  generates the initial Float32Array for a given parameter shape. Runs
+ *  on the main thread before initial values are transferred to the worker. */
+function resolveInit(spec: InitSpec | undefined): InitFn {
+  if (!spec || spec === 'randn') return randnFn(0.02)
+  if (spec === 'zeros') return (size) => new Float32Array(size)
+  if (spec === 'ones') return (size) => { const a = new Float32Array(size); a.fill(1); return a }
+  switch (spec.kind) {
+    case 'randn': return randnFn(spec.scale)
+    case 'kaiming': {
+      const gain = spec.gain ?? Math.sqrt(2)
+      return (size, shape) => {
+        const fanIn = shape[0] ?? size
+        const std = gain / Math.sqrt(fanIn)
+        const arr = new Float32Array(size)
+        for (let i = 0; i < size; i++) arr[i] = boxMuller() * std
+        return arr
+      }
+    }
+    case 'literal': {
+      const data = spec.data
+      return (size) => {
+        if (data.length !== size) {
+          throw new Error(`init.literal: data length ${data.length} doesn't match param size ${size}`)
+        }
+        return new Float32Array(data)
+      }
+    }
+  }
+}
+
+/** Resolve the decay default for a param. Weight-shaped inits (randn,
+ *  kaiming, literal) default to decay=true; ones/zeros default to false
+ *  (biases, LN gains). Explicit `decay` opt overrides. */
 function resolveDecay(opts: ParamOptions | undefined): boolean {
   if (opts?.decay !== undefined) return opts.decay
-  const init = opts?.init ?? 'randn'
-  if (init === 'zeros' || init === 'ones') return false
-  return true   // 'randn' or function
+  const spec = opts?.init ?? 'randn'
+  return spec !== 'zeros' && spec !== 'ones'
 }
 
 // ============================================================================
@@ -127,7 +165,7 @@ export abstract class Module {
   protected param(shape: Shape, opts?: ParamOptions): Tensor {
     const dtype = opts?.dtype ?? 'f32'
     // Lie to TypeScript: the sentinel becomes a Tensor at materialize time.
-    return new ParamSentinel(shape, dtype, resolveInit(opts), resolveDecay(opts)) as unknown as Tensor
+    return new ParamSentinel(shape, dtype, resolveInit(opts?.init), resolveDecay(opts)) as unknown as Tensor
   }
 }
 

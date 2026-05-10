@@ -1,6 +1,6 @@
 {
   "name": "tensorgrad",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "description": "Tiny TypeScript-native tensor library with autograd, compiling to WebGPU. Train small models in the browser without hand-writing kernels.",
   "license": "MIT",
   "author": "Ben Albahari",
@@ -40,7 +40,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build:js": "tsc -p tsconfig.json",
+    "build:js": "node scripts/build.mjs",
+    "build:js:watch": "node scripts/build.mjs --watch",
     "build:types": "tsc -p tsconfig.types.json && rollup -c rollup.dts.config.mjs && rimraf dist/types-temp",
     "build": "npm run build:js && npm run build:types",
     "clean": "rimraf dist",
@@ -49,6 +50,7 @@
     "prepublishOnly": "npm run clean && npm run build"
   },
   "devDependencies": {
+    "esbuild": "^0.28.0",
     "rimraf": "^6.0.1",
     "rollup": "^4.0.0",
     "rollup-plugin-dts": "^6.2.0",

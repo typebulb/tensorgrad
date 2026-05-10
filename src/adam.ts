@@ -32,12 +32,68 @@ import type { WritebackDecl } from './buffers.js'
 import { traceInto, stateInput, tensorInput } from './trace.js'
 import { adamUpdateM, adamUpdateV, adamUpdateP } from './ops.js'
 
+/** Per-step learning-rate schedule. Either a fixed number or one of the
+ *  serializable shape forms below. Functions/closures are not supported —
+ *  the schedule needs to cross thread boundaries and survive serialization
+ *  for the worker-internal runtime, and every realistic LR pattern (constant,
+ *  linear decay, cosine, warmup-then-decay) maps to a finite set of shapes.
+ *  Use the `lr` helper namespace to construct shapes ergonomically. */
+export type LRSchedule =
+  | number
+  | { readonly kind: 'constant'; readonly value: number }
+  | { readonly kind: 'linearDecay'; readonly peak: number; readonly final: number; readonly steps: number }
+  | { readonly kind: 'cosineDecay'; readonly peak: number; readonly final: number; readonly steps: number }
+  | { readonly kind: 'warmup'; readonly peakLr: number; readonly warmupSteps: number; readonly after: LRSchedule }
+
+/** Ergonomic constructors for LRSchedule shapes. */
+export const lr = {
+  constant: (value: number): LRSchedule => ({ kind: 'constant', value }),
+  /** Linearly interpolate from `peak` at step 1 to `final` at step `steps`,
+   *  then hold at `final`. Matches `peak + (final - peak) * min(step/steps, 1)`. */
+  linearDecay: (opts: { peak: number; final: number; steps: number }): LRSchedule =>
+    ({ kind: 'linearDecay', ...opts }),
+  /** Half-cosine from `peak` at step 1 down to `final` at step `steps`,
+   *  then hold at `final`. */
+  cosineDecay: (opts: { peak: number; final: number; steps: number }): LRSchedule =>
+    ({ kind: 'cosineDecay', ...opts }),
+  /** Linear ramp from 0 to `peakLr` over `warmupSteps` steps, then hand off
+   *  to `after` (offset so step 1 of `after` = first post-warmup step). */
+  warmup: (opts: { peakLr: number; warmupSteps: number; after: LRSchedule }): LRSchedule =>
+    ({ kind: 'warmup', ...opts }),
+}
+
+/** Resolve a schedule to its scalar value at a given 1-based step. */
+export function resolveLR(schedule: LRSchedule, step: number): number {
+  if (typeof schedule === 'number') return schedule
+  switch (schedule.kind) {
+    case 'constant': return schedule.value
+    case 'linearDecay': {
+      const f = Math.min(step / schedule.steps, 1)
+      return schedule.peak + (schedule.final - schedule.peak) * f
+    }
+    case 'cosineDecay': {
+      const f = Math.min(step / schedule.steps, 1)
+      return schedule.final + 0.5 * (schedule.peak - schedule.final) * (1 + Math.cos(Math.PI * f))
+    }
+    case 'warmup': {
+      if (step <= schedule.warmupSteps) return schedule.peakLr * (step / schedule.warmupSteps)
+      return resolveLR(schedule.after, step - schedule.warmupSteps)
+    }
+  }
+}
+
+/** True for shapes that produce different values at different steps (so the
+ *  AdamW decayShrink scalar must be a per-step input rather than baked).
+ *  Numbers and `{kind:'constant'}` are static; everything else varies. */
+export function isLRDynamic(schedule: LRSchedule): boolean {
+  if (typeof schedule === 'number') return false
+  return schedule.kind !== 'constant'
+}
+
 export interface AdamConfig {
-  /** Constant scalar (e.g., `0.005`) or a per-step schedule function
-   *  `(step) => lr`. Schedule fn lets the user implement linear/cosine decay
-   *  or warmup; first call passes `step=1`. Decay-shrink (AdamW) updates
-   *  per-step automatically when this is a function. */
-  lr: number | ((step: number) => number)
+  /** Learning rate schedule. Pass a number for fixed lr, or a shape from
+   *  the `lr` helpers (e.g., `lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 })`). */
+  lr: LRSchedule
   b1?: number   // default 0.9
   b2?: number   // default 0.999
   eps?: number  // default 1e-8
@@ -52,16 +108,17 @@ export interface AdamConfig {
   decayFilter?: (paramName: string) => boolean
 }
 
-/** Resolved hyperparameters: lr is the schedule fn (constants are wrapped). */
+/** Resolved hyperparameters with all fields populated. `lr` stays as the
+ *  shape (not pre-resolved) so the runtime can compute per-step values. */
 export interface AdamResolvedConfig {
-  lr: (step: number) => number
+  lr: LRSchedule
   b1: number
   b2: number
   eps: number
   weightDecay: number
   decayFilter: (name: string) => boolean
-  /** True iff the user supplied an lr function (vs a constant). When false,
-   *  decayShrink is baked at compile time and never updated. */
+  /** True iff the lr shape varies with step (linearDecay, cosineDecay,
+   *  warmup). When false, decayShrink is baked at compile time. */
   lrIsScheduled: boolean
 }
 
@@ -101,13 +158,10 @@ export function appendAdam(
    *  directly without a Module). */
   decayFlags?: Record<string, boolean>,
 ): AdamResult {
-  const lrIsScheduled = typeof config.lr === 'function'
-  const lrFn = lrIsScheduled
-    ? config.lr as (step: number) => number
-    : (() => config.lr as number)
-  const initialLr = lrFn(1)
+  const lrIsScheduled = isLRDynamic(config.lr)
+  const initialLr = resolveLR(config.lr, 1)
   const fullConfig: AdamResolvedConfig = {
-    lr: lrFn,
+    lr: config.lr,
     b1: config.b1 ?? 0.9,
     b2: config.b2 ?? 0.999,
     eps: config.eps ?? 1e-8,

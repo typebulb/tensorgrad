@@ -33,15 +33,19 @@ export {
 // adam.ts can import them) but aren't part of the public API — `add`/`mul`
 // overload on JS numbers, `where` subsumes the rest.
 export { appendGrad, type GradResult } from './grad.js'
-export { appendAdam, type AdamConfig, type AdamResult } from './adam.js'
+export { appendAdam, lr, resolveLR, type AdamConfig, type AdamResult, type LRSchedule } from './adam.js'
 export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
 export { emitKernels, type KernelSpec } from './codegen.js'
-export { createRuntime, createForwardRuntime, Captures, type CompiledRuntime, type CompiledForward, type RuntimeOpts, type RunOptions, type StepResult, type RunResult } from './runtime.js'
+// Runtime types: only the user-facing pieces. CompiledRuntime/CompiledForward
+// (worker-internal) and createRuntime/createForwardRuntime aren't part of the
+// public API — users get CompiledModule/CompiledForwardModule (proxies) from
+// compileModule/compileForward instead.
+export { Captures, type RunOptions, type StepResult, type RunResult, type UploadParamsOptions } from './runtime.js'
 export {
-  compile, compileToIR, compileModule, compileForward,
+  compileToIR, compileModule, compileForward,
   type CompiledIR, type CompileModuleOptions, type CompileForwardOptions, type CompileForwardMethodOptions,
   type CompiledModule, type CompiledForwardModule,
   type InputDecl, type InputDecls, type InputsTensors, type ForwardFn,
 } from './compile.js'
-export { Module, materializeParams, type InitSpec, type ParamOptions, type MaterializedParams } from './module.js'
+export { Module, materializeParams, init, type InitSpec, type ParamOptions, type MaterializedParams } from './module.js'
 export * as nn from './nn.js'
