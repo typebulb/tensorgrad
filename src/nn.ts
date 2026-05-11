@@ -88,6 +88,26 @@ export class LayerNorm extends Module {
 }
 
 // ----------------------------------------------------------------------------
+// RMSNorm — Llama-style normalization. Scale-only (no mean-subtraction, no
+// bias), so cheaper than LayerNorm and stable enough for modern transformers.
+// `y = x / sqrt(mean(x², dim=-1) + eps) * g`
+// ----------------------------------------------------------------------------
+
+export class RMSNorm extends Module {
+  /** Gain (gamma), shape `[d]`, init `ones`. Scales the RMS-normalized output. */
+  g: Tensor
+  constructor(public readonly d: number, public readonly eps: number = 1e-6) {
+    super()
+    this.g = this.param([d], { init: 'ones' })
+  }
+  fwd(x: Tensor): Tensor {
+    const ms = mean(mul(x, x), -1, { keepDims: true })  // mean of squares; [..., 1]
+    const rstd = sqrt(add(ms, this.eps))                // [..., 1]
+    return mul(div(x, rstd), this.g)
+  }
+}
+
+// ----------------------------------------------------------------------------
 // Multi-head attention shape helpers — split the last (model) axis into
 // [nHeads, headDim] and bring heads ahead of the sequence axis.
 // ----------------------------------------------------------------------------

@@ -349,6 +349,7 @@ import { nn } from 'tensorgrad'
 
 nn.Linear(inDim, outDim, { bias? })  // .fwd(x); W: [inDim, outDim], b: [outDim]
 nn.LayerNorm(dim)                    // .fwd(x); g (gain) and b (bias) both [dim]
+nn.RMSNorm(dim, eps?)                // .fwd(x); g (gain) only — Llama-style
 nn.Embedding(vocab, dim)             // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
 nn.splitHeads(x, nHeads)             // [B, T, D] → [B, H, T, D/H]
 nn.mergeHeads(x)                     // inverse of splitHeads
