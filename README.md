@@ -477,7 +477,7 @@ separate graphs — dropout is literally absent from the inference path.
 ```ts
 function lossFn(m: Model, { x, y }: { x: Tensor; y: Tensor }) {
   const h = relu(dropout(m.l1.fwd(x), 0.1))    // dropout in training
-  return mean(nn.crossEntropyLast(m.l2.fwd(h), y))
+  return mean(nn.crossEntropy(m.l2.fwd(h), y))
 }
 
 function predictFn(m: Model, { x }: { x: Tensor }) {
@@ -496,7 +496,7 @@ Wrap any tensor inside a forward to expose its activation post-run:
 ```ts
 import { capture } from 'tensorgrad'
 
-const attn = capture(`attn.${i}`, softmaxCausalLast(scores))
+const attn = capture(`attn.${i}`, softmaxCausal(scores))
 ```
 
 ```ts
