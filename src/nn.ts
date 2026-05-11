@@ -13,10 +13,29 @@
 
 import { Module } from './module.js'
 import type { Tensor } from './ir.js'
-import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmaxLast } from './ops.js'
+import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmaxLast, embedding } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
 import type { Captures } from './runtime.js'
+
+// ----------------------------------------------------------------------------
+// Embedding: integer indices → row lookup. Like `nn.Embedding` in PyTorch.
+// ----------------------------------------------------------------------------
+
+export class Embedding extends Module {
+  /** Embedding table, shape `[vocab, dim]`. Default init is `randn` with
+   *  PyTorch's default std (0.02 in tensorgrad). For Llama-style scaled
+   *  init, pass `{ init: init.randn({ scale: 1 / Math.sqrt(dim) }) }`. */
+  W: Tensor
+  constructor(public readonly vocab: number, public readonly dim: number) {
+    super()
+    this.W = this.param([vocab, dim])
+  }
+  /** Lookup: `idx` is `[...]` of i32, returns `[..., dim]` f32. */
+  fwd(idx: Tensor): Tensor {
+    return embedding(this.W, idx)
+  }
+}
 
 // ----------------------------------------------------------------------------
 // Linear: y = x @ W (+ b)

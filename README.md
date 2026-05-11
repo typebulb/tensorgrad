@@ -99,6 +99,11 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `x.mean()` / `x.sum()` | `mean(x)` / `sum(x)` — 0-d scalar |
 | `x.mean(dim=k, keepdim=True)` | `mean(x, k, { keepDims: true })` |
 | `F.softmax(x, dim=-1)` | `softmaxLast(x)` (last axis only; transpose for other axes) |
+| Causal-masked softmax (`tril` + `masked_fill` + `softmax`) | `softmaxCausalLast(scores)` (fused; preferred over composing the mask yourself) |
+| `x.transpose(a, b)` | `swapAxes(x, a, b)` |
+| `x.view(B, T, H, -1)` / `x.reshape(B, -1)` | `reshape(x, [B, T, H, -1])` — exactly one `-1` allowed, inferred from total size |
+| `torch.split(x, sizes, dim)` | `split(x, dim, sizes)` (note argument order) |
+| `nn.Embedding(V, D)` | `new nn.Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
 | `torch.flatten(x, 1)` | `reshape(x, [B, dim])` with `dim` computed explicitly. No `-1` wildcard yet. |
 | `nn.Conv2d` / `nn.MaxPool2d` | Not yet supported. |
 
@@ -344,6 +349,7 @@ import { nn } from 'tensorgrad'
 
 nn.Linear(inDim, outDim, { bias? })  // .fwd(x); W: [inDim, outDim], b: [outDim]
 nn.LayerNorm(dim)                    // .fwd(x); g (gain) and b (bias) both [dim]
+nn.Embedding(vocab, dim)             // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
 nn.splitHeads(x, nHeads)             // [B, T, D] → [B, H, T, D/H]
 nn.mergeHeads(x)                     // inverse of splitHeads
 nn.unsplitHeads(captures, name)      // pull per-head slices off a capture
