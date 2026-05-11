@@ -38,28 +38,48 @@ import { adamUpdateM, adamUpdateV, adamUpdateP } from './ops.js'
  *  for the worker-internal runtime, and every realistic LR pattern (constant,
  *  linear decay, cosine, warmup-then-decay) maps to a finite set of shapes.
  *  Use the `lr` helper namespace to construct shapes ergonomically. */
+/**
+ * Each non-constant schedule variant carries an optional `startStep`
+ * (default 0). The schedule's intrinsic step is `current_step - startStep`,
+ * clamped to be ≥ 1. This lets a user say "decay starting from where I am
+ * now" instead of "decay measured from step 1 of training," without us
+ * having to bake closures into the schedule shape.
+ *
+ * Pair with `setOptimizerConfig({...}, { rebaseLrSchedule: true })`: the
+ * runtime fills in `startStep = current_t` for any schedule that doesn't
+ * already specify one, so the schedule's "step 1" lines up with the Adam
+ * step it took effect.
+ */
 export type LRSchedule =
   | number
   | { readonly kind: 'constant'; readonly value: number }
-  | { readonly kind: 'linearDecay'; readonly peak: number; readonly final: number; readonly steps: number }
-  | { readonly kind: 'cosineDecay'; readonly peak: number; readonly final: number; readonly steps: number }
-  | { readonly kind: 'warmup'; readonly peakLr: number; readonly warmupSteps: number; readonly after: LRSchedule }
+  | { readonly kind: 'linearDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
+  | { readonly kind: 'cosineDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
+  | { readonly kind: 'warmup'; readonly peakLr: number; readonly warmupSteps: number; readonly after: LRSchedule; readonly startStep?: number }
 
 /** Ergonomic constructors for LRSchedule shapes. */
 export const lr = {
   constant: (value: number): LRSchedule => ({ kind: 'constant', value }),
-  /** Linearly interpolate from `peak` at step 1 to `final` at step `steps`,
-   *  then hold at `final`. Matches `peak + (final - peak) * min(step/steps, 1)`. */
-  linearDecay: (opts: { peak: number; final: number; steps: number }): LRSchedule =>
+  /** Linearly interpolate from `peak` at intrinsic step 1 to `final` at
+   *  intrinsic step `steps`, then hold at `final`. Optional `startStep` shifts
+   *  the timeline (intrinsic = current - startStep + 1). */
+  linearDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LRSchedule =>
     ({ kind: 'linearDecay', ...opts }),
-  /** Half-cosine from `peak` at step 1 down to `final` at step `steps`,
-   *  then hold at `final`. */
-  cosineDecay: (opts: { peak: number; final: number; steps: number }): LRSchedule =>
+  /** Half-cosine from `peak` at intrinsic step 1 down to `final` at intrinsic
+   *  step `steps`, then hold at `final`. Optional `startStep` shifts the
+   *  timeline. */
+  cosineDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LRSchedule =>
     ({ kind: 'cosineDecay', ...opts }),
-  /** Linear ramp from 0 to `peakLr` over `warmupSteps` steps, then hand off
-   *  to `after` (offset so step 1 of `after` = first post-warmup step). */
-  warmup: (opts: { peakLr: number; warmupSteps: number; after: LRSchedule }): LRSchedule =>
+  /** Linear ramp from 0 to `peakLr` over `warmupSteps`, then hand off to
+   *  `after` (offset so step 1 of `after` = first post-warmup step). Optional
+   *  `startStep` shifts the timeline. */
+  warmup: (opts: { peakLr: number; warmupSteps: number; after: LRSchedule; startStep?: number }): LRSchedule =>
     ({ kind: 'warmup', ...opts }),
+}
+
+/** Apply a schedule's `startStep` offset to a current step and clamp to ≥ 1. */
+function intrinsicStep(startStep: number | undefined, currentStep: number): number {
+  return Math.max(1, currentStep - (startStep ?? 0))
 }
 
 /** Resolve a schedule to its scalar value at a given 1-based step. */
@@ -68,18 +88,31 @@ export function resolveLR(schedule: LRSchedule, step: number): number {
   switch (schedule.kind) {
     case 'constant': return schedule.value
     case 'linearDecay': {
-      const f = Math.min(step / schedule.steps, 1)
+      const s = intrinsicStep(schedule.startStep, step)
+      const f = Math.min(s / schedule.steps, 1)
       return schedule.peak + (schedule.final - schedule.peak) * f
     }
     case 'cosineDecay': {
-      const f = Math.min(step / schedule.steps, 1)
+      const s = intrinsicStep(schedule.startStep, step)
+      const f = Math.min(s / schedule.steps, 1)
       return schedule.final + 0.5 * (schedule.peak - schedule.final) * (1 + Math.cos(Math.PI * f))
     }
     case 'warmup': {
-      if (step <= schedule.warmupSteps) return schedule.peakLr * (step / schedule.warmupSteps)
-      return resolveLR(schedule.after, step - schedule.warmupSteps)
+      const s = intrinsicStep(schedule.startStep, step)
+      if (s <= schedule.warmupSteps) return schedule.peakLr * (s / schedule.warmupSteps)
+      return resolveLR(schedule.after, s - schedule.warmupSteps)
     }
   }
+}
+
+/** Rewrite a schedule to start its timeline at `baseStep` (sets startStep on
+ *  the outer shape to `baseStep - 1`, so the schedule's intrinsic step 1
+ *  aligns with the user's `baseStep`). Numbers and `{kind:'constant'}` have
+ *  no notion of time and pass through unchanged. Used by the worker when
+ *  setOptimizerConfig is called with `rebaseLrSchedule: true`. */
+export function rebaseLR(schedule: LRSchedule, baseStep: number): LRSchedule {
+  if (typeof schedule === 'number' || schedule.kind === 'constant') return schedule
+  return { ...schedule, startStep: baseStep - 1 }
 }
 
 /** True for shapes that produce different values at different steps (so the

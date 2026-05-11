@@ -7,7 +7,7 @@
 // exist. WebGPU IS available in workers (Chrome 113+, Safari 17.4+).
 
 import { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
-import { resolveLR, type LRSchedule } from './adam.js'
+import { resolveLR, rebaseLR, type LRSchedule } from './adam.js'
 import type { Req, Res, WireIR, WireAdamConfig, WireError } from './worker-protocol.js'
 import { wireError } from './worker-protocol.js'
 
@@ -24,6 +24,11 @@ interface GraphSlot {
   /** Adam state for this graph, if it's a training graph. The wrapped step
    *  uses these to populate the per-step lrt and decayShrink scalars. */
   adam: AdamState | null
+  /** Parent graph id for sibling forward graphs (those that share params via
+   *  `sharedParams`). Set during `compileForward`; `null` for the training
+   *  graph itself. Used by `handleDestroy` to cascade-destroy children when
+   *  the parent goes away. */
+  parentGraphId: number | null
 }
 
 interface AdamState {
@@ -85,6 +90,7 @@ async function handleCreateRuntime(payload: {
     kernelCount: kernels.filter(k => k.wgsl).length,
     captureShapes,
     adam: payload.adam ? createAdamState(payload.adam) : null,
+    parentGraphId: null,
   }
   graphs.set(payload.graphId, slot)
 
@@ -124,6 +130,7 @@ async function handleCompileForward(payload: {
     kernelCount: kernels.filter(k => k.wgsl).length,
     captureShapes,
     adam: null,
+    parentGraphId: payload.parentGraphId,
   }
   graphs.set(payload.graphId, slot)
 
@@ -233,15 +240,22 @@ function handleResetOptimizer(payload: { graphId: number }): void {
 function handleSetOptimizerConfig(payload: {
   graphId: number
   update: { lr?: LRSchedule; weightDecay?: number; b1?: number; b2?: number }
+  rebaseLrSchedule?: boolean
 }): void {
   const slot = mustGet(payload.graphId)
   if (!slot.adam) {
     throw new Error(`setOptimizerConfig: graph ${payload.graphId} has no Adam optimizer (compileForward graphs don't take optimizer state)`)
   }
   const cur = slot.adam.config
+  // The next step will increment t from its current value, so the schedule
+  // takes effect at t+1 — that's the step we rebase against.
+  const nextStep = slot.adam.t + 1
+  const newLR = payload.update.lr !== undefined
+    ? (payload.rebaseLrSchedule ? rebaseLR(payload.update.lr, nextStep) : payload.update.lr)
+    : cur.lr
   slot.adam.config = {
     ...cur,
-    lr: payload.update.lr !== undefined ? payload.update.lr : cur.lr,
+    lr: newLR,
     weightDecay: payload.update.weightDecay !== undefined ? payload.update.weightDecay : cur.weightDecay,
     b1: payload.update.b1 !== undefined ? payload.update.b1 : cur.b1,
     b2: payload.update.b2 !== undefined ? payload.update.b2 : cur.b2,
@@ -249,6 +263,15 @@ function handleSetOptimizerConfig(payload: {
 }
 
 function handleDestroy(payload: { graphId: number }): void {
+  // Cascade: any graph that listed this one as parent (a sibling forward
+  // sharing params) loses its backing buffers when we destroy the parent.
+  // Destroy children first so their bind groups release before parent buffers.
+  for (const [id, slot] of graphs) {
+    if (slot.parentGraphId === payload.graphId) {
+      slot.runtime.destroy()
+      graphs.delete(id)
+    }
+  }
   const slot = graphs.get(payload.graphId)
   if (!slot) return
   slot.runtime.destroy()

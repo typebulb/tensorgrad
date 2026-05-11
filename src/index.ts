@@ -42,10 +42,11 @@ export { emitKernels, type KernelSpec } from './codegen.js'
 // compileModule/compileForward instead.
 export { Captures, type RunOptions, type StepResult, type RunResult, type UploadParamsOptions } from './runtime.js'
 export {
-  compileToIR, compileModule, compileForward,
-  type CompiledIR, type CompileModuleOptions, type CompileForwardOptions, type CompileForwardMethodOptions,
+  compileToIR, compileModule,
+  type CompiledIR, type CompileModuleOptions, type CompileForwardMethodOptions, type OptimizerConfigUpdate,
   type CompiledModule, type CompiledForwardModule,
-  type InputDecl, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,
+  type InputDecl, type InputDeclObject, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,
 } from './compile.js'
 export { Module, materializeParams, init, type InitSpec, type ParamOptions, type MaterializedParams } from './module.js'
+export { singleFlight } from './single-flight.js'
 export * as nn from './nn.js'

@@ -52,12 +52,10 @@ function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   return mul(sumLast(reshape(mul(diff, diff), [B])), 1 / B)
 }
 
-const compiled = await compileModule(() => new MLP(), lossFn, {
+const compiled = await compileModule(() => new MLP(), {
+  loss: lossFn,
   adam: { lr: 0.005 },
-  inputs: {
-    x: { shape: [B, 1], dtype: 'f32' },
-    y: { shape: [B, 1], dtype: 'f32' },
-  },
+  inputs: { x: [B, 1], y: [B, 1] },   // shape tuples; dtype defaults to f32
 })
 
 for (let step = 0; step < 1000; step++) {
@@ -74,11 +72,12 @@ for (let step = 0; step < 1000; step++) {
 - A *forward function* takes the materialized module + a record of named
   input tensors and returns a tensor (the loss for `compileModule`, or any
   output for `compileForward`).
-- `compileModule(factory, forward, opts)` traces the forward, derives
-  gradients, wires Adam, plans buffers, generates WGSL, spawns a worker, and
-  returns a `CompiledModule`. The factory `() => new Model()` is invoked
-  once during compile; the model instance is consumed (its param sentinels
-  are mutated into `Tensor`s).
+- `compileModule(factory, opts)` traces the forward, derives gradients,
+  wires Adam, plans buffers, generates WGSL, spawns a worker, and returns
+  a `CompiledModule`. The factory `() => new Model()` is invoked once
+  per compile (and again per shape variant of any polymorphic sibling
+  forward); the model instance is consumed (its param sentinels are
+  mutated into `Tensor`s).
 - Every method on the compiled module is async. `await compiled.step(...)`
   resolves with the loss after the worker's GPU work finishes.
 
@@ -87,19 +86,27 @@ for (let step = 0; step < 1000; step++) {
 ### Compile entry points
 
 ```ts
-compileModule(factory, forward, { adam?, inputs? }): Promise<CompiledModule>
-compileForward(factory, forward, { inputs? }): Promise<CompiledForwardModule>
+compileModule(factory, { loss, inputs, adam? }): Promise<CompiledModule>
+compiled.compileForward({ forward, inputs }): Promise<CompiledForwardModule>
+compiled.replaceModel(newFactory): Promise<CompiledModule>
 ```
 
-`compileForward` produces a forward-only graph in its own worker. To share
-params with an existing training graph, use the sibling method:
+There's one entry point: `compileModule`. Inference graphs are created
+via the `compileForward` method on the training compile — they share its
+worker (one GPUDevice) and its param GPUBuffers, so training-step updates
+are immediately visible to inference:
 
 ```ts
-const train  = await compileModule(() => new Model(), lossFn, { ... })
-const infer  = await train.compileForward(predictFn, {
-  inputs: { tokens: { shape: [1, T], dtype: 'i32' } },
+const train = await compileModule(() => new Model(), {
+  loss: lossFn,
+  inputs: { tokens: [B, T], targets: [B, T], mask: [T] },
+  adam: { lr: 0.001 },
 })
-// infer runs in train's worker — every step's param updates are visible.
+
+const infer = await train.compileForward({
+  forward: predictFn,
+  inputs: { tokens: { shape: [null, T], dtype: 'i32' } },  // null = parametric batch
+})
 ```
 
 **Parametric batch dim.** When you need the same forward function at
@@ -108,44 +115,48 @@ mark the dim as `null` and the proxy compiles + caches a sibling graph
 per actual size on demand:
 
 ```ts
-const infer = await train.compileForward(predictFn, {
-  inputs: { x: { shape: [null, 784], dtype: 'f32' } },  // batch is parametric
+const infer = await train.compileForward({
+  forward: predictFn,
+  inputs: { x: [null, 784] },   // batch is parametric
 })
-await infer.run({ x: arr1 })       // first call → compile at B=1, cache
-await infer.run({ x: arr256 })     // first call → compile at B=256, cache
+await infer.run({ x: arr1 })       // first call at B=1 → compile + cache
+await infer.run({ x: arr256 })     // first call at B=256 → compile + cache
 await infer.run({ x: arr1Again })  // cache hit
 ```
 
 Wildcards follow the TF/ONNX/MLIR convention: `null` for an inferred dim.
-One `null` per shape (multi-wildcard isn't exposed yet). Only available
-on the sibling-method form of `compileForward`; standalone `compileForward`
-and `compileModule` require fully concrete shapes.
-
-The first `run()` at each new shape pays the trace + codegen cost. For
-latency-sensitive paths, pre-warm a known set of shapes:
-
-```ts
-await infer.precompile({ x: { shape: [1, 784], dtype: 'f32' } })
-await infer.precompile({ x: { shape: [256, 784], dtype: 'f32' } })
-// later run() calls at those shapes hit the cache immediately
-```
+One `null` per shape (multi-wildcard isn't exposed yet). The first `run()`
+at each new shape pays the trace + codegen cost. For latency-sensitive
+paths, warm the cache by calling `run()` once at startup with a dummy
+batch.
 
 The proxy emits a one-time `console.warn` if its cache grows past 8
-distinct shapes — a guardrail against accidental shape fuzzing.
-Inspect with `infer.cachedShapeCount`.
+distinct shapes — a guardrail against accidental shape fuzzing. Before
+the first `run()`, `infer.kernelCount` reports `0`, `infer.outputShape`
+is `[]`, and `infer.ir` is `undefined`.
 
-Forward-only modules also expose `runLatest(inputs)` for live-preview
-patterns: if a previous `runLatest` is still in flight, the new call
-queues; if *another* arrives before the queued one runs, the queued one
-**rejects with `AbortError`** (matching RxJS `switchMap` / p-debounce
-convention). Only the most recent call's result is delivered. Use it
-when stale intermediate inputs (earlier mouse positions, partial
-drawings) should be dropped:
+**Replacing the model.** If your UI lets the user change the model
+topology (layer count, hidden width, etc.), `replaceModel(newFactory)`
+swaps it without respawning the worker. Sibling forward graphs are
+cascade-destroyed; you'll re-create them on the returned compile:
 
 ```ts
+compiled = await compiled.replaceModel(() => new MLP(newLayerSpec))
+infer = await compiled.compileForward({ forward: predictFn, inputs: {...} })
+```
+
+For live-preview patterns where stale intermediate inputs (earlier mouse
+positions, partial drawings) should be dropped in favor of the newest
+user state, wrap your `run` call with the `singleFlight` utility:
+
+```ts
+import { singleFlight } from 'tensorgrad'
+
+const predict = singleFlight((tokens: Int32Array) => infer.run({ tokens }))
+
 canvas.addEventListener('pointermove', async () => {
   try {
-    const out = await infer.runLatest({ tokens: latestTokens() })
+    const out = await predict(latestTokens())
     updateUI(out)
   } catch (e: any) {
     if (e?.name === 'AbortError') return  // superseded — newer call will update
@@ -153,6 +164,12 @@ canvas.addEventListener('pointermove', async () => {
   }
 })
 ```
+
+`singleFlight` matches the RxJS `switchMap` / p-debounce convention:
+displaced callers reject with `AbortError`; only the most recent call
+actually runs when the in-flight one finishes. It's a generic async
+helper — works around `run`, `step`, or any other promise-returning
+function with a single argument.
 
 ### CompiledModule methods (all `Promise`-returning)
 
@@ -167,12 +184,15 @@ compiled.downloadParamGrads()                   // → Record<name, Float32Array
 compiled.reset()                                // re-init params + zero Adam state
 compiled.resetOptimizerState()
 compiled.setOptimizerConfig({ lr?, weightDecay?, b1?, b2? })  // mutate without recompile
-compiled.compileForward(forward, { inputs? })   // sibling forward graph
+compiled.compileForward({ forward, inputs })    // sibling forward graph
+compiled.replaceModel(newFactory)               // swap topology, same worker
 compiled.destroy()                              // tear down worker + GPU
 ```
 
 `compiled.kernelCount`, `compiled.outputShape`, `compiled.paramNames`, and
-`compiled.ir` are sync properties for inspection.
+`compiled.ir` are sync properties for inspection. On forward proxies,
+`paramNames` is unavailable (params live on the parent training graph);
+`kernelCount`, `outputShape`, and `ir` populate after the first `run()`.
 
 ### Operators
 
@@ -222,15 +242,24 @@ boundary). Use a `number` for constant LR, or one of the constructors above.
 
 Mutate Adam hyperparameters mid-training without recompiling via
 `compiled.setOptimizerConfig({ ... })`. Pass any subset; absent fields
-stay put. The step counter is preserved (a new `lr` schedule resolves
-at the current step). Useful for UI knobs that adjust LR or weight
-decay live:
+stay put. The step counter is preserved.
 
 ```ts
 await compiled.setOptimizerConfig({ lr: 0.001 })
-await compiled.setOptimizerConfig({ lr: lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }) })
 await compiled.setOptimizerConfig({ weightDecay: 0.01 })
-await compiled.setOptimizerConfig({ lr: 0.0005, weightDecay: 0.001 })  // both at once
+await compiled.setOptimizerConfig({ lr: 0.0005, b2: 0.99 })  // any subset
+```
+
+When you set a non-constant schedule mid-training (cosine, linear decay,
+warmup), it resolves at the *current* step by default — which usually
+isn't what you want. Pass `{ rebaseLrSchedule: true }` to make the
+schedule's step 1 line up with the next training step ("decay from now"):
+
+```ts
+await compiled.setOptimizerConfig(
+  { lr: lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }) },
+  { rebaseLrSchedule: true },
+)
 ```
 
 Note: which params receive weight decay is baked at compile time (via

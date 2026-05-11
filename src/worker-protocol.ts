@@ -116,6 +116,11 @@ export interface SetOptimizerConfigPayload {
     b1?: number
     b2?: number
   }
+  /** When true and `update.lr` is a non-constant schedule, the worker
+   *  rebases the schedule so its intrinsic step 1 aligns with the *next*
+   *  Adam step. Lets the caller say "decay from now" without having to
+   *  know the current step counter. Default false. */
+  rebaseLrSchedule?: boolean
 }
 
 // ============================================================================
