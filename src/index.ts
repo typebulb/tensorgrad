@@ -43,7 +43,7 @@ export { emitKernels, type KernelSpec } from './codegen.js'
 // (worker-internal) and createRuntime/createForwardRuntime aren't part of the
 // public API — users get CompiledModule/CompiledForwardModule (proxies) from
 // compileModule/compileForward instead.
-export { Captures, type RunOptions, type StepResult, type RunResult, type UploadParamsOptions } from './runtime.js'
+export { Captures, type RunOptions, type StepResult, type RunResult, type Outcome, type UploadParamsOptions } from './runtime.js'
 export {
   compileToIR, compileModule, isWebGPUAvailable,
   type CompiledIR, type CompileModuleOptions, type CompileForwardMethodOptions, type OptimizerConfigUpdate,

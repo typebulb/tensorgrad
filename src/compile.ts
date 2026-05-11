@@ -28,7 +28,7 @@ import {
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
 import {
-  Captures, type RunResult, type StepResult, type RunOptions, type UploadParamsOptions,
+  Captures, type RunResult, type StepResult, type RunOptions, type Outcome, type UploadParamsOptions,
 } from './runtime.js'
 import { Module, materializeParams, mulberry32, type MaterializedParams, type Rng, type InitFn } from './module.js'
 import { WorkerProxy } from './worker-proxy.js'
@@ -192,9 +192,19 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
 
   step(inputs: TypedInputs<I>): Promise<number>
   step(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<StepResult>
+  step(inputs: TypedInputs<I>, opts: { onAbort: 'value' }): Promise<Outcome<{ loss: number }>>
+  step(
+    inputs: TypedInputs<I>,
+    opts: { withCaptures: true; onAbort: 'value' },
+  ): Promise<Outcome<{ loss: number; captures: Captures }>>
 
   run(inputs: TypedInputs<I>): Promise<Float32Array>
   run(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<RunResult>
+  run(inputs: TypedInputs<I>, opts: { onAbort: 'value' }): Promise<Outcome<{ output: Float32Array }>>
+  run(
+    inputs: TypedInputs<I>,
+    opts: { withCaptures: true; onAbort: 'value' },
+  ): Promise<Outcome<{ output: Float32Array; captures: Captures }>>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
   /** Read params back as a typed tree mirroring the model class structure.
@@ -227,8 +237,8 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
   ): Promise<CompiledForwardModule<M, I2>>
 
   /** Swap the model topology in place: destroy the current training graph in
-   *  the worker, compile a fresh one with the same loss/inputs/adam config
-   *  but the new factory. This handle remains valid (same object, same `I`
+   *  the worker, compile a fresh one with the same loss/inputs config and
+   *  the new factory. This handle remains valid (same object, same `I`
    *  generic, same `paramNames`/`kernelCount`/`ir` after the call). Sibling
    *  forward proxies created via `compileForward` stay registered: their
    *  per-shape kernel caches are cleared and recompile lazily on next `run()`.
@@ -238,10 +248,17 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
    *  reproducible topology comparisons). Use the existing seed explicitly via
    *  `{ seed: compiled.seed }` if you want strict determinism across the swap.
    *
+   *  Pass `{ adam }` to update optimizer config atomically with the topology
+   *  swap. Without it, the existing optimizer config carries over. For
+   *  mid-training LR changes without a topology swap, use `setOptimizerConfig`.
+   *
    *  Use when the user changes layer count, hidden width, or any other
    *  shape-affecting model parameter — you don't need to re-create the
    *  worker or re-wire siblings. */
-  replaceModel(newFactory: () => M, opts?: { seed?: number }): Promise<void>
+  replaceModel(
+    newFactory: () => M,
+    opts?: { seed?: number; adam?: AdamConfig },
+  ): Promise<void>
 
   /** Tear down the worker + GPU resources. */
   destroy(): void
@@ -259,6 +276,11 @@ export interface CompiledForwardModule<M extends Module = Module, I extends Inpu
 
   run(inputs: TypedInputs<I>): Promise<Float32Array>
   run(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<RunResult>
+  run(inputs: TypedInputs<I>, opts: { onAbort: 'value' }): Promise<Outcome<{ output: Float32Array }>>
+  run(
+    inputs: TypedInputs<I>,
+    opts: { withCaptures: true; onAbort: 'value' },
+  ): Promise<Outcome<{ output: Float32Array; captures: Captures }>>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
   /** Typed tree view of the shared param state — same shape as the parent
@@ -422,28 +444,62 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
 
   step(inputs: LooseInputs): Promise<number>
   step(inputs: LooseInputs, opts: { withCaptures: true }): Promise<StepResult>
+  step(inputs: LooseInputs, opts: { onAbort: 'value' }): Promise<Outcome<{ loss: number }>>
+  step(
+    inputs: LooseInputs,
+    opts: { withCaptures: true; onAbort: 'value' },
+  ): Promise<Outcome<{ loss: number; captures: Captures }>>
   async step(
     inputs: LooseInputs,
-    opts?: { withCaptures?: boolean },
-  ): Promise<number | StepResult> {
-    const r = await this.proxy.request<StepResultWire>(
-      { kind: 'step', payload: { graphId: this.graphId, inputs, withCaptures: opts?.withCaptures === true } },
-    )
-    if (opts?.withCaptures) return { loss: r.loss, captures: makeCaptures(r.captures, this.meta.captureShapes) }
-    return r.loss
+    opts?: { withCaptures?: boolean; onAbort?: 'value' },
+  ): Promise<number | StepResult | Outcome<{ loss: number }> | Outcome<{ loss: number; captures: Captures }>> {
+    try {
+      const r = await this.proxy.request<StepResultWire>(
+        { kind: 'step', payload: { graphId: this.graphId, inputs, withCaptures: opts?.withCaptures === true } },
+      )
+      if (opts?.withCaptures) {
+        const captures = makeCaptures(r.captures, this.meta.captureShapes)
+        return opts.onAbort === 'value'
+          ? { kind: 'ok', loss: r.loss, captures }
+          : { loss: r.loss, captures }
+      }
+      return opts?.onAbort === 'value' ? { kind: 'ok', loss: r.loss } : r.loss
+    } catch (e) {
+      if (opts?.onAbort === 'value' && (e as { name?: string })?.name === 'AbortError') {
+        return { kind: 'aborted' }
+      }
+      throw e
+    }
   }
 
   run(inputs: LooseInputs): Promise<Float32Array>
   run(inputs: LooseInputs, opts: { withCaptures: true }): Promise<RunResult>
+  run(inputs: LooseInputs, opts: { onAbort: 'value' }): Promise<Outcome<{ output: Float32Array }>>
+  run(
+    inputs: LooseInputs,
+    opts: { withCaptures: true; onAbort: 'value' },
+  ): Promise<Outcome<{ output: Float32Array; captures: Captures }>>
   async run(
     inputs: LooseInputs,
-    opts?: { withCaptures?: boolean },
-  ): Promise<Float32Array | RunResult> {
-    const r = await this.proxy.request<RunResultWire>(
-      { kind: 'run', payload: { graphId: this.graphId, inputs, withCaptures: opts?.withCaptures === true } },
-    )
-    if (opts?.withCaptures) return { output: r.output, captures: makeCaptures(r.captures, this.meta.captureShapes) }
-    return r.output
+    opts?: { withCaptures?: boolean; onAbort?: 'value' },
+  ): Promise<Float32Array | RunResult | Outcome<{ output: Float32Array }> | Outcome<{ output: Float32Array; captures: Captures }>> {
+    try {
+      const r = await this.proxy.request<RunResultWire>(
+        { kind: 'run', payload: { graphId: this.graphId, inputs, withCaptures: opts?.withCaptures === true } },
+      )
+      if (opts?.withCaptures) {
+        const captures = makeCaptures(r.captures, this.meta.captureShapes)
+        return opts.onAbort === 'value'
+          ? { kind: 'ok', output: r.output, captures }
+          : { output: r.output, captures }
+      }
+      return opts?.onAbort === 'value' ? { kind: 'ok', output: r.output } : r.output
+    } catch (e) {
+      if (opts?.onAbort === 'value' && (e as { name?: string })?.name === 'AbortError') {
+        return { kind: 'aborted' }
+      }
+      throw e
+    }
   }
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void> {
@@ -503,14 +559,20 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
     return child
   }
 
-  async replaceModel(newFactory: () => M, replaceOpts?: { seed?: number }): Promise<void> {
+  async replaceModel(
+    newFactory: () => M,
+    replaceOpts?: { seed?: number; adam?: AdamConfig },
+  ): Promise<void> {
     // Invalidate (don't destroy) sibling forward proxies: their per-shape
     // kernels are model-specific, but the proxy objects stay alive so callers'
     // references remain valid — caches recompile lazily on the next run().
     for (const child of this.children) child._invalidateForReplace()
     this.proxy.send({ kind: 'destroy', payload: { graphId: this.graphId } })
     const newOpts: CompileModuleOptions<M, I> = {
-      ...this.opts, factory: newFactory, seed: replaceOpts?.seed ?? randomSeed(),
+      ...this.opts,
+      factory: newFactory,
+      seed: replaceOpts?.seed ?? randomSeed(),
+      ...(replaceOpts?.adam !== undefined ? { adam: replaceOpts.adam } : {}),
     }
     const built = await buildTrainingGraph(this.proxy, newOpts, this.graphId)
     this.ir = built.ir
@@ -562,16 +624,33 @@ class ForwardProxy<M extends Module, I extends InputDecls>
 
   run(inputs: LooseInputs): Promise<Float32Array>
   run(inputs: LooseInputs, opts: { withCaptures: true }): Promise<RunResult>
+  run(inputs: LooseInputs, opts: { onAbort: 'value' }): Promise<Outcome<{ output: Float32Array }>>
+  run(
+    inputs: LooseInputs,
+    opts: { withCaptures: true; onAbort: 'value' },
+  ): Promise<Outcome<{ output: Float32Array; captures: Captures }>>
   async run(
     inputs: LooseInputs,
-    opts?: { withCaptures?: boolean },
-  ): Promise<Float32Array | RunResult> {
-    const sib = await this.siblingFor(inputs)
-    const r = await this.proxy.request<RunResultWire>(
-      { kind: 'run', payload: { graphId: sib.graphId, inputs, withCaptures: opts?.withCaptures === true } },
-    )
-    if (opts?.withCaptures) return { output: r.output, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
-    return r.output
+    opts?: { withCaptures?: boolean; onAbort?: 'value' },
+  ): Promise<Float32Array | RunResult | Outcome<{ output: Float32Array }> | Outcome<{ output: Float32Array; captures: Captures }>> {
+    try {
+      const sib = await this.siblingFor(inputs)
+      const r = await this.proxy.request<RunResultWire>(
+        { kind: 'run', payload: { graphId: sib.graphId, inputs, withCaptures: opts?.withCaptures === true } },
+      )
+      if (opts?.withCaptures) {
+        const captures = makeCaptures(r.captures, sib.meta.captureShapes)
+        return opts.onAbort === 'value'
+          ? { kind: 'ok', output: r.output, captures }
+          : { output: r.output, captures }
+      }
+      return opts?.onAbort === 'value' ? { kind: 'ok', output: r.output } : r.output
+    } catch (e) {
+      if (opts?.onAbort === 'value' && (e as { name?: string })?.name === 'AbortError') {
+        return { kind: 'aborted' }
+      }
+      throw e
+    }
   }
 
   async uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void> {

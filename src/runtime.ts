@@ -62,6 +62,12 @@ export interface StepResult {
   captures: Captures
 }
 
+/** Discriminated result returned by `step`/`run` when called with
+ *  `{ onAbort: 'value' }`. Tags successful completion as `'ok'` and
+ *  cancellation (e.g. the graph was destroyed mid-flight by `replaceModel`)
+ *  as `'aborted'` — no try/catch needed at the call site. */
+export type Outcome<Ok> = ({ kind: 'ok' } & Ok) | { kind: 'aborted' }
+
 export interface RunOptions {
   /** Read back tensors registered via `capture(name, t)` during the trace.
    *  Default false. When false, the returned `captures` is empty (calling

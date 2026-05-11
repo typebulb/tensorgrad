@@ -210,12 +210,21 @@ async function handleStep(payload: {
 }): Promise<{ loss: number; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
   const merged = injectDropoutSeed(slot, injectAdamScalars(slot, payload.inputs))
-  if (payload.withCaptures) {
-    const r = await slot.runtime.step(merged, { withCaptures: true })
-    return { loss: r.loss, captures: capturesToRecord(r.captures, slot.captureShapes) }
+  try {
+    if (payload.withCaptures) {
+      const r = await slot.runtime.step(merged, { withCaptures: true })
+      return { loss: r.loss, captures: capturesToRecord(r.captures, slot.captureShapes) }
+    }
+    const loss = await slot.runtime.step(merged)
+    return { loss, captures: null }
+  } catch (e) {
+    // If the graph was destroyed mid-flight (e.g. replaceModel ran while we
+    // were awaiting mapAsync), surface a clean AbortError instead of the raw
+    // WebGPU "buffer is destroyed" or similar — callers can branch on it
+    // (or pass { onAbort: 'value' } to get a discriminated result).
+    if (!graphs.has(payload.graphId)) throw abortErr('step aborted: graph destroyed mid-flight')
+    throw e
   }
-  const loss = await slot.runtime.step(merged)
-  return { loss, captures: null }
 }
 
 async function handleRun(payload: {
@@ -225,12 +234,23 @@ async function handleRun(payload: {
 }): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
   const merged = injectDropoutSeed(slot, payload.inputs)
-  if (payload.withCaptures) {
-    const r = await slot.runtime.run(merged, { withCaptures: true })
-    return { output: r.output, captures: capturesToRecord(r.captures, slot.captureShapes) }
+  try {
+    if (payload.withCaptures) {
+      const r = await slot.runtime.run(merged, { withCaptures: true })
+      return { output: r.output, captures: capturesToRecord(r.captures, slot.captureShapes) }
+    }
+    const output = await slot.runtime.run(merged)
+    return { output, captures: null }
+  } catch (e) {
+    if (!graphs.has(payload.graphId)) throw abortErr('run aborted: graph destroyed mid-flight')
+    throw e
   }
-  const output = await slot.runtime.run(merged)
-  return { output, captures: null }
+}
+
+function abortErr(msg: string): Error {
+  const e = new Error(msg)
+  e.name = 'AbortError'
+  return e
 }
 
 /** Captures (a class instance with a private Map) → a plain Record so the

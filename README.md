@@ -82,7 +82,7 @@ for (let step = 0; step < 1000; step++) {
 ```ts
 compileModule({ factory, loss, inputs, adam? }): Promise<CompiledModule>
 compiled.compileForward({ forward, inputs }): Promise<CompiledForwardModule>
-compiled.replaceModel(newFactory, { seed? }): Promise<void>
+compiled.replaceModel(newFactory, { seed?, adam? }): Promise<void>
 isWebGPUAvailable(): boolean              // friendly pre-flight check
 ```
 
@@ -135,7 +135,17 @@ caches are cleared and recompile lazily on the next `run()`:
 ```ts
 await compiled.replaceModel(() => new MLP(newLayerSpec))
 // compiled and any forward proxies are still valid.
+
+// Update optimizer config atomically with the swap (e.g. user also
+// changed LR via a UI control):
+await compiled.replaceModel(
+  () => new MLP(newLayerSpec),
+  { adam: { lr: 0.005 } },
+)
 ```
+
+For mid-training optimizer changes *without* a topology swap (LR
+schedule update on the existing weights), use `setOptimizerConfig`.
 
 ### `singleFlight` (live-preview helper)
 
@@ -163,8 +173,10 @@ Generic — works around `run`, `step`, or any single-argument promise function.
 ```ts
 compiled.step(inputs)                           // → loss: number
 compiled.step(inputs, { withCaptures: true })   // → { loss, captures }
+compiled.step(inputs, { onAbort: 'value' })     // → { kind: 'ok', loss } | { kind: 'aborted' }
 compiled.run(inputs)                            // → Float32Array
 compiled.run(inputs, { withCaptures: true })    // → { output, captures }
+compiled.run(inputs, { onAbort: 'value' })      // → { kind: 'ok', output } | { kind: 'aborted' }
 compiled.uploadParams(record, { partial? })
 compiled.downloadParams()                       // → ParamTree<M> (typed tree, mirrors class)
 compiled.downloadParamsFlat()                   // → Record<'layers.0.W' | …, Float32Array>
@@ -205,6 +217,21 @@ type is a compile-time error.
 single `run()` must resolve to the same value (matches Keras `None` /
 ONNX dynamic-axis convention). Mismatched inferred dims throw at the
 call boundary, not deep in kernel dispatch.
+
+**Cancellation as value.** If your UI tears down or rebuilds the model
+while a `step` / `run` is in flight (e.g. the user picks a new layer
+size mid-training, triggering `replaceModel`), the in-flight call is
+aborted. By default it rejects with `AbortError`; pass `{ onAbort:
+'value' }` to get a discriminated result instead:
+
+```ts
+const r = await compiled.step(batch, { onAbort: 'value' })
+if (r.kind === 'aborted') return    // graph was replaced; nothing to do
+useLoss(r.loss)
+```
+
+Composes with `{ withCaptures: true }`: the `'ok'` branch carries
+`captures`, the `'aborted'` branch carries no payload.
 
 **Factory hygiene.** `factory` must return a *fresh* `Module` each call —
 the pipeline mutates `ParamSentinel` fields into `Tensor`s on first
