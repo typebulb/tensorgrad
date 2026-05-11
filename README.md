@@ -102,6 +102,25 @@ const infer  = await train.compileForward(predictFn, {
 // infer runs in train's worker — every step's param updates are visible.
 ```
 
+**Parametric batch dim.** When you need the same forward function at
+multiple batch sizes (B=1 for live prediction, B=256 for held-out eval),
+mark the dim as `null` and the proxy compiles + caches a sibling graph
+per actual size on demand:
+
+```ts
+const infer = await train.compileForward(predictFn, {
+  inputs: { x: { shape: [null, 784], dtype: 'f32' } },  // batch is parametric
+})
+await infer.run({ x: arr1 })       // first call → compile at B=1, cache
+await infer.run({ x: arr256 })     // first call → compile at B=256, cache
+await infer.run({ x: arr1Again })  // cache hit
+```
+
+Wildcards follow the TF/ONNX/MLIR convention: `null` for an inferred dim.
+One `null` per shape (multi-wildcard isn't exposed yet). Only available
+on the sibling-method form of `compileForward`; standalone `compileForward`
+and `compileModule` require fully concrete shapes.
+
 Forward-only modules also expose `runLatest(inputs)` for live-preview
 patterns: if a previous `runLatest` is still in flight, subsequent calls
 coalesce — only the newest inputs actually run, and every queued caller

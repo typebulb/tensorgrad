@@ -45,7 +45,7 @@ export {
   compileToIR, compileModule, compileForward,
   type CompiledIR, type CompileModuleOptions, type CompileForwardOptions, type CompileForwardMethodOptions,
   type CompiledModule, type CompiledForwardModule,
-  type InputDecl, type InputDecls, type InputsTensors, type ForwardFn,
+  type InputDecl, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,
 } from './compile.js'
 export { Module, materializeParams, init, type InitSpec, type ParamOptions, type MaterializedParams } from './module.js'
 export * as nn from './nn.js'

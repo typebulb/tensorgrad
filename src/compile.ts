@@ -45,11 +45,19 @@ declare const __WORKER_SOURCE__: string
 // Public types
 // ============================================================================
 
+/** Shape of a declared input. Each dim is either a fixed number, or `null`
+ *  to mark the dim as parametric (its concrete value is inferred from the
+ *  actual TypedArray length at `run()` time). At most one `null` per shape
+ *  in this iteration; multiple parametric dims require named symbols, which
+ *  aren't exposed yet. Matches the TF/ONNX/MLIR convention of using a
+ *  wildcard for dynamic dims. */
+export type InputShape = readonly (number | null)[]
+
 /** Declares one input tensor of the model's forward function. The name is the
  *  key in the `inputs:` Record at compile time and the key on the `step()`/
  *  `run()` data object at runtime. */
 export interface InputDecl {
-  shape: Shape
+  shape: InputShape
   dtype?: Dtype
 }
 
@@ -369,20 +377,20 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M> {
     forward: ForwardFn<M, I>,
     opts: CompileForwardMethodOptions<I> = {},
   ): Promise<CompiledForwardModule> {
-    const { graph, materialized: _materialized } = traceModule(this.modelFactory, forward, opts.inputs ?? {})
-    const outputTensor = graph.tensors[graph.outputs[0]!]!
-    const plan = planBuffers(graph, /* paramGrads */ {})
-    const kernels = emitKernels(graph, plan)
-    const ir: CompiledIR = { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
-
-    const childGraphId = this.nextGraphId.v++
-    const wireIR: WireIR = { graph, plan, kernels }
-
-    const meta = await this.proxy.request<CompileForwardResult>(
-      { kind: 'compileForward', payload: { graphId: childGraphId, parentGraphId: this.graphId, ir: wireIR } },
+    const decls = opts.inputs ?? {}
+    // Polymorphic path: any `null` wildcard in an input shape defers
+    // compilation. The proxy compiles + caches lazily on each first call
+    // at a new resolved shape.
+    if (isPolymorphicDecls(decls)) {
+      return new PolymorphicForwardProxy<M>(
+        this.proxy, this.graphId, this.modelFactory, forward as ForwardFn<M, InputDecls>,
+        decls, this.nextGraphId,
+      )
+    }
+    return await compileForwardEager<M>(
+      this.proxy, this.graphId, this.modelFactory, forward as ForwardFn<M, InputDecls>,
+      decls, this.nextGraphId,
     )
-
-    return new CompiledForwardModuleProxy(this.proxy, childGraphId, ir, meta, /* ownsWorker */ false)
   }
 
   destroy(): void {
@@ -486,6 +494,155 @@ class CompiledForwardModuleProxy implements CompiledForwardModule {
   }
 }
 
+/** Polymorphic sibling forward proxy. Returned by `train.compileForward(...)`
+ *  when any input shape contains a `null` wildcard. Compiles a fresh sibling
+ *  graph the first time `run()` is called at each distinct resolved shape;
+ *  subsequent calls at the same shape hit the cache. All sibling graphs
+ *  share the training graph's param GPUBuffers, so a single set of params
+ *  is visible across every batch size. */
+class PolymorphicForwardProxy<M extends Module> implements CompiledForwardModule {
+  private readonly cache = new Map<string, CompiledForwardModuleProxy>()
+  /** Most-recently-compiled sibling. Used as a fallback for `ir`,
+   *  `kernelCount`, `outputShape`, `paramNames` after the first call. */
+  private last: CompiledForwardModuleProxy | null = null
+
+  // Single-flight state for runLatest, shared across all cached siblings:
+  // we always coalesce against whichever sibling matches the latest shape.
+  private latestActive: Promise<unknown> | null = null
+  private latestPending:
+    | { inputs: Record<string, Int32Array | Float32Array>; opts: { withCaptures?: boolean } | undefined;
+        resolvers: Array<{ resolve: (r: Float32Array | RunResult) => void; reject: (e: Error) => void }> }
+    | null = null
+
+  constructor(
+    private readonly proxy: WorkerProxy,
+    private readonly parentGraphId: number,
+    private readonly modelFactory: () => M,
+    private readonly forward: ForwardFn<M, InputDecls>,
+    private readonly decls: InputDecls,
+    private readonly nextGraphId: { v: number },
+  ) {}
+
+  get ir(): CompiledIR {
+    if (!this.last) throw new Error('polymorphic forward graph: no compile yet — call run() at least once first')
+    return this.last.ir
+  }
+  get kernelCount(): number {
+    if (!this.last) throw new Error('polymorphic forward graph: no compile yet — call run() at least once first')
+    return this.last.kernelCount
+  }
+  get outputShape(): readonly number[] {
+    if (!this.last) throw new Error('polymorphic forward graph: no compile yet — call run() at least once first')
+    return this.last.outputShape
+  }
+  get paramNames(): readonly string[] {
+    if (!this.last) throw new Error('polymorphic forward graph: no compile yet — call run() at least once first')
+    return this.last.paramNames
+  }
+
+  private async siblingFor(inputs: Record<string, Int32Array | Float32Array>): Promise<CompiledForwardModuleProxy> {
+    const resolved = resolveDecls(this.decls, inputs)
+    const key = shapeKey(resolved)
+    const hit = this.cache.get(key)
+    if (hit) { this.last = hit; return hit }
+    const sib = await compileForwardEager<M>(
+      this.proxy, this.parentGraphId, this.modelFactory, this.forward,
+      resolved, this.nextGraphId,
+    )
+    this.cache.set(key, sib)
+    this.last = sib
+    return sib
+  }
+
+  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  async run(
+    inputs: Record<string, Int32Array | Float32Array>,
+    opts?: { withCaptures?: boolean },
+  ): Promise<Float32Array | RunResult> {
+    const sib = await this.siblingFor(inputs)
+    return await sib.run(inputs, opts as { withCaptures: true })
+  }
+
+  runLatest(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  runLatest(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  runLatest(
+    inputs: Record<string, Int32Array | Float32Array>,
+    opts?: { withCaptures?: boolean },
+  ): Promise<Float32Array | RunResult> {
+    if (!this.latestActive) {
+      const p = this.run(inputs, opts as { withCaptures: true })
+      this.latestActive = p.finally(() => {
+        this.latestActive = null
+        if (this.latestPending) {
+          const { inputs, opts, resolvers } = this.latestPending
+          this.latestPending = null
+          this.runLatest(inputs, opts as { withCaptures: true }).then(
+            (r) => resolvers.forEach(rv => rv.resolve(r)),
+            (e) => resolvers.forEach(rv => rv.reject(e as Error)),
+          )
+        }
+      })
+      return p
+    }
+    if (this.latestPending) {
+      this.latestPending.inputs = inputs
+      this.latestPending.opts = opts
+      return new Promise<Float32Array | RunResult>((resolve, reject) => {
+        this.latestPending!.resolvers.push({ resolve, reject })
+      })
+    }
+    return new Promise<Float32Array | RunResult>((resolve, reject) => {
+      this.latestPending = { inputs, opts, resolvers: [{ resolve, reject }] }
+    })
+  }
+
+  async uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void> {
+    // Params live on the parent training graph (shared with all siblings).
+    await this.proxy.request<null>(
+      { kind: 'uploadParams', payload: { graphId: this.parentGraphId, params, partial: !!opts?.partial } },
+    )
+  }
+
+  async downloadParams(): Promise<Record<string, Float32Array>> {
+    const r = await this.proxy.request<DownloadParamsResult>(
+      { kind: 'downloadParams', payload: { graphId: this.parentGraphId } },
+    )
+    return r.params
+  }
+
+  destroy(): void {
+    for (const sib of this.cache.values()) sib.destroy()
+    this.cache.clear()
+    this.last = null
+  }
+}
+
+/** Eager (concrete-shape) compileForward sibling. Extracted so both the
+ *  method form (when shapes are concrete) and the polymorphic proxy (one
+ *  call per distinct resolved shape) share the same compilation pipeline. */
+async function compileForwardEager<M extends Module>(
+  proxy: WorkerProxy,
+  parentGraphId: number,
+  modelFactory: () => M,
+  forward: ForwardFn<M, InputDecls>,
+  decls: InputDecls,
+  nextGraphId: { v: number },
+): Promise<CompiledForwardModuleProxy> {
+  const { graph, materialized: _m } = traceModule(modelFactory, forward, decls)
+  const outputTensor = graph.tensors[graph.outputs[0]!]!
+  const plan = planBuffers(graph, {})
+  const kernels = emitKernels(graph, plan)
+  const ir: CompiledIR = { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
+
+  const childGraphId = nextGraphId.v++
+  const wireIR: WireIR = { graph, plan, kernels }
+  const meta = await proxy.request<CompileForwardResult>(
+    { kind: 'compileForward', payload: { graphId: childGraphId, parentGraphId, ir: wireIR } },
+  )
+  return new CompiledForwardModuleProxy(proxy, childGraphId, ir, meta, /* ownsWorker */ false)
+}
+
 // ============================================================================
 // Internals
 // ============================================================================
@@ -507,11 +664,94 @@ function traceModule<M extends Module, I extends InputDecls>(
     materialized = materializeParams(model)
     const inputTensors: Record<string, Tensor> = {}
     for (const [name, decl] of Object.entries(inputDecls)) {
-      inputTensors[name] = tensorInput(name, decl.shape, decl.dtype ?? 'f32')
+      const concrete = asConcreteShape(decl.shape, name)
+      inputTensors[name] = tensorInput(name, concrete, decl.dtype ?? 'f32')
     }
     return forward(model, inputTensors as InputsTensors<I>)
   })
   return { graph, materialized }
+}
+
+/** Assert every dim in an InputShape is a number (no `null` wildcards left).
+ *  Called from paths that require fully-resolved shapes — `compileModule`,
+ *  standalone `compileForward`, and per-shape compiles inside the
+ *  polymorphic proxy after wildcard resolution. */
+function asConcreteShape(shape: InputShape, inputName: string): Shape {
+  const out: number[] = []
+  for (let i = 0; i < shape.length; i++) {
+    const d = shape[i]
+    if (d === null || d === undefined) {
+      throw new Error(
+        `compile: input '${inputName}' has an unresolved parametric dim at index ${i}. ` +
+        `Polymorphic shapes are only supported via the sibling method form ` +
+        `(\`train.compileForward(predictFwd, { inputs: { x: { shape: [null, 784] } } })\`); ` +
+        `standalone compileForward and compileModule require fully concrete shapes.`,
+      )
+    }
+    out.push(d)
+  }
+  return out
+}
+
+/** Detect any `null` wildcard in an `InputDecls` shape, which signals the
+ *  caller wants per-call shape inference (the polymorphic proxy path). */
+function isPolymorphicDecls(decls: InputDecls): boolean {
+  for (const decl of Object.values(decls)) {
+    for (const d of decl.shape) if (d === null) return true
+  }
+  return false
+}
+
+/** Resolve null-wildcard dims in an InputDecls against actual input
+ *  TypedArrays. For each input that has a wildcard, infer the missing dim
+ *  from `arr.length / product(concrete dims)`. At most one `null` per
+ *  shape allowed (multi-null requires named symbols, deferred). */
+function resolveDecls(
+  decls: InputDecls,
+  inputs: Record<string, Int32Array | Float32Array>,
+): InputDecls {
+  const out: InputDecls = {}
+  for (const [name, decl] of Object.entries(decls)) {
+    let nullCount = 0
+    let nullIdx = -1
+    let concreteProduct = 1
+    for (let i = 0; i < decl.shape.length; i++) {
+      const d = decl.shape[i]
+      if (d === null) { nullCount++; nullIdx = i } else concreteProduct *= d!
+    }
+    if (nullCount === 0) { out[name] = decl; continue }
+    if (nullCount > 1) {
+      throw new Error(
+        `run: input '${name}' has ${nullCount} parametric dims in shape [${decl.shape.join(', ')}]. ` +
+        `Only one \`null\` wildcard per shape is supported (multi-wildcard requires named symbols, not yet exposed).`,
+      )
+    }
+    const arr = inputs[name]
+    if (!arr) throw new Error(`run: missing input '${name}'`)
+    if (arr.length % concreteProduct !== 0) {
+      throw new Error(
+        `run: input '${name}' length ${arr.length} is not divisible by ` +
+        `the product of concrete dims (${concreteProduct}) in shape [${decl.shape.join(', ')}].`,
+      )
+    }
+    const resolved = arr.length / concreteProduct
+    const concrete = decl.shape.slice() as (number | null)[]
+    concrete[nullIdx] = resolved
+    const dt: Dtype = decl.dtype ?? 'f32'
+    out[name] = { shape: concrete as number[], dtype: dt }
+  }
+  return out
+}
+
+/** Canonical cache key for a fully concrete `InputDecls`. Used by the
+ *  polymorphic forward proxy to look up an already-compiled graph at the
+ *  resolved input shapes. */
+function shapeKey(decls: InputDecls): string {
+  const parts: string[] = []
+  for (const name of Object.keys(decls).sort()) {
+    parts.push(`${name}:${decls[name]!.shape.join('x')}:${decls[name]!.dtype ?? 'f32'}`)
+  }
+  return parts.join('|')
 }
 
 /** Run each param's init function against its declared shape to produce the
