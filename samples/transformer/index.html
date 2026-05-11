@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Transformer (tensorgrad)</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; }
+    button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+    #log { background: #111; color: #ddd; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12px; height: 400px; overflow-y: auto; white-space: pre-wrap; margin-top: 1rem; }
+    .err { color: #f88; }
+    .ok { color: #8f8; }
+  </style>
+</head>
+<body>
+  <h1>Transformer (tensorgrad / WebGPU)</h1>
+  <p>2-digit addition, trained from scratch. Forward + backward + Adam all run as compiled WGSL kernels.</p>
+  <button id="run">Train</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="log"></div>
+  <p><a href="/">← back to samples</a></p>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

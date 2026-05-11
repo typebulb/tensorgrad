@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>tensorgrad samples</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.6rem; margin-bottom: 0.5rem; }
+    .subtitle { color: #666; margin-top: 0; }
+    ul { padding-left: 0; list-style: none; }
+    li { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.25rem; margin: 0.75rem 0; }
+    li a { font-size: 1.05rem; font-weight: 600; text-decoration: none; color: #06c; }
+    li p { margin: 0.4rem 0 0; color: #444; font-size: 0.95rem; }
+    code { background: #f3f3f3; padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>tensorgrad samples</h1>
+  <p class="subtitle">Small browser-side ML programs built on the <code>tensorgrad</code> library.</p>
+
+  <ul>
+    <li>
+      <a href="/transformer/">Transformer learns addition</a>
+      <p>Multi-layer transformer training from scratch on 2-digit addition. Full forward + backward + Adam compiled to WGSL via tensorgrad. ~1000 examples/sec.</p>
+    </li>
+    <li>
+      <a href="/mlp-sin/">MLP fits sin(x)</a>
+      <p>Tiny 2-layer MLP regressor. Demonstrates the same library on a much smaller model — lets you see autograd, Adam, and the Module abstraction work in a different shape of problem.</p>
+    </li>
+  </ul>
+</body>
+</html>

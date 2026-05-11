@@ -9,12 +9,9 @@ dist/
 .env.local
 typebulbs
 
-# Temporarily excluded from the initial cautious push.
-# Re-include incrementally as samples/tests/CI are validated for public consumption.
-samples/
-test/
+# Excluded from publication. Specs are working design notes; .claude/.github
+# are local config; typebulbs are demo apps with their own deployment story
+# (excluded above with `typebulbs`).
 .github/
 .claude/
 specs/
-pnpm-workspace.yaml
-pnpm-lock.yaml
