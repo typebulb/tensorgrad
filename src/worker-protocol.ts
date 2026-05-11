@@ -38,6 +38,25 @@ export interface WireAdamConfig {
   decayShrinkInputName: string | null
 }
 
+/** Serializable subset of SGDResolvedConfig for the wire. `decayFilter` is
+ *  baked into the IR at appendSGD time, so it doesn't cross. */
+export interface WireSGDConfig {
+  lr: LR
+  momentum: number
+  nesterov: boolean
+  weightDecay: number
+  lrIsScheduled: boolean
+  /** Name of the per-step lr scalar input the worker must populate before
+   *  every step (`_sgd_lr`). */
+  lrInputName: string
+}
+
+/** Discriminated optimizer config that crosses the wire. Exactly one branch
+ *  is populated when training; `null` for forward-only compiles. */
+export type WireOptimizerConfig =
+  | { kind: 'adam'; config: WireAdamConfig }
+  | { kind: 'sgd'; config: WireSGDConfig }
+
 /** Compile output that crosses to the worker. Same fields as CompiledIR
  *  minus the `loss` tensor (carried by graph.outputs[0]). */
 export interface WireIR {
@@ -69,8 +88,8 @@ export interface CreateRuntimePayload {
   /** Initial param values per name. Transferred (zero-copy) — the main
    *  thread loses access after postMessage. */
   initialParams: Record<string, Float32Array>
-  /** Adam config when training; absent for forward-only compiles. */
-  adam: WireAdamConfig | null
+  /** Optimizer config when training; `null` for forward-only compiles. */
+  optimizer: WireOptimizerConfig | null
 }
 
 /** Build a sibling forward-only graph that shares param buffers with an

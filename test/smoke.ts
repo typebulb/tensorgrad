@@ -319,4 +319,85 @@ if (reentry.captures.has('should_not_register')) {
 }
 console.log('  ✓ capture() inside traceInto is a no-op')
 
+// ---- Verify appendSGD writebacks + invariants ------------------------------
+
+console.log('\nVerifying appendSGD...')
+
+import { appendSGD } from '../src/index.js'
+
+// Build a trivial training graph: one param p, loss = sumAll(p * p).
+// (sumAll isn't imported above — bring it in via a local import to avoid
+// reorganizing the file header.)
+const { sumAll } = await import('../src/index.js')
+
+function buildTrivialTrainingGraph(): { graph: Graph; paramGrads: Record<string, Tensor>; paramTensors: Record<string, Tensor> } {
+  let pTensor: Tensor | null = null
+  const g = trace(() => {
+    const p = paramInput('p', [4])
+    pTensor = p
+    return sumAll(mul(p, p))
+  })
+  const { paramGrads } = appendGrad(g)
+  return { graph: g, paramGrads, paramTensors: { p: pTensor! } }
+}
+
+// 1. Plain SGD (no momentum, no decay): 1 writeback per param (the param itself).
+{
+  const { graph, paramGrads, paramTensors } = buildTrivialTrainingGraph()
+  const r = appendSGD(graph, paramGrads, paramTensors, { lr: 0.1 })
+  const paramWbs = r.writebacks.filter(w => w.destKind === 'param')
+  const stateWbs = r.writebacks.filter(w => w.destKind === 'state')
+  if (paramWbs.length !== 1 || stateWbs.length !== 0) {
+    console.error(`FAIL: plain SGD writebacks expected (1 param, 0 state), got (${paramWbs.length}, ${stateWbs.length})`)
+    process.exit(1)
+  }
+  if (r.config.momentum !== 0 || r.config.nesterov !== false) {
+    console.error('FAIL: plain SGD config defaults wrong')
+    process.exit(1)
+  }
+  console.log('  ✓ plain SGD: 1 param writeback, no momentum state')
+}
+
+// 2. SGD with momentum: adds a state buffer per param.
+{
+  const { graph, paramGrads, paramTensors } = buildTrivialTrainingGraph()
+  const r = appendSGD(graph, paramGrads, paramTensors, { lr: 0.1, momentum: 0.9 })
+  const paramWbs = r.writebacks.filter(w => w.destKind === 'param')
+  const stateWbs = r.writebacks.filter(w => w.destKind === 'state')
+  if (paramWbs.length !== 1 || stateWbs.length !== 1) {
+    console.error(`FAIL: momentum SGD writebacks expected (1 param, 1 state), got (${paramWbs.length}, ${stateWbs.length})`)
+    process.exit(1)
+  }
+  if (stateWbs[0]!.destName !== 'sgd_v_p') {
+    console.error(`FAIL: state name wrong: ${stateWbs[0]!.destName}`)
+    process.exit(1)
+  }
+  console.log('  ✓ momentum SGD: adds sgd_v_<name> state writeback')
+}
+
+// 3. Nesterov requires momentum > 0.
+try {
+  const { graph, paramGrads, paramTensors } = buildTrivialTrainingGraph()
+  appendSGD(graph, paramGrads, paramTensors, { lr: 0.1, nesterov: true })
+  console.error('FAIL: nesterov without momentum should have thrown')
+  process.exit(1)
+} catch (e: any) {
+  if (!String(e?.message ?? e).includes('nesterov requires momentum')) {
+    console.error('FAIL: wrong error for nesterov-without-momentum:', e)
+    process.exit(1)
+  }
+  console.log('  ✓ nesterov without momentum throws')
+}
+
+// 4. weightDecay > 0 marks the right params (default filter is decay-everything).
+{
+  const { graph, paramGrads, paramTensors } = buildTrivialTrainingGraph()
+  const r = appendSGD(graph, paramGrads, paramTensors, { lr: 0.1, weightDecay: 1e-3 })
+  if (r.config.weightDecay !== 1e-3) {
+    console.error(`FAIL: weightDecay not propagated: ${r.config.weightDecay}`)
+    process.exit(1)
+  }
+  console.log('  ✓ SGD with weightDecay: config preserved through appendSGD')
+}
+
 console.log('\nPhase 1 smoke test complete.')

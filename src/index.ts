@@ -37,6 +37,7 @@ export {
 // overload on JS numbers, `where` subsumes the rest.
 export { appendGrad, type GradResult } from './grad.js'
 export { appendAdam, appendGradClip, lr, resolveLR, type AdamConfig, type AdamResult, type LR } from './adam.js'
+export { appendSGD, type SGDConfig, type SGDResult } from './sgd.js'
 export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
 export { emitKernels, type KernelSpec } from './codegen.js'
 // Runtime types: only the user-facing pieces. CompiledRuntime/CompiledForward

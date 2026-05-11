@@ -25,6 +25,7 @@ import {
   appendAdam, resolveLR,
   type AdamConfig, type AdamResult, type AdamResolvedConfig, type LR,
 } from './adam.js'
+import { appendSGD, type SGDConfig, type SGDResult, type SGDResolvedConfig } from './sgd.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
 import {
@@ -34,7 +35,7 @@ import { Module, materializeParams, mulberry32, type MaterializedParams, type Rn
 import { WorkerProxy } from './worker-proxy.js'
 import {
   transferablesOfRecord,
-  type Req, type WireIR, type WireAdamConfig,
+  type Req, type WireIR, type WireAdamConfig, type WireSGDConfig, type WireOptimizerConfig,
   type CreateRuntimeResult, type CompileForwardResult,
   type StepResultWire, type RunResultWire, type DownloadParamsResult,
 } from './worker-protocol.js'
@@ -146,10 +147,13 @@ export interface CompileModuleOptions<M extends Module, I extends InputDecls = I
   loss: ForwardFn<M, I>
   /** Input shape declarations (one per named tensor input). */
   inputs: I
-  /** Optional Adam config. When absent, the module compiles but has no
-   *  optimizer — `step()` will fail. (Used internally for `compileToIR`-like
-   *  flows where the user only wants the forward pass.) */
+  /** Adam / AdamW optimizer. Mutually exclusive with `sgd`. When neither is
+   *  present, the module compiles but has no optimizer — `step()` will fail.
+   *  (Used internally for `compileToIR`-like flows where the user only wants
+   *  the forward pass.) */
   adam?: AdamConfig
+  /** SGD / SGD-with-momentum / Nesterov optimizer. Mutually exclusive with `adam`. */
+  sgd?: SGDConfig
   /** 32-bit integer seed for the param-init RNG. Same seed + same model
    *  topology → identical initial params, every time. If omitted, a seed
    *  is generated and exposed as `compiled.seed` so you can reproduce a
@@ -248,8 +252,9 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
    *  reproducible topology comparisons). Use the existing seed explicitly via
    *  `{ seed: compiled.seed }` if you want strict determinism across the swap.
    *
-   *  Pass `{ adam }` to update optimizer config atomically with the topology
-   *  swap. Without it, the existing optimizer config carries over. For
+   *  Pass `{ adam }` or `{ sgd }` to update optimizer config atomically with
+   *  the topology swap (must match the optimizer kind used at compileModule
+   *  time). Without it, the existing optimizer config carries over. For
    *  mid-training LR changes without a topology swap, use `setOptimizerConfig`.
    *
    *  Use when the user changes layer count, hidden width, or any other
@@ -257,7 +262,7 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
    *  worker or re-wire siblings. */
   replaceModel(
     newFactory: () => M,
-    opts?: { seed?: number; adam?: AdamConfig },
+    opts?: { seed?: number; adam?: AdamConfig; sgd?: SGDConfig },
   ): Promise<void>
 
   /** Tear down the worker + GPU resources. */
@@ -354,6 +359,9 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   opts: CompileModuleOptions<M, I>,
   graphId: number,
 ): Promise<BuiltTrainingGraph> {
+  if (opts.adam && opts.sgd) {
+    throw new Error('compileModule: pass either `adam` or `sgd`, not both')
+  }
   const loss = opts.loss as unknown as ForwardFn<M, InputDecls>
   const inputs = opts.inputs as InputDecls
   const { graph, materialized } = traceModule(opts.factory(), loss, inputs)
@@ -361,18 +369,26 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   const adamResult = opts.adam
     ? appendAdam(graph, paramGrads, materialized.tensors, opts.adam, materialized.decayFlags)
     : undefined
+  const sgdResult = opts.sgd
+    ? appendSGD(graph, paramGrads, materialized.tensors, opts.sgd, materialized.decayFlags)
+    : undefined
 
-  const plan = planBuffers(graph, paramGrads, adamResult?.writebacks ?? [])
+  const optimizerWritebacks =
+    adamResult?.writebacks ?? sgdResult?.writebacks ?? []
+  const plan = planBuffers(graph, paramGrads, optimizerWritebacks)
   const kernels = emitKernels(graph, plan)
   const ir: CompiledIR = { graph, paramGrads, loss: lossTensor, plan, kernels }
 
   const initialParams = buildInitialParams(plan, materialized.initFns, mulberry32(opts.seed!))
   const wireIR: WireIR = { graph, plan, kernels }
-  const wireAdam = adamResult ? wireAdamConfig(adamResult) : null
+  const wireOptimizer: WireOptimizerConfig | null =
+    adamResult ? { kind: 'adam', config: wireAdamConfig(adamResult) }
+    : sgdResult ? { kind: 'sgd', config: wireSGDConfig(sgdResult) }
+    : null
   const transfers = transferablesOfRecord(initialParams)
 
   const meta = await proxy.request<CreateRuntimeResult>(
-    { kind: 'createRuntime', payload: { graphId, ir: wireIR, initialParams, adam: wireAdam } },
+    { kind: 'createRuntime', payload: { graphId, ir: wireIR, initialParams, optimizer: wireOptimizer } },
     transfers,
   )
   return { ir, meta, initFns: materialized.initFns }
@@ -561,8 +577,11 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
 
   async replaceModel(
     newFactory: () => M,
-    replaceOpts?: { seed?: number; adam?: AdamConfig },
+    replaceOpts?: { seed?: number; adam?: AdamConfig; sgd?: SGDConfig },
   ): Promise<void> {
+    if (replaceOpts?.adam && replaceOpts?.sgd) {
+      throw new Error('replaceModel: pass either `adam` or `sgd`, not both')
+    }
     // Invalidate (don't destroy) sibling forward proxies: their per-shape
     // kernels are model-specific, but the proxy objects stay alive so callers'
     // references remain valid — caches recompile lazily on the next run().
@@ -573,6 +592,7 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
       factory: newFactory,
       seed: replaceOpts?.seed ?? randomSeed(),
       ...(replaceOpts?.adam !== undefined ? { adam: replaceOpts.adam } : {}),
+      ...(replaceOpts?.sgd !== undefined ? { sgd: replaceOpts.sgd } : {}),
     }
     const built = await buildTrainingGraph(this.proxy, newOpts, this.graphId)
     this.ir = built.ir
@@ -912,6 +932,18 @@ function wireAdamConfig(r: AdamResult): WireAdamConfig {
     lrIsScheduled: c.lrIsScheduled,
     lrtInputName: r.lrtInputName,
     decayShrinkInputName: r.decayShrinkInputName,
+  }
+}
+
+function wireSGDConfig(r: SGDResult): WireSGDConfig {
+  const c: SGDResolvedConfig = r.config
+  return {
+    lr: c.lr,
+    momentum: c.momentum,
+    nesterov: c.nesterov,
+    weightDecay: c.weightDecay,
+    lrIsScheduled: c.lrIsScheduled,
+    lrInputName: r.lrInputName,
   }
 }
 

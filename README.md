@@ -90,7 +90,7 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `model.parameters()` | `compiled.paramNames`, `compiled.downloadParams()` |
 | `optimizer.zero_grad(); out = model(x); loss = ...; loss.backward(); optimizer.step()` | `await compiled.step(inputs)` — forward + backward + Adam update are fused |
 | `optim.Adam(params, lr=...)` | `adam: { lr }` in `compileModule({ ... })` |
-| `optim.SGD(...)` | Not yet supported |
+| `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `sgd: { lr, momentum?, nesterov? }` in `compileModule({ ... })` |
 | `nn.Dropout(p)` as a child module | `dropout(x, p)` as a free-function call inside the training forward |
 | `x.mean(dim=-1)` / `x.sum(dim=-1)` / `F.softmax(x, dim=-1)` | `meanLast(x)` / `sumLast(x)` / `softmaxLast(x)` |
 | `x.mean()` / `x.sum()` | `meanAll(x)` / `sumAll(x)` |
@@ -130,7 +130,7 @@ to try/catch.
 ### Compile entry points
 
 ```ts
-compileModule({ factory, loss, inputs, adam? }): Promise<CompiledModule>
+compileModule({ factory, loss, inputs, adam? | sgd? }): Promise<CompiledModule>
 compiled.compileForward({ forward, inputs }): Promise<CompiledForwardModule>
 compiled.replaceModel(newFactory, { seed?, adam? }): Promise<void>
 isWebGPUAvailable(): boolean              // friendly pre-flight check
@@ -346,14 +346,33 @@ Convention: leaf modules (`Linear`, `LayerNorm`) expose `.fwd(x)` for ergonomic
 chaining. Composite modules you write yourself are typically free functions
 taking `(p: ModuleType, x: Tensor)`.
 
-### LR schedules (`lr` namespace)
+### Optimizers
+
+`compileModule` takes either `adam:` or `sgd:` (not both). Both accept
+the same LR schedule shapes from the `lr` namespace.
 
 ```ts
 import { lr } from 'tensorgrad'
 
-adam: { lr: 0.005 }                                                 // constant
+// Adam / AdamW
+adam: { lr: 0.005 }
+adam: { lr: 0.005, weightDecay: 0.01 }
+adam: { lr: 0.005, weightDecay: 0.01, decayFilter: n => n.endsWith('.W') }
+adam: { lr: 0.005, clipGradNorm: 1.0 }
+
+// SGD / SGD-with-momentum / Nesterov. Plain SGD when momentum is 0 (default).
+sgd: { lr: 0.05 }
+sgd: { lr: 0.05, momentum: 0.9 }
+sgd: { lr: 0.05, momentum: 0.9, nesterov: true }
+sgd: { lr: 0.05, weightDecay: 5e-4 }   // PyTorch-style L2 (injected into gradient)
+```
+
+### LR schedules (`lr` namespace)
+
+```ts
 adam: { lr: lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 }) }
 adam: { lr: lr.cosineDecay({ peak: 0.005, final: 0.0001, steps: 5000 }) }
+sgd:  { lr: lr.cosineDecay({ peak: 0.1, final: 0.001, steps: 10000 }), momentum: 0.9 }
 adam: { lr: lr.warmup({ peakLr: 0.001, warmupSteps: 200, after: lr.constant(0.001) }) }
 ```
 
@@ -362,8 +381,10 @@ boundary). Use a `number` for constant LR, or one of the constructors above.
 
 ### `setOptimizerConfig` (mid-training)
 
-Mutate Adam hyperparameters live, without recompiling. Pass any subset;
-absent fields stay put. The step counter is preserved.
+Mutate hyperparameters live, without recompiling. For Adam graphs:
+`{ lr?, weightDecay?, b1?, b2? }`. For SGD graphs: `{ lr? }` only
+(passing `b1` / `b2` to an SGD graph throws). Pass any subset; absent
+fields stay put. The step counter is preserved.
 
 ```ts
 await compiled.setOptimizerConfig({ lr: 0.001 })

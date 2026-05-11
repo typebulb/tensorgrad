@@ -9,7 +9,7 @@
 import { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
 import { resolveLR, rebaseLR, type LR } from './adam.js'
 import { DROPOUT_SEED_INPUT } from './ops.js'
-import type { Req, Res, WireIR, WireAdamConfig, WireError } from './worker-protocol.js'
+import type { Req, Res, WireIR, WireAdamConfig, WireSGDConfig, WireOptimizerConfig, WireError } from './worker-protocol.js'
 import { wireError } from './worker-protocol.js'
 
 // ----------------------------------------------------------------------------
@@ -22,9 +22,11 @@ interface GraphSlot {
   outputShape: number[]
   kernelCount: number
   captureShapes: Record<string, number[]>
-  /** Adam state for this graph, if it's a training graph. The wrapped step
-   *  uses these to populate the per-step lrt and decayShrink scalars. */
-  adam: AdamState | null
+  /** Optimizer state for this graph, if it's a training graph. The wrapped
+   *  step uses these to populate per-step scalars (Adam's lrt + decayShrink,
+   *  or SGD's lr). Exactly one branch is populated when training; `null`
+   *  for forward-only graphs (compileForward siblings). */
+  optimizer: OptimizerState | null
   /** Parent graph id for sibling forward graphs (those that share params via
    *  `sharedParams`). Set during `compileForward`; `null` for the training
    *  graph itself. Used by `handleDestroy` to cascade-destroy children when
@@ -36,11 +38,21 @@ interface GraphSlot {
   dropout: DropoutState | null
 }
 
+type OptimizerState =
+  | { kind: 'adam'; state: AdamState }
+  | { kind: 'sgd'; state: SGDState }
+
 interface AdamState {
   config: WireAdamConfig
   t: number
   lrtBuf: Float32Array
   decayShrinkBuf: Float32Array | null
+}
+
+interface SGDState {
+  config: WireSGDConfig
+  t: number
+  lrBuf: Float32Array
 }
 
 interface DropoutState {
@@ -78,7 +90,7 @@ async function handleCreateRuntime(payload: {
   graphId: number
   ir: WireIR
   initialParams: Record<string, Float32Array>
-  adam: WireAdamConfig | null
+  optimizer: WireOptimizerConfig | null
 }): Promise<{ paramNames: string[]; outputShape: number[]; kernelCount: number; captureShapes: Record<string, number[]> }> {
   const dev = await ensureDevice()
   const { graph, plan, kernels } = payload.ir
@@ -104,7 +116,7 @@ async function handleCreateRuntime(payload: {
     outputShape: [...runtime.outputShape],
     kernelCount: kernels.filter(k => k.wgsl).length,
     captureShapes,
-    adam: payload.adam ? createAdamState(payload.adam) : null,
+    optimizer: createOptimizerState(payload.optimizer),
     parentGraphId: null,
     dropout: graphUsesDropout(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
   }
@@ -116,6 +128,12 @@ async function handleCreateRuntime(payload: {
     kernelCount: slot.kernelCount,
     captureShapes: slot.captureShapes,
   }
+}
+
+function createOptimizerState(cfg: WireOptimizerConfig | null): OptimizerState | null {
+  if (!cfg) return null
+  if (cfg.kind === 'adam') return { kind: 'adam', state: createAdamState(cfg.config) }
+  return { kind: 'sgd', state: createSGDState(cfg.config) }
 }
 
 /** True iff the graph contains any `dropout` op. Drives whether the slot
@@ -152,7 +170,7 @@ async function handleCompileForward(payload: {
     outputShape: [...runtime.outputShape],
     kernelCount: kernels.filter(k => k.wgsl).length,
     captureShapes,
-    adam: null,
+    optimizer: null,
     parentGraphId: payload.parentGraphId,
     dropout: graphUsesDropout(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
   }
@@ -175,21 +193,33 @@ function createAdamState(cfg: WireAdamConfig): AdamState {
   }
 }
 
-/** Inject Adam's per-step lrt + decayShrink scalars into the inputs map.
- *  Called before every step on a training graph. The buffers are reused
- *  across steps to avoid allocation. */
-function injectAdamScalars(slot: GraphSlot, inputs: Record<string, Int32Array | Float32Array>): Record<string, Int32Array | Float32Array> {
-  const a = slot.adam
-  if (!a) return inputs
-  a.t++
-  const lrNow = resolveLR(a.config.lr as LR, a.t)
-  a.lrtBuf[0] = lrNow * Math.sqrt(1 - Math.pow(a.config.b2, a.t)) / (1 - Math.pow(a.config.b1, a.t))
-  const merged: Record<string, Int32Array | Float32Array> = { ...inputs, [a.config.lrtInputName]: a.lrtBuf }
-  if (a.decayShrinkBuf && a.config.decayShrinkInputName) {
-    a.decayShrinkBuf[0] = 1 - lrNow * a.config.weightDecay
-    merged[a.config.decayShrinkInputName] = a.decayShrinkBuf
+function createSGDState(cfg: WireSGDConfig): SGDState {
+  return { config: cfg, t: 0, lrBuf: new Float32Array(1) }
+}
+
+/** Inject the optimizer's per-step scalars into the inputs map. For Adam:
+ *  the bias-corrected effective LR (`lrt`) and optionally `decayShrink`.
+ *  For SGD: the per-step LR. Buffers are reused across steps. */
+function injectOptimizerScalars(slot: GraphSlot, inputs: Record<string, Int32Array | Float32Array>): Record<string, Int32Array | Float32Array> {
+  const o = slot.optimizer
+  if (!o) return inputs
+  if (o.kind === 'adam') {
+    const a = o.state
+    a.t++
+    const lrNow = resolveLR(a.config.lr as LR, a.t)
+    a.lrtBuf[0] = lrNow * Math.sqrt(1 - Math.pow(a.config.b2, a.t)) / (1 - Math.pow(a.config.b1, a.t))
+    const merged: Record<string, Int32Array | Float32Array> = { ...inputs, [a.config.lrtInputName]: a.lrtBuf }
+    if (a.decayShrinkBuf && a.config.decayShrinkInputName) {
+      a.decayShrinkBuf[0] = 1 - lrNow * a.config.weightDecay
+      merged[a.config.decayShrinkInputName] = a.decayShrinkBuf
+    }
+    return merged
   }
-  return merged
+  // SGD
+  const s = o.state
+  s.t++
+  s.lrBuf[0] = resolveLR(s.config.lr as LR, s.t)
+  return { ...inputs, [s.config.lrInputName]: s.lrBuf }
 }
 
 /** Inject the per-step dropout seed into `inputs` when this graph uses
@@ -209,7 +239,7 @@ async function handleStep(payload: {
   withCaptures: boolean
 }): Promise<{ loss: number; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
-  const merged = injectDropoutSeed(slot, injectAdamScalars(slot, payload.inputs))
+  const merged = injectDropoutSeed(slot, injectOptimizerScalars(slot, payload.inputs))
   try {
     if (payload.withCaptures) {
       const r = await slot.runtime.step(merged, { withCaptures: true })
@@ -290,7 +320,10 @@ async function handleDownloadParamGrads(payload: { graphId: number }): Promise<{
 function handleResetOptimizer(payload: { graphId: number }): void {
   const slot = mustGet(payload.graphId)
   slot.runtime.resetOptimizerState()
-  if (slot.adam) slot.adam.t = 0
+  if (slot.optimizer) {
+    if (slot.optimizer.kind === 'adam') slot.optimizer.state.t = 0
+    else slot.optimizer.state.t = 0
+  }
 }
 
 function handleSetOptimizerConfig(payload: {
@@ -298,22 +331,36 @@ function handleSetOptimizerConfig(payload: {
   update: { lr?: LR; weightDecay?: number; b1?: number; b2?: number }
 }): void {
   const slot = mustGet(payload.graphId)
-  if (!slot.adam) {
-    throw new Error(`setOptimizerConfig: graph ${payload.graphId} has no Adam optimizer (compileForward graphs don't take optimizer state)`)
+  if (!slot.optimizer) {
+    throw new Error(`setOptimizerConfig: graph ${payload.graphId} has no optimizer (compileForward graphs don't take optimizer state)`)
   }
-  const cur = slot.adam.config
-  // The next step will increment t from its current value, so the schedule
-  // takes effect at t+1 — that's the step we rebase against.
-  const nextStep = slot.adam.t + 1
-  const newLR = payload.update.lr !== undefined
-    ? rebaseLR(payload.update.lr, nextStep)
-    : cur.lr
-  slot.adam.config = {
-    ...cur,
-    lr: newLR,
-    weightDecay: payload.update.weightDecay !== undefined ? payload.update.weightDecay : cur.weightDecay,
-    b1: payload.update.b1 !== undefined ? payload.update.b1 : cur.b1,
-    b2: payload.update.b2 !== undefined ? payload.update.b2 : cur.b2,
+  if (slot.optimizer.kind === 'adam') {
+    const a = slot.optimizer.state
+    const cur = a.config
+    // The next step will increment t from its current value, so the schedule
+    // takes effect at t+1 — that's the step we rebase against.
+    const nextStep = a.t + 1
+    const newLR = payload.update.lr !== undefined
+      ? rebaseLR(payload.update.lr, nextStep)
+      : cur.lr
+    a.config = {
+      ...cur,
+      lr: newLR,
+      weightDecay: payload.update.weightDecay !== undefined ? payload.update.weightDecay : cur.weightDecay,
+      b1: payload.update.b1 !== undefined ? payload.update.b1 : cur.b1,
+      b2: payload.update.b2 !== undefined ? payload.update.b2 : cur.b2,
+    }
+    return
+  }
+  // SGD: only `lr` is mutable mid-training. b1/b2 are ignored; weightDecay
+  // is baked at compile time (which params get it via decayFilter).
+  const s = slot.optimizer.state
+  if (payload.update.b1 !== undefined || payload.update.b2 !== undefined) {
+    throw new Error('setOptimizerConfig: b1/b2 are Adam-only; this graph uses SGD')
+  }
+  if (payload.update.lr !== undefined) {
+    const nextStep = s.t + 1
+    s.config = { ...s.config, lr: rebaseLR(payload.update.lr, nextStep) }
   }
 }
 
