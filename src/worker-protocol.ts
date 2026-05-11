@@ -107,7 +107,12 @@ export interface UploadParamsPayload {
  *  present are updated; absent fields stay unchanged. Note that the set
  *  of decayed params is baked into the IR at compile time — adjusting
  *  weightDecay here changes the shrink magnitude on already-decayed
- *  params, not which params receive decay. */
+ *  params, not which params receive decay.
+ *
+ *  When `update.lr` is a non-constant schedule with no explicit `startStep`,
+ *  the worker auto-rebases it so step 1 aligns with the next training step
+ *  ("decay from now"). Numbers, `constant`, and schedules with an explicit
+ *  `startStep` pass through unchanged. */
 export interface SetOptimizerConfigPayload {
   graphId: number
   update: {
@@ -116,11 +121,6 @@ export interface SetOptimizerConfigPayload {
     b1?: number
     b2?: number
   }
-  /** When true and `update.lr` is a non-constant schedule, the worker
-   *  rebases the schedule so its intrinsic step 1 aligns with the *next*
-   *  Adam step. Lets the caller say "decay from now" without having to
-   *  know the current step counter. Default false. */
-  rebaseLrSchedule?: boolean
 }
 
 // ============================================================================

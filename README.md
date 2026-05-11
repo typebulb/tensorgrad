@@ -52,7 +52,8 @@ function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   return mul(sumLast(reshape(mul(diff, diff), [B])), 1 / B)
 }
 
-const compiled = await compileModule(() => new MLP(), {
+const compiled = await compileModule({
+  factory: () => new MLP(),
   loss: lossFn,
   adam: { lr: 0.005 },
   inputs: { x: [B, 1], y: [B, 1] },   // shape tuples; dtype defaults to f32
@@ -72,12 +73,12 @@ for (let step = 0; step < 1000; step++) {
 - A *forward function* takes the materialized module + a record of named
   input tensors and returns a tensor (the loss for `compileModule`, or any
   output for `compileForward`).
-- `compileModule(factory, opts)` traces the forward, derives gradients,
-  wires Adam, plans buffers, generates WGSL, spawns a worker, and returns
-  a `CompiledModule`. The factory `() => new Model()` is invoked once
-  per compile (and again per shape variant of any polymorphic sibling
-  forward); the model instance is consumed (its param sentinels are
-  mutated into `Tensor`s).
+- `compileModule({ factory, loss, inputs, adam })` traces the forward,
+  derives gradients, wires Adam, plans buffers, generates WGSL, spawns a
+  worker, and returns a `CompiledModule`. The factory `() => new Model()`
+  is invoked once per compile (and again per shape variant of any
+  polymorphic sibling forward); the model instance is consumed (its
+  param sentinels are mutated into `Tensor`s).
 - Every method on the compiled module is async. `await compiled.step(...)`
   resolves with the loss after the worker's GPU work finishes.
 
@@ -86,9 +87,9 @@ for (let step = 0; step < 1000; step++) {
 ### Compile entry points
 
 ```ts
-compileModule(factory, { loss, inputs, adam? }): Promise<CompiledModule>
+compileModule({ factory, loss, inputs, adam? }): Promise<CompiledModule>
 compiled.compileForward({ forward, inputs }): Promise<CompiledForwardModule>
-compiled.replaceModel(newFactory): Promise<CompiledModule>
+compiled.replaceModel(newFactory): Promise<void>
 ```
 
 There's one entry point: `compileModule`. Inference graphs are created
@@ -97,7 +98,8 @@ worker (one GPUDevice) and its param GPUBuffers, so training-step updates
 are immediately visible to inference:
 
 ```ts
-const train = await compileModule(() => new Model(), {
+const train = await compileModule({
+  factory: () => new Model(),
   loss: lossFn,
   inputs: { tokens: [B, T], targets: [B, T], mask: [T] },
   adam: { lr: 0.001 },
@@ -126,23 +128,21 @@ await infer.run({ x: arr1Again })  // cache hit
 
 Wildcards follow the TF/ONNX/MLIR convention: `null` for an inferred dim.
 One `null` per shape (multi-wildcard isn't exposed yet). The first `run()`
-at each new shape pays the trace + codegen cost. For latency-sensitive
-paths, warm the cache by calling `run()` once at startup with a dummy
-batch.
-
-The proxy emits a one-time `console.warn` if its cache grows past 8
-distinct shapes — a guardrail against accidental shape fuzzing. Before
-the first `run()`, `infer.kernelCount` reports `0`, `infer.outputShape`
-is `[]`, and `infer.ir` is `undefined`.
+at each new shape pays the trace + codegen cost; the cache grows
+unbounded, so for latency-sensitive paths warm the cache at startup with
+a dummy `run()` per expected shape. Before the first `run()`,
+`infer.kernelCount` reports `0`, `infer.outputShape` is `[]`, and
+`infer.ir` is `undefined`.
 
 **Replacing the model.** If your UI lets the user change the model
 topology (layer count, hidden width, etc.), `replaceModel(newFactory)`
-swaps it without respawning the worker. Sibling forward graphs are
-cascade-destroyed; you'll re-create them on the returned compile:
+swaps it in place — same handle, same worker. Sibling forward proxies
+created via `compileForward` stay registered; their per-shape kernel
+caches are cleared and recompile lazily on the next `run()`:
 
 ```ts
-compiled = await compiled.replaceModel(() => new MLP(newLayerSpec))
-infer = await compiled.compileForward({ forward: predictFn, inputs: {...} })
+await compiled.replaceModel(() => new MLP(newLayerSpec))
+// compiled, infer, predictDebounced — all still valid.
 ```
 
 For live-preview patterns where stale intermediate inputs (earlier mouse
@@ -190,9 +190,30 @@ compiled.destroy()                              // tear down worker + GPU
 ```
 
 `compiled.kernelCount`, `compiled.outputShape`, `compiled.paramNames`, and
-`compiled.ir` are sync properties for inspection. On forward proxies,
-`paramNames` is unavailable (params live on the parent training graph);
-`kernelCount`, `outputShape`, and `ir` populate after the first `run()`.
+`compiled.ir` are sync properties for inspection. Forward proxies expose
+only `paramNames` (the same names as the parent training graph) — kernel
+count and output shape aren't stable on a proxy that caches multiple
+shape variants.
+
+**Typed inputs.** `step` / `run` are typed against the declared `inputs`
+shape, so each named input expects the right TypedArray: a dtype-`'f32'`
+input (or a tuple shape, which defaults to f32) expects a `Float32Array`;
+a dtype-`'i32'` input expects an `Int32Array`. Passing the wrong array
+type is a compile-time error.
+
+**Wildcard consistency.** When more than one input declares a `null`
+wildcard, every wildcard in a single `run()` call must resolve to the
+same value (matches Keras `None` / ONNX dynamic-axis convention). If
+two inputs imply different parametric dims, the proxy throws at the
+call boundary rather than letting kernels run with mismatched shapes.
+
+**Factory hygiene.** `compileModule({ factory: ... })` calls the factory
+once per compile (and once per shape variant of any polymorphic forward).
+Each call must return a *fresh* `Module` instance — the compile pipeline
+consumes the instance by mutating its `ParamSentinel` fields into
+`Tensor`s. If your factory returns the same instance twice, the second
+compile sees Tensors where sentinels are expected; the library detects
+this and throws a clear error.
 
 ### Operators
 
@@ -251,15 +272,15 @@ await compiled.setOptimizerConfig({ lr: 0.0005, b2: 0.99 })  // any subset
 ```
 
 When you set a non-constant schedule mid-training (cosine, linear decay,
-warmup), it resolves at the *current* step by default — which usually
-isn't what you want. Pass `{ rebaseLrSchedule: true }` to make the
-schedule's step 1 line up with the next training step ("decay from now"):
+warmup), the runtime auto-rebases it so its step 1 lines up with the next
+training step ("decay from now"). Numbers and `constant` schedules don't
+need rebasing. If you pass a schedule with an explicit `startStep`, that
+takes precedence — the auto-rebase only fills in a missing one.
 
 ```ts
-await compiled.setOptimizerConfig(
-  { lr: lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }) },
-  { rebaseLrSchedule: true },
-)
+await compiled.setOptimizerConfig({
+  lr: lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }),
+})
 ```
 
 Note: which params receive weight decay is baked at compile time (via

@@ -1,12 +1,14 @@
 // Top-level compile pipeline.
 //
-//   compileModule(model, { loss, inputs, adam })
+//   compileModule({ factory, loss, inputs, adam })
 //     → trace, autograd, Adam, buffer plan, codegen, worker spawn → CompiledModule
 //   compiled.compileForward({ forward, inputs })
 //     → sibling forward graph sharing parent's param GPUBuffers, polymorphic
 //       on `null` wildcards
-//   compiled.replaceModel(newModel)
-//     → swap topology, preserve worker, return fresh CompiledModule
+//   compiled.replaceModel(newFactory)
+//     → swap topology in place; same handle, same worker. Sibling forward
+//       proxies stay registered — their per-shape kernel caches are cleared
+//       and recompiled lazily on the next run().
 //
 // Compile-time work runs on the main thread; everything past createRuntime
 // runs in a worker (see specs/WorkerArchitecture.md, runtime.ts, worker.ts).
@@ -66,6 +68,28 @@ export type InputDecls = Record<string, InputDecl>
  *  same keys, each value is a Tensor. */
 export type InputsTensors<I extends InputDecls> = { [K in keyof I]: Tensor }
 
+/** Extract the declared dtype from an `InputDecl`. Tuple shapes and object
+ *  forms without an explicit `dtype` default to `'f32'`; the object form's
+ *  `dtype` field is preserved as a literal when present. */
+export type DtypeOf<D extends InputDecl> =
+  D extends readonly (number | null)[] ? 'f32'
+  : D extends { dtype: infer T extends Dtype } ? T
+  : 'f32'
+
+/** The TypedArray type the runtime expects for a given dtype. `bool` isn't
+ *  user-facing as an input (it's an internal IR dtype produced by
+ *  comparisons), so it has no input ArrayType. */
+export type TypedArrayFor<D extends Dtype> =
+  D extends 'f32' ? Float32Array
+  : D extends 'i32' ? Int32Array
+  : never
+
+/** Inputs record typed against an `InputDecls` shape: each declared input's
+ *  TypedArray type matches its declared dtype. Used by `step`/`run` on the
+ *  compiled-module proxies so dtype mismatches fail at compile time, not
+ *  at marshal time. */
+export type TypedInputs<I extends InputDecls> = { [K in keyof I]: TypedArrayFor<DtypeOf<I[K]>> }
+
 /** Forward function shape. */
 export type ForwardFn<M extends Module, I extends InputDecls = InputDecls> =
   (m: M, inputs: InputsTensors<I>) => Tensor
@@ -92,6 +116,10 @@ export function compileToIR(traceFn: () => Tensor): CompiledIR {
 // ============================================================================
 
 export interface CompileModuleOptions<M extends Module, I extends InputDecls = InputDecls> {
+  /** Model factory `() => new Model()`. Invoked once per compile (and once
+   *  per cache-miss in any polymorphic sibling forward). The model instance
+   *  is consumed: its `ParamSentinel` fields are mutated into Tensors. */
+  factory: () => M
   /** Forward function that returns the scalar loss tensor. */
   loss: ForwardFn<M, I>
   /** Input shape declarations (one per named tensor input). */
@@ -122,19 +150,20 @@ export interface OptimizerConfigUpdate {
 }
 
 /** Returned by `compileModule`. Proxies all GPU work to an internal worker;
- *  every method returns a Promise. */
-export interface CompiledModule<M extends Module> {
+ *  every method returns a Promise. Generic over the declared inputs shape
+ *  `I` so `step` / `run` accept inputs with the right TypedArray per dtype. */
+export interface CompiledModule<M extends Module, I extends InputDecls = InputDecls> {
   readonly ir: CompiledIR
   readonly kernelCount: number
   readonly outputShape: readonly number[]
   /** Names of the model's parameters, in materialization order. */
   readonly paramNames: readonly string[]
 
-  step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
-  step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
+  step(inputs: TypedInputs<I>): Promise<number>
+  step(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<StepResult>
 
-  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  run(inputs: TypedInputs<I>): Promise<Float32Array>
+  run(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<RunResult>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
   downloadParams(): Promise<Record<string, Float32Array>>
@@ -145,42 +174,48 @@ export interface CompiledModule<M extends Module> {
   resetOptimizerState(): Promise<void>
 
   /** Update one or more Adam hyperparameters at runtime, without recompiling.
-   *  Pass `{ rebaseLrSchedule: true }` to make a non-constant schedule's
-   *  step 1 align with the next training step ("decay from now"). */
-  setOptimizerConfig(update: OptimizerConfigUpdate, opts?: { rebaseLrSchedule?: boolean }): Promise<void>
+   *
+   *  When `update.lr` is a non-constant schedule and the schedule has no
+   *  explicit `startStep`, the schedule is rebased so its step 1 aligns with
+   *  the next training step ("decay from now"). Numbers and `constant`
+   *  schedules pass through unchanged. */
+  setOptimizerConfig(update: OptimizerConfigUpdate): Promise<void>
 
   /** Compile a sibling forward-only graph that shares this runtime's worker
    *  (and therefore its param GPUBuffers). Polymorphic by default — `null`
    *  dims in the input shapes resolve per-call. */
-  compileForward<I extends InputDecls>(
-    opts: CompileForwardMethodOptions<M, I>,
-  ): Promise<CompiledForwardModule>
+  compileForward<I2 extends InputDecls>(
+    opts: CompileForwardMethodOptions<M, I2>,
+  ): Promise<CompiledForwardModule<I2>>
 
-  /** Swap the model topology: destroy the current training graph (and any
-   *  forward siblings of it), compile a fresh training graph with the same
-   *  loss / inputs / adam config but the new model factory, and return a
-   *  new `CompiledModule`. The worker is reused — only the graphs inside
-   *  it change. Use this when the user changes layer count, hidden width,
-   *  or any other shape-affecting model parameter; you do not need to
-   *  re-create the worker each time. */
-  replaceModel(newFactory: () => M): Promise<CompiledModule<M>>
+  /** Swap the model topology in place: destroy the current training graph in
+   *  the worker, compile a fresh one with the same loss/inputs/adam config
+   *  but the new factory. This handle remains valid (same object, same `I`
+   *  generic, same `paramNames`/`kernelCount`/`ir` after the call). Sibling
+   *  forward proxies created via `compileForward` stay registered: their
+   *  per-shape kernel caches are cleared and recompile lazily on next `run()`.
+   *
+   *  Use when the user changes layer count, hidden width, or any other
+   *  shape-affecting model parameter — you don't need to re-create the
+   *  worker or re-wire siblings. */
+  replaceModel(newFactory: () => M): Promise<void>
 
   /** Tear down the worker + GPU resources. */
   destroy(): void
 }
 
 /** Returned by `compiled.compileForward({...})`. Polymorphic by default:
- *  `run()` at a new resolved shape lazily compiles + caches a sibling.
- *  `kernelCount` / `outputShape` / `ir` report the most-recently-compiled
- *  sibling's values, or sensible defaults (0 / [] / undefined) before the
- *  first `run()`. */
-export interface CompiledForwardModule {
-  readonly ir: CompiledIR | undefined
-  readonly kernelCount: number
-  readonly outputShape: readonly number[]
+ *  `run()` at a new resolved shape lazily compiles + caches a sibling. Param
+ *  reads/writes route to the parent training graph (shared buffers).
+ *
+ *  No sync inspection surface for kernel count / output shape / IR — those
+ *  would lie on a polymorphic proxy that caches multiple shape variants. */
+export interface CompiledForwardModule<I extends InputDecls = InputDecls> {
+  /** Same as the parent training graph's param names. */
+  readonly paramNames: readonly string[]
 
-  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  run(inputs: TypedInputs<I>): Promise<Float32Array>
+  run(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<RunResult>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
   downloadParams(): Promise<Record<string, Float32Array>>
@@ -194,14 +229,13 @@ export interface CompiledForwardModule {
 
 /**
  * Compile a Module-based model into a runtime that lives in an internal
- * Web Worker. Takes a *factory* `() => new Model()` (not the instance):
- * compilation consumes a model by mutating its `ParamSentinel` fields into
- * Tensors, and sibling forward compiles need to re-trace against a fresh
- * model per resolved shape — which means the factory is called once per
- * compile, including each cache miss in a polymorphic forward proxy.
+ * Web Worker. `factory: () => new Model()` is invoked once per compile (and
+ * once per cache-miss in any polymorphic sibling forward); the model
+ * instance is consumed (its `ParamSentinel` fields are mutated into Tensors).
  *
  * ```ts
- * const compiled = await compileModule(() => new MLP(), {
+ * const compiled = await compileModule({
+ *   factory: () => new MLP(),
  *   loss: (m, { x, y }) => mse(m(x), y),
  *   inputs: { x: [128, 784], y: [128] },
  *   adam: { lr: 0.001 },
@@ -209,30 +243,40 @@ export interface CompiledForwardModule {
  * ```
  */
 export async function compileModule<M extends Module, I extends InputDecls>(
-  modelFactory: () => M,
   opts: CompileModuleOptions<M, I>,
-): Promise<CompiledModule<M>> {
+): Promise<CompiledModule<M, I>> {
   const proxy = new WorkerProxy(__WORKER_SOURCE__)
   try {
-    return await compileModuleOnWorker(proxy, modelFactory, opts)
+    const built = await buildTrainingGraph(proxy, opts, /* graphId */ 0)
+    return new CompiledModuleProxy<M>(
+      proxy, /* graphId */ 0, built.ir, built.meta,
+      opts as unknown as CompileModuleOptions<M, InputDecls>,
+      built.initFns,
+      /* nextGraphId */ { v: 1 },
+    ) as unknown as CompiledModule<M, I>
   } catch (e) {
     proxy.terminate()
     throw e
   }
 }
 
-/** Internal: same as `compileModule` but uses an existing worker. Used by
- *  `replaceModel` to swap the model topology without respawning the worker. */
-async function compileModuleOnWorker<M extends Module, I extends InputDecls>(
+interface BuiltTrainingGraph {
+  ir: CompiledIR
+  meta: CreateRuntimeResult
+  initFns: Record<string, InitFn>
+}
+
+/** Trace + autograd + Adam + buffer-plan + codegen + worker createRuntime,
+ *  using an existing worker proxy. Used both by `compileModule` (fresh worker)
+ *  and by `replaceModel` (existing worker, same graphId). */
+async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   proxy: WorkerProxy,
-  modelFactory: () => M,
   opts: CompileModuleOptions<M, I>,
-  graphId = 0,
-): Promise<CompiledModule<M>> {
-  // ---- Compile-time work (main thread) ------------------------------------
+  graphId: number,
+): Promise<BuiltTrainingGraph> {
   const loss = opts.loss as unknown as ForwardFn<M, InputDecls>
   const inputs = opts.inputs as InputDecls
-  const { graph, materialized } = traceModule(modelFactory(), loss, inputs)
+  const { graph, materialized } = traceModule(opts.factory(), loss, inputs)
   const { paramGrads, loss: lossTensor } = appendGrad(graph)
   const adamResult = opts.adam
     ? appendAdam(graph, paramGrads, materialized.tensors, opts.adam, materialized.decayFlags)
@@ -243,7 +287,6 @@ async function compileModuleOnWorker<M extends Module, I extends InputDecls>(
   const ir: CompiledIR = { graph, paramGrads, loss: lossTensor, plan, kernels }
 
   const initialParams = buildInitialParams(plan, materialized.initFns)
-
   const wireIR: WireIR = { graph, plan, kernels }
   const wireAdam = adamResult ? wireAdamConfig(adamResult) : null
   const transfers = transferablesOfRecord(initialParams)
@@ -252,44 +295,58 @@ async function compileModuleOnWorker<M extends Module, I extends InputDecls>(
     { kind: 'createRuntime', payload: { graphId, ir: wireIR, initialParams, adam: wireAdam } },
     transfers,
   )
-
-  return new CompiledModuleProxy<M>(
-    proxy, graphId, ir, meta,
-    /* modelFactory */ modelFactory,
-    /* initFns */ materialized.initFns,
-    /* originalOpts */ opts as unknown as CompileModuleOptions<M, InputDecls>,
-    /* nextGraphId */ { v: graphId + 1 },
-  )
+  return { ir, meta, initFns: materialized.initFns }
 }
 
 // ============================================================================
 // Proxy implementations
 // ============================================================================
 
-class CompiledModuleProxy<M extends Module> implements CompiledModule<M> {
+/** Internal-only loose input record. The public proxy interfaces type these
+ *  by declared dtype via `TypedInputs<I>`; the implementation keeps the
+ *  wider type since it doesn't know `I` at the class level. */
+type LooseInputs = Record<string, Int32Array | Float32Array>
+
+class CompiledModuleProxy<M extends Module> implements CompiledModule<M, InputDecls> {
   /** Forward proxies created via `compileForward` — tracked so `destroy()`
-   *  and `replaceModel()` can clean them up cascade-style. */
+   *  can clean them up cascade-style, and `replaceModel()` can invalidate
+   *  their per-shape kernel caches without unregistering them. */
   private readonly children = new Set<ForwardProxy<M>>()
+
+  // Mutable: `replaceModel` swaps these in place so callers' references
+  // (and any sibling ForwardProxy holding `this`) stay valid.
+  ir: CompiledIR
+  private meta: CreateRuntimeResult
+  private opts: CompileModuleOptions<M, InputDecls>
+  private initFns: Record<string, InitFn>
 
   constructor(
     private readonly proxy: WorkerProxy,
-    private readonly graphId: number,
-    public readonly ir: CompiledIR,
-    private readonly meta: CreateRuntimeResult,
-    private readonly modelFactory: () => M,
-    private readonly initFns: Record<string, InitFn>,
-    private readonly originalOpts: CompileModuleOptions<M, InputDecls>,
+    readonly graphId: number,
+    ir: CompiledIR,
+    meta: CreateRuntimeResult,
+    opts: CompileModuleOptions<M, InputDecls>,
+    initFns: Record<string, InitFn>,
     private readonly nextGraphId: { v: number },
-  ) {}
+  ) {
+    this.ir = ir
+    this.meta = meta
+    this.opts = opts
+    this.initFns = initFns
+  }
 
   get kernelCount(): number { return this.meta.kernelCount }
   get outputShape(): readonly number[] { return this.meta.outputShape }
   get paramNames(): readonly string[] { return this.meta.paramNames }
 
-  step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
-  step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
+  /** Current model factory. Sibling ForwardProxies read this through the
+   *  proxy ref so they always re-trace against the latest topology. */
+  currentFactory(): M { return this.opts.factory() }
+
+  step(inputs: LooseInputs): Promise<number>
+  step(inputs: LooseInputs, opts: { withCaptures: true }): Promise<StepResult>
   async step(
-    inputs: Record<string, Int32Array | Float32Array>,
+    inputs: LooseInputs,
     opts?: { withCaptures?: boolean },
   ): Promise<number | StepResult> {
     const r = await this.proxy.request<StepResultWire>(
@@ -299,10 +356,10 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M> {
     return r.loss
   }
 
-  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  run(inputs: LooseInputs): Promise<Float32Array>
+  run(inputs: LooseInputs, opts: { withCaptures: true }): Promise<RunResult>
   async run(
-    inputs: Record<string, Int32Array | Float32Array>,
+    inputs: LooseInputs,
     opts?: { withCaptures?: boolean },
   ): Promise<Float32Array | RunResult> {
     const r = await this.proxy.request<RunResultWire>(
@@ -344,39 +401,42 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M> {
     ).then(() => undefined)
   }
 
-  setOptimizerConfig(update: OptimizerConfigUpdate, opts?: { rebaseLrSchedule?: boolean }): Promise<void> {
+  setOptimizerConfig(update: OptimizerConfigUpdate): Promise<void> {
     return this.proxy.request<null>(
-      { kind: 'setOptimizerConfig', payload: { graphId: this.graphId, update, rebaseLrSchedule: opts?.rebaseLrSchedule } },
+      { kind: 'setOptimizerConfig', payload: { graphId: this.graphId, update } },
     ).then(() => undefined)
   }
 
-  async compileForward<I extends InputDecls>(
-    opts: CompileForwardMethodOptions<M, I>,
-  ): Promise<CompiledForwardModule> {
+  async compileForward<I2 extends InputDecls>(
+    opts: CompileForwardMethodOptions<M, I2>,
+  ): Promise<CompiledForwardModule<I2>> {
     const child = new ForwardProxy<M>(
-      this.proxy, this.graphId,
+      this.proxy,
+      this,
       opts.forward as ForwardFn<M, InputDecls>,
       normalizeDecls(opts.inputs as InputDecls),
       this.nextGraphId,
-      this.modelFactory,
       () => this.children.delete(child),
     )
     this.children.add(child)
-    return child
+    return child as unknown as CompiledForwardModule<I2>
   }
 
-  async replaceModel(newFactory: () => M): Promise<CompiledModule<M>> {
-    // 1. Destroy children siblings (their shared params point at our buffers).
-    for (const child of this.children) child._destroyInternal()
-    this.children.clear()
+  async replaceModel(newFactory: () => M): Promise<void> {
+    // 1. Invalidate sibling caches: their per-shape kernels are model-specific
+    //    so the worker-side graphs must go, but the proxy objects stay alive
+    //    (callers hold references to them) and recompile lazily on next run().
+    for (const child of this.children) child._invalidateForReplace()
     // 2. Destroy current training graph in worker.
     this.proxy.send({ kind: 'destroy', payload: { graphId: this.graphId } })
-    // 3. Build the new training graph on the same worker.
-    return await compileModuleOnWorker<M, InputDecls>(
-      this.proxy, newFactory,
-      this.originalOpts as CompileModuleOptions<M, InputDecls>,
-      this.graphId,
-    )
+    // 3. Rebuild the training graph on the same worker, same graphId.
+    const newOpts = { ...this.opts, factory: newFactory } as CompileModuleOptions<M, InputDecls>
+    const built = await buildTrainingGraph<M, InputDecls>(this.proxy, newOpts, this.graphId)
+    // 4. Mutate this proxy in place — same object, new internals.
+    this.ir = built.ir
+    this.meta = built.meta
+    this.initFns = built.initFns
+    this.opts = newOpts
   }
 
   destroy(): void {
@@ -389,52 +449,39 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M> {
 
 /** Single forward proxy class — handles both fully-concrete and polymorphic
  *  shapes (concrete is the cache-size-1 case). Sibling of a training graph;
- *  shares its param GPUBuffers. */
-class ForwardProxy<M extends Module> implements CompiledForwardModule {
+ *  shares its param GPUBuffers. Holds a reference to the parent proxy so it
+ *  picks up the current model factory after `replaceModel`. */
+class ForwardProxy<M extends Module> implements CompiledForwardModule<InputDecls> {
   private readonly cache = new Map<string, ForwardSiblingMeta>()
-  private last: ForwardSiblingMeta | null = null
-  private warnedCacheSize = false
 
   constructor(
     private readonly proxy: WorkerProxy,
-    private readonly parentGraphId: number,
+    private readonly parent: CompiledModuleProxy<M>,
     private readonly forward: ForwardFn<M, InputDecls>,
     private readonly decls: NormalizedDecls,
     private readonly nextGraphId: { v: number },
-    private readonly modelFactory: () => M,
     private readonly onDestroy: () => void,
   ) {}
 
-  get ir(): CompiledIR | undefined { return this.last?.ir }
-  get kernelCount(): number { return this.last?.meta.kernelCount ?? 0 }
-  get outputShape(): readonly number[] { return this.last?.meta.outputShape ?? [] }
+  get paramNames(): readonly string[] { return this.parent.paramNames }
 
   private async siblingFor(inputs: Record<string, Int32Array | Float32Array>): Promise<ForwardSiblingMeta> {
     const resolved = resolveDecls(this.decls, inputs)
     const key = shapeKey(resolved)
     const hit = this.cache.get(key)
-    if (hit) { this.last = hit; return hit }
+    if (hit) return hit
     const sib = await compileSibling<M>(
-      this.proxy, this.parentGraphId, this.modelFactory, this.forward,
+      this.proxy, this.parent.graphId, this.parent.currentFactory(), this.forward,
       resolved, this.nextGraphId,
     )
     this.cache.set(key, sib)
-    this.last = sib
-    if (!this.warnedCacheSize && this.cache.size > POLYMORPHIC_CACHE_WARN_AT) {
-      this.warnedCacheSize = true
-      console.warn(
-        `tensorgrad: forward proxy has compiled ${this.cache.size} distinct input shapes. ` +
-        `Each entry holds its own kernels and bind groups. If unexpected, your call sites ` +
-        `may be feeding too many distinct shapes.`,
-      )
-    }
     return sib
   }
 
-  run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  run(inputs: LooseInputs): Promise<Float32Array>
+  run(inputs: LooseInputs, opts: { withCaptures: true }): Promise<RunResult>
   async run(
-    inputs: Record<string, Int32Array | Float32Array>,
+    inputs: LooseInputs,
     opts?: { withCaptures?: boolean },
   ): Promise<Float32Array | RunResult> {
     const sib = await this.siblingFor(inputs)
@@ -448,13 +495,13 @@ class ForwardProxy<M extends Module> implements CompiledForwardModule {
   async uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void> {
     // Params live on the parent training graph (shared with all siblings).
     await this.proxy.request<null>(
-      { kind: 'uploadParams', payload: { graphId: this.parentGraphId, params, partial: !!opts?.partial } },
+      { kind: 'uploadParams', payload: { graphId: this.parent.graphId, params, partial: !!opts?.partial } },
     )
   }
 
   async downloadParams(): Promise<Record<string, Float32Array>> {
     const r = await this.proxy.request<DownloadParamsResult>(
-      { kind: 'downloadParams', payload: { graphId: this.parentGraphId } },
+      { kind: 'downloadParams', payload: { graphId: this.parent.graphId } },
     )
     return r.params
   }
@@ -465,14 +512,20 @@ class ForwardProxy<M extends Module> implements CompiledForwardModule {
   }
 
   /** Internal: destroy without unregistering from parent. Called by the
-   *  parent during its own destroy / replaceModel — the parent will clear
-   *  the whole children set after iteration. */
+   *  parent during its own destroy — the parent clears its children set
+   *  after iteration. */
   _destroyInternal(): void {
+    this._invalidateForReplace()
+  }
+
+  /** Invalidate per-shape kernel caches because the parent's model topology
+   *  changed. The proxy object stays alive; next run() recompiles against
+   *  the new model. */
+  _invalidateForReplace(): void {
     for (const sib of this.cache.values()) {
       this.proxy.send({ kind: 'destroy', payload: { graphId: sib.graphId } })
     }
     this.cache.clear()
-    this.last = null
   }
 }
 
@@ -483,19 +536,17 @@ interface ForwardSiblingMeta {
   meta: CompileForwardResult
 }
 
-const POLYMORPHIC_CACHE_WARN_AT = 8
-
 /** Compile a per-shape sibling forward graph against the parent training
  *  graph. Used inside the forward proxy on each new resolved shape. */
 async function compileSibling<M extends Module>(
   proxy: WorkerProxy,
   parentGraphId: number,
-  modelFactory: () => M,
+  model: M,
   forward: ForwardFn<M, InputDecls>,
   decls: ResolvedDecls,
   nextGraphId: { v: number },
 ): Promise<ForwardSiblingMeta> {
-  const { graph } = traceModule(modelFactory(), forward, decls)
+  const { graph } = traceModule(model, forward, decls)
   const outputTensor = graph.tensors[graph.outputs[0]!]!
   const plan = planBuffers(graph, {})
   const kernels = emitKernels(graph, plan)
@@ -535,6 +586,12 @@ function normalizeDecls(decls: InputDecls): NormalizedDecls {
   return out
 }
 
+/** Tracks Module instances we've already materialized, so we can detect when
+ *  a factory accidentally returns the same object on a second call (the param
+ *  sentinels get mutated to Tensors on the first compile; reusing the
+ *  instance silently corrupts later compiles). WeakSet — does not retain. */
+const seenModels = new WeakSet<Module>()
+
 /** Trace the forward function with a fresh model + tensor inputs and capture
  *  the materialized params. Caller provides the model instance directly. */
 function traceModule<M extends Module>(
@@ -542,6 +599,17 @@ function traceModule<M extends Module>(
   forward: ForwardFn<M, InputDecls>,
   inputDecls: InputDecls,
 ): { graph: Graph; materialized: MaterializedParams } {
+  if (seenModels.has(model)) {
+    throw new Error(
+      `compile: factory returned a Module instance that has already been compiled. ` +
+      `Factories must return a fresh \`new Model()\` per call — the compile pipeline ` +
+      `consumes the instance by mutating its ParamSentinel fields into Tensors, so a ` +
+      `reused instance has Tensor fields where sentinels are expected. Replace ` +
+      `\`compileModule({ factory: () => existingInstance })\` with ` +
+      `\`compileModule({ factory: () => new Model() })\`.`,
+    )
+  }
+  seenModels.add(model)
   const normalized = normalizeDecls(inputDecls)
   let materialized: MaterializedParams = { tensors: {}, initFns: {}, decayFlags: {} }
   const graph = trace(() => {
@@ -573,12 +641,20 @@ function asConcreteShape(shape: InputShape, inputName: string): Shape {
   return out
 }
 
-/** Resolve null-wildcard dims by inferring from each input array's length. */
+/** Resolve null-wildcard dims by inferring from each input array's length.
+ *
+ *  Invariant: all `null` wildcards across all inputs in a single call must
+ *  resolve to the same value (matches the named-axis convention of Keras
+ *  `None` / ONNX dynamic axes). If you genuinely want two different
+ *  parametric dims, name them with explicit concrete shapes and recompile,
+ *  or use separate `compileForward` graphs. */
 function resolveDecls(
   decls: NormalizedDecls,
   inputs: Record<string, Int32Array | Float32Array>,
 ): ResolvedDecls {
-  const out: ResolvedDecls = {}
+  // First pass: validate + collect per-input wildcard info.
+  type WildcardInfo = { nullIdx: number; concreteProduct: number; resolvedDim: number }
+  const wildcards: Record<string, WildcardInfo | null> = {}
   for (const [name, decl] of Object.entries(decls)) {
     let nullCount = 0
     let nullIdx = -1
@@ -587,10 +663,7 @@ function resolveDecls(
       const d = decl.shape[i]
       if (d === null) { nullCount++; nullIdx = i } else concreteProduct *= d!
     }
-    if (nullCount === 0) {
-      out[name] = { shape: decl.shape as number[], dtype: decl.dtype }
-      continue
-    }
+    if (nullCount === 0) { wildcards[name] = null; continue }
     if (nullCount > 1) {
       throw new Error(
         `run: input '${name}' has ${nullCount} parametric dims in shape [${decl.shape.join(', ')}]. ` +
@@ -605,8 +678,32 @@ function resolveDecls(
         `the product of concrete dims (${concreteProduct}) in shape [${decl.shape.join(', ')}].`,
       )
     }
+    wildcards[name] = { nullIdx, concreteProduct, resolvedDim: arr.length / concreteProduct }
+  }
+
+  // Cross-input consistency: every wildcard must resolve to the same value.
+  let agreedDim: number | undefined
+  let agreedSource: string | undefined
+  for (const [name, w] of Object.entries(wildcards)) {
+    if (!w) continue
+    if (agreedDim === undefined) { agreedDim = w.resolvedDim; agreedSource = name; continue }
+    if (w.resolvedDim !== agreedDim) {
+      throw new Error(
+        `run: parametric dim resolved inconsistently across inputs — '${agreedSource}' implies ${agreedDim}, ` +
+        `but '${name}' implies ${w.resolvedDim}. All \`null\` wildcards in a single call must resolve to the ` +
+        `same value (matches Keras None / ONNX dynamic-axis convention). Either feed matching batch lengths ` +
+        `or use explicit concrete shapes for the dims that should vary independently.`,
+      )
+    }
+  }
+
+  // Second pass: build the resolved decls record.
+  const out: ResolvedDecls = {}
+  for (const [name, decl] of Object.entries(decls)) {
+    const w = wildcards[name]
+    if (!w) { out[name] = { shape: decl.shape as number[], dtype: decl.dtype }; continue }
     const concrete = decl.shape.slice() as number[]
-    concrete[nullIdx] = arr.length / concreteProduct
+    concrete[w.nullIdx] = w.resolvedDim
     out[name] = { shape: concrete, dtype: decl.dtype }
   }
   return out

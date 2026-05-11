@@ -45,10 +45,10 @@ import { adamUpdateM, adamUpdateV, adamUpdateP } from './ops.js'
  * now" instead of "decay measured from step 1 of training," without us
  * having to bake closures into the schedule shape.
  *
- * Pair with `setOptimizerConfig({...}, { rebaseLrSchedule: true })`: the
- * runtime fills in `startStep = current_t` for any schedule that doesn't
- * already specify one, so the schedule's "step 1" lines up with the Adam
- * step it took effect.
+ * `setOptimizerConfig({ lr: <schedule> })` auto-fills `startStep = current_t`
+ * for any non-constant schedule that doesn't already specify one, so the
+ * schedule's "step 1" lines up with the Adam step it took effect. If the
+ * caller sets `startStep` explicitly, it's respected as-is.
  */
 export type LRSchedule =
   | number
@@ -108,8 +108,8 @@ export function resolveLR(schedule: LRSchedule, step: number): number {
 /** Rewrite a schedule to start its timeline at `baseStep` (sets startStep on
  *  the outer shape to `baseStep - 1`, so the schedule's intrinsic step 1
  *  aligns with the user's `baseStep`). Numbers and `{kind:'constant'}` have
- *  no notion of time and pass through unchanged. Used by the worker when
- *  setOptimizerConfig is called with `rebaseLrSchedule: true`. */
+ *  no notion of time and pass through unchanged. Used by the worker to
+ *  auto-rebase non-constant schedules handed to `setOptimizerConfig`. */
 export function rebaseLR(schedule: LRSchedule, baseStep: number): LRSchedule {
   if (typeof schedule === 'number' || schedule.kind === 'constant') return schedule
   return { ...schedule, startStep: baseStep - 1 }
