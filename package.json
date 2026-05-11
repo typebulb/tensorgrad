@@ -45,7 +45,7 @@
     "build:types": "tsc -p tsconfig.types.json && rollup -c rollup.dts.config.mjs && rimraf dist/types-temp",
     "build": "npm run build:js && npm run build:types",
     "clean": "rimraf dist",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "tsx test/ops.ts && tsx test/grad.ts && tsx test/codegen.ts && tsx test/smoke.ts",
     "prepublishOnly": "npm run clean && npm run build"
   },

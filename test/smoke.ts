@@ -25,6 +25,9 @@ import {
   type Tensor, type Graph,
 } from '../src/index.js'
 
+// Minimal Node typing — keeps `@types/node` off the dev-dep tree.
+declare const process: { exit(code: number): never }
+
 // Hyperparameters, same as transformer.bulb.md.
 const VOCAB = 12, D = 64, N_LAYERS = 3
 const SEQ_LEN = 9, RESULT_START = 6

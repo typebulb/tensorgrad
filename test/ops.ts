@@ -16,7 +16,7 @@ import {
   softmaxLast, logSoftmaxLast, softmaxCausalLast, whereCausal,
   type Tensor,
 } from '../src/index.js'
-import { section, assertShape, assertEq, assertThrows, done, ok } from './_assert.js'
+import { section, assertShape, assertEq, assertThrows, done, ok, fail } from './_assert.js'
 
 // Helper: trace a single-expression graph and pull the last produced tensor.
 function tr(fn: () => Tensor): Tensor {
@@ -329,10 +329,7 @@ section('dropout')
     return out
   })
   const opKinds = g.ops.map(o => o.kind)
-  if (opKinds.includes('dropout')) {
-    console.error('  ✗ dropout(x, 0) should not emit an op')
-    process.exit(1)
-  }
+  if (opKinds.includes('dropout')) fail('dropout(x, 0) should not emit an op')
   ok('dropout(x, 0) short-circuits to identity (no op)')
 
   const r = tr(() => dropout(a('x', [4, 8]), 0.1))
@@ -346,19 +343,13 @@ section('dropout')
     return d2
   })
   const seedInputs = g2.ops.filter(o => o.kind === 'tensor_input' && o.name === '__dropoutSeed').length
-  if (seedInputs !== 1) {
-    console.error(`  ✗ dropout seed input should be shared; got ${seedInputs} occurrences`)
-    process.exit(1)
-  }
+  if (seedInputs !== 1) fail(`dropout seed input should be shared; got ${seedInputs} occurrences`)
   ok('multiple dropouts share __dropoutSeed tensor_input')
 
   // Each dropout op gets a unique salt.
   const dropoutOps = g2.ops.filter(o => o.kind === 'dropout') as Array<{ kind: 'dropout'; salt: number }>
   const salts = dropoutOps.map(o => o.salt)
-  if (new Set(salts).size !== salts.length) {
-    console.error(`  ✗ dropout salts must be unique within a graph; got ${salts}`)
-    process.exit(1)
-  }
+  if (new Set(salts).size !== salts.length) fail(`dropout salts must be unique within a graph; got ${salts}`)
   ok(`dropout salts unique within graph: [${salts.join(', ')}]`)
 }
 assertThrows(

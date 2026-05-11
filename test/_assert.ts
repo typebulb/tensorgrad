@@ -5,6 +5,11 @@
 // Style matches the existing smoke.ts: console-driven, fail-fast, no asserts
 // that swallow context. Helpers exist to deduplicate the prefix/format.
 
+// Minimal Node typings the test harness needs. We don't pull in `@types/node`
+// to keep the dev-dep tree small; the few symbols the runner touches are
+// declared here.
+declare const process: { exit(code: number): never }
+
 let sectionDepth = 0
 
 export function section(name: string): void {

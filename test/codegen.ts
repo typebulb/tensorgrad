@@ -178,9 +178,11 @@ section('per-op binding counts')
 // Pull representative kernels and check their binding count matches the
 // expected wiring (inputs + output). Spot-checks for the new ops.
 function findKernel(kind: string) {
-  const k = kernels.find(k => k.opKind === kind)
+  // `k.opKind` is a string-literal union (the op discriminator); cast to
+  // string so a runtime test against an arbitrary kind string typechecks.
+  const k = kernels.find(k => (k.opKind as string) === kind)
   if (!k) fail(`no kernel emitted for ${kind}`)
-  return k!
+  return k
 }
 
 // Unary: 1 input + 1 output = 2 bindings.
@@ -238,7 +240,7 @@ section('appendGradClip + appendAdam: ops show up in the kernel emit set')
   appendAdam(g2, clipped, { w: wTensor }, { lr: 0.001 })
   const plan2 = planBuffers(g2, clipped)
   const ks2 = emitKernels(g2, plan2)
-  const adamKinds = ks2.filter(k => k.wgsl !== '').map(k => k.opKind)
+  const adamKinds: string[] = ks2.filter(k => k.wgsl !== '').map(k => k.opKind as string)
   const expectedAdam = ['adam_update_m', 'adam_update_v', 'adam_update_p']
   for (const k of expectedAdam) {
     if (!adamKinds.includes(k)) fail(`appendAdam: missing kernel '${k}'`)
