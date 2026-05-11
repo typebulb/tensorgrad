@@ -108,6 +108,10 @@ log-softmax yourself. Applying it twice silently
 double-log-softmaxes; the model trains but converges to garbage. This
 is the worst class of bug: it runs.
 
+If you specifically want the log-probability intermediate visible (e.g.
+to `capture` it for inspection), use `nn.nllLoss(logSoftmaxLast(logits),
+targets)` instead — same numerics, just unfused.
+
 **No `.train()` / `.eval()` mode flag.** Write two forwards: a training
 one (`lossFn`, includes `dropout` etc.) and an inference one
 (`predictFn`, deterministic). Compile training with `compileModule`,
@@ -339,7 +343,8 @@ nn.LayerNorm(dim)                    // .fwd(x); g (gain) and b (bias) both [dim
 nn.splitHeads(x, nHeads)             // [B, T, D] → [B, H, T, D/H]
 nn.mergeHeads(x)                     // inverse of splitHeads
 nn.unsplitHeads(captures, name)      // pull per-head slices off a capture
-nn.crossEntropyLast(logits, targets) // standard CE
+nn.crossEntropyLast(logits, targets) // fused log-softmax + NLL (pass raw logits)
+nn.nllLoss(logProbs, targets)        // NLL only — pair with logSoftmaxLast if you need the log-prob intermediate
 ```
 
 Convention: leaf modules (`Linear`, `LayerNorm`) expose `.fwd(x)` for ergonomic

@@ -133,18 +133,44 @@ export function unsplitHeads(captures: Captures, name: string): Float32Array[] {
 // Loss helpers
 // ----------------------------------------------------------------------------
 
+/** Per-position negative log-likelihood along the last axis: returns
+ *  `-logProbs[target]` at each position. `logProbs` is `[..., V]` (already
+ *  log-softmaxed); `targets` is `[...]` of i32; result is `[...]` (one
+ *  rank less than `logProbs`).
+ *
+ *  Mirrors PyTorch's `F.nll_loss` *before* reduction. Pair with
+ *  `logSoftmaxLast` when you need the log-probability intermediate visible
+ *  (e.g. to `capture` it for inspection). Otherwise prefer
+ *  `crossEntropyLast(logits, targets)` which takes raw logits and fuses
+ *  log-softmax + NLL — same numerics, fewer ops, no risk of accidentally
+ *  passing logits twice (a silent miscompose if you also wrote
+ *  `log_softmax` upstream). */
+export function nllLoss(logProbs: Tensor, targets: Tensor): Tensor {
+  const site = captureSite('nllLoss')
+  if (targets.dtype !== 'i32') {
+    throw new ShapeError(`nllLoss: targets must be i32, got ${targets.dtype}`, site)
+  }
+  const vocab = logProbs.shape[logProbs.shape.length - 1]!
+  const targetLp = sumLast(mul(logProbs, oneHot(targets, vocab, 'f32')))   // [...]
+  return mul(targetLp, -1)
+}
+
 /** Per-position cross-entropy along the last (vocab) axis: returns
- *  `-log p(target)` at each position. `logits` is `[..., V]`; `targets` is
- *  `[...]` of i32; result is `[...]` (one rank less than logits). The user
- *  applies their own masking + reduction downstream — useful when only some
- *  positions contribute (e.g. result-digit masking) or for label smoothing. */
+ *  `-log p(target)` at each position. `logits` is `[..., V]` (raw, NOT
+ *  pre-log-softmaxed); `targets` is `[...]` of i32; result is `[...]`
+ *  (one rank less than logits). The user applies their own masking +
+ *  reduction downstream — useful when only some positions contribute
+ *  (e.g. result-digit masking) or for label smoothing.
+ *
+ *  Fused log-softmax + NLL. Pass raw logits — don't apply `logSoftmaxLast`
+ *  yourself first or the model silently double-log-softmaxes (a common
+ *  miscompose when porting PyTorch code that uses `log_softmax` in the
+ *  model and `F.nll_loss` in the loss). If you need the log-probability
+ *  intermediate visible, use `logSoftmaxLast` + `nllLoss` instead. */
 export function crossEntropyLast(logits: Tensor, targets: Tensor): Tensor {
   const site = captureSite('crossEntropyLast')
   if (targets.dtype !== 'i32') {
     throw new ShapeError(`crossEntropyLast: targets must be i32, got ${targets.dtype}`, site)
   }
-  const vocab = logits.shape[logits.shape.length - 1]!
-  const lp = logSoftmaxLast(logits)                                   // [..., V]
-  const targetLp = sumLast(mul(lp, oneHot(targets, vocab, 'f32')))    // [...]
-  return mul(targetLp, -1)
+  return nllLoss(logSoftmaxLast(logits), targets)
 }
