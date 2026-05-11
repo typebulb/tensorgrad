@@ -50,14 +50,15 @@ declare const __WORKER_SOURCE__: string
  *  At most one `null` per shape. Matches the TF/ONNX/MLIR wildcard convention. */
 export type InputShape = readonly (number | null)[]
 
-/** Object form of an input declaration. Only needed when dtype isn't `f32`
- *  (the default), or for stylistic explicitness. */
+/** Object form of an input declaration. Required when dtype isn't `f32` (use
+ *  the tuple form for f32). `dtype` is required so the input's TypedArray type
+ *  always resolves to a single literal, not a `Float32Array | Int32Array` union. */
 export interface InputDeclObject {
   readonly shape: InputShape
-  readonly dtype?: Dtype
+  readonly dtype: Dtype
 }
 
-/** An input declaration value: shape tuple (dtype defaults to `f32`) or
+/** An input declaration value: shape tuple (dtype = `f32`) or
  *  `{ shape, dtype }` for non-f32 (`i32` / `bool`). */
 export type InputDecl = InputShape | InputDeclObject
 
@@ -68,9 +69,8 @@ export type InputDecls = Record<string, InputDecl>
  *  same keys, each value is a Tensor. */
 export type InputsTensors<I extends InputDecls> = { [K in keyof I]: Tensor }
 
-/** Extract the declared dtype from an `InputDecl`. Tuple shapes and object
- *  forms without an explicit `dtype` default to `'f32'`; the object form's
- *  `dtype` field is preserved as a literal when present. */
+/** Extract the declared dtype from an `InputDecl`. Tuple shapes resolve to
+ *  `'f32'`; the object form's required `dtype` field is preserved as a literal. */
 export type DtypeOf<D extends InputDecl> =
   D extends readonly (number | null)[] ? 'f32'
   : D extends { dtype: infer T extends Dtype } ? T
@@ -666,7 +666,7 @@ type ResolvedDecls = Record<string, { shape: Shape; dtype: Dtype }>
 function normalizeDecl(d: InputDecl): { shape: InputShape; dtype: Dtype } {
   if (Array.isArray(d)) return { shape: d as InputShape, dtype: 'f32' }
   const obj = d as InputDeclObject
-  return { shape: obj.shape, dtype: obj.dtype ?? 'f32' }
+  return { shape: obj.shape, dtype: obj.dtype }
 }
 
 function normalizeDecls(decls: InputDecls): NormalizedDecls {
