@@ -100,12 +100,18 @@ fn main() {
     case 'add':
     case 'sub':
     case 'mul':
-    case 'div': {
+    case 'div':
+    case 'min':
+    case 'max': {
       const out = tof(op.out)
       const a = tof(op.a)
       const b = tof(op.b)
-      const opStr = { add: '+', sub: '-', mul: '*', div: '/' }[op.kind]
       const total = shapeSize(out.shape)
+      // Infix for arithmetic; WGSL builtin for min/max.
+      const expr =
+        op.kind === 'min' ? 'min(a[aIdx], b[bIdx])' :
+        op.kind === 'max' ? 'max(a[aIdx], b[bIdx])' :
+        `a[aIdx] ${({ add: '+', sub: '-', mul: '*', div: '/' } as const)[op.kind]} b[bIdx]`
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<${wgslDtype(a.dtype)}>;
 @group(0) @binding(1) var<storage, read> b : array<${wgslDtype(b.dtype)}>;
@@ -116,7 +122,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (i >= ${total}u) { return; }
 ${broadcastIndexBlock('i', out.shape, a.shape, 'aIdx')}
 ${broadcastIndexBlock('i', out.shape, b.shape, 'bIdx')}
-  out[i] = a[aIdx] ${opStr} b[bIdx];
+  out[i] = ${expr};
 }`.trim()
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
@@ -146,16 +152,26 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     case 'rsqrt':
     case 'log':
     case 'exp':
-    case 'relu': {
+    case 'relu':
+    case 'neg':
+    case 'abs':
+    case 'tanh':
+    case 'sigmoid': {
       const out = tof(op.out)
       const a = tof(op.a)
       const total = shapeSize(out.shape)
       const expr =
-        op.kind === 'sqrt'  ? 'sqrt(x)' :
-        op.kind === 'rsqrt' ? '1.0 / sqrt(x)' :
-        op.kind === 'log'   ? 'log(x)' :
-        op.kind === 'exp'   ? 'exp(x)' :
-        /* relu */            'max(x, 0.0)'
+        op.kind === 'sqrt'    ? 'sqrt(x)' :
+        op.kind === 'rsqrt'   ? '1.0 / sqrt(x)' :
+        op.kind === 'log'     ? 'log(x)' :
+        op.kind === 'exp'     ? 'exp(x)' :
+        op.kind === 'relu'    ? 'max(x, 0.0)' :
+        op.kind === 'neg'     ? '-x' :
+        op.kind === 'abs'     ? 'abs(x)' :
+        op.kind === 'tanh'    ? 'tanh(x)' :
+        // sigmoid via tanh identity for numerical stability:
+        // sigmoid(x) = 0.5 + 0.5 * tanh(0.5 * x)
+        /* sigmoid */           '0.5 + 0.5 * tanh(0.5 * x)'
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<${wgslDtype(a.dtype)}>;
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
@@ -251,6 +267,29 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     s = s + a[base + j];
   }
   out[i] = s / ${divisor};
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: outerSize, workgroupSize: WG_SIZE }
+    }
+
+    case 'argmax_last': {
+      const a = tof(op.a)
+      const D = a.shape[a.shape.length - 1]!
+      const outerSize = shapeSize(a.shape) / D
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read_write> out : array<i32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${outerSize}u) { return; }
+  let base = i * ${D}u;
+  var bestVal : f32 = a[base];
+  var bestIdx : i32 = 0;
+  for (var j : u32 = 1u; j < ${D}u; j = j + 1u) {
+    let v = a[base + j];
+    if (v > bestVal) { bestVal = v; bestIdx = i32(j); }
+  }
+  out[i] = bestIdx;
 }`.trim()
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: outerSize, workgroupSize: WG_SIZE }
     }

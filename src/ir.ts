@@ -56,6 +56,8 @@ export type OpNode =
   | { kind: 'sub'; out: number; a: number; b: number }
   | { kind: 'mul'; out: number; a: number; b: number }
   | { kind: 'div'; out: number; a: number; b: number }
+  | { kind: 'min'; out: number; a: number; b: number }
+  | { kind: 'max'; out: number; a: number; b: number }
   | { kind: 'mul_scalar'; out: number; a: number; scalar: number }
   | { kind: 'add_scalar'; out: number; a: number; scalar: number }
 
@@ -65,10 +67,16 @@ export type OpNode =
   | { kind: 'log'; out: number; a: number }
   | { kind: 'exp'; out: number; a: number }
   | { kind: 'relu'; out: number; a: number }
+  | { kind: 'neg'; out: number; a: number }
+  | { kind: 'abs'; out: number; a: number }
+  | { kind: 'tanh'; out: number; a: number }
+  | { kind: 'sigmoid'; out: number; a: number }
 
   // ---- Reductions (over last axis only; reshape if you need other axes) ----
   | { kind: 'mean_last'; out: number; a: number }   // keepdims=true
   | { kind: 'sum_last'; out: number; a: number }    // keepdims=false
+  // argmax over the last axis (keepdims=false). Returns i32; non-differentiable.
+  | { kind: 'argmax_last'; out: number; a: number }
 
   // ---- Shape ---------------------------------------------------------------
   | { kind: 'reshape'; out: number; a: number; newShape: Shape }

@@ -226,17 +226,21 @@ await compiled.replaceModel(newFactory, { seed: compiled.seed })  // keep curren
 
 Imported from `'tensorgrad'`:
 
-- Element-wise: `add`, `sub`, `mul`, `div`, `sqrt`, `rsqrt`, `log`, `exp`, `relu`
+- Arithmetic (binary): `add`, `sub`, `mul`, `div`, `min`, `max`
+- Unary math: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`
+- Activations: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`
+- Clamping: `clamp(x, lo, hi)` (scalar bounds)
 - Comparisons / select: `less`, `greater`, `where`
-- Reductions (last axis / all): `meanLast`, `sumLast`, `sumAll`, `meanAll`
+- Reductions (last axis / all): `meanLast`, `sumLast`, `sumAll`, `meanAll`, `argmaxLast`
 - Shape: `reshape`, `transpose`, `swapAxes`
 - Linear algebra: `matmul`, `matmulBatched`
 - Indexing / casting: `oneHot`, `arange`, `embedding`
 - Slicing: `sliceLastRange`
 - Fused ML primitives: `softmaxLast`, `logSoftmaxLast`, `softmaxCausalLast`, `whereCausal`
 
-`add`, `sub`, `mul`, `div`, `less`, `greater` all accept `(Tensor, Tensor)`
-or `(Tensor, number)` — scalar broadcasts. The standard loss tail is
+`add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
+`(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmaxLast`
+returns `i32` and is non-differentiable. The standard loss tail is
 `meanAll(crossEntropyLast(logits, targets))`.
 
 ### `nn` namespace

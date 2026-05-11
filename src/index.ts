@@ -8,14 +8,15 @@ export { ShapeError } from './shape.js'
 export { trace, traceInto, paramInput, tensorInput, stateInput } from './trace.js'
 export { capture } from './capture.js'
 export {
-  // Element-wise arithmetic. The binops accept Tensor or JS-number for the second arg.
-  add, sub, mul, div,
+  // Element-wise arithmetic. Binops accept Tensor or JS-number for the second arg.
+  add, sub, mul, div, min, max, clamp,
   // Element-wise unary
   sqrt, rsqrt, log, exp, relu,
+  neg, abs, tanh, sigmoid, gelu, silu,
   // Comparisons + select
   less, greater, where,
   // Reductions over the last axis (other axes via reshape/transpose first)
-  meanLast, sumLast, sumAll, meanAll,
+  meanLast, sumLast, sumAll, meanAll, argmaxLast,
   // Shape ops
   reshape, transpose, swapAxes,
   // Linear algebra

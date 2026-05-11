@@ -112,6 +112,12 @@ export function inferSumLast(opName: string, aShape: Shape, site: CallSite | nul
   return aShape.slice(0, -1)
 }
 
+/** argmax_last shares sum_last's shape rule (drops the last axis). The
+ *  output dtype is i32, set by the caller. */
+export function inferArgmaxLast(opName: string, aShape: Shape, site: CallSite | null): Shape {
+  return inferSumLast(opName, aShape, site)
+}
+
 export function inferReshape(opName: string, aShape: Shape, newShape: Shape, site: CallSite | null): Shape {
   // Validate -1 placeholder (at most one allowed) and total size match.
   let inferIdx = -1

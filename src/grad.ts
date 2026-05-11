@@ -22,7 +22,7 @@ import {
   exp,
   broadcastTo, sumToShape,
   constScalar, reluGrad,
-  sumLast, where,
+  sumLast, where, less, greater,
 } from './ops.js'
 import { traceInto } from './trace.js'
 import { shapesEqual } from './shape.js'
@@ -228,6 +228,50 @@ function runTransposeRule(
       accumulate(cotangents, op.a, reluGrad(a, outCotan))
       return
     }
+    case 'neg': {
+      // c = -a. dc/da = -1.
+      accumulate(cotangents, op.a, mulScalar(outCotan, -1))
+      return
+    }
+    case 'abs': {
+      // c = |a|. dc/da = sign(a) (subgradient 0 at a=0, fine in practice).
+      const a = tensorOf(op.a)
+      const dySigned = where(less(a, constScalar(0, 'f32')), mulScalar(outCotan, -1), outCotan)
+      accumulate(cotangents, op.a, dySigned)
+      return
+    }
+    case 'tanh': {
+      // c = tanh(a). dc/da = 1 - c² = (1 - c) * (1 + c).
+      const c = tensorOf(op.out)
+      const oneMinusCSq = sub(constScalar(1, 'f32'), mul(c, c))
+      accumulate(cotangents, op.a, mul(outCotan, oneMinusCSq))
+      return
+    }
+    case 'sigmoid': {
+      // c = sigmoid(a). dc/da = c * (1 - c) = c - c².
+      const c = tensorOf(op.out)
+      const cMinusCSq = sub(c, mul(c, c))
+      accumulate(cotangents, op.a, mul(outCotan, cMinusCSq))
+      return
+    }
+    case 'min': {
+      // c = min(a, b). Pass dy through to whichever side won (a if a <= b).
+      const a = tensorOf(op.a), b = tensorOf(op.b)
+      const zero = constScalar(0, 'f32')
+      const aWins = less(a, b)  // ties go to b; subgradient choice
+      accumulate(cotangents, op.a, unbroadcast(where(aWins, outCotan, broadcastTo(zero, outCotan.shape)), a.shape))
+      accumulate(cotangents, op.b, unbroadcast(where(aWins, broadcastTo(zero, outCotan.shape), outCotan), b.shape))
+      return
+    }
+    case 'max': {
+      // c = max(a, b). Pass dy through to whichever side won (a if a >= b).
+      const a = tensorOf(op.a), b = tensorOf(op.b)
+      const zero = constScalar(0, 'f32')
+      const aWins = greater(a, b)  // ties go to b; subgradient choice
+      accumulate(cotangents, op.a, unbroadcast(where(aWins, outCotan, broadcastTo(zero, outCotan.shape)), a.shape))
+      accumulate(cotangents, op.b, unbroadcast(where(aWins, broadcastTo(zero, outCotan.shape), outCotan), b.shape))
+      return
+    }
 
     // ---- Reductions over last axis ---------------------------------------
     case 'mean_last': {
@@ -375,6 +419,10 @@ function runTransposeRule(
     case 'less':
     case 'greater':
       // No gradient flows through bool comparisons. Stop here.
+      return
+
+    case 'argmax_last':
+      // Non-differentiable: index output is discrete.
       return
 
     case 'where': {

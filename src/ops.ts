@@ -13,7 +13,7 @@ import type { Tensor, Shape, Dtype, OpNode } from './ir.js'
 import { addOp, captureSite } from './ir.js'
 import { currentGraph } from './trace.js'
 import {
-  inferElementwiseBinop, inferUnary, inferMeanLast, inferSumLast,
+  inferElementwiseBinop, inferUnary, inferMeanLast, inferSumLast, inferArgmaxLast,
   inferReshape, inferTranspose, inferMatmul, inferMatmulBatched,
   inferOneHot, inferWhereCausal, inferSliceLastRange,
   inferBroadcastTo, inferSumToShape, inferReluGrad, inferWhere,
@@ -61,6 +61,20 @@ export function div(a: Tensor, b: Tensor | number): Tensor {
   return binopOp('div', 'div', a, b)
 }
 
+export function min(a: Tensor, b: Tensor | number): Tensor {
+  const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
+  return binopOp('min', 'min', a, rhs)
+}
+export function max(a: Tensor, b: Tensor | number): Tensor {
+  const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
+  return binopOp('max', 'max', a, rhs)
+}
+
+/** Element-wise clamp: `min(max(a, lo), hi)`. Both bounds are scalars. */
+export function clamp(a: Tensor, lo: number, hi: number): Tensor {
+  return min(max(a, lo), hi)
+}
+
 // ----------------------------------------------------------------------------
 // Element-wise scalar binops (mul/add by JS number). Used for things like
 // `scores * (1/sqrt(d))` and `logits + 1e-5` where allocating a 0-d tensor
@@ -81,17 +95,37 @@ export function addScalar(a: Tensor, scalar: number): Tensor {
 // Unary ops.
 // ----------------------------------------------------------------------------
 
-function unary(name: 'sqrt' | 'rsqrt' | 'log' | 'exp' | 'relu', a: Tensor): Tensor {
+type UnaryKind = 'sqrt' | 'rsqrt' | 'log' | 'exp' | 'relu' | 'neg' | 'abs' | 'tanh' | 'sigmoid'
+
+function unary(name: UnaryKind, a: Tensor): Tensor {
   const site = captureSite(name)
   if (a.dtype !== 'f32') throw new ShapeError(`${name}: requires f32, got ${a.dtype}`, site)
   return addOp(currentGraph(), name, inferUnary(name, a.shape, site), 'f32', site, { a: a.id })
 }
 
-export const sqrt  = (a: Tensor): Tensor => unary('sqrt',  a)
-export const rsqrt = (a: Tensor): Tensor => unary('rsqrt', a)
-export const log   = (a: Tensor): Tensor => unary('log',   a)
-export const exp   = (a: Tensor): Tensor => unary('exp',   a)
-export const relu  = (a: Tensor): Tensor => unary('relu',  a)
+export const sqrt    = (a: Tensor): Tensor => unary('sqrt',    a)
+export const rsqrt   = (a: Tensor): Tensor => unary('rsqrt',   a)
+export const log     = (a: Tensor): Tensor => unary('log',     a)
+export const exp     = (a: Tensor): Tensor => unary('exp',     a)
+export const relu    = (a: Tensor): Tensor => unary('relu',    a)
+export const neg     = (a: Tensor): Tensor => unary('neg',     a)
+export const abs     = (a: Tensor): Tensor => unary('abs',     a)
+export const tanh    = (a: Tensor): Tensor => unary('tanh',    a)
+export const sigmoid = (a: Tensor): Tensor => unary('sigmoid', a)
+
+/** SiLU / Swish: `x * sigmoid(x)`. Composed from primitives. */
+export function silu(a: Tensor): Tensor {
+  return mul(a, sigmoid(a))
+}
+
+/** GELU using the GPT-2 tanh approximation:
+ *  `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))`. Composed. */
+export function gelu(a: Tensor): Tensor {
+  const c = 0.7978845608028654 // sqrt(2 / π)
+  const x3 = mul(mul(a, a), a)
+  const inner = mul(add(a, mul(x3, 0.044715)), c)
+  return mul(mul(a, 0.5), add(tanh(inner), 1))
+}
 
 // ----------------------------------------------------------------------------
 // Reductions over the last axis. To reduce along other axes, transpose first.
@@ -115,6 +149,17 @@ export function sumLast(a: Tensor): Tensor {
 /** Reduce all elements to a 0-d scalar. Composes `reshape` + `sumLast`. */
 export function sumAll(a: Tensor): Tensor {
   return sumLast(reshape(a, [-1]))
+}
+
+/** Index of the maximum value along the last axis. Returns `i32`, one rank
+ *  less than input (keepdims=false). Non-differentiable: gradients do not
+ *  flow back through this op. Useful for greedy decode, accuracy probes,
+ *  and any in-graph classification where you don't want a CPU readback. */
+export function argmaxLast(a: Tensor): Tensor {
+  const site = captureSite('argmaxLast')
+  if (a.dtype !== 'f32') throw new ShapeError(`argmaxLast: requires f32, got ${a.dtype}`, site)
+  const outShape = inferArgmaxLast('argmaxLast', a.shape, site)
+  return addOp(currentGraph(), 'argmax_last', outShape, 'i32', site, { a: a.id })
 }
 
 /** Mean of every element, returning a 0-d scalar. Equivalent to
