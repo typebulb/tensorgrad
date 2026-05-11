@@ -537,6 +537,161 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
     case 'adam_update_p':
       throw new Error(`eval: ${op.kind} is an optimizer-fused op; tests should not need to evaluate it`)
 
+    // ---- 2D conv + pool. Mirror WGSL in src/codegen.ts byte-for-byte
+    //      in terms of index math + scan order (especially for the pool
+    //      argmax-on-ties behavior). ----------------------------------------
+    case 'conv2d': {
+      const input = vals.get(op.input)! as Float32Array
+      const weight = vals.get(op.weight)! as Float32Array
+      const inT = graph.tensors[op.input]!
+      const wT = graph.tensors[op.weight]!
+      const outT = graph.tensors[op.out]!
+      const [, cIn, H, W] = inT.shape
+      const [cOut, , kH, kW] = wT.shape
+      const [, , hOut, wOut] = outT.shape
+      const out = new Float32Array(shapeSize(outT.shape))
+      const B = outT.shape[0]!
+      for (let b = 0; b < B; b++) for (let co = 0; co < cOut!; co++) for (let ho = 0; ho < hOut!; ho++) for (let wo = 0; wo < wOut!; wo++) {
+        let s = 0
+        for (let ci = 0; ci < cIn!; ci++) for (let kh = 0; kh < kH!; kh++) {
+          const hi = ho * op.strideH + kh - op.padH
+          if (hi < 0 || hi >= H!) continue
+          for (let kw = 0; kw < kW!; kw++) {
+            const wi = wo * op.strideW + kw - op.padW
+            if (wi < 0 || wi >= W!) continue
+            s += input[b * cIn! * H! * W! + ci * H! * W! + hi * W! + wi]!
+               * weight[co * cIn! * kH! * kW! + ci * kH! * kW! + kh * kW! + kw]!
+          }
+        }
+        out[b * cOut! * hOut! * wOut! + co * hOut! * wOut! + ho * wOut! + wo] = s
+      }
+      return out
+    }
+    case 'conv2d_input_grad': {
+      const weight = vals.get(op.weight)! as Float32Array
+      const dy = vals.get(op.dy)! as Float32Array
+      const wT = graph.tensors[op.weight]!
+      const dyT = graph.tensors[op.dy]!
+      const outT = graph.tensors[op.out]!
+      const [cOut, cIn, kH, kW] = wT.shape
+      const [, , hOut, wOut] = dyT.shape
+      const [B, , inH, inW] = outT.shape
+      const out = new Float32Array(shapeSize(outT.shape))
+      for (let b = 0; b < B!; b++) for (let ci = 0; ci < cIn!; ci++) for (let hi = 0; hi < inH!; hi++) for (let wi = 0; wi < inW!; wi++) {
+        let s = 0
+        for (let co = 0; co < cOut!; co++) {
+          for (let kh = 0; kh < kH!; kh++) {
+            const numH = hi + op.padH - kh
+            if (numH < 0 || numH % op.strideH !== 0) continue
+            const ho = numH / op.strideH
+            if (ho >= hOut!) continue
+            for (let kw = 0; kw < kW!; kw++) {
+              const numW = wi + op.padW - kw
+              if (numW < 0 || numW % op.strideW !== 0) continue
+              const wo = numW / op.strideW
+              if (wo >= wOut!) continue
+              s += weight[co * cIn! * kH! * kW! + ci * kH! * kW! + kh * kW! + kw]!
+                 * dy[b * cOut! * hOut! * wOut! + co * hOut! * wOut! + ho * wOut! + wo]!
+            }
+          }
+        }
+        out[b * cIn! * inH! * inW! + ci * inH! * inW! + hi * inW! + wi] = s
+      }
+      return out
+    }
+    case 'conv2d_weight_grad': {
+      const input = vals.get(op.input)! as Float32Array
+      const dy = vals.get(op.dy)! as Float32Array
+      const inT = graph.tensors[op.input]!
+      const dyT = graph.tensors[op.dy]!
+      const outT = graph.tensors[op.out]!
+      const [B, cIn, H, W] = inT.shape
+      const [, cOut, hOut, wOut] = dyT.shape
+      const [, , kH, kW] = outT.shape
+      const out = new Float32Array(shapeSize(outT.shape))
+      for (let co = 0; co < cOut!; co++) for (let ci = 0; ci < cIn!; ci++) for (let kh = 0; kh < kH!; kh++) for (let kw = 0; kw < kW!; kw++) {
+        let s = 0
+        for (let b = 0; b < B!; b++) {
+          for (let ho = 0; ho < hOut!; ho++) {
+            const hi = ho * op.strideH + kh - op.padH
+            if (hi < 0 || hi >= H!) continue
+            for (let wo = 0; wo < wOut!; wo++) {
+              const wi = wo * op.strideW + kw - op.padW
+              if (wi < 0 || wi >= W!) continue
+              s += input[b * cIn! * H! * W! + ci * H! * W! + hi * W! + wi]!
+                 * dy[b * cOut! * hOut! * wOut! + co * hOut! * wOut! + ho * wOut! + wo]!
+            }
+          }
+        }
+        out[co * cIn! * kH! * kW! + ci * kH! * kW! + kh * kW! + kw] = s
+      }
+      return out
+    }
+    case 'max_pool_2d': {
+      const input = vals.get(op.input)! as Float32Array
+      const inT = graph.tensors[op.input]!
+      const outT = graph.tensors[op.out]!
+      const [B, C, H, W] = inT.shape
+      const [, , hOut, wOut] = outT.shape
+      const out = new Float32Array(shapeSize(outT.shape))
+      for (let b = 0; b < B!; b++) for (let c = 0; c < C!; c++) for (let ho = 0; ho < hOut!; ho++) for (let wo = 0; wo < wOut!; wo++) {
+        let m = -3.4e38
+        for (let kh = 0; kh < op.kH; kh++) {
+          const hi = ho * op.strideH + kh - op.padH
+          if (hi < 0 || hi >= H!) continue
+          for (let kw = 0; kw < op.kW; kw++) {
+            const wi = wo * op.strideW + kw - op.padW
+            if (wi < 0 || wi >= W!) continue
+            const v = input[b * C! * H! * W! + c * H! * W! + hi * W! + wi]!
+            if (v > m) m = v
+          }
+        }
+        out[b * C! * hOut! * wOut! + c * hOut! * wOut! + ho * wOut! + wo] = m
+      }
+      return out
+    }
+    case 'max_pool_2d_grad': {
+      const input = vals.get(op.input)! as Float32Array
+      const dy = vals.get(op.dy)! as Float32Array
+      const inT = graph.tensors[op.input]!
+      const dyT = graph.tensors[op.dy]!
+      const [B, C, H, W] = inT.shape
+      const [, , hOut, wOut] = dyT.shape
+      const out = new Float32Array(shapeSize(inT.shape))
+      for (let b = 0; b < B!; b++) for (let c = 0; c < C!; c++) for (let hi = 0; hi < H!; hi++) for (let wi = 0; wi < W!; wi++) {
+        let s = 0
+        for (let kh = 0; kh < op.kH; kh++) {
+          const numH = hi + op.padH - kh
+          if (numH < 0 || numH % op.strideH !== 0) continue
+          const ho = numH / op.strideH
+          if (ho >= hOut!) continue
+          for (let kw = 0; kw < op.kW; kw++) {
+            const numW = wi + op.padW - kw
+            if (numW < 0 || numW % op.strideW !== 0) continue
+            const wo = numW / op.strideW
+            if (wo >= wOut!) continue
+            // Recompute argmax for (b, c, ho, wo).
+            let m = -3.4e38, argH = -1, argW = -1
+            for (let kkh = 0; kkh < op.kH; kkh++) {
+              const hh = ho * op.strideH + kkh - op.padH
+              if (hh < 0 || hh >= H!) continue
+              for (let kkw = 0; kkw < op.kW; kkw++) {
+                const ww = wo * op.strideW + kkw - op.padW
+                if (ww < 0 || ww >= W!) continue
+                const v = input[b * C! * H! * W! + c * H! * W! + hh * W! + ww]!
+                if (v > m) { m = v; argH = hh; argW = ww }
+              }
+            }
+            if (argH === hi && argW === wi) {
+              s += dy[b * C! * hOut! * wOut! + c * hOut! * wOut! + ho * wOut! + wo]!
+            }
+          }
+        }
+        out[b * C! * H! * W! + c * H! * W! + hi * W! + wi] = s
+      }
+      return out
+    }
+
     default: {
       const _exhaustive: never = op
       void _exhaustive

@@ -13,10 +13,58 @@
 
 import { Module } from './module.js'
 import type { Tensor } from './ir.js'
-import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmaxLast, embedding } from './ops.js'
+import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmaxLast, embedding, conv2d } from './ops.js'
+import type { Conv2dOptions } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
 import type { Captures } from './runtime.js'
+
+// ----------------------------------------------------------------------------
+// Conv2D: NCHW 2D convolution. Like `nn.Conv2d` in PyTorch.
+// ----------------------------------------------------------------------------
+
+export interface Conv2DOptions extends Conv2dOptions {
+  /** Include a bias term (default true). Shape `[outC]`, broadcast over
+   *  (B, H_out, W_out). */
+  bias?: boolean
+}
+
+export class Conv2D extends Module {
+  /** Weight, shape `[outC, inC, kH, kW]`. Default init is `randn` with
+   *  scale 0.02 (the tensorgrad default). For Kaiming init, pass
+   *  `{ init: init.kaiming() }` to a custom param() override — or rely on
+   *  the loss landscape's tolerance for the default. */
+  W: Tensor
+  /** Bias, shape `[outC]`, or null if `bias: false`. Broadcasts across the
+   *  H_out, W_out axes via reshape. */
+  b: Tensor | null
+  readonly strideH: number; readonly strideW: number
+  readonly padH: number;    readonly padW: number
+  constructor(
+    public readonly inC: number,
+    public readonly outC: number,
+    kernelSize: number | readonly [number, number],
+    opts: Conv2DOptions = {},
+  ) {
+    super()
+    const [kH, kW] = typeof kernelSize === 'number' ? [kernelSize, kernelSize] : [kernelSize[0], kernelSize[1]]
+    const [sH, sW] = typeof opts.stride === 'number' ? [opts.stride, opts.stride]
+      : opts.stride ? [opts.stride[0], opts.stride[1]] : [1, 1]
+    const [pH, pW] = typeof opts.padding === 'number' ? [opts.padding, opts.padding]
+      : opts.padding ? [opts.padding[0], opts.padding[1]] : [0, 0]
+    this.strideH = sH; this.strideW = sW
+    this.padH = pH; this.padW = pW
+    this.W = this.param([outC, inC, kH, kW])
+    this.b = opts.bias === false ? null : this.param([outC], { init: 'zeros' })
+  }
+  fwd(x: Tensor): Tensor {
+    const y = conv2d(x, this.W, { stride: [this.strideH, this.strideW], padding: [this.padH, this.padW] })
+    if (!this.b) return y
+    // Reshape bias [outC] → [1, outC, 1, 1] so it broadcasts over (B, H, W).
+    const bShaped = reshape(this.b, [1, this.outC, 1, 1])
+    return add(y, bShaped)
+  }
+}
 
 // ----------------------------------------------------------------------------
 // Embedding: integer indices → row lookup. Like `nn.Embedding` in PyTorch.

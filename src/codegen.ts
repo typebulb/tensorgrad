@@ -749,6 +749,254 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const total = shapeSize(out.shape)
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
+
+    // ---- 2D conv + pool ----------------------------------------------------
+    case 'conv2d': {
+      const input = tof(op.input)
+      const weight = tof(op.weight)
+      const out = tof(op.out)
+      const [, cIn, H, W] = input.shape
+      const [cOut, , kH, kW] = weight.shape
+      const [, , hOut, wOut] = out.shape
+      const total = shapeSize(out.shape)
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> input : array<f32>;
+@group(0) @binding(1) var<storage, read> weight : array<f32>;
+@group(0) @binding(2) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  let b      = i / ${cOut! * hOut! * wOut!}u;
+  let rem0   = i % ${cOut! * hOut! * wOut!}u;
+  let cOut_  = rem0 / ${hOut! * wOut!}u;
+  let rem1   = rem0 % ${hOut! * wOut!}u;
+  let h_out  = rem1 / ${wOut!}u;
+  let w_out  = rem1 % ${wOut!}u;
+  let inBase    = b * ${cIn! * H! * W!}u;
+  let wBase     = cOut_ * ${cIn! * kH! * kW!}u;
+  var s : f32 = 0.0;
+  for (var c : u32 = 0u; c < ${cIn!}u; c = c + 1u) {
+    let inChan = inBase + c * ${H! * W!}u;
+    let wChan  = wBase  + c * ${kH! * kW!}u;
+    for (var kh : u32 = 0u; kh < ${kH!}u; kh = kh + 1u) {
+      let h_in = i32(h_out * ${op.strideH}u + kh) - ${op.padH};
+      if (h_in < 0 || h_in >= ${H!}) { continue; }
+      for (var kw : u32 = 0u; kw < ${kW!}u; kw = kw + 1u) {
+        let w_in = i32(w_out * ${op.strideW}u + kw) - ${op.padW};
+        if (w_in < 0 || w_in >= ${W!}) { continue; }
+        s = s + input[inChan + u32(h_in) * ${W!}u + u32(w_in)]
+              * weight[wChan + kh * ${kW!}u + kw];
+      }
+    }
+  }
+  out[i] = s;
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.weight), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
+
+    case 'conv2d_input_grad': {
+      // dInput[b, c_in, h_in, w_in] = sum over (c_out, kh, kw) of
+      //   weight[c_out, c_in, kh, kw] * dy[b, c_out, h_out, w_out]
+      // where h_in = h_out * strideH + kh - padH, w_in similarly. Invert:
+      // h_out = (h_in + padH - kh) / strideH (must divide evenly).
+      const weight = tof(op.weight)
+      const dy = tof(op.dy)
+      const out = tof(op.out)
+      const [, cIn, inH, inW] = out.shape
+      const [cOut, , kH, kW] = weight.shape
+      const [, , hOut, wOut] = dy.shape
+      const total = shapeSize(out.shape)
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> weight : array<f32>;
+@group(0) @binding(1) var<storage, read> dy : array<f32>;
+@group(0) @binding(2) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  let b     = i / ${cIn! * inH! * inW!}u;
+  let rem0  = i % ${cIn! * inH! * inW!}u;
+  let c_in_ = rem0 / ${inH! * inW!}u;
+  let rem1  = rem0 % ${inH! * inW!}u;
+  let h_in  = rem1 / ${inW!}u;
+  let w_in  = rem1 % ${inW!}u;
+  var s : f32 = 0.0;
+  for (var c_out : u32 = 0u; c_out < ${cOut!}u; c_out = c_out + 1u) {
+    let wBase  = c_out * ${cIn! * kH! * kW!}u + c_in_ * ${kH! * kW!}u;
+    let dyBase = b * ${cOut! * hOut! * wOut!}u + c_out * ${hOut! * wOut!}u;
+    for (var kh : u32 = 0u; kh < ${kH!}u; kh = kh + 1u) {
+      let numH = i32(h_in) + ${op.padH} - i32(kh);
+      if (numH < 0) { continue; }
+      if ((numH % ${op.strideH}) != 0) { continue; }
+      let h_out = numH / ${op.strideH};
+      if (h_out >= ${hOut!}) { continue; }
+      for (var kw : u32 = 0u; kw < ${kW!}u; kw = kw + 1u) {
+        let numW = i32(w_in) + ${op.padW} - i32(kw);
+        if (numW < 0) { continue; }
+        if ((numW % ${op.strideW}) != 0) { continue; }
+        let w_out = numW / ${op.strideW};
+        if (w_out >= ${wOut!}) { continue; }
+        s = s + weight[wBase + kh * ${kW!}u + kw]
+              * dy[dyBase + u32(h_out) * ${wOut!}u + u32(w_out)];
+      }
+    }
+  }
+  out[i] = s;
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.weight), buf(op.dy), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
+
+    case 'conv2d_weight_grad': {
+      // dWeight[c_out, c_in, kh, kw] = sum over (b, h_out, w_out) of
+      //   input[b, c_in, h_in, w_in] * dy[b, c_out, h_out, w_out]
+      // where h_in = h_out * strideH + kh - padH.
+      const input = tof(op.input)
+      const dy = tof(op.dy)
+      const out = tof(op.out)
+      const [cOut, cIn, kH, kW] = out.shape
+      const [B, , H, W] = input.shape
+      const [, , hOut, wOut] = dy.shape
+      const total = shapeSize(out.shape)
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> input : array<f32>;
+@group(0) @binding(1) var<storage, read> dy : array<f32>;
+@group(0) @binding(2) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  let c_out_ = i / ${cIn! * kH! * kW!}u;
+  let rem0   = i % ${cIn! * kH! * kW!}u;
+  let c_in_  = rem0 / ${kH! * kW!}u;
+  let rem1   = rem0 % ${kH! * kW!}u;
+  let kh     = rem1 / ${kW!}u;
+  let kw     = rem1 % ${kW!}u;
+  var s : f32 = 0.0;
+  for (var b : u32 = 0u; b < ${B!}u; b = b + 1u) {
+    let inBase = b * ${cIn! * H! * W!}u + c_in_ * ${H! * W!}u;
+    let dyBase = b * ${cOut! * hOut! * wOut!}u + c_out_ * ${hOut! * wOut!}u;
+    for (var h_out : u32 = 0u; h_out < ${hOut!}u; h_out = h_out + 1u) {
+      let h_in = i32(h_out * ${op.strideH}u + kh) - ${op.padH};
+      if (h_in < 0 || h_in >= ${H!}) { continue; }
+      for (var w_out : u32 = 0u; w_out < ${wOut!}u; w_out = w_out + 1u) {
+        let w_in = i32(w_out * ${op.strideW}u + kw) - ${op.padW};
+        if (w_in < 0 || w_in >= ${W!}) { continue; }
+        s = s + input[inBase + u32(h_in) * ${W!}u + u32(w_in)]
+              * dy[dyBase + h_out * ${wOut!}u + w_out];
+      }
+    }
+  }
+  out[i] = s;
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.dy), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
+
+    case 'max_pool_2d': {
+      const input = tof(op.input)
+      const out = tof(op.out)
+      const [, C, H, W] = input.shape
+      const [B, , hOut, wOut] = out.shape
+      const total = shapeSize(out.shape)
+      // Initialize max to a large negative so out-of-bounds (padding) never
+      // wins. Forward picks the strictly-greater value, so ties favor the
+      // earliest position in scan order — backward replicates this scan.
+      const NEG = '-3.4e38'
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> input : array<f32>;
+@group(0) @binding(1) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  let b     = i / ${C! * hOut! * wOut!}u;
+  let rem0  = i % ${C! * hOut! * wOut!}u;
+  let c     = rem0 / ${hOut! * wOut!}u;
+  let rem1  = rem0 % ${hOut! * wOut!}u;
+  let h_out = rem1 / ${wOut!}u;
+  let w_out = rem1 % ${wOut!}u;
+  let inChan = b * ${C! * H! * W!}u + c * ${H! * W!}u;
+  var m : f32 = ${NEG};
+  for (var kh : u32 = 0u; kh < ${op.kH}u; kh = kh + 1u) {
+    let h_in = i32(h_out * ${op.strideH}u + kh) - ${op.padH};
+    if (h_in < 0 || h_in >= ${H!}) { continue; }
+    for (var kw : u32 = 0u; kw < ${op.kW}u; kw = kw + 1u) {
+      let w_in = i32(w_out * ${op.strideW}u + kw) - ${op.padW};
+      if (w_in < 0 || w_in >= ${W!}) { continue; }
+      let v = input[inChan + u32(h_in) * ${W!}u + u32(w_in)];
+      if (v > m) { m = v; }
+    }
+  }
+  out[i] = m;
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
+
+    case 'max_pool_2d_grad': {
+      // For each input position, walk every output whose receptive field
+      // covers it. Recompute the argmax (scan order, strictly-greater) and
+      // if our position was first-tied-max, accumulate dy.
+      const input = tof(op.input)
+      const dy = tof(op.dy)
+      const out = tof(op.out)
+      const [B, C, H, W] = input.shape
+      const [, , hOut, wOut] = dy.shape
+      const total = shapeSize(out.shape)
+      const NEG = '-3.4e38'
+      void B
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> input : array<f32>;
+@group(0) @binding(1) var<storage, read> dy : array<f32>;
+@group(0) @binding(2) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  let b     = i / ${C! * H! * W!}u;
+  let rem0  = i % ${C! * H! * W!}u;
+  let c     = rem0 / ${H! * W!}u;
+  let rem1  = rem0 % ${H! * W!}u;
+  let h_in  = rem1 / ${W!}u;
+  let w_in  = rem1 % ${W!}u;
+  let inChan = b * ${C! * H! * W!}u + c * ${H! * W!}u;
+  let dyChan = b * ${C! * hOut! * wOut!}u + c * ${hOut! * wOut!}u;
+  var s : f32 = 0.0;
+  for (var kh : u32 = 0u; kh < ${op.kH}u; kh = kh + 1u) {
+    let numH = i32(h_in) + ${op.padH} - i32(kh);
+    if (numH < 0) { continue; }
+    if ((numH % ${op.strideH}) != 0) { continue; }
+    let h_out = numH / ${op.strideH};
+    if (h_out >= ${hOut!}) { continue; }
+    for (var kw : u32 = 0u; kw < ${op.kW}u; kw = kw + 1u) {
+      let numW = i32(w_in) + ${op.padW} - i32(kw);
+      if (numW < 0) { continue; }
+      if ((numW % ${op.strideW}) != 0) { continue; }
+      let w_out = numW / ${op.strideW};
+      if (w_out >= ${wOut!}) { continue; }
+      // Recompute argmax for (b, c, h_out, w_out). Use the same scan order
+      // as forward so tie-breaking matches.
+      var m : f32 = ${NEG};
+      var argH : i32 = -1;
+      var argW : i32 = -1;
+      for (var kkh : u32 = 0u; kkh < ${op.kH}u; kkh = kkh + 1u) {
+        let hh = i32(u32(h_out) * ${op.strideH}u + kkh) - ${op.padH};
+        if (hh < 0 || hh >= ${H!}) { continue; }
+        for (var kkw : u32 = 0u; kkw < ${op.kW}u; kkw = kkw + 1u) {
+          let ww = i32(u32(w_out) * ${op.strideW}u + kkw) - ${op.padW};
+          if (ww < 0 || ww >= ${W!}) { continue; }
+          let v = input[inChan + u32(hh) * ${W!}u + u32(ww)];
+          if (v > m) { m = v; argH = hh; argW = ww; }
+        }
+      }
+      if (argH == i32(h_in) && argW == i32(w_in)) {
+        s = s + dy[dyChan + u32(h_out) * ${wOut!}u + u32(w_out)];
+      }
+    }
+  }
+  out[i] = s;
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.dy), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
   }
 }
 

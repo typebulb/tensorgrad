@@ -19,6 +19,7 @@ import {
   concat,
   softmaxCausalLast,
   gelu,
+  conv2d, maxPool2D,
 } from '../src/index.js'
 import { section, done } from './_assert.js'
 import { assertGradMatchesFD } from './_fdgrad.js'
@@ -70,6 +71,29 @@ assertGradMatchesFD('concat (variadic, gradient via sliceRange)', [3, 4], p => {
 //    (mul → add → mul → tanh → add → mul). Catches any layer-of-the-stack
 //    bug in chain-rule composition.
 assertGradMatchesFD('gelu (composed: chain rule through tanh approx)', [4], p => mean(gelu(p)))
+
+// 9. Conv2D (input gradient, two-input op with stride+padding). The param
+//    is the input image; the weight is a fixed tensor_input. Tests the
+//    conv2d_input_grad kernel which is the input-side backward.
+//    Shape [B=1, C_in=2, H=4, W=4]; weight [C_out=3, C_in=2, K_h=2, K_w=2];
+//    stride 1, padding 0 → output [1, 3, 3, 3].
+assertGradMatchesFD('conv2d (input gradient, stride 1, no padding)', [1, 2, 4, 4], p => {
+  const k = tensorInput('k', [3, 2, 2, 2])
+  return mean(conv2d(p, k))
+}, { extraInputs: { k: makeRange([3, 2, 2, 2]) } })
+
+// 9b. Conv2D weight gradient. Param is the weight; input is a fixed tensor.
+assertGradMatchesFD('conv2d (weight gradient, stride 2, padding 1)', [3, 2, 2, 2], p => {
+  const x = tensorInput('x', [1, 2, 4, 4])
+  return mean(conv2d(x, p, { stride: 2, padding: 1 }))
+}, { extraInputs: { x: makeRange([1, 2, 4, 4]) } })
+
+// 10. MaxPool2D: gradient routes only to the argmax position in each window.
+//     Use deterministic, well-separated values so ties don't muddy the FD
+//     comparison.
+assertGradMatchesFD('maxPool2D (argmax-routing gradient)', [1, 2, 4, 4], p => {
+  return mean(maxPool2D(p, 2))   // 2x2 pool, stride 2 (default)
+}, { paramInit: makeRange([1, 2, 4, 4]) })
 
 done('test/grad.ts')
 

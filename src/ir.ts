@@ -169,6 +169,70 @@ export type OpNode =
   // ReLU's backward: passes `dy` through where `x > 0`, else 0. Output shape = x's.
   | { kind: 'relu_grad'; out: number; x: number; dy: number }
 
+  // ---- 2D convolution (NCHW) ----------------------------------------------
+  // conv2d: forward. Input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
+  // -> [B, C_out, H_out, W_out]. Bias is added separately (via `add` + broadcast)
+  // so this op stays pure. Stride and per-side padding are non-negative ints.
+  | {
+      kind: 'conv2d'
+      out: number
+      input: number          // [B, C_in, H, W]
+      weight: number         // [C_out, C_in, K_h, K_w]
+      strideH: number; strideW: number
+      padH: number; padW: number
+    }
+  // conv2d input gradient: dInput = "transposed conv" of dy with weight.
+  // Computed as a gather: each input position sums contributions from every
+  // output position whose receptive field contained it. Shape matches `input`.
+  | {
+      kind: 'conv2d_input_grad'
+      out: number
+      weight: number         // [C_out, C_in, K_h, K_w]
+      dy: number             // [B, C_out, H_out, W_out]
+      inH: number; inW: number  // input spatial dims (target shape carries C_in implicitly via weight)
+      strideH: number; strideW: number
+      padH: number; padW: number
+    }
+  // conv2d weight gradient: dWeight = correlation between input and dy.
+  // Computed as a gather over (B, H_out, W_out) per (C_out, C_in, K_h, K_w).
+  // Shape matches `weight`.
+  | {
+      kind: 'conv2d_weight_grad'
+      out: number
+      input: number          // [B, C_in, H, W]
+      dy: number             // [B, C_out, H_out, W_out]
+      kH: number; kW: number
+      strideH: number; strideW: number
+      padH: number; padW: number
+    }
+
+  // ---- 2D max pooling (NCHW) ----------------------------------------------
+  // max_pool_2d: forward. Input [B, C, H, W] -> [B, C, H_out, W_out]. Argmax
+  // indices are not stored; the backward kernel recomputes them on the fly.
+  // Padded regions are treated as -inf (don't contribute to argmax).
+  | {
+      kind: 'max_pool_2d'
+      out: number
+      input: number          // [B, C, H, W]
+      kH: number; kW: number
+      strideH: number; strideW: number
+      padH: number; padW: number
+    }
+  // max_pool_2d backward: scatters dy to whichever input position was the
+  // argmax. Implemented as a gather (one thread per input element) to avoid
+  // atomics: each input position checks every output whose receptive field
+  // covers it, and if it's the argmax for that output, accumulates dy.
+  // `input` is the original forward input (needed to recompute argmax).
+  | {
+      kind: 'max_pool_2d_grad'
+      out: number
+      input: number          // [B, C, H, W] — the original forward input
+      dy: number             // [B, C, H_out, W_out]
+      kH: number; kW: number
+      strideH: number; strideW: number
+      padH: number; padW: number
+    }
+
 // A Graph collects ops and tensors during tracing, then becomes the input to
 // autograd and codegen. Once tracing is done it should be treated as immutable.
 export interface Graph {

@@ -17,6 +17,7 @@ import {
   inferReshape, inferTranspose, inferMatmul, inferMatmulBatched,
   inferOneHot, inferWhereCausal, inferSliceLastRange, inferSliceRange, inferConcat,
   inferBroadcastTo, inferSumToShape, inferReluGrad, inferWhere,
+  inferConv2d, inferMaxPool2d,
   ShapeError, showShape,
 } from './shape.js'
 
@@ -302,6 +303,21 @@ export function reshape(a: Tensor, newShape: Shape): Tensor {
   const site = captureSite('reshape')
   const outShape = inferReshape('reshape', a.shape, newShape, site)
   return addOp(currentGraph(), 'reshape', outShape, a.dtype, site, { a: a.id, newShape: outShape })
+}
+
+/** Flatten axes `[startAxis, end)` into a single trailing axis. PyTorch's
+ *  `torch.flatten(x, start_dim)`. Default `startAxis=1` collapses everything
+ *  but the leading batch dim — the canonical CNN classifier-head transition
+ *  from `[B, C, H, W]` to `[B, C*H*W]`. Pure reshape; no new IR op. */
+export function flatten(a: Tensor, startAxis: number = 1): Tensor {
+  const r = a.shape.length
+  const s = startAxis < 0 ? r + startAxis : startAxis
+  const site = captureSite('flatten')
+  if (s < 0 || s > r) {
+    throw new ShapeError(`flatten: startAxis ${startAxis} out of range for rank-${r}`, site)
+  }
+  if (s === r) return a  // no axes to collapse
+  return reshape(a, [...a.shape.slice(0, s), -1])
 }
 
 export function transpose(a: Tensor, perm: readonly number[]): Tensor {
@@ -631,5 +647,114 @@ export function adamUpdateP(
     eps,
     decayShrink: isTensor ? 1 : decayShrink,
     decayShrinkTensor: isTensor ? decayShrink.id : null,
+  })
+}
+
+// ----------------------------------------------------------------------------
+// 2D convolution and pooling (NCHW). Layout matches PyTorch so 1-shot ports
+// don't need a transpose. Bias is added separately (via `add` + broadcast) so
+// the IR op stays pure; see `nn.Conv2D` for the standard wrapper.
+// ----------------------------------------------------------------------------
+
+export interface Conv2dOptions {
+  /** Strides along H and W. Number = same for both. Default 1. */
+  stride?: number | readonly [number, number]
+  /** Per-side padding along H and W (zero-padding). Default 0. */
+  padding?: number | readonly [number, number]
+}
+
+function pairOpt(v: number | readonly [number, number] | undefined, defaultVal: number): [number, number] {
+  if (v === undefined) return [defaultVal, defaultVal]
+  if (typeof v === 'number') return [v, v]
+  return [v[0], v[1]]
+}
+
+/** 2D convolution. Input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
+ *  -> [B, C_out, H_out, W_out]. Bias is added separately via `add`; see
+ *  `nn.Conv2D` for the canonical layer wrapper. */
+export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOptions = {}): Tensor {
+  const site = captureSite('conv2d')
+  if (input.dtype !== 'f32') throw new ShapeError(`conv2d: input must be f32, got ${input.dtype}`, site)
+  if (weight.dtype !== 'f32') throw new ShapeError(`conv2d: weight must be f32, got ${weight.dtype}`, site)
+  const [sH, sW] = pairOpt(opts.stride, 1)
+  const [pH, pW] = pairOpt(opts.padding, 0)
+  const outShape = inferConv2d('conv2d', input.shape, weight.shape, sH, sW, pH, pW, site)
+  return addOp(currentGraph(), 'conv2d', outShape, 'f32', site, {
+    input: input.id, weight: weight.id,
+    strideH: sH, strideW: sW, padH: pH, padW: pW,
+  })
+}
+
+/** conv2d input-gradient op. Internal: emitted by autograd. */
+export function conv2dInputGrad(
+  weight: Tensor, dy: Tensor,
+  inH: number, inW: number,
+  strideH: number, strideW: number, padH: number, padW: number,
+): Tensor {
+  const site = captureSite('conv2dInputGrad')
+  const [cOut, cIn] = [weight.shape[0]!, weight.shape[1]!]
+  const B = dy.shape[0]!
+  // Output shape matches the original conv2d input.
+  const targetShape: Shape = [B, cIn, inH, inW]
+  // Validate dy's channel count matches weight's C_out.
+  if (dy.shape[1] !== cOut) {
+    throw new ShapeError(`conv2dInputGrad: dy's C=${dy.shape[1]} doesn't match weight C_out=${cOut}`, site)
+  }
+  return addOp(currentGraph(), 'conv2d_input_grad', targetShape, 'f32', site, {
+    weight: weight.id, dy: dy.id, inH, inW, strideH, strideW, padH, padW,
+  })
+}
+
+/** conv2d weight-gradient op. Internal: emitted by autograd. */
+export function conv2dWeightGrad(
+  input: Tensor, dy: Tensor,
+  kH: number, kW: number,
+  strideH: number, strideW: number, padH: number, padW: number,
+): Tensor {
+  const site = captureSite('conv2dWeightGrad')
+  const cIn = input.shape[1]!
+  const cOut = dy.shape[1]!
+  // Output shape matches the original conv2d weight.
+  const targetShape: Shape = [cOut, cIn, kH, kW]
+  return addOp(currentGraph(), 'conv2d_weight_grad', targetShape, 'f32', site, {
+    input: input.id, dy: dy.id, kH, kW, strideH, strideW, padH, padW,
+  })
+}
+
+export interface MaxPool2dOptions {
+  /** Strides along H and W. Default = kernel size (non-overlapping). */
+  stride?: number | readonly [number, number]
+  /** Per-side padding along H and W. Default 0. */
+  padding?: number | readonly [number, number]
+}
+
+/** 2D max pooling. Input [B, C, H, W] -> [B, C, H_out, W_out]. Padded regions
+ *  are treated as -inf for argmax. `kernelSize` is `[K_h, K_w]`; pass a number
+ *  for a square kernel. Default stride equals kernel size (non-overlapping).
+ *  PyTorch's `F.max_pool2d` convention. */
+export function maxPool2D(input: Tensor, kernelSize: number | readonly [number, number], opts: MaxPool2dOptions = {}): Tensor {
+  const site = captureSite('maxPool2D')
+  if (input.dtype !== 'f32') throw new ShapeError(`maxPool2D: input must be f32, got ${input.dtype}`, site)
+  const [kH, kW] = typeof kernelSize === 'number' ? [kernelSize, kernelSize] : [kernelSize[0], kernelSize[1]]
+  // Default stride = kernel (non-overlapping pooling, matching PyTorch).
+  const [sH, sW] = pairOpt(opts.stride, 0)
+  const [strideH, strideW] = sH === 0 ? [kH, kW] : [sH, sW]
+  const [pH, pW] = pairOpt(opts.padding, 0)
+  const outShape = inferMaxPool2d('maxPool2D', input.shape, kH, kW, strideH, strideW, pH, pW, site)
+  return addOp(currentGraph(), 'max_pool_2d', outShape, 'f32', site, {
+    input: input.id, kH, kW, strideH, strideW, padH: pH, padW: pW,
+  })
+}
+
+/** max_pool_2d backward op. Internal: emitted by autograd. Recomputes the
+ *  argmax on the fly to avoid needing a saved-indices buffer. */
+export function maxPool2DGrad(
+  input: Tensor, dy: Tensor,
+  kH: number, kW: number, strideH: number, strideW: number, padH: number, padW: number,
+): Tensor {
+  const site = captureSite('maxPool2DGrad')
+  // Output shape matches `input`.
+  return addOp(currentGraph(), 'max_pool_2d_grad', input.shape, 'f32', site, {
+    input: input.id, dy: dy.id, kH, kW, strideH, strideW, padH, padW,
   })
 }

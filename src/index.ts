@@ -23,12 +23,18 @@ export {
   type ReduceOpts,
   // Shape ops
   reshape, transpose, swapAxes,
+  // PyTorch-style flatten — collapse trailing axes into one. Sugar for reshape(-1).
+  flatten,
   // Linear algebra
   matmul, matmulBatched,
   // Indexing / casting
   oneHot, arange, embedding,
   // ML primitives — fused for the transformer
   softmaxCausalLast, logSoftmaxLast, softmaxLast, whereCausal,
+  // 2D convolution + pooling (NCHW, PyTorch-shape). conv2d/maxPool2D are the
+  // user surface; the *Grad helpers are emitted by autograd.
+  conv2d, maxPool2D,
+  type Conv2dOptions, type MaxPool2dOptions,
   // Slicing / structural
   sliceLastRange, sliceRange, concat, stack, split,
 } from './ops.js'

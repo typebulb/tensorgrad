@@ -104,8 +104,9 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `x.view(B, T, H, -1)` / `x.reshape(B, -1)` | `reshape(x, [B, T, H, -1])` — exactly one `-1` allowed, inferred from total size |
 | `torch.split(x, sizes, dim)` | `split(x, dim, sizes)` (note argument order) |
 | `nn.Embedding(V, D)` | `new nn.Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
-| `torch.flatten(x, 1)` | `reshape(x, [B, dim])` with `dim` computed explicitly. No `-1` wildcard yet. |
-| `nn.Conv2d` / `nn.MaxPool2d` | Not yet supported. |
+| `torch.flatten(x, start_dim=1)` | `flatten(x, 1)` (or `reshape(x, [B, -1])`) |
+| `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new nn.Conv2D(in, out, k, { stride: s, padding: p })` |
+| `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2D(x, k, { stride: s, padding: p })` |
 
 ### Things that aren't 1-to-1
 
@@ -328,6 +329,7 @@ Imported from `'tensorgrad'`:
 - Indexing / casting: `oneHot`, `arange`, `embedding`
 - Slicing / structural: `sliceLastRange`, `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, axis, sizes)`
 - Fused ML primitives: `softmaxLast`, `logSoftmaxLast`, `softmaxCausalLast`, `whereCausal`
+- 2D conv / pool (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2D(x, k, { stride?, padding? })`, `flatten(x, startAxis?)`
 
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
 `(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmaxLast`
@@ -351,6 +353,8 @@ nn.Linear(inDim, outDim, { bias? })  // .fwd(x); W: [inDim, outDim], b: [outDim]
 nn.LayerNorm(dim)                    // .fwd(x); g (gain) and b (bias) both [dim]
 nn.RMSNorm(dim, eps?)                // .fwd(x); g (gain) only — Llama-style
 nn.Embedding(vocab, dim)             // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
+nn.Conv2D(inC, outC, k, { stride?, padding?, bias? }) // .fwd(x); NCHW
+                                     // x: [B, inC, H, W] -> [B, outC, H', W']
 nn.splitHeads(x, nHeads)             // [B, T, D] → [B, H, T, D/H]
 nn.mergeHeads(x)                     // inverse of splitHeads
 nn.unsplitHeads(captures, name)      // pull per-head slices off a capture

@@ -310,3 +310,59 @@ export function inferReluGrad(opName: string, xShape: Shape, dyShape: Shape, sit
   }
   return xShape
 }
+
+/** Output spatial size for a 2D conv / pool. PyTorch convention:
+ *  `out = floor((in + 2*pad - kernel) / stride) + 1`.
+ *  Throws if the result would be < 1. */
+export function inferConv2dOutputSpatial(
+  opName: string,
+  inSize: number, kernel: number, stride: number, pad: number,
+  axisName: string, site: CallSite | null,
+): number {
+  if (kernel < 1) fail(`${opName}: ${axisName} kernel must be >= 1, got ${kernel}`, site)
+  if (stride < 1) fail(`${opName}: ${axisName} stride must be >= 1, got ${stride}`, site)
+  if (pad < 0) fail(`${opName}: ${axisName} padding must be >= 0, got ${pad}`, site)
+  const out = Math.floor((inSize + 2 * pad - kernel) / stride) + 1
+  if (out < 1) fail(`${opName}: ${axisName} output size would be ${out} (in=${inSize}, kernel=${kernel}, stride=${stride}, pad=${pad})`, site)
+  return out
+}
+
+/** conv2d: input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
+ *  -> [B, C_out, H_out, W_out]. */
+export function inferConv2d(
+  opName: string,
+  inputShape: Shape, weightShape: Shape,
+  strideH: number, strideW: number, padH: number, padW: number,
+  site: CallSite | null,
+): Shape {
+  if (inputShape.length !== 4) {
+    fail(`${opName}: input must be rank-4 [B, C_in, H, W], got ${showShape(inputShape)}`, site)
+  }
+  if (weightShape.length !== 4) {
+    fail(`${opName}: weight must be rank-4 [C_out, C_in, K_h, K_w], got ${showShape(weightShape)}`, site)
+  }
+  const [B, cIn, H, W] = [inputShape[0]!, inputShape[1]!, inputShape[2]!, inputShape[3]!]
+  const [cOut, wInC, kH, kW] = [weightShape[0]!, weightShape[1]!, weightShape[2]!, weightShape[3]!]
+  if (cIn !== wInC) {
+    fail(`${opName}: input C_in=${cIn} doesn't match weight C_in=${wInC}`, site)
+  }
+  const hOut = inferConv2dOutputSpatial(opName, H, kH, strideH, padH, 'H', site)
+  const wOut = inferConv2dOutputSpatial(opName, W, kW, strideW, padW, 'W', site)
+  return [B, cOut, hOut, wOut]
+}
+
+/** max_pool_2d: input [B, C, H, W] -> [B, C, H_out, W_out]. */
+export function inferMaxPool2d(
+  opName: string,
+  inputShape: Shape,
+  kH: number, kW: number, strideH: number, strideW: number, padH: number, padW: number,
+  site: CallSite | null,
+): Shape {
+  if (inputShape.length !== 4) {
+    fail(`${opName}: input must be rank-4 [B, C, H, W], got ${showShape(inputShape)}`, site)
+  }
+  const [B, C, H, W] = [inputShape[0]!, inputShape[1]!, inputShape[2]!, inputShape[3]!]
+  const hOut = inferConv2dOutputSpatial(opName, H, kH, strideH, padH, 'H', site)
+  const wOut = inferConv2dOutputSpatial(opName, W, kW, strideW, padW, 'W', site)
+  return [B, C, hOut, wOut]
+}

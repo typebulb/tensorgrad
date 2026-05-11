@@ -25,6 +25,7 @@ import {
   sum, where, less, greater,
   dropoutWithSalt,
   sliceRange,
+  conv2dInputGrad, conv2dWeightGrad, maxPool2DGrad,
 } from './ops.js'
 import { traceInto } from './trace.js'
 import { shapesEqual } from './shape.js'
@@ -481,6 +482,39 @@ function runTransposeRule(
     case 'adam_update_v':
     case 'adam_update_p':
       throw new Error(`autograd: cannot differentiate through ${op.kind}`)
+
+    // ---- Conv2D + MaxPool2D ----------------------------------------------
+    case 'conv2d': {
+      // c = conv2d(input, weight) with stride+padding.
+      // dInput = transposed-conv(weight, dy). dWeight = correlation(input, dy).
+      // Both implemented as gather kernels with the same stride/padding params.
+      const input = tensorOf(op.input)
+      const weight = tensorOf(op.weight)
+      const inH = input.shape[2]!
+      const inW = input.shape[3]!
+      const kH = weight.shape[2]!
+      const kW = weight.shape[3]!
+      accumulate(cotangents, op.input, conv2dInputGrad(
+        weight, outCotan, inH, inW, op.strideH, op.strideW, op.padH, op.padW,
+      ))
+      accumulate(cotangents, op.weight, conv2dWeightGrad(
+        input, outCotan, kH, kW, op.strideH, op.strideW, op.padH, op.padW,
+      ))
+      return
+    }
+    case 'max_pool_2d': {
+      const input = tensorOf(op.input)
+      accumulate(cotangents, op.input, maxPool2DGrad(
+        input, outCotan, op.kH, op.kW, op.strideH, op.strideW, op.padH, op.padW,
+      ))
+      return
+    }
+    case 'conv2d_input_grad':
+    case 'conv2d_weight_grad':
+    case 'max_pool_2d_grad':
+      // These are themselves backward ops emitted by conv2d / max_pool_2d.
+      // No second-order autograd through them.
+      throw new Error(`autograd: cannot differentiate through ${op.kind} (it's a backward op)`)
 
     // ---- relu_grad has no further backward (autograd-internal) ----------
     case 'relu_grad': {
