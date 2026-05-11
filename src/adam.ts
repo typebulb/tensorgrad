@@ -30,7 +30,7 @@ import type { Tensor } from './ir.js'
 import type { Graph } from './ir.js'
 import type { WritebackDecl } from './buffers.js'
 import { traceInto, stateInput, tensorInput } from './trace.js'
-import { adamUpdateM, adamUpdateV, adamUpdateP } from './ops.js'
+import { adamUpdateM, adamUpdateV, adamUpdateP, add, mul, sqrt, sumAll, div, min, broadcastTo, constScalar } from './ops.js'
 
 /** Per-step learning-rate schedule. Either a fixed number or one of the
  *  serializable shape forms below. Functions/closures are not supported —
@@ -140,6 +140,13 @@ export interface AdamConfig {
    *  transformer convention (decay weights/embeddings, skip biases + LN gains).
    *  Example: `(name) => name.includes('.W') || name.endsWith('_emb')`. */
   decayFilter?: (paramName: string) => boolean
+  /** Global L2-norm gradient clipping. When set, every gradient is scaled
+   *  by `min(1, maxNorm / (totalNorm + 1e-6))` before the Adam update,
+   *  where `totalNorm = sqrt(sum_p sumAll(grad_p ** 2))`. Standard
+   *  training-stability hygiene; matches PyTorch's `clip_grad_norm_` and
+   *  optax's `clip_by_global_norm`. Use `appendGradClip` directly if you
+   *  need to compose clipping with a custom optimizer. */
+  clipGradNorm?: number
 }
 
 /** Resolved hyperparameters with all fields populated. `lr` stays as the
@@ -170,6 +177,45 @@ export interface AdamResult {
 }
 
 /**
+ * Append global L2-norm gradient clipping to `graph`. Reads every gradient
+ * in `paramGrads`, computes the total norm across all of them, and emits a
+ * fresh `paramGrads` record where each tensor has been scaled by
+ * `min(1, maxNorm / (totalNorm + 1e-6))`.
+ *
+ * Matches PyTorch's `clip_grad_norm_` semantics and optax's
+ * `clip_by_global_norm`. The scale is global — every gradient shares one
+ * scaling factor — not per-parameter.
+ *
+ * Standalone extension hook: use this directly when composing clipping with
+ * a custom optimizer. For Adam, set `AdamConfig.clipGradNorm` and
+ * `appendAdam` calls this internally.
+ *
+ * Cross-parameter reduction is a chained add — fine at browser-scale param
+ * counts (tens to low hundreds). Each add is a rank-0 dispatch.
+ */
+export function appendGradClip(
+  graph: Graph,
+  paramGrads: Record<string, Tensor>,
+  maxNorm: number,
+): Record<string, Tensor> {
+  return traceInto(graph, () => {
+    const entries = Object.entries(paramGrads)
+    if (entries.length === 0) return paramGrads
+    // sum_p sumAll(grad_p²) — chained adds across params; each summand is rank-0.
+    let sumSq: Tensor = sumAll(mul(entries[0]![1], entries[0]![1]))
+    for (let i = 1; i < entries.length; i++) {
+      sumSq = add(sumSq, sumAll(mul(entries[i]![1], entries[i]![1])))
+    }
+    const scale = min(div(constScalar(maxNorm, 'f32'), add(sqrt(sumSq), 1e-6)), 1)
+    const clipped: Record<string, Tensor> = {}
+    for (const [name, g] of entries) {
+      clipped[name] = mul(g, broadcastTo(scale, g.shape))
+    }
+    return clipped
+  })
+}
+
+/**
  * Append Adam update ops to `graph`. Must be called inside an active trace
  * context (or after a trace, since traceInto re-enters the graph).
  *
@@ -192,6 +238,12 @@ export function appendAdam(
    *  directly without a Module). */
   decayFlags?: Record<string, boolean>,
 ): AdamResult {
+  // Global L2-norm clipping (if requested) runs before Adam's update path:
+  // gradients are scaled in-graph and the rest of appendAdam consumes the
+  // clipped values as if they were the originals.
+  if (config.clipGradNorm !== undefined && config.clipGradNorm > 0) {
+    paramGrads = appendGradClip(graph, paramGrads, config.clipGradNorm)
+  }
   const lrIsScheduled = isLRDynamic(config.lr)
   const initialLr = resolveLR(config.lr, 1)
   const fullConfig: AdamResolvedConfig = {

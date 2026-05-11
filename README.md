@@ -292,6 +292,26 @@ Which params receive weight decay is baked at compile time (per-param
 shrink magnitude on already-decayed params; it doesn't add decay to
 params that didn't have it.
 
+### Gradient clipping
+
+Global L2-norm clipping matches PyTorch's `clip_grad_norm_` and optax's
+`clip_by_global_norm`. Set `AdamConfig.clipGradNorm` for the common case:
+
+```ts
+const compiled = await compileModule({
+  ...,
+  adam: { lr: 0.001, clipGradNorm: 1.0 },   // bake clipping into the graph
+})
+```
+
+The clip is **global** across all params (one shared scale factor),
+applied between backward and the Adam update. Constant at compile time
+— there's no runtime knob to change `clipGradNorm` after compile.
+
+For custom optimizers, `appendGradClip(graph, paramGrads, maxNorm)` is
+the composable extension hook — call it before whatever optimizer pass
+you append, the same way `appendAdam` does internally.
+
 ### Param init (`init` namespace)
 
 ```ts

@@ -34,7 +34,7 @@ export {
 // adam.ts can import them) but aren't part of the public API — `add`/`mul`
 // overload on JS numbers, `where` subsumes the rest.
 export { appendGrad, type GradResult } from './grad.js'
-export { appendAdam, lr, resolveLR, type AdamConfig, type AdamResult, type LR } from './adam.js'
+export { appendAdam, appendGradClip, lr, resolveLR, type AdamConfig, type AdamResult, type LR } from './adam.js'
 export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
 export { emitKernels, type KernelSpec } from './codegen.js'
 // Runtime types: only the user-facing pieces. CompiledRuntime/CompiledForward
