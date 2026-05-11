@@ -59,7 +59,7 @@ export type Req =
   | { id: number; kind: 'downloadParams'; payload: { graphId: number } }
   | { id: number; kind: 'downloadParamGrads'; payload: { graphId: number } }
   | { id: number; kind: 'resetOptimizer'; payload: { graphId: number } }
-  | { id: number; kind: 'setLR'; payload: SetLRPayload }
+  | { id: number; kind: 'setOptimizerConfig'; payload: SetOptimizerConfigPayload }
   | { id: number; kind: 'destroy'; payload: { graphId: number } }
 
 /** Build the training runtime. Always graphId=0 for a fresh worker. */
@@ -102,12 +102,20 @@ export interface UploadParamsPayload {
   partial: boolean
 }
 
-/** Update the LR schedule of a training graph at runtime, without
- *  recompiling. The Adam step counter (`t`) is preserved — the new
- *  schedule is resolved at the current step. */
-export interface SetLRPayload {
+/** Update one or more Adam hyperparameters on a training graph at runtime,
+ *  without recompiling. The step counter is preserved. Only the fields
+ *  present are updated; absent fields stay unchanged. Note that the set
+ *  of decayed params is baked into the IR at compile time — adjusting
+ *  weightDecay here changes the shrink magnitude on already-decayed
+ *  params, not which params receive decay. */
+export interface SetOptimizerConfigPayload {
   graphId: number
-  lr: LRSchedule
+  update: {
+    lr?: LRSchedule
+    weightDecay?: number
+    b1?: number
+    b2?: number
+  }
 }
 
 // ============================================================================

@@ -230,12 +230,22 @@ function handleResetOptimizer(payload: { graphId: number }): void {
   if (slot.adam) slot.adam.t = 0
 }
 
-function handleSetLR(payload: { graphId: number; lr: LRSchedule }): void {
+function handleSetOptimizerConfig(payload: {
+  graphId: number
+  update: { lr?: LRSchedule; weightDecay?: number; b1?: number; b2?: number }
+}): void {
   const slot = mustGet(payload.graphId)
   if (!slot.adam) {
-    throw new Error(`setLR: graph ${payload.graphId} has no Adam optimizer (compileForward graphs don't take an LR)`)
+    throw new Error(`setOptimizerConfig: graph ${payload.graphId} has no Adam optimizer (compileForward graphs don't take optimizer state)`)
   }
-  slot.adam.config = { ...slot.adam.config, lr: payload.lr }
+  const cur = slot.adam.config
+  slot.adam.config = {
+    ...cur,
+    lr: payload.update.lr !== undefined ? payload.update.lr : cur.lr,
+    weightDecay: payload.update.weightDecay !== undefined ? payload.update.weightDecay : cur.weightDecay,
+    b1: payload.update.b1 !== undefined ? payload.update.b1 : cur.b1,
+    b2: payload.update.b2 !== undefined ? payload.update.b2 : cur.b2,
+  }
 }
 
 function handleDestroy(payload: { graphId: number }): void {
@@ -269,7 +279,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case 'downloadParams':    { const r = await handleDownloadParams(req.payload); result = r; transferList = collectTransfers(r.params); break }
       case 'downloadParamGrads':{ const r = await handleDownloadParamGrads(req.payload); result = r; transferList = collectTransfers(r.params); break }
       case 'resetOptimizer':    handleResetOptimizer(req.payload); result = null; break
-      case 'setLR':             handleSetLR(req.payload); result = null; break
+      case 'setOptimizerConfig':handleSetOptimizerConfig(req.payload); result = null; break
       case 'destroy':           handleDestroy(req.payload); result = null; break
       default: throw new Error(`unknown request kind: ${(req as { kind: string }).kind}`)
     }

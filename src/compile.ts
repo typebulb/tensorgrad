@@ -102,6 +102,16 @@ export interface CompileForwardOptions<I extends InputDecls = InputDecls> {
   inputs?: I
 }
 
+/** Optional fields to mutate on a CompiledModule's Adam state via
+ *  `setOptimizerConfig`. Any subset is allowed; absent fields keep their
+ *  current values. */
+export interface OptimizerConfigUpdate {
+  lr?: LRSchedule
+  weightDecay?: number
+  b1?: number
+  b2?: number
+}
+
 export interface CompileForwardMethodOptions<I extends InputDecls = InputDecls> {
   inputs?: I
 }
@@ -130,11 +140,14 @@ export interface CompiledModule<M extends Module> {
   reset(): Promise<void>
   resetOptimizerState(): Promise<void>
 
-  /** Update the Adam learning-rate schedule at runtime, without recompiling.
-   *  The step counter is preserved — the new schedule resolves at the current
-   *  step. Use a number for constant LR, or one of the `lr.*` shape
-   *  constructors (linearDecay, cosineDecay, warmup). */
-  setLR(schedule: LRSchedule): Promise<void>
+  /** Update one or more Adam hyperparameters at runtime, without recompiling.
+   *  Only the fields you pass are changed; everything else stays put. The
+   *  step counter is preserved (the new `lr` schedule, if any, resolves at
+   *  the current step). Use a number for constant `lr`, or one of the
+   *  `lr.*` shape constructors. Note: which params receive weight decay is
+   *  baked at compile time, so adjusting `weightDecay` here changes the
+   *  shrink magnitude on already-decayed params, not which params decay. */
+  setOptimizerConfig(update: OptimizerConfigUpdate): Promise<void>
 
   /** Compile a sibling forward-only graph that shares this runtime's worker
    *  (and therefore its param GPUBuffers). */
@@ -169,6 +182,16 @@ export interface CompiledForwardModule {
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
   downloadParams(): Promise<Record<string, Float32Array>>
+
+  /** Polymorphic-only: pre-compile a sibling at a specific resolved shape
+   *  so the first `run()` at that shape doesn't pay the trace + codegen
+   *  cost. Throws on non-polymorphic proxies (their shape is already
+   *  fixed) or on shapes that still contain a `null` wildcard. */
+  precompile?(decls: InputDecls): Promise<CompiledForwardModule>
+
+  /** Polymorphic-only: number of distinct input shapes this proxy has
+   *  cached. Stays at 1 for non-polymorphic proxies. */
+  readonly cachedShapeCount?: number
 
   destroy(): void
 }
@@ -367,9 +390,9 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M> {
     ).then(() => undefined)
   }
 
-  setLR(schedule: LRSchedule): Promise<void> {
+  setOptimizerConfig(update: OptimizerConfigUpdate): Promise<void> {
     return this.proxy.request<null>(
-      { kind: 'setLR', payload: { graphId: this.graphId, lr: schedule } },
+      { kind: 'setOptimizerConfig', payload: { graphId: this.graphId, update } },
     ).then(() => undefined)
   }
 
@@ -410,13 +433,15 @@ class CompiledForwardModuleProxy implements CompiledForwardModule {
     private readonly ownsWorker: boolean,
   ) {}
 
-  // Single-flight state for `runLatest`. One run is allowed in flight; any
-  // additional calls coalesce — the most recent (inputs, opts) is what
-  // actually runs next, and every queued caller resolves with that result.
+  // Single-flight state for `runLatest`. One run is allowed in flight; at
+  // most one queued waiter. If a new call arrives while one is queued, the
+  // older queued waiter rejects with `AbortError` (matching RxJS switchMap
+  // / p-debounce convention). Only the *most recent* caller's args run when
+  // the in-flight call finishes.
   private latestActive: Promise<unknown> | null = null
   private latestPending:
     | { inputs: Record<string, Int32Array | Float32Array>; opts: { withCaptures?: boolean } | undefined;
-        resolvers: Array<{ resolve: (r: Float32Array | RunResult) => void; reject: (e: Error) => void }> }
+        resolver: { resolve: (r: Float32Array | RunResult) => void; reject: (e: Error) => void } }
     | null = null
 
   get kernelCount(): number { return this.meta.kernelCount }
@@ -449,29 +474,25 @@ class CompiledForwardModuleProxy implements CompiledForwardModule {
       const p = this.run(inputs, opts as { withCaptures: true })
       this.latestActive = p.finally(() => {
         this.latestActive = null
+        // Drain the queue, if any: only the latest waiter runs.
         if (this.latestPending) {
-          const { inputs, opts, resolvers } = this.latestPending
+          const pend = this.latestPending
           this.latestPending = null
-          // Re-enter with the latest args; broadcast result to all queued callers.
-          this.runLatest(inputs, opts as { withCaptures: true }).then(
-            (r) => resolvers.forEach(rv => rv.resolve(r)),
-            (e) => resolvers.forEach(rv => rv.reject(e as Error)),
+          this.runLatest(pend.inputs, pend.opts as { withCaptures: true }).then(
+            pend.resolver.resolve, pend.resolver.reject,
           )
         }
       })
       return p
     }
-    // Already in flight: replace queued args with these, return a promise
-    // that resolves with the next run's result.
+    // Already in flight: this call replaces any older queued waiter. The
+    // displaced waiter rejects with AbortError — caller should swallow it
+    // (it just means a newer call superseded them).
     if (this.latestPending) {
-      this.latestPending.inputs = inputs
-      this.latestPending.opts = opts
-      return new Promise<Float32Array | RunResult>((resolve, reject) => {
-        this.latestPending!.resolvers.push({ resolve, reject })
-      })
+      this.latestPending.resolver.reject(abortErr('runLatest: superseded by newer call'))
     }
     return new Promise<Float32Array | RunResult>((resolve, reject) => {
-      this.latestPending = { inputs, opts, resolvers: [{ resolve, reject }] }
+      this.latestPending = { inputs, opts, resolver: { resolve, reject } }
     })
   }
 
@@ -494,6 +515,18 @@ class CompiledForwardModuleProxy implements CompiledForwardModule {
   }
 }
 
+function abortErr(msg: string): Error {
+  const e = new Error(msg)
+  e.name = 'AbortError'
+  return e
+}
+
+/** Threshold at which the polymorphic forward proxy emits a one-time
+ *  console warning about cache growth. Picked as a reasonable upper bound
+ *  for legitimate use (B=1 predict + B=N eval + a few sizes for autoregressive
+ *  generation) but low enough to catch accidental shape fuzzing early. */
+const POLYMORPHIC_CACHE_WARN_AT = 8
+
 /** Polymorphic sibling forward proxy. Returned by `train.compileForward(...)`
  *  when any input shape contains a `null` wildcard. Compiles a fresh sibling
  *  graph the first time `run()` is called at each distinct resolved shape;
@@ -505,13 +538,17 @@ class PolymorphicForwardProxy<M extends Module> implements CompiledForwardModule
   /** Most-recently-compiled sibling. Used as a fallback for `ir`,
    *  `kernelCount`, `outputShape`, `paramNames` after the first call. */
   private last: CompiledForwardModuleProxy | null = null
+  /** Single warning per proxy when the cache crosses the threshold; further
+   *  growth is silent (the user has been told). */
+  private warnedCacheSize = false
 
-  // Single-flight state for runLatest, shared across all cached siblings:
-  // we always coalesce against whichever sibling matches the latest shape.
+  // Single-flight state for runLatest. Same reject-queued semantics as the
+  // eager proxy: an older queued waiter rejects with AbortError when a
+  // newer call arrives.
   private latestActive: Promise<unknown> | null = null
   private latestPending:
     | { inputs: Record<string, Int32Array | Float32Array>; opts: { withCaptures?: boolean } | undefined;
-        resolvers: Array<{ resolve: (r: Float32Array | RunResult) => void; reject: (e: Error) => void }> }
+        resolver: { resolve: (r: Float32Array | RunResult) => void; reject: (e: Error) => void } }
     | null = null
 
   constructor(
@@ -542,6 +579,10 @@ class PolymorphicForwardProxy<M extends Module> implements CompiledForwardModule
 
   private async siblingFor(inputs: Record<string, Int32Array | Float32Array>): Promise<CompiledForwardModuleProxy> {
     const resolved = resolveDecls(this.decls, inputs)
+    return await this.siblingForDecls(resolved)
+  }
+
+  private async siblingForDecls(resolved: InputDecls): Promise<CompiledForwardModuleProxy> {
     const key = shapeKey(resolved)
     const hit = this.cache.get(key)
     if (hit) { this.last = hit; return hit }
@@ -551,8 +592,34 @@ class PolymorphicForwardProxy<M extends Module> implements CompiledForwardModule
     )
     this.cache.set(key, sib)
     this.last = sib
+    if (!this.warnedCacheSize && this.cache.size > POLYMORPHIC_CACHE_WARN_AT) {
+      this.warnedCacheSize = true
+      console.warn(
+        `tensorgrad: polymorphic forward proxy has compiled ${this.cache.size} distinct ` +
+        `input shapes. Each entry holds its own kernels and bind groups — if this is ` +
+        `unexpected, your call sites may be feeding too many distinct shapes. ` +
+        `Use .precompile(...) to pre-warm a known set of shapes, or .destroy() to clear.`,
+      )
+    }
     return sib
   }
+
+  /** Pre-compile a sibling at a specific resolved shape so the first
+   *  matching `run()` is hot. Useful for latency-sensitive paths that
+   *  would otherwise pay the trace + codegen cost on first call. Returns
+   *  the resolved sibling proxy so its `ir`/`kernelCount`/`outputShape`
+   *  metadata are also available eagerly. Shapes here must be fully
+   *  concrete (no `null`). */
+  async precompile(decls: InputDecls): Promise<CompiledForwardModule> {
+    if (isPolymorphicDecls(decls)) {
+      throw new Error('precompile: shapes must be fully concrete (no `null` wildcards)')
+    }
+    return await this.siblingForDecls(decls)
+  }
+
+  /** Number of distinct input shapes this proxy has compiled (and is
+   *  caching). Useful for monitoring if you suspect cache growth. */
+  get cachedShapeCount(): number { return this.cache.size }
 
   run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
   run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
@@ -575,25 +642,20 @@ class PolymorphicForwardProxy<M extends Module> implements CompiledForwardModule
       this.latestActive = p.finally(() => {
         this.latestActive = null
         if (this.latestPending) {
-          const { inputs, opts, resolvers } = this.latestPending
+          const pend = this.latestPending
           this.latestPending = null
-          this.runLatest(inputs, opts as { withCaptures: true }).then(
-            (r) => resolvers.forEach(rv => rv.resolve(r)),
-            (e) => resolvers.forEach(rv => rv.reject(e as Error)),
+          this.runLatest(pend.inputs, pend.opts as { withCaptures: true }).then(
+            pend.resolver.resolve, pend.resolver.reject,
           )
         }
       })
       return p
     }
     if (this.latestPending) {
-      this.latestPending.inputs = inputs
-      this.latestPending.opts = opts
-      return new Promise<Float32Array | RunResult>((resolve, reject) => {
-        this.latestPending!.resolvers.push({ resolve, reject })
-      })
+      this.latestPending.resolver.reject(abortErr('runLatest: superseded by newer call'))
     }
     return new Promise<Float32Array | RunResult>((resolve, reject) => {
-      this.latestPending = { inputs, opts, resolvers: [{ resolve, reject }] }
+      this.latestPending = { inputs, opts, resolver: { resolve, reject } }
     })
   }
 

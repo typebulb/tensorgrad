@@ -121,16 +121,36 @@ One `null` per shape (multi-wildcard isn't exposed yet). Only available
 on the sibling-method form of `compileForward`; standalone `compileForward`
 and `compileModule` require fully concrete shapes.
 
+The first `run()` at each new shape pays the trace + codegen cost. For
+latency-sensitive paths, pre-warm a known set of shapes:
+
+```ts
+await infer.precompile({ x: { shape: [1, 784], dtype: 'f32' } })
+await infer.precompile({ x: { shape: [256, 784], dtype: 'f32' } })
+// later run() calls at those shapes hit the cache immediately
+```
+
+The proxy emits a one-time `console.warn` if its cache grows past 8
+distinct shapes — a guardrail against accidental shape fuzzing.
+Inspect with `infer.cachedShapeCount`.
+
 Forward-only modules also expose `runLatest(inputs)` for live-preview
-patterns: if a previous `runLatest` is still in flight, subsequent calls
-coalesce — only the newest inputs actually run, and every queued caller
-resolves with that latest result. Use it when stale intermediate inputs
-(earlier mouse positions, partial drawings) should be dropped:
+patterns: if a previous `runLatest` is still in flight, the new call
+queues; if *another* arrives before the queued one runs, the queued one
+**rejects with `AbortError`** (matching RxJS `switchMap` / p-debounce
+convention). Only the most recent call's result is delivered. Use it
+when stale intermediate inputs (earlier mouse positions, partial
+drawings) should be dropped:
 
 ```ts
 canvas.addEventListener('pointermove', async () => {
-  const out = await infer.runLatest({ tokens: latestTokens() })
-  updateUI(out)
+  try {
+    const out = await infer.runLatest({ tokens: latestTokens() })
+    updateUI(out)
+  } catch (e: any) {
+    if (e?.name === 'AbortError') return  // superseded — newer call will update
+    throw e
+  }
 })
 ```
 
@@ -146,7 +166,7 @@ compiled.downloadParams()                       // → Record<name, Float32Array
 compiled.downloadParamGrads()                   // → Record<name, Float32Array>
 compiled.reset()                                // re-init params + zero Adam state
 compiled.resetOptimizerState()
-compiled.setLR(schedule)                        // change Adam LR without recompile
+compiled.setOptimizerConfig({ lr?, weightDecay?, b1?, b2? })  // mutate without recompile
 compiled.compileForward(forward, { inputs? })   // sibling forward graph
 compiled.destroy()                              // tear down worker + GPU
 ```
@@ -200,14 +220,23 @@ adam: { lr: lr.warmup({ peakLr: 0.001, warmupSteps: 200, after: lr.constant(0.00
 LR schedules are serializable shapes, not closures (they cross the worker
 boundary). Use a `number` for constant LR, or one of the constructors above.
 
-Change LR mid-training without recompiling via `compiled.setLR(schedule)`.
-The Adam step counter is preserved — the new schedule resolves at the
-current step. Useful for UI knobs that adjust LR live:
+Mutate Adam hyperparameters mid-training without recompiling via
+`compiled.setOptimizerConfig({ ... })`. Pass any subset; absent fields
+stay put. The step counter is preserved (a new `lr` schedule resolves
+at the current step). Useful for UI knobs that adjust LR or weight
+decay live:
 
 ```ts
-await compiled.setLR(0.001)                                          // constant
-await compiled.setLR(lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }))
+await compiled.setOptimizerConfig({ lr: 0.001 })
+await compiled.setOptimizerConfig({ lr: lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }) })
+await compiled.setOptimizerConfig({ weightDecay: 0.01 })
+await compiled.setOptimizerConfig({ lr: 0.0005, weightDecay: 0.001 })  // both at once
 ```
+
+Note: which params receive weight decay is baked at compile time (via
+per-param `{ decay: true | false }` metadata). `setOptimizerConfig`
+changes the shrink magnitude on already-decayed params; it doesn't
+add decay to params that didn't have it.
 
 ### Param init (`init` namespace)
 
