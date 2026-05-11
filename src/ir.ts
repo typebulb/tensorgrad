@@ -149,6 +149,15 @@ export type OpNode =
   // last axis replaced by (end - start). Used for splitting Q/K/V from a
   // single fused QKV matmul.
   | { kind: 'slice_last_range'; out: number; a: number; start: number; end: number }
+  // General-axis slice: take elements [start, end) along `axis`. Axis is
+  // non-negative; ops.ts normalizes negative axes before constructing.
+  | { kind: 'slice_range'; out: number; a: number; axis: number; start: number; end: number }
+  // Concatenation along `axis` of two or more inputs. All inputs must have
+  // identical shape except along `axis`; output's size on `axis` is the sum.
+  // Variable-arity input — the only such op in the IR. Capped at 7 inputs
+  // by codegen (WebGPU bind group limit: 8 storage buffers per stage,
+  // minus 1 for the output).
+  | { kind: 'concat'; out: number; inputs: readonly number[]; axis: number }
   // Broadcast `a` to `targetShape`. Standard right-aligned NumPy broadcast.
   // Used by autograd to expand cotangents back over reduced/broadcast axes.
   | { kind: 'broadcast_to'; out: number; a: number; targetShape: Shape }

@@ -217,6 +217,49 @@ export function inferSliceLastRange(opName: string, aShape: Shape, start: number
   return [...aShape.slice(0, -1), end - start]
 }
 
+/** General-axis slice. `axis` is non-negative; callers must normalize any
+ *  negative-axis input before calling. */
+export function inferSliceRange(opName: string, aShape: Shape, axis: number, start: number, end: number, site: CallSite | null): Shape {
+  if (aShape.length === 0) fail(`${opName}: cannot slice 0-d tensor`, site)
+  if (axis < 0 || axis >= aShape.length) {
+    fail(`${opName}: axis ${axis} out of range for shape ${showShape(aShape)}`, site)
+  }
+  const dim = aShape[axis]!
+  if (start < 0 || end > dim || start >= end) {
+    fail(`${opName}: invalid range [${start}, ${end}) for axis ${axis} of size ${dim}`, site)
+  }
+  const out = aShape.slice()
+  out[axis] = end - start
+  return out
+}
+
+/** Concat along `axis`. All inputs must have identical shape except along
+ *  `axis`; output's size on `axis` is the sum. `axis` is non-negative. */
+export function inferConcat(opName: string, shapes: readonly Shape[], axis: number, site: CallSite | null): Shape {
+  if (shapes.length === 0) fail(`${opName}: needs at least one input`, site)
+  const first = shapes[0]!
+  if (axis < 0 || axis >= first.length) {
+    fail(`${opName}: axis ${axis} out of range for shape ${showShape(first)}`, site)
+  }
+  let axisTotal = first[axis]!
+  for (let i = 1; i < shapes.length; i++) {
+    const s = shapes[i]!
+    if (s.length !== first.length) {
+      fail(`${opName}: input ${i} has rank ${s.length}, expected ${first.length}`, site)
+    }
+    for (let d = 0; d < first.length; d++) {
+      if (d === axis) continue
+      if (s[d]! !== first[d]!) {
+        fail(`${opName}: input ${i} has shape ${showShape(s)}, must match ${showShape(first)} except along axis ${axis}`, site)
+      }
+    }
+    axisTotal += s[axis]!
+  }
+  const out = first.slice()
+  out[axis] = axisTotal
+  return out
+}
+
 // broadcast_to: validate that `aShape` can broadcast to `targetShape` under
 // right-aligned NumPy rules. Returns targetShape on success.
 export function inferBroadcastTo(opName: string, aShape: Shape, targetShape: Shape, site: CallSite | null): Shape {

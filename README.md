@@ -236,13 +236,21 @@ Imported from `'tensorgrad'`:
 - Shape: `reshape`, `transpose`, `swapAxes`
 - Linear algebra: `matmul`, `matmulBatched`
 - Indexing / casting: `oneHot`, `arange`, `embedding`
-- Slicing: `sliceLastRange`
+- Slicing / structural: `sliceLastRange`, `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, axis, sizes)`
 - Fused ML primitives: `softmaxLast`, `logSoftmaxLast`, `softmaxCausalLast`, `whereCausal`
 
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
 `(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmaxLast`
 returns `i32` and is non-differentiable. The standard loss tail is
 `meanAll(crossEntropyLast(logits, targets))`.
+
+**Structural ops.** `concat([a, b], axis)` joins along an existing axis;
+`stack([a, b], axis)` joins along a new axis (sugar for
+`reshape` + `concat`). Negative axes index from the end (Python
+convention). Concat is capped at 7 inputs (WebGPU bind-group limit:
+8 storage buffers per shader stage minus the output) — chain a second
+concat if you need more. `split(t, axis, sizes)` is the inverse, built
+from `sliceRange`.
 
 ### `nn` namespace
 

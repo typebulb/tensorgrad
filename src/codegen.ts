@@ -573,6 +573,84 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
 
+    case 'slice_range': {
+      // General-axis slice. Output element at flat index `i` decomposes into
+      // (outerIdx, axisIdx, innerIdx); input element is at the same outer/inner
+      // but axisIdx shifted by `start` and axis stride D_in instead of D_out.
+      const out = tof(op.out)
+      const a = tof(op.a)
+      const axis = op.axis
+      const inner = a.shape.slice(axis + 1).reduce((p, d) => p * d, 1)
+      const D_in = a.shape[axis]!
+      const D_out = op.end - op.start
+      const total = shapeSize(out.shape)
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> a : array<${wgslDtype(a.dtype)}>;
+@group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  let outer = i / ${D_out * inner}u;
+  let rest = i % ${D_out * inner}u;
+  let axisIdx = rest / ${inner}u;
+  let innerIdx = rest % ${inner}u;
+  out[i] = a[outer * ${D_in * inner}u + (axisIdx + ${op.start}u) * ${inner}u + innerIdx];
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
+
+    case 'concat': {
+      // Variadic. For each output element, locate which input it came from
+      // by walking the axis-offset chain; index into that input. Inputs are
+      // bound 0..N-1; output is the last binding.
+      const out = tof(op.out)
+      const axis = op.axis
+      const inner = out.shape.slice(axis + 1).reduce((p, d) => p * d, 1)
+      const D_out = out.shape[axis]!
+      const total = shapeSize(out.shape)
+      const inputDtypes = op.inputs.map(id => tof(id).dtype)
+      const inputAxisSizes = op.inputs.map(id => tof(id).shape[axis]!)
+      // Chain of `if (axisIdx < offset+size) { read from input k }` selecting
+      // the source input by output's axis index.
+      let cursor = 0
+      const branches: string[] = []
+      for (let k = 0; k < op.inputs.length; k++) {
+        const sz = inputAxisSizes[k]!
+        const lo = cursor
+        const hi = cursor + sz
+        const D_in = sz
+        branches.push(
+          `  ${k === 0 ? '' : 'else '}if (axisIdx < ${hi}u) {\n` +
+          `    out[i] = src${k}[outer * ${D_in * inner}u + (axisIdx - ${lo}u) * ${inner}u + innerIdx];\n` +
+          `    return;\n` +
+          `  }`,
+        )
+        cursor += sz
+      }
+      const bindingDecls = op.inputs.map((_, k) =>
+        `@group(0) @binding(${k}) var<storage, read> src${k} : array<${wgslDtype(inputDtypes[k]!)}>;`,
+      ).join('\n')
+      const wgsl = `
+${bindingDecls}
+@group(0) @binding(${op.inputs.length}) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  let outer = i / ${D_out * inner}u;
+  let rest = i % ${D_out * inner}u;
+  let axisIdx = rest / ${inner}u;
+  let innerIdx = rest % ${inner}u;
+${branches.join('\n')}
+}`.trim()
+      return {
+        opIndex, opKind: op.kind, wgsl,
+        bindings: [...op.inputs.map(id => buf(id)), buf(op.out)],
+        threads: total, workgroupSize: WG_SIZE,
+      }
+    }
+
     // ---- Broadcast / un-broadcast (autograd infrastructure) ----------------
     case 'broadcast_to': {
       const out = tof(op.out)

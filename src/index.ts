@@ -27,8 +27,8 @@ export {
   oneHot, arange, embedding,
   // ML primitives — fused for the transformer
   softmaxCausalLast, logSoftmaxLast, softmaxLast, whereCausal,
-  // Slicing
-  sliceLastRange,
+  // Slicing / structural
+  sliceLastRange, sliceRange, concat, stack, split,
 } from './ops.js'
 
 // Note: addScalar/mulScalar/broadcastTo/sumToShape/constScalar/reluGrad/adam_update_*

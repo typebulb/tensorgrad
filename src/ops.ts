@@ -15,7 +15,7 @@ import { currentGraph, tensorInput } from './trace.js'
 import {
   inferElementwiseBinop, inferUnary, inferMeanLast, inferSumLast, inferArgmaxLast,
   inferReshape, inferTranspose, inferMatmul, inferMatmulBatched,
-  inferOneHot, inferWhereCausal, inferSliceLastRange,
+  inferOneHot, inferWhereCausal, inferSliceLastRange, inferSliceRange, inferConcat,
   inferBroadcastTo, inferSumToShape, inferReluGrad, inferWhere,
   ShapeError, showShape,
 } from './shape.js'
@@ -373,6 +373,71 @@ export function sliceLastRange(a: Tensor, start: number, end: number): Tensor {
   const site = captureSite('sliceLastRange')
   const outShape = inferSliceLastRange('sliceLastRange', a.shape, start, end, site)
   return addOp(currentGraph(), 'slice_last_range', outShape, a.dtype, site, { a: a.id, start, end })
+}
+
+/** General-axis slice: take elements `[start, end)` along `axis`. Negative
+ *  `axis` indexes from the end (Python convention). Backward not yet
+ *  implemented — same as `sliceLastRange`. */
+export function sliceRange(a: Tensor, axis: number, start: number, end: number): Tensor {
+  const site = captureSite('sliceRange')
+  const ax = axis < 0 ? a.shape.length + axis : axis
+  const outShape = inferSliceRange('sliceRange', a.shape, ax, start, end, site)
+  return addOp(currentGraph(), 'slice_range', outShape, a.dtype, site, { a: a.id, axis: ax, start, end })
+}
+
+/** Concatenate two or more tensors along `axis`. All inputs must share
+ *  shape except along `axis`; output's size on `axis` is the sum. Negative
+ *  `axis` indexes from the end. Capped at 7 inputs (WebGPU bind-group
+ *  limit) — chain calls for more. */
+const CONCAT_INPUT_CAP = 7
+export function concat(tensors: readonly Tensor[], axis: number): Tensor {
+  const site = captureSite('concat')
+  if (tensors.length === 0) throw new ShapeError(`concat: needs at least one input`, site)
+  if (tensors.length === 1) return tensors[0]!
+  if (tensors.length > CONCAT_INPUT_CAP) {
+    throw new ShapeError(
+      `concat: ${tensors.length} inputs exceeds the bind-group cap of ${CONCAT_INPUT_CAP}. ` +
+      `Chain two concats, or restructure the call site.`, site,
+    )
+  }
+  const dtype = tensors[0]!.dtype
+  for (const t of tensors) {
+    if (t.dtype !== dtype) throw new ShapeError(`concat: dtype mismatch (${dtype} vs ${t.dtype})`, site)
+  }
+  const ax = axis < 0 ? tensors[0]!.shape.length + axis : axis
+  const outShape = inferConcat('concat', tensors.map(t => t.shape), ax, site)
+  return addOp(currentGraph(), 'concat', outShape, dtype, site, { inputs: tensors.map(t => t.id), axis: ax })
+}
+
+/** Stack `tensors` along a *new* axis at position `axis`. Each input gets
+ *  an `unsqueeze` first, then concat. All inputs must share shape. */
+export function stack(tensors: readonly Tensor[], axis: number): Tensor {
+  if (tensors.length === 0) throw new ShapeError(`stack: needs at least one input`, captureSite('stack'))
+  const t0 = tensors[0]!
+  const ax = axis < 0 ? t0.shape.length + 1 + axis : axis
+  const newShape = [...t0.shape.slice(0, ax), 1, ...t0.shape.slice(ax)]
+  const expanded = tensors.map(t => reshape(t, newShape))
+  return concat(expanded, ax)
+}
+
+/** Inverse of `concat`: split into pieces along `axis` with the given
+ *  per-piece sizes (must sum to the axis's size). Composes from
+ *  `sliceRange` — no new IR. */
+export function split(t: Tensor, axis: number, sizes: readonly number[]): Tensor[] {
+  const site = captureSite('split')
+  const ax = axis < 0 ? t.shape.length + axis : axis
+  if (ax < 0 || ax >= t.shape.length) throw new ShapeError(`split: axis ${axis} out of range`, site)
+  const total = sizes.reduce((s, x) => s + x, 0)
+  if (total !== t.shape[ax]) {
+    throw new ShapeError(`split: sizes sum to ${total}, but axis ${ax} has size ${t.shape[ax]}`, site)
+  }
+  const out: Tensor[] = []
+  let cursor = 0
+  for (const s of sizes) {
+    out.push(sliceRange(t, ax, cursor, cursor + s))
+    cursor += s
+  }
+  return out
 }
 
 // ----------------------------------------------------------------------------

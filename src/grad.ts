@@ -24,6 +24,7 @@ import {
   constScalar, reluGrad,
   sumLast, where, less, greater,
   dropoutWithSalt,
+  sliceRange,
 } from './ops.js'
 import { traceInto } from './trace.js'
 import { shapesEqual } from './shape.js'
@@ -262,6 +263,27 @@ function runTransposeRule(
       accumulate(cotangents, op.a, dropoutWithSalt(outCotan, op.p, op.salt, op.seed))
       return
     }
+    case 'concat': {
+      // Backward of concat is slicing the gradient back into each input's
+      // shape along the concat axis.
+      let cursor = 0
+      for (const inputId of op.inputs) {
+        const inputTensor = tensorOf(inputId)
+        const sliceSize = inputTensor.shape[op.axis]!
+        accumulate(cotangents, inputId, sliceRange(outCotan, op.axis, cursor, cursor + sliceSize))
+        cursor += sliceSize
+      }
+      return
+    }
+    case 'slice_range':
+      // Backward would be scatter-into-zero (pad along axis). Same status
+      // as slice_last_range — deferred until a user needs to differentiate
+      // through one. For now: throws if reached.
+      throw new Error(
+        `autograd: slice_range backward not implemented yet ` +
+        `(used as backward of concat — concat's gradient already uses sliceRange ` +
+        `but does not need to differentiate *through* it). If you hit this, please file an issue.`,
+      )
     case 'min': {
       // c = min(a, b). Pass dy through to whichever side won (a if a <= b).
       const a = tensorOf(op.a), b = tensorOf(op.b)
