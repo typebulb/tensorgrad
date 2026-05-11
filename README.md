@@ -102,6 +102,19 @@ const infer  = await train.compileForward(predictFn, {
 // infer runs in train's worker — every step's param updates are visible.
 ```
 
+Forward-only modules also expose `runLatest(inputs)` for live-preview
+patterns: if a previous `runLatest` is still in flight, subsequent calls
+coalesce — only the newest inputs actually run, and every queued caller
+resolves with that latest result. Use it when stale intermediate inputs
+(earlier mouse positions, partial drawings) should be dropped:
+
+```ts
+canvas.addEventListener('pointermove', async () => {
+  const out = await infer.runLatest({ tokens: latestTokens() })
+  updateUI(out)
+})
+```
+
 ### CompiledModule methods (all `Promise`-returning)
 
 ```ts
@@ -114,6 +127,7 @@ compiled.downloadParams()                       // → Record<name, Float32Array
 compiled.downloadParamGrads()                   // → Record<name, Float32Array>
 compiled.reset()                                // re-init params + zero Adam state
 compiled.resetOptimizerState()
+compiled.setLR(schedule)                        // change Adam LR without recompile
 compiled.compileForward(forward, { inputs? })   // sibling forward graph
 compiled.destroy()                              // tear down worker + GPU
 ```
@@ -166,6 +180,15 @@ adam: { lr: lr.warmup({ peakLr: 0.001, warmupSteps: 200, after: lr.constant(0.00
 
 LR schedules are serializable shapes, not closures (they cross the worker
 boundary). Use a `number` for constant LR, or one of the constructors above.
+
+Change LR mid-training without recompiling via `compiled.setLR(schedule)`.
+The Adam step counter is preserved — the new schedule resolves at the
+current step. Useful for UI knobs that adjust LR live:
+
+```ts
+await compiled.setLR(0.001)                                          // constant
+await compiled.setLR(lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }))
+```
 
 ### Param init (`init` namespace)
 

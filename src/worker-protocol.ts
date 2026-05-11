@@ -59,6 +59,7 @@ export type Req =
   | { id: number; kind: 'downloadParams'; payload: { graphId: number } }
   | { id: number; kind: 'downloadParamGrads'; payload: { graphId: number } }
   | { id: number; kind: 'resetOptimizer'; payload: { graphId: number } }
+  | { id: number; kind: 'setLR'; payload: SetLRPayload }
   | { id: number; kind: 'destroy'; payload: { graphId: number } }
 
 /** Build the training runtime. Always graphId=0 for a fresh worker. */
@@ -99,6 +100,14 @@ export interface UploadParamsPayload {
   graphId: number
   params: Record<string, Float32Array>  // transferred
   partial: boolean
+}
+
+/** Update the LR schedule of a training graph at runtime, without
+ *  recompiling. The Adam step counter (`t`) is preserved — the new
+ *  schedule is resolved at the current step. */
+export interface SetLRPayload {
+  graphId: number
+  lr: LRSchedule
 }
 
 // ============================================================================

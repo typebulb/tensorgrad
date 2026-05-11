@@ -230,6 +230,14 @@ function handleResetOptimizer(payload: { graphId: number }): void {
   if (slot.adam) slot.adam.t = 0
 }
 
+function handleSetLR(payload: { graphId: number; lr: LRSchedule }): void {
+  const slot = mustGet(payload.graphId)
+  if (!slot.adam) {
+    throw new Error(`setLR: graph ${payload.graphId} has no Adam optimizer (compileForward graphs don't take an LR)`)
+  }
+  slot.adam.config = { ...slot.adam.config, lr: payload.lr }
+}
+
 function handleDestroy(payload: { graphId: number }): void {
   const slot = graphs.get(payload.graphId)
   if (!slot) return
@@ -261,6 +269,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case 'downloadParams':    { const r = await handleDownloadParams(req.payload); result = r; transferList = collectTransfers(r.params); break }
       case 'downloadParamGrads':{ const r = await handleDownloadParamGrads(req.payload); result = r; transferList = collectTransfers(r.params); break }
       case 'resetOptimizer':    handleResetOptimizer(req.payload); result = null; break
+      case 'setLR':             handleSetLR(req.payload); result = null; break
       case 'destroy':           handleDestroy(req.payload); result = null; break
       default: throw new Error(`unknown request kind: ${(req as { kind: string }).kind}`)
     }

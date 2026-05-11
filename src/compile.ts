@@ -19,7 +19,7 @@ import { trace, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
 import {
   appendAdam, resolveLR,
-  type AdamConfig, type AdamResult, type AdamResolvedConfig,
+  type AdamConfig, type AdamResult, type AdamResolvedConfig, type LRSchedule,
 } from './adam.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
@@ -122,6 +122,12 @@ export interface CompiledModule<M extends Module> {
   reset(): Promise<void>
   resetOptimizerState(): Promise<void>
 
+  /** Update the Adam learning-rate schedule at runtime, without recompiling.
+   *  The step counter is preserved — the new schedule resolves at the current
+   *  step. Use a number for constant LR, or one of the `lr.*` shape
+   *  constructors (linearDecay, cosineDecay, warmup). */
+  setLR(schedule: LRSchedule): Promise<void>
+
   /** Compile a sibling forward-only graph that shares this runtime's worker
    *  (and therefore its param GPUBuffers). */
   compileForward<I extends InputDecls>(
@@ -142,6 +148,16 @@ export interface CompiledForwardModule {
 
   run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
   run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+
+  /** Single-flight variant of `run`: if a previous `runLatest` call is still
+   *  in flight, this one waits for it; if multiple `runLatest` calls queue up
+   *  while one is in flight, only the *most recent* arguments actually run
+   *  when the in-flight call finishes, and every queued caller resolves with
+   *  that latest result. Useful for live-preview UI patterns where stale
+   *  inputs (e.g. earlier mouse positions, partial drawings) should be
+   *  dropped in favor of the newest user state. */
+  runLatest(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  runLatest(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
   downloadParams(): Promise<Record<string, Float32Array>>
@@ -343,6 +359,12 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M> {
     ).then(() => undefined)
   }
 
+  setLR(schedule: LRSchedule): Promise<void> {
+    return this.proxy.request<null>(
+      { kind: 'setLR', payload: { graphId: this.graphId, lr: schedule } },
+    ).then(() => undefined)
+  }
+
   async compileForward<I extends InputDecls>(
     forward: ForwardFn<M, I>,
     opts: CompileForwardMethodOptions<I> = {},
@@ -380,6 +402,15 @@ class CompiledForwardModuleProxy implements CompiledForwardModule {
     private readonly ownsWorker: boolean,
   ) {}
 
+  // Single-flight state for `runLatest`. One run is allowed in flight; any
+  // additional calls coalesce — the most recent (inputs, opts) is what
+  // actually runs next, and every queued caller resolves with that result.
+  private latestActive: Promise<unknown> | null = null
+  private latestPending:
+    | { inputs: Record<string, Int32Array | Float32Array>; opts: { withCaptures?: boolean } | undefined;
+        resolvers: Array<{ resolve: (r: Float32Array | RunResult) => void; reject: (e: Error) => void }> }
+    | null = null
+
   get kernelCount(): number { return this.meta.kernelCount }
   get outputShape(): readonly number[] { return this.meta.outputShape }
   get paramNames(): readonly string[] { return this.meta.paramNames }
@@ -398,6 +429,42 @@ class CompiledForwardModuleProxy implements CompiledForwardModule {
       return { output: r.output, captures: makeCaptures(r.captures, this.meta.captureShapes) }
     }
     return r.output
+  }
+
+  runLatest(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
+  runLatest(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
+  runLatest(
+    inputs: Record<string, Int32Array | Float32Array>,
+    opts?: { withCaptures?: boolean },
+  ): Promise<Float32Array | RunResult> {
+    if (!this.latestActive) {
+      const p = this.run(inputs, opts as { withCaptures: true })
+      this.latestActive = p.finally(() => {
+        this.latestActive = null
+        if (this.latestPending) {
+          const { inputs, opts, resolvers } = this.latestPending
+          this.latestPending = null
+          // Re-enter with the latest args; broadcast result to all queued callers.
+          this.runLatest(inputs, opts as { withCaptures: true }).then(
+            (r) => resolvers.forEach(rv => rv.resolve(r)),
+            (e) => resolvers.forEach(rv => rv.reject(e as Error)),
+          )
+        }
+      })
+      return p
+    }
+    // Already in flight: replace queued args with these, return a promise
+    // that resolves with the next run's result.
+    if (this.latestPending) {
+      this.latestPending.inputs = inputs
+      this.latestPending.opts = opts
+      return new Promise<Float32Array | RunResult>((resolve, reject) => {
+        this.latestPending!.resolvers.push({ resolve, reject })
+      })
+    }
+    return new Promise<Float32Array | RunResult>((resolve, reject) => {
+      this.latestPending = { inputs, opts, resolvers: [{ resolve, reject }] }
+    })
   }
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void> {
