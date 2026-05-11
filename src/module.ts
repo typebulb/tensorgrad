@@ -76,16 +76,33 @@ export interface ParamOptions {
   decay?: boolean
 }
 
-type InitFn = (size: number, shape: readonly number[]) => Float32Array
+/** RNG closure: returns a uniform value in [0, 1). Threaded through init
+ *  functions so the same `seed` produces identical params across runs. */
+export type Rng = () => number
 
-function boxMuller(): number {
-  return Math.sqrt(-2 * Math.log(Math.max(1e-10, Math.random()))) * Math.cos(2 * Math.PI * Math.random())
+/** Mulberry32 — small, fast, sufficient for param init. Returns an Rng
+ *  seeded deterministically from the given 32-bit integer. */
+export function mulberry32(seed: number): Rng {
+  let s = seed >>> 0
+  return () => {
+    s = (s + 0x6D2B79F5) | 0
+    let t = s
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+export type InitFn = (size: number, shape: readonly number[], rng: Rng) => Float32Array
+
+function boxMuller(rng: Rng): number {
+  return Math.sqrt(-2 * Math.log(Math.max(1e-10, rng()))) * Math.cos(2 * Math.PI * rng())
 }
 
 function randnFn(scale: number): InitFn {
-  return (size) => {
+  return (size, _shape, rng) => {
     const arr = new Float32Array(size)
-    for (let i = 0; i < size; i++) arr[i] = boxMuller() * scale
+    for (let i = 0; i < size; i++) arr[i] = boxMuller(rng) * scale
     return arr
   }
 }
@@ -101,11 +118,11 @@ function resolveInit(spec: InitSpec | undefined): InitFn {
     case 'randn': return randnFn(spec.scale)
     case 'kaiming': {
       const gain = spec.gain ?? Math.sqrt(2)
-      return (size, shape) => {
+      return (size, shape, rng) => {
         const fanIn = shape[0] ?? size
         const std = gain / Math.sqrt(fanIn)
         const arr = new Float32Array(size)
-        for (let i = 0; i < size; i++) arr[i] = boxMuller() * std
+        for (let i = 0; i < size; i++) arr[i] = boxMuller(rng) * std
         return arr
       }
     }

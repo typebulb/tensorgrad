@@ -30,7 +30,7 @@ import { emitKernels, type KernelSpec } from './codegen.js'
 import {
   Captures, type RunResult, type StepResult, type RunOptions, type UploadParamsOptions,
 } from './runtime.js'
-import { Module, materializeParams, type MaterializedParams } from './module.js'
+import { Module, materializeParams, mulberry32, type MaterializedParams, type Rng, type InitFn } from './module.js'
 import { WorkerProxy } from './worker-proxy.js'
 import {
   transferablesOfRecord,
@@ -90,6 +90,28 @@ export type TypedArrayFor<D extends Dtype> =
  *  at marshal time. */
 export type TypedInputs<I extends InputDecls> = { [K in keyof I]: TypedArrayFor<DtypeOf<I[K]>> }
 
+/** A typed view of a Module's params, mirroring the class structure with
+ *  every Tensor leaf replaced by its backing `Float32Array`. Returned by
+ *  `compiled.downloadParams()` so user code can write
+ *  `params.layers[0].W` instead of `params['layers.0.W']` — typed,
+ *  autocompletable, no string indexing.
+ *
+ *  Filters keep only fields that contribute params: `Tensor`, nested
+ *  `Module`, and arrays of `Module`. Other instance fields (`inDim`,
+ *  config metadata, etc.) are pruned. */
+export type ParamTree<M> = {
+  [K in keyof M as
+      M[K] extends Tensor ? K
+    : M[K] extends Module ? K
+    : M[K] extends readonly Module[] ? K
+    : never
+  ]:
+      M[K] extends Tensor ? Float32Array
+    : M[K] extends readonly (infer U extends Module)[] ? ParamTree<U>[]
+    : M[K] extends Module ? ParamTree<M[K]>
+    : never
+}
+
 /** Forward function shape. */
 export type ForwardFn<M extends Module, I extends InputDecls = InputDecls> =
   (m: M, inputs: InputsTensors<I>) => Tensor
@@ -128,6 +150,11 @@ export interface CompileModuleOptions<M extends Module, I extends InputDecls = I
    *  optimizer — `step()` will fail. (Used internally for `compileToIR`-like
    *  flows where the user only wants the forward pass.) */
   adam?: AdamConfig
+  /** 32-bit integer seed for the param-init RNG. Same seed + same model
+   *  topology → identical initial params, every time. If omitted, a seed
+   *  is generated and exposed as `compiled.seed` so you can reproduce a
+   *  run by passing it back. */
+  seed?: number
 }
 
 export interface CompileForwardMethodOptions<M extends Module, I extends InputDecls = InputDecls> {
@@ -158,6 +185,10 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
   readonly outputShape: readonly number[]
   /** Names of the model's parameters, in materialization order. */
   readonly paramNames: readonly string[]
+  /** The actual seed used for param init (either the one you passed, or a
+   *  freshly-generated one if you didn't). Pass this back as
+   *  `compileModule({ seed: ... })` to reproduce a run. */
+  readonly seed: number
 
   step(inputs: TypedInputs<I>): Promise<number>
   step(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<StepResult>
@@ -166,8 +197,15 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
   run(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<RunResult>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
-  downloadParams(): Promise<Record<string, Float32Array>>
-  downloadParamGrads(): Promise<Record<string, Float32Array>>
+  /** Read params back as a typed tree mirroring the model class structure.
+   *  `params.layers[0].W` etc. — typed, autocompletable. */
+  downloadParams(): Promise<ParamTree<M>>
+  /** Escape hatch: read params back as a flat `{ 'layers.0.W': Float32Array, ... }`
+   *  record. Useful for serialization, iteration over all params, or partial
+   *  re-uploads via `uploadParams`. */
+  downloadParamsFlat(): Promise<Record<string, Float32Array>>
+  /** Gradients in the same tree shape as `downloadParams`. */
+  downloadParamGrads(): Promise<ParamTree<M>>
 
   /** Re-initialize all params + zero optimizer state. */
   reset(): Promise<void>
@@ -186,7 +224,7 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
    *  dims in the input shapes resolve per-call. */
   compileForward<I2 extends InputDecls>(
     opts: CompileForwardMethodOptions<M, I2>,
-  ): Promise<CompiledForwardModule<I2>>
+  ): Promise<CompiledForwardModule<M, I2>>
 
   /** Swap the model topology in place: destroy the current training graph in
    *  the worker, compile a fresh one with the same loss/inputs/adam config
@@ -195,10 +233,13 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
    *  forward proxies created via `compileForward` stay registered: their
    *  per-shape kernel caches are cleared and recompile lazily on next `run()`.
    *
+   *  By default, inherits the current `seed` — deterministic per
+   *  (topology, seed). Pass `{ seed }` to override and get fresh init.
+   *
    *  Use when the user changes layer count, hidden width, or any other
    *  shape-affecting model parameter — you don't need to re-create the
    *  worker or re-wire siblings. */
-  replaceModel(newFactory: () => M): Promise<void>
+  replaceModel(newFactory: () => M, opts?: { seed?: number }): Promise<void>
 
   /** Tear down the worker + GPU resources. */
   destroy(): void
@@ -210,7 +251,7 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
  *
  *  No sync inspection surface for kernel count / output shape / IR — those
  *  would lie on a polymorphic proxy that caches multiple shape variants. */
-export interface CompiledForwardModule<I extends InputDecls = InputDecls> {
+export interface CompiledForwardModule<M extends Module = Module, I extends InputDecls = InputDecls> {
   /** Same as the parent training graph's param names. */
   readonly paramNames: readonly string[]
 
@@ -218,7 +259,11 @@ export interface CompiledForwardModule<I extends InputDecls = InputDecls> {
   run(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<RunResult>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
-  downloadParams(): Promise<Record<string, Float32Array>>
+  /** Typed tree view of the shared param state — same shape as the parent
+   *  training graph's `downloadParams()` (params are physically shared). */
+  downloadParams(): Promise<ParamTree<M>>
+  /** Escape hatch: flat `{ 'layers.0.W': Float32Array, ... }` record. */
+  downloadParamsFlat(): Promise<Record<string, Float32Array>>
 
   destroy(): void
 }
@@ -246,18 +291,26 @@ export async function compileModule<M extends Module, I extends InputDecls>(
   opts: CompileModuleOptions<M, I>,
 ): Promise<CompiledModule<M, I>> {
   const proxy = new WorkerProxy(__WORKER_SOURCE__)
+  const seed = opts.seed ?? randomSeed()
   try {
-    const built = await buildTrainingGraph(proxy, opts, /* graphId */ 0)
-    return new CompiledModuleProxy<M>(
+    const built = await buildTrainingGraph(proxy, opts, /* graphId */ 0, seed)
+    return new CompiledModuleProxy<M, I>(
       proxy, /* graphId */ 0, built.ir, built.meta,
-      opts as unknown as CompileModuleOptions<M, InputDecls>,
+      { ...opts, seed },
       built.initFns,
+      seed,
       /* nextGraphId */ { v: 1 },
-    ) as unknown as CompiledModule<M, I>
+    )
   } catch (e) {
     proxy.terminate()
     throw e
   }
+}
+
+/** Fresh 32-bit integer seed for compile runs that didn't pass one. Exposed
+ *  on the returned `CompiledModule.seed` so users can reproduce. */
+function randomSeed(): number {
+  return (Math.random() * 0x100000000) >>> 0
 }
 
 interface BuiltTrainingGraph {
@@ -273,6 +326,7 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   proxy: WorkerProxy,
   opts: CompileModuleOptions<M, I>,
   graphId: number,
+  seed: number,
 ): Promise<BuiltTrainingGraph> {
   const loss = opts.loss as unknown as ForwardFn<M, InputDecls>
   const inputs = opts.inputs as InputDecls
@@ -286,7 +340,7 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   const kernels = emitKernels(graph, plan)
   const ir: CompiledIR = { graph, paramGrads, loss: lossTensor, plan, kernels }
 
-  const initialParams = buildInitialParams(plan, materialized.initFns)
+  const initialParams = buildInitialParams(plan, materialized.initFns, mulberry32(seed))
   const wireIR: WireIR = { graph, plan, kernels }
   const wireAdam = adamResult ? wireAdamConfig(adamResult) : null
   const transfers = transferablesOfRecord(initialParams)
@@ -304,40 +358,62 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
 
 /** Internal-only loose input record. The public proxy interfaces type these
  *  by declared dtype via `TypedInputs<I>`; the implementation keeps the
- *  wider type since it doesn't know `I` at the class level. */
+ *  wider type since it doesn't know `I` at the method body level. */
 type LooseInputs = Record<string, Int32Array | Float32Array>
 
-class CompiledModuleProxy<M extends Module> implements CompiledModule<M, InputDecls> {
+/** Parent's view of a child forward proxy. The Set in CompiledModuleProxy
+ *  only needs these two methods; using a non-generic supertype lets the Set
+ *  store heterogeneous ForwardProxy<M, I_k> without `any`. */
+interface ChildProxy {
+  _invalidateForReplace(): void
+  _destroyInternal(): void
+}
+
+/** Child's view of its parent training graph. ForwardProxy<M, I2> doesn't
+ *  need the parent's `I` — only the (stable) graph id and a way to get a
+ *  fresh model instance for per-shape sibling compiles. */
+interface ParentRef<M extends Module> {
+  readonly graphId: number
+  readonly paramNames: readonly string[]
+  currentFactory(): M
+}
+
+class CompiledModuleProxy<M extends Module, I extends InputDecls> implements CompiledModule<M, I> {
   /** Forward proxies created via `compileForward` — tracked so `destroy()`
    *  can clean them up cascade-style, and `replaceModel()` can invalidate
    *  their per-shape kernel caches without unregistering them. */
-  private readonly children = new Set<ForwardProxy<M>>()
+  private readonly children = new Set<ChildProxy>()
 
   // Mutable: `replaceModel` swaps these in place so callers' references
   // (and any sibling ForwardProxy holding `this`) stay valid.
   ir: CompiledIR
   private meta: CreateRuntimeResult
-  private opts: CompileModuleOptions<M, InputDecls>
+  private opts: CompileModuleOptions<M, I>
   private initFns: Record<string, InitFn>
+  /** Seed used for the most recent (re)build of the training graph. */
+  private currentSeed: number
 
   constructor(
     private readonly proxy: WorkerProxy,
     readonly graphId: number,
     ir: CompiledIR,
     meta: CreateRuntimeResult,
-    opts: CompileModuleOptions<M, InputDecls>,
+    opts: CompileModuleOptions<M, I>,
     initFns: Record<string, InitFn>,
+    seed: number,
     private readonly nextGraphId: { v: number },
   ) {
     this.ir = ir
     this.meta = meta
     this.opts = opts
     this.initFns = initFns
+    this.currentSeed = seed
   }
 
   get kernelCount(): number { return this.meta.kernelCount }
   get outputShape(): readonly number[] { return this.meta.outputShape }
   get paramNames(): readonly string[] { return this.meta.paramNames }
+  get seed(): number { return this.currentSeed }
 
   /** Current model factory. Sibling ForwardProxies read this through the
    *  proxy ref so they always re-trace against the latest topology. */
@@ -375,22 +451,30 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M, InputDe
     ).then(() => undefined)
   }
 
-  async downloadParams(): Promise<Record<string, Float32Array>> {
+  async downloadParams(): Promise<ParamTree<M>> {
+    const r = await this.proxy.request<DownloadParamsResult>(
+      { kind: 'downloadParams', payload: { graphId: this.graphId } },
+    )
+    return buildParamTree(r.params) as ParamTree<M>
+  }
+
+  async downloadParamsFlat(): Promise<Record<string, Float32Array>> {
     const r = await this.proxy.request<DownloadParamsResult>(
       { kind: 'downloadParams', payload: { graphId: this.graphId } },
     )
     return r.params
   }
 
-  async downloadParamGrads(): Promise<Record<string, Float32Array>> {
+  async downloadParamGrads(): Promise<ParamTree<M>> {
     const r = await this.proxy.request<DownloadParamsResult>(
       { kind: 'downloadParamGrads', payload: { graphId: this.graphId } },
     )
-    return r.params
+    return buildParamTree(r.params) as ParamTree<M>
   }
 
   async reset(): Promise<void> {
-    const initialParams = buildInitialParams(this.ir.plan, this.initFns)
+    // Re-init using the *same* seed → reset is reproducible per (topology, seed).
+    const initialParams = buildInitialParams(this.ir.plan, this.initFns, mulberry32(this.currentSeed))
     await this.uploadParams(initialParams)
     await this.resetOptimizerState()
   }
@@ -409,34 +493,37 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M, InputDe
 
   async compileForward<I2 extends InputDecls>(
     opts: CompileForwardMethodOptions<M, I2>,
-  ): Promise<CompiledForwardModule<I2>> {
-    const child = new ForwardProxy<M>(
+  ): Promise<CompiledForwardModule<M, I2>> {
+    const child: ForwardProxy<M, I2> = new ForwardProxy<M, I2>(
       this.proxy,
       this,
-      opts.forward as ForwardFn<M, InputDecls>,
-      normalizeDecls(opts.inputs as InputDecls),
+      opts.forward,
+      normalizeDecls(opts.inputs),
       this.nextGraphId,
       () => this.children.delete(child),
     )
     this.children.add(child)
-    return child as unknown as CompiledForwardModule<I2>
+    return child
   }
 
-  async replaceModel(newFactory: () => M): Promise<void> {
+  async replaceModel(newFactory: () => M, replaceOpts?: { seed?: number }): Promise<void> {
     // 1. Invalidate sibling caches: their per-shape kernels are model-specific
     //    so the worker-side graphs must go, but the proxy objects stay alive
     //    (callers hold references to them) and recompile lazily on next run().
     for (const child of this.children) child._invalidateForReplace()
     // 2. Destroy current training graph in worker.
     this.proxy.send({ kind: 'destroy', payload: { graphId: this.graphId } })
-    // 3. Rebuild the training graph on the same worker, same graphId.
-    const newOpts = { ...this.opts, factory: newFactory } as CompileModuleOptions<M, InputDecls>
-    const built = await buildTrainingGraph<M, InputDecls>(this.proxy, newOpts, this.graphId)
+    // 3. Rebuild the training graph on the same worker, same graphId. Inherit
+    //    the current seed by default; the caller can override for fresh init.
+    const newSeed = replaceOpts?.seed ?? this.currentSeed
+    const newOpts: CompileModuleOptions<M, I> = { ...this.opts, factory: newFactory, seed: newSeed }
+    const built = await buildTrainingGraph(this.proxy, newOpts, this.graphId, newSeed)
     // 4. Mutate this proxy in place — same object, new internals.
     this.ir = built.ir
     this.meta = built.meta
     this.initFns = built.initFns
     this.opts = newOpts
+    this.currentSeed = newSeed
   }
 
   destroy(): void {
@@ -451,13 +538,15 @@ class CompiledModuleProxy<M extends Module> implements CompiledModule<M, InputDe
  *  shapes (concrete is the cache-size-1 case). Sibling of a training graph;
  *  shares its param GPUBuffers. Holds a reference to the parent proxy so it
  *  picks up the current model factory after `replaceModel`. */
-class ForwardProxy<M extends Module> implements CompiledForwardModule<InputDecls> {
+class ForwardProxy<M extends Module, I extends InputDecls>
+  implements CompiledForwardModule<M, I>, ChildProxy
+{
   private readonly cache = new Map<string, ForwardSiblingMeta>()
 
   constructor(
     private readonly proxy: WorkerProxy,
-    private readonly parent: CompiledModuleProxy<M>,
-    private readonly forward: ForwardFn<M, InputDecls>,
+    private readonly parent: ParentRef<M>,
+    private readonly forward: ForwardFn<M, I>,
     private readonly decls: NormalizedDecls,
     private readonly nextGraphId: { v: number },
     private readonly onDestroy: () => void,
@@ -465,12 +554,12 @@ class ForwardProxy<M extends Module> implements CompiledForwardModule<InputDecls
 
   get paramNames(): readonly string[] { return this.parent.paramNames }
 
-  private async siblingFor(inputs: Record<string, Int32Array | Float32Array>): Promise<ForwardSiblingMeta> {
+  private async siblingFor(inputs: LooseInputs): Promise<ForwardSiblingMeta> {
     const resolved = resolveDecls(this.decls, inputs)
     const key = shapeKey(resolved)
     const hit = this.cache.get(key)
     if (hit) return hit
-    const sib = await compileSibling<M>(
+    const sib = await compileSibling<M, I>(
       this.proxy, this.parent.graphId, this.parent.currentFactory(), this.forward,
       resolved, this.nextGraphId,
     )
@@ -499,7 +588,14 @@ class ForwardProxy<M extends Module> implements CompiledForwardModule<InputDecls
     )
   }
 
-  async downloadParams(): Promise<Record<string, Float32Array>> {
+  async downloadParams(): Promise<ParamTree<M>> {
+    const r = await this.proxy.request<DownloadParamsResult>(
+      { kind: 'downloadParams', payload: { graphId: this.parent.graphId } },
+    )
+    return buildParamTree(r.params) as ParamTree<M>
+  }
+
+  async downloadParamsFlat(): Promise<Record<string, Float32Array>> {
     const r = await this.proxy.request<DownloadParamsResult>(
       { kind: 'downloadParams', payload: { graphId: this.parent.graphId } },
     )
@@ -538,15 +634,15 @@ interface ForwardSiblingMeta {
 
 /** Compile a per-shape sibling forward graph against the parent training
  *  graph. Used inside the forward proxy on each new resolved shape. */
-async function compileSibling<M extends Module>(
+async function compileSibling<M extends Module, I extends InputDecls>(
   proxy: WorkerProxy,
   parentGraphId: number,
   model: M,
-  forward: ForwardFn<M, InputDecls>,
+  forward: ForwardFn<M, I>,
   decls: ResolvedDecls,
   nextGraphId: { v: number },
 ): Promise<ForwardSiblingMeta> {
-  const { graph } = traceModule(model, forward, decls)
+  const { graph } = traceModule(model, forward as ForwardFn<M, InputDecls>, decls)
   const outputTensor = graph.tensors[graph.outputs[0]!]!
   const plan = planBuffers(graph, {})
   const kernels = emitKernels(graph, plan)
@@ -565,7 +661,6 @@ async function compileSibling<M extends Module>(
 // ============================================================================
 
 type Graph = ReturnType<typeof trace>
-type InitFn = (size: number, shape: readonly number[]) => Float32Array
 
 /** Internal-only fully-normalized inputs decl (concrete dtype, shape with
  *  possibly-null wildcards). */
@@ -717,14 +812,18 @@ function shapeKey(decls: ResolvedDecls): string {
   return parts.join('|')
 }
 
-function buildInitialParams(plan: BufferPlan, initFns: Record<string, InitFn>): Record<string, Float32Array> {
+function buildInitialParams(
+  plan: BufferPlan,
+  initFns: Record<string, InitFn>,
+  rng: Rng,
+): Record<string, Float32Array> {
   const out: Record<string, Float32Array> = {}
   for (const [name, bufId] of plan.paramsByName) {
     const shape = plan.buffers[bufId]!.shape
     const size = shape.reduce((a, b) => a * b, 1)
     const initFn = initFns[name]
     if (!initFn) throw new Error(`compile: no init for param '${name}'`)
-    out[name] = initFn(size, shape)
+    out[name] = initFn(size, shape, rng)
   }
   return out
 }
@@ -750,4 +849,30 @@ function makeCaptures(
   const data = new Map<string, Float32Array>()
   if (captures) for (const [name, arr] of Object.entries(captures)) data.set(name, arr)
   return new Captures(captureShapes, data)
+}
+
+/** Inflate a flat `{ 'layers.0.W': Float32Array, ... }` record into a tree
+ *  that mirrors the Module class structure (nested objects, arrays where
+ *  the path segment is numeric). Pairs with `ParamTree<M>` for the typed
+ *  view of `downloadParams()`. */
+function buildParamTree(flat: Record<string, Float32Array>): Record<string, unknown> {
+  const tree: Record<string, unknown> = {}
+  for (const [name, value] of Object.entries(flat)) {
+    setDeep(tree, name.split('.'), value)
+  }
+  return tree
+}
+
+function setDeep(root: Record<string, unknown>, parts: string[], value: Float32Array): void {
+  let cur: any = root
+  for (let i = 0; i < parts.length; i++) {
+    const seg = parts[i]!
+    const segIsIdx = /^\d+$/.test(seg)
+    const key: string | number = segIsIdx ? parseInt(seg, 10) : seg
+    if (i === parts.length - 1) { cur[key] = value; return }
+    const next = parts[i + 1]!
+    const nextIsIdx = /^\d+$/.test(next)
+    if (cur[key] === undefined) cur[key] = nextIsIdx ? [] : {}
+    cur = cur[key]
+  }
 }

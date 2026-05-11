@@ -179,8 +179,9 @@ compiled.step(inputs, { withCaptures: true })   // → { loss, captures }
 compiled.run(inputs)                            // → Float32Array
 compiled.run(inputs, { withCaptures: true })    // → { output, captures }
 compiled.uploadParams(record, { partial? })
-compiled.downloadParams()                       // → Record<name, Float32Array>
-compiled.downloadParamGrads()                   // → Record<name, Float32Array>
+compiled.downloadParams()                       // → ParamTree<M> (typed tree, mirrors class)
+compiled.downloadParamsFlat()                   // → Record<'layers.0.W' | …, Float32Array>
+compiled.downloadParamGrads()                   // → ParamTree<M> (same tree shape)
 compiled.reset()                                // re-init params + zero Adam state
 compiled.resetOptimizerState()
 compiled.setOptimizerConfig({ lr?, weightDecay?, b1?, b2? })  // mutate without recompile
@@ -189,11 +190,23 @@ compiled.replaceModel(newFactory)               // swap topology, same worker
 compiled.destroy()                              // tear down worker + GPU
 ```
 
-`compiled.kernelCount`, `compiled.outputShape`, `compiled.paramNames`, and
-`compiled.ir` are sync properties for inspection. Forward proxies expose
-only `paramNames` (the same names as the parent training graph) — kernel
-count and output shape aren't stable on a proxy that caches multiple
-shape variants.
+`compiled.kernelCount`, `compiled.outputShape`, `compiled.paramNames`,
+`compiled.seed`, and `compiled.ir` are sync properties for inspection.
+Forward proxies expose only `paramNames` (the same names as the parent
+training graph) — kernel count and output shape aren't stable on a proxy
+that caches multiple shape variants.
+
+**Typed param tree.** `downloadParams()` returns a tree that mirrors the
+model class. If `MLP` has `l1: Linear; l2: Linear; l3: Linear` and `Linear`
+has `W: Tensor; b: Tensor`, then the return type is
+`{ l1: { W, b }; l2: { W, b }; l3: { W, b } }` with `Float32Array` leaves —
+typed access (`params.l1.W`), no string indexing. Arrays of Modules
+(e.g. `layers: Linear[]`) become arrays of subtrees
+(`params.layers[0].W`). Non-param fields on the model class (numbers,
+config, etc.) are pruned. `downloadParamsFlat()` is the escape hatch
+returning the legacy `Record<string, Float32Array>` — useful for
+serialization, full-tree iteration, or partial re-upload via
+`uploadParams`.
 
 **Typed inputs.** `step` / `run` are typed against the declared `inputs`
 shape, so each named input expects the right TypedArray: a dtype-`'f32'`
@@ -214,6 +227,26 @@ consumes the instance by mutating its `ParamSentinel` fields into
 `Tensor`s. If your factory returns the same instance twice, the second
 compile sees Tensors where sentinels are expected; the library detects
 this and throws a clear error.
+
+**Reproducible init.** Param initialization uses a deterministic
+Mulberry32 PRNG seeded at compile time. Pass `seed` to control it; the
+seed actually used (yours, or a freshly-generated one) is exposed as
+`compiled.seed` so a non-deterministic run can be replayed later:
+
+```ts
+const compiled = await compileModule({ ..., seed: 42 })
+// Same (topology, seed) — identical initial params across runs:
+compiled.seed === 42
+compiled.reset()  // also re-inits from this seed
+```
+
+`replaceModel` inherits the existing seed by default — deterministic per
+(topology, seed). Pass `{ seed }` to override:
+
+```ts
+await compiled.replaceModel(() => new MLP(newSpec))                // same seed
+await compiled.replaceModel(() => new MLP(newSpec), { seed: 7 })   // fresh
+```
 
 ### Operators
 

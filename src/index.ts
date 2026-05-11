@@ -46,8 +46,11 @@ export {
   type CompiledIR, type CompileModuleOptions, type CompileForwardMethodOptions, type OptimizerConfigUpdate,
   type CompiledModule, type CompiledForwardModule,
   type InputDecl, type InputDeclObject, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,
-  type DtypeOf, type TypedArrayFor, type TypedInputs,
+  type DtypeOf, type TypedArrayFor, type TypedInputs, type ParamTree,
 } from './compile.js'
-export { Module, materializeParams, init, type InitSpec, type ParamOptions, type MaterializedParams } from './module.js'
+export {
+  Module, materializeParams, init, mulberry32,
+  type InitSpec, type ParamOptions, type MaterializedParams, type InitFn, type Rng,
+} from './module.js'
 export { singleFlight } from './single-flight.js'
 export * as nn from './nn.js'
