@@ -197,8 +197,7 @@ async function run() {
   })
   const compileMs = performance.now() - t0
 
-  const paramCount = compiled.ir.plan.paramsByName.size
-  log(`  ${paramCount} params, ${compiled.kernelCount} kernels, compile ${compileMs.toFixed(0)} ms`, 'ok')
+  log(`  ${compiled.paramNames.length} params, ${compiled.kernelCount} kernels, compile ${compileMs.toFixed(0)} ms`, 'ok')
 
   log('Compiling inference graph (B=1)...')
   const tInfer = performance.now()

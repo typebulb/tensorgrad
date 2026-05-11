@@ -4,8 +4,8 @@
 // test that the library works for non-transformer shapes of problem.
 
 import {
-  Module, compileModule, init,
-  add, mul, sub, mean, matmul, relu,
+  Module, compileModule, nn,
+  mul, sub, mean, relu,
   type Tensor,
 } from 'tensorgrad'
 
@@ -14,44 +14,25 @@ const HIDDEN = 64
 const B = 256                 // batch size
 const LR = 0.005
 
-// ---------- Modules: a 1 → HIDDEN → HIDDEN → 1 MLP -------------------------
-
-class Linear extends Module {
-  W: Tensor; b: Tensor
-  constructor(public readonly inDim: number, public readonly outDim: number) {
-    super()
-    this.W = this.param([inDim, outDim], { init: init.kaiming() })
-    this.b = this.param([outDim], { init: 'zeros' })
-  }
-}
+// ---------- Model: 1 → HIDDEN → HIDDEN → 1 MLP ----------------------------
 
 class MLP extends Module {
-  l1: Linear; l2: Linear; l3: Linear
-  constructor() {
-    super()
-    this.l1 = new Linear(1, HIDDEN)
-    this.l2 = new Linear(HIDDEN, HIDDEN)
-    this.l3 = new Linear(HIDDEN, 1)
-  }
-}
-
-// ---------- Forward + loss -------------------------------------------------
-
-function linearFwd(p: Linear, x: Tensor): Tensor {
-  return add(matmul(x, p.W), p.b)
+  l1 = new nn.Linear(1, HIDDEN)
+  l2 = new nn.Linear(HIDDEN, HIDDEN)
+  l3 = new nn.Linear(HIDDEN, 1)
 }
 
 function modelFwd(p: MLP, x: Tensor): Tensor {
-  // x: [B, 1] -> [B, 1]
-  const h1 = relu(linearFwd(p.l1, x))
-  const h2 = relu(linearFwd(p.l2, h1))
-  return linearFwd(p.l3, h2)
+  return p.l3.fwd(relu(p.l2.fwd(relu(p.l1.fwd(x)))))
 }
 
 function lossFn(p: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
-  // Inputs are [B, 1] each; loss is mean squared error.
   const diff = sub(modelFwd(p, x), y)
   return mean(mul(diff, diff))
+}
+
+function predictFn(p: MLP, { x }: { x: Tensor }): Tensor {
+  return modelFwd(p, x)
 }
 
 // ---------- Batch generation ----------------------------------------------
@@ -152,11 +133,17 @@ async function run() {
   })
   log(`  ${compiled.kernelCount} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
 
-  // For visualisation we run a separate forward-only mini-pipeline. The simple
-  // approach here: use the same step but with a fixed plot batch padded to B.
-  // For brevity in this sample, we just compute model output via a plain JS
-  // re-walk of the trained params after each viz interval. (Not as efficient as
-  // a second compiled pipeline, but trivially correct and fine for B=200.)
+  // Inference graph for plotting: shares param buffers with the training
+  // graph, polymorphic over the batch dim so we can run it at PLOT_N=200
+  // without recompiling per-shape.
+  const predict = await compiled.compileForward({
+    forward: predictFn,
+    inputs: { x: [null, 1] },
+  })
+
+  // Stretch the plot x's into [PLOT_N, 1] for the [B, 1] input shape.
+  const plotInput = new Float32Array(PLOT_N)
+  for (let i = 0; i < PLOT_N; i++) plotInput[i] = plotXs[i]!
 
   log('Training...')
   let step = 0
@@ -164,10 +151,7 @@ async function run() {
   while (!stopRequested) {
     step++
     const { x, y } = makeBatch()
-    const lossVal = await compiled.step({
-      x: new Float32Array(x),
-      y: new Float32Array(y),
-    })
+    const lossVal = await compiled.step({ x, y })
 
     if (step === 1 || step % 100 === 0) {
       log(`  step ${step.toString().padStart(4)}  loss ${lossVal.toFixed(6)}`)
@@ -177,54 +161,16 @@ async function run() {
     const now = performance.now()
     if (now - lastViz > 250 || step === 1) {
       lastViz = now
-      // Read params back, run model in JS for plotXs.
-      const params = await compiled.downloadParams()
-      const modelYs = forwardJS(params, plotXs)
+      const modelYs = await predict.run({ x: plotInput })
       drawPlot(plotXs, modelYs)
     }
 
     if (step % 5 === 0) await new Promise(r => setTimeout(r, 0))
   }
   log(`Stopped at step ${step}.`, 'ok')
+  predict.destroy()
   compiled.destroy()
   runBtn.disabled = false; stopBtn.disabled = true
-}
-
-// JS reference forward. Lets us plot without a second compiled pipeline.
-// Takes the typed param tree returned by downloadParams() — the layout
-// mirrors the MLP class (l1/l2/l3, each with W and b).
-function forwardJS(
-  params: { l1: { W: Float32Array; b: Float32Array }; l2: { W: Float32Array; b: Float32Array }; l3: { W: Float32Array; b: Float32Array } },
-  xs: Float32Array,
-): Float32Array {
-  const N = xs.length
-  // l1: 1 -> HIDDEN
-  const W1 = params.l1.W, b1 = params.l1.b
-  const W2 = params.l2.W, b2 = params.l2.b
-  const W3 = params.l3.W, b3 = params.l3.b
-  const out = new Float32Array(N)
-  const h1 = new Float32Array(HIDDEN)
-  const h2 = new Float32Array(HIDDEN)
-  for (let n = 0; n < N; n++) {
-    const x = xs[n]!
-    // h1 = relu(x * W1 + b1)
-    for (let j = 0; j < HIDDEN; j++) {
-      let s = b1[j]!
-      s += x * W1[j]!  // W1 is [1, HIDDEN], row-major
-      h1[j] = s > 0 ? s : 0
-    }
-    // h2 = relu(h1 @ W2 + b2)
-    for (let j = 0; j < HIDDEN; j++) {
-      let s = b2[j]!
-      for (let k = 0; k < HIDDEN; k++) s += h1[k]! * W2[k * HIDDEN + j]!
-      h2[j] = s > 0 ? s : 0
-    }
-    // y = h2 @ W3 + b3
-    let s = b3[0]!
-    for (let k = 0; k < HIDDEN; k++) s += h2[k]! * W3[k]!
-    out[n] = s
-  }
-  return out
 }
 
 runBtn.onclick = () => { run().catch(e => log(`error: ${e?.message ?? e}\n${e?.stack ?? ''}`, 'err')) }

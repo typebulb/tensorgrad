@@ -307,13 +307,9 @@ async function runTraining(): Promise<void> {
   try {
     while (running && compiled) {
       const batch = nextTrainBatch()
-      try {
-        lastLoss = await compiled.step(batch)
-      } catch (e: unknown) {
-        const err = e as { name?: string }
-        if (err?.name === 'AbortError') return    // graph was replaced; quietly bail
-        throw e
-      }
+      const r = await compiled.step(batch, { onAbort: 'value' })
+      if (r.kind === 'aborted') return   // graph was replaced; quietly bail
+      lastLoss = r.loss
       step += 1
       const now = Date.now()
       if (now - lastEval > 1000) {
