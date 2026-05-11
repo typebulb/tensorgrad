@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Digit Canvas (tensorgrad)</title>
+  <style>
+    body {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      max-width: 900px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      color: #222;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .subtitle { color: #666; margin-top: 0; margin-bottom: 1.5rem; }
+    .row { display: flex; gap: 2rem; align-items: flex-start; flex-wrap: wrap; }
+    .col { flex: 1 1 280px; }
+
+    #draw {
+      width: 280px; height: 280px;
+      background: #000;
+      border-radius: 8px;
+      touch-action: none;
+      display: block;
+    }
+
+    .controls { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+    .controls .line { display: flex; gap: 0.5rem; align-items: center; }
+    button {
+      padding: 0.4rem 0.8rem;
+      font-size: 0.95rem;
+      cursor: pointer;
+      background: #fff;
+      border: 1px solid #bbb;
+      border-radius: 4px;
+    }
+    button:disabled { opacity: 0.5; cursor: default; }
+    button.primary { background: #06c; color: #fff; border-color: #06c; }
+    label { font-size: 0.85rem; color: #444; }
+    select { padding: 0.25rem 0.4rem; font-size: 0.9rem; }
+
+    #prediction {
+      font-size: 9rem;
+      line-height: 1;
+      font-weight: 200;
+      text-align: center;
+      min-height: 9rem;
+      color: #06c;
+      user-select: none;
+    }
+    #probs { font-family: ui-monospace, monospace; font-size: 0.85rem; }
+    #probs > div { display: flex; align-items: center; gap: 0.5rem; padding: 1px 0; }
+    #probs .d { width: 1rem; text-align: right; color: #888; }
+    #probs .bar { height: 0.7rem; background: #06c; border-radius: 2px; min-width: 1px; }
+    #probs .pct { width: 3.5rem; text-align: right; color: #555; }
+
+    #status {
+      font-family: ui-monospace, monospace;
+      font-size: 0.85rem;
+      color: #555;
+      margin-top: 1rem;
+      min-height: 1.2em;
+    }
+
+    p.help { color: #555; font-size: 0.9rem; margin-top: 1rem; }
+    p.help code { background: #f3f3f3; padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>Digit Canvas</h1>
+  <p class="subtitle">
+    MNIST classifier trained from scratch in your browser. Draw a digit on
+    the left; predictions update on every stroke. The model trains in the
+    background — accuracy climbs as you watch.
+  </p>
+
+  <div class="row">
+    <div class="col">
+      <canvas id="draw" width="280" height="280"></canvas>
+      <div class="controls">
+        <div class="line">
+          <button id="train" class="primary">Train</button>
+          <button id="stop" disabled>Stop</button>
+          <button id="clear">Clear canvas</button>
+          <button id="reset-weights">Reset weights</button>
+        </div>
+        <div class="line">
+          <label>hidden size
+            <select id="layer-size">
+              <option value="32">32</option>
+              <option value="64" selected>64</option>
+              <option value="128">128</option>
+              <option value="256">256</option>
+            </select>
+          </label>
+          <label>lr
+            <select id="lr">
+              <option value="0.0005">5e-4</option>
+              <option value="0.001" selected>1e-3</option>
+              <option value="0.002">2e-3</option>
+              <option value="0.005">5e-3</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div id="status">initializing…</div>
+    </div>
+
+    <div class="col">
+      <div id="prediction"></div>
+      <div id="probs"></div>
+    </div>
+  </div>
+
+  <p class="help">
+    Demonstrates: <code>compileForward</code> with a parametric batch dim
+    (same predict graph serves B=1 for the canvas and B=256 for the
+    accuracy probe), <code>dropout</code> in training only (omitted from
+    the inference forward — no <code>.train()/.eval()</code> mode flag),
+    <code>setOptimizerConfig</code> for live LR changes,
+    <code>replaceModel</code> for swapping hidden size without losing the
+    worker, <code>clipGradNorm</code> for training stability,
+    <code>singleFlight</code> so rapid-stroke predictions don't queue up,
+    and <code>meanAll(crossEntropyLast(...))</code> as the canonical
+    classification loss tail.
+  </p>
+
+  <p><a href="/">← back to samples</a></p>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

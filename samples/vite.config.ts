@@ -33,6 +33,7 @@ export default defineConfig({
         index: 'index.html',
         transformer: 'transformer/index.html',
         'mlp-sin': 'mlp-sin/index.html',
+        'digit-canvas': 'digit-canvas/index.html',
       },
     },
   },
