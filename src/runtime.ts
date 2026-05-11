@@ -63,7 +63,7 @@ export interface StepResult {
 }
 
 /** Discriminated result returned by `step`/`run` when called with
- *  `{ onAbort: 'value' }`. Tags successful completion as `'ok'` and
+ *  `{ abortAsValue: true }`. Tags successful completion as `'ok'` and
  *  cancellation (e.g. the graph was destroyed mid-flight by `replaceModel`)
  *  as `'aborted'` — no try/catch needed at the call site. */
 export type Outcome<Ok> = ({ kind: 'ok' } & Ok) | { kind: 'aborted' }

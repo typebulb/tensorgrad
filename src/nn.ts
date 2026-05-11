@@ -13,7 +13,7 @@
 
 import { Module } from './module.js'
 import type { Tensor } from './ir.js'
-import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmax, embedding, conv2d } from './ops.js'
+import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmax, embedding, conv2d, pairOpt } from './ops.js'
 import type { Conv2dOptions } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
@@ -38,14 +38,12 @@ export class Conv2d extends Module {
     public readonly inC: number,
     public readonly outC: number,
     kernelSize: number | readonly [number, number],
-    opts: Conv2dOptions = {},
+    opts: Conv2dOptions & { bias?: boolean } = {},
   ) {
     super()
-    const [kH, kW] = typeof kernelSize === 'number' ? [kernelSize, kernelSize] : [kernelSize[0], kernelSize[1]]
-    const [sH, sW] = typeof opts.stride === 'number' ? [opts.stride, opts.stride]
-      : opts.stride ? [opts.stride[0], opts.stride[1]] : [1, 1]
-    const [pH, pW] = typeof opts.padding === 'number' ? [opts.padding, opts.padding]
-      : opts.padding ? [opts.padding[0], opts.padding[1]] : [0, 0]
+    const [kH, kW] = pairOpt(kernelSize, 1)
+    const [sH, sW] = pairOpt(opts.stride, 1)
+    const [pH, pW] = pairOpt(opts.padding, 0)
     this.strideH = sH; this.strideW = sW
     this.padH = pH; this.padW = pW
     this.W = this.param([outC, inC, kH, kW])

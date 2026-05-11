@@ -170,13 +170,6 @@ export interface CompileForwardMethodOptions<M extends Module, I extends InputDe
   inputs: I
 }
 
-/** Live-mutable optimizer fields for `setOptimizerConfig`. Only `lr` is
- *  mutable mid-training — for anything else (weightDecay, b1, b2, momentum,
- *  nesterov), use `replaceModel({ adam })` or `replaceModel({ sgd })` to
- *  rebuild the optimizer atomically. */
-export interface OptimizerConfigUpdate {
-  lr?: LR
-}
 
 /** Returned by `compileModule`. Proxies all GPU work to an internal worker;
  *  every method returns a Promise. Generic over the declared inputs shape
@@ -194,18 +187,18 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
 
   step(inputs: TypedInputs<I>): Promise<number>
   step(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<StepResult>
-  step(inputs: TypedInputs<I>, opts: { onAbort: 'value' }): Promise<Outcome<{ loss: number }>>
+  step(inputs: TypedInputs<I>, opts: { abortAsValue: true }): Promise<Outcome<{ loss: number }>>
   step(
     inputs: TypedInputs<I>,
-    opts: { withCaptures: true; onAbort: 'value' },
+    opts: { withCaptures: true; abortAsValue: true },
   ): Promise<Outcome<{ loss: number; captures: Captures }>>
 
   run(inputs: TypedInputs<I>): Promise<Float32Array>
   run(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<RunResult>
-  run(inputs: TypedInputs<I>, opts: { onAbort: 'value' }): Promise<Outcome<{ output: Float32Array }>>
+  run(inputs: TypedInputs<I>, opts: { abortAsValue: true }): Promise<Outcome<{ output: Float32Array }>>
   run(
     inputs: TypedInputs<I>,
-    opts: { withCaptures: true; onAbort: 'value' },
+    opts: { withCaptures: true; abortAsValue: true },
   ): Promise<Outcome<{ output: Float32Array; captures: Captures }>>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
@@ -229,7 +222,7 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
    *  explicit `startStep`, the schedule is rebased so its step 1 aligns with
    *  the next training step ("decay from now"). Numbers and `constant`
    *  schedules pass through unchanged. */
-  setOptimizerConfig(update: OptimizerConfigUpdate): Promise<void>
+  setOptimizerConfig(update: { lr?: LR }): Promise<void>
 
   /** Compile a sibling forward-only graph that shares this runtime's worker
    *  (and therefore its param GPUBuffers). Polymorphic by default — `null`
@@ -279,10 +272,10 @@ export interface CompiledForwardModule<M extends Module = Module, I extends Inpu
 
   run(inputs: TypedInputs<I>): Promise<Float32Array>
   run(inputs: TypedInputs<I>, opts: { withCaptures: true }): Promise<RunResult>
-  run(inputs: TypedInputs<I>, opts: { onAbort: 'value' }): Promise<Outcome<{ output: Float32Array }>>
+  run(inputs: TypedInputs<I>, opts: { abortAsValue: true }): Promise<Outcome<{ output: Float32Array }>>
   run(
     inputs: TypedInputs<I>,
-    opts: { withCaptures: true; onAbort: 'value' },
+    opts: { withCaptures: true; abortAsValue: true },
   ): Promise<Outcome<{ output: Float32Array; captures: Captures }>>
 
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
@@ -458,14 +451,14 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
 
   step(inputs: LooseInputs): Promise<number>
   step(inputs: LooseInputs, opts: { withCaptures: true }): Promise<StepResult>
-  step(inputs: LooseInputs, opts: { onAbort: 'value' }): Promise<Outcome<{ loss: number }>>
+  step(inputs: LooseInputs, opts: { abortAsValue: true }): Promise<Outcome<{ loss: number }>>
   step(
     inputs: LooseInputs,
-    opts: { withCaptures: true; onAbort: 'value' },
+    opts: { withCaptures: true; abortAsValue: true },
   ): Promise<Outcome<{ loss: number; captures: Captures }>>
   async step(
     inputs: LooseInputs,
-    opts?: { withCaptures?: boolean; onAbort?: 'value' },
+    opts?: { withCaptures?: boolean; abortAsValue?: boolean },
   ): Promise<number | StepResult | Outcome<{ loss: number }> | Outcome<{ loss: number; captures: Captures }>> {
     try {
       const r = await this.proxy.request<StepResultWire>(
@@ -473,13 +466,13 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
       )
       if (opts?.withCaptures) {
         const captures = makeCaptures(r.captures, this.meta.captureShapes)
-        return opts.onAbort === 'value'
+        return opts.abortAsValue === true
           ? { kind: 'ok', loss: r.loss, captures }
           : { loss: r.loss, captures }
       }
-      return opts?.onAbort === 'value' ? { kind: 'ok', loss: r.loss } : r.loss
+      return opts?.abortAsValue === true ? { kind: 'ok', loss: r.loss } : r.loss
     } catch (e) {
-      if (opts?.onAbort === 'value' && (e as { name?: string })?.name === 'AbortError') {
+      if (opts?.abortAsValue === true && (e as { name?: string })?.name === 'AbortError') {
         return { kind: 'aborted' }
       }
       throw e
@@ -488,14 +481,14 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
 
   run(inputs: LooseInputs): Promise<Float32Array>
   run(inputs: LooseInputs, opts: { withCaptures: true }): Promise<RunResult>
-  run(inputs: LooseInputs, opts: { onAbort: 'value' }): Promise<Outcome<{ output: Float32Array }>>
+  run(inputs: LooseInputs, opts: { abortAsValue: true }): Promise<Outcome<{ output: Float32Array }>>
   run(
     inputs: LooseInputs,
-    opts: { withCaptures: true; onAbort: 'value' },
+    opts: { withCaptures: true; abortAsValue: true },
   ): Promise<Outcome<{ output: Float32Array; captures: Captures }>>
   async run(
     inputs: LooseInputs,
-    opts?: { withCaptures?: boolean; onAbort?: 'value' },
+    opts?: { withCaptures?: boolean; abortAsValue?: boolean },
   ): Promise<Float32Array | RunResult | Outcome<{ output: Float32Array }> | Outcome<{ output: Float32Array; captures: Captures }>> {
     try {
       const r = await this.proxy.request<RunResultWire>(
@@ -503,13 +496,13 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
       )
       if (opts?.withCaptures) {
         const captures = makeCaptures(r.captures, this.meta.captureShapes)
-        return opts.onAbort === 'value'
+        return opts.abortAsValue === true
           ? { kind: 'ok', output: r.output, captures }
           : { output: r.output, captures }
       }
-      return opts?.onAbort === 'value' ? { kind: 'ok', output: r.output } : r.output
+      return opts?.abortAsValue === true ? { kind: 'ok', output: r.output } : r.output
     } catch (e) {
-      if (opts?.onAbort === 'value' && (e as { name?: string })?.name === 'AbortError') {
+      if (opts?.abortAsValue === true && (e as { name?: string })?.name === 'AbortError') {
         return { kind: 'aborted' }
       }
       throw e
@@ -552,7 +545,7 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
     ).then(() => undefined)
   }
 
-  setOptimizerConfig(update: OptimizerConfigUpdate): Promise<void> {
+  setOptimizerConfig(update: { lr?: LR }): Promise<void> {
     return this.proxy.request<null>(
       { kind: 'setOptimizerConfig', payload: { graphId: this.graphId, update } },
     ).then(() => undefined)
@@ -642,14 +635,14 @@ class ForwardProxy<M extends Module, I extends InputDecls>
 
   run(inputs: LooseInputs): Promise<Float32Array>
   run(inputs: LooseInputs, opts: { withCaptures: true }): Promise<RunResult>
-  run(inputs: LooseInputs, opts: { onAbort: 'value' }): Promise<Outcome<{ output: Float32Array }>>
+  run(inputs: LooseInputs, opts: { abortAsValue: true }): Promise<Outcome<{ output: Float32Array }>>
   run(
     inputs: LooseInputs,
-    opts: { withCaptures: true; onAbort: 'value' },
+    opts: { withCaptures: true; abortAsValue: true },
   ): Promise<Outcome<{ output: Float32Array; captures: Captures }>>
   async run(
     inputs: LooseInputs,
-    opts?: { withCaptures?: boolean; onAbort?: 'value' },
+    opts?: { withCaptures?: boolean; abortAsValue?: boolean },
   ): Promise<Float32Array | RunResult | Outcome<{ output: Float32Array }> | Outcome<{ output: Float32Array; captures: Captures }>> {
     try {
       const sib = await this.siblingFor(inputs)
@@ -658,13 +651,13 @@ class ForwardProxy<M extends Module, I extends InputDecls>
       )
       if (opts?.withCaptures) {
         const captures = makeCaptures(r.captures, sib.meta.captureShapes)
-        return opts.onAbort === 'value'
+        return opts.abortAsValue === true
           ? { kind: 'ok', output: r.output, captures }
           : { output: r.output, captures }
       }
-      return opts?.onAbort === 'value' ? { kind: 'ok', output: r.output } : r.output
+      return opts?.abortAsValue === true ? { kind: 'ok', output: r.output } : r.output
     } catch (e) {
-      if (opts?.onAbort === 'value' && (e as { name?: string })?.name === 'AbortError') {
+      if (opts?.abortAsValue === true && (e as { name?: string })?.name === 'AbortError') {
         return { kind: 'aborted' }
       }
       throw e

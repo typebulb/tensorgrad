@@ -307,7 +307,7 @@ async function runTraining(): Promise<void> {
   try {
     while (running && compiled) {
       const batch = nextTrainBatch()
-      const r = await compiled.step(batch, { onAbort: 'value' })
+      const r = await compiled.step(batch, { abortAsValue: true })
       if (r.kind === 'aborted') return   // graph was replaced; quietly bail
       lastLoss = r.loss
       step += 1

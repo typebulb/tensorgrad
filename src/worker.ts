@@ -251,7 +251,7 @@ async function handleStep(payload: {
     // If the graph was destroyed mid-flight (e.g. replaceModel ran while we
     // were awaiting mapAsync), surface a clean AbortError instead of the raw
     // WebGPU "buffer is destroyed" or similar — callers can branch on it
-    // (or pass { onAbort: 'value' } to get a discriminated result).
+    // (or pass { abortAsValue: true } to get a discriminated result).
     if (!graphs.has(payload.graphId)) throw abortErr('step aborted: graph destroyed mid-flight')
     throw e
   }

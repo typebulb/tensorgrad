@@ -542,7 +542,7 @@ export function stack(tensors: readonly Tensor[], axis: number): Tensor {
 /** Inverse of `concat`: split into pieces along `axis` with the given
  *  per-piece sizes (must sum to the axis's size). Composes from
  *  `sliceRange` — no new IR. */
-export function split(t: Tensor, axis: number, sizes: readonly number[]): Tensor[] {
+export function split(t: Tensor, sizes: readonly number[], axis: number): Tensor[] {
   const site = captureSite('split')
   const ax = axis < 0 ? t.shape.length + axis : axis
   if (ax < 0 || ax >= t.shape.length) throw new ShapeError(`split: axis ${axis} out of range`, site)
@@ -695,13 +695,12 @@ export interface Conv2dOptions {
   stride?: number | readonly [number, number]
   /** Per-side padding along H and W (zero-padding). Default 0. */
   padding?: number | readonly [number, number]
-  /** Include a bias term (default true; only consulted by the `nn.Conv2d`
-   *  layer wrapper, not by the free `conv2d` function which has no bias
-   *  input). Shape `[outC]`, broadcast over (B, H_out, W_out). */
-  bias?: boolean
 }
 
-function pairOpt(v: number | readonly [number, number] | undefined, defaultVal: number): [number, number] {
+/** Normalize a number-or-pair to a concrete `[number, number]`, applying
+ *  `defaultVal` to both dims when omitted. Shared by conv2d / maxPool2d /
+ *  nn.Conv2d for stride/padding/kernel handling. */
+export function pairOpt(v: number | readonly [number, number] | undefined, defaultVal: number): [number, number] {
   if (v === undefined) return [defaultVal, defaultVal]
   if (typeof v === 'number') return [v, v]
   return [v[0], v[1]]

@@ -56,7 +56,7 @@ export { emitKernels, type KernelSpec } from './codegen.js'
 export { Captures, type RunOptions, type StepResult, type RunResult, type Outcome, type UploadParamsOptions } from './runtime.js'
 export {
   compileToIR, compileModule, isWebGPUAvailable,
-  type CompiledIR, type CompileModuleOptions, type CompileForwardMethodOptions, type OptimizerConfigUpdate,
+  type CompiledIR, type CompileModuleOptions, type CompileForwardMethodOptions,
   type CompiledModule, type CompiledForwardModule,
   type InputDecl, type InputDeclObject, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,
   type DtypeOf, type TypedArrayFor, type TypedInputs, type ParamTree,

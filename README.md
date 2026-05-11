@@ -103,7 +103,7 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `x.argmax(dim=k)` | `argmax(x, k)` (defaults to last axis; flat argmax over the whole tensor if no axis) |
 | `x.transpose(a, b)` | `swapAxes(x, a, b)` |
 | `x.view(B, T, H, -1)` / `x.reshape(B, -1)` | `reshape(x, [B, T, H, -1])` — exactly one `-1` allowed, inferred from total size |
-| `torch.split(x, sizes, dim)` | `split(x, dim, sizes)` (note argument order) |
+| `torch.split(x, sizes, dim)` | `split(x, sizes, dim)` |
 | `nn.Embedding(V, D)` | `new nn.Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
 | `torch.flatten(x, start_dim=1)` | `flatten(x, 1)` (or `reshape(x, [B, -1])`) |
 | `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new nn.Conv2d(in, out, k, { stride: s, padding: p })` |
@@ -137,7 +137,7 @@ call `step` / `run` with `{ withCaptures: true }`.
 **Tensorgrad runs in a worker.** Every method on a compiled module is
 async. Cancellation (e.g. `replaceModel` while a `step` is in flight)
 shows up as a rejected promise with `name === 'AbortError'`; pass
-`{ onAbort: 'value' }` to get a discriminated result instead of having
+`{ abortAsValue: true }` to get a discriminated result instead of having
 to try/catch.
 
 ## Public API
@@ -238,10 +238,10 @@ Generic — works around `run`, `step`, or any single-argument promise function.
 ```ts
 compiled.step(inputs)                           // → loss: number
 compiled.step(inputs, { withCaptures: true })   // → { loss, captures }
-compiled.step(inputs, { onAbort: 'value' })     // → { kind: 'ok', loss } | { kind: 'aborted' }
+compiled.step(inputs, { abortAsValue: true })     // → { kind: 'ok', loss } | { kind: 'aborted' }
 compiled.run(inputs)                            // → Float32Array
 compiled.run(inputs, { withCaptures: true })    // → { output, captures }
-compiled.run(inputs, { onAbort: 'value' })      // → { kind: 'ok', output } | { kind: 'aborted' }
+compiled.run(inputs, { abortAsValue: true })      // → { kind: 'ok', output } | { kind: 'aborted' }
 compiled.uploadParams(record, { partial? })
 compiled.downloadParams()                       // → ParamTree<M> (typed tree, mirrors class)
 compiled.downloadParamsFlat()                   // → Record<'layers.0.W' | …, Float32Array>
@@ -286,11 +286,11 @@ call boundary, not deep in kernel dispatch.
 **Cancellation as value.** If your UI tears down or rebuilds the model
 while a `step` / `run` is in flight (e.g. the user picks a new layer
 size mid-training, triggering `replaceModel`), the in-flight call is
-aborted. By default it rejects with `AbortError`; pass `{ onAbort:
-'value' }` to get a discriminated result instead:
+aborted. By default it rejects with `AbortError`; pass `{ abortAsValue:
+true }` to get a discriminated result instead:
 
 ```ts
-const r = await compiled.step(batch, { onAbort: 'value' })
+const r = await compiled.step(batch, { abortAsValue: true })
 if (r.kind === 'aborted') return    // graph was replaced; nothing to do
 useLoss(r.loss)
 ```
@@ -328,7 +328,7 @@ Imported from `'tensorgrad'`:
 - Shape: `reshape`, `transpose`, `swapAxes`
 - Linear algebra: `matmul`, `matmulBatched`
 - Indexing / casting: `oneHot`, `arange`, `embedding`
-- Slicing / structural: `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, axis, sizes)`
+- Slicing / structural: `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x)`, `whereCausal`
 - 2D conv / pool (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `flatten(x, startAxis?)`
 
@@ -342,7 +342,7 @@ returns `i32` and is non-differentiable. The standard loss tail is
 `reshape` + `concat`). Negative axes index from the end (Python
 convention). Concat is capped at 7 inputs (WebGPU bind-group limit:
 8 storage buffers per shader stage minus the output) — chain a second
-concat if you need more. `split(t, axis, sizes)` is the inverse, built
+concat if you need more. `split(t, sizes, axis)` is the inverse, built
 from `sliceRange`.
 
 ### `nn` namespace
