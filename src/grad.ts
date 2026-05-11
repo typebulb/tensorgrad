@@ -23,6 +23,7 @@ import {
   broadcastTo, sumToShape,
   constScalar, reluGrad,
   sumLast, where, less, greater,
+  dropoutWithSalt,
 } from './ops.js'
 import { traceInto } from './trace.js'
 import { shapesEqual } from './shape.js'
@@ -252,6 +253,13 @@ function runTransposeRule(
       const c = tensorOf(op.out)
       const cMinusCSq = sub(c, mul(c, c))
       accumulate(cotangents, op.a, mul(outCotan, cMinusCSq))
+      return
+    }
+    case 'dropout': {
+      // Same kernel applied to dy with the same (seed, salt, p) — the PCG
+      // hash reproduces the forward mask. The 1/(1-p) scale is already
+      // baked into the dropout kernel.
+      accumulate(cotangents, op.a, dropoutWithSalt(outCotan, op.p, op.salt, op.seed))
       return
     }
     case 'min': {

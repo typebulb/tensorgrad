@@ -71,6 +71,13 @@ export type OpNode =
   | { kind: 'abs'; out: number; a: number }
   | { kind: 'tanh'; out: number; a: number }
   | { kind: 'sigmoid'; out: number; a: number }
+  // Inverted dropout. Same kernel runs forward (a = x) and backward (a = dy):
+  // applies a per-element mask of value 0 or 1/(1-p), reproducibly from
+  // (seed, salt, thread_id). `salt` is a per-dropout-call counter unique
+  // within this graph; backward emits another `dropout` op with the same
+  // salt + seed so the masks match. `seed` is the id of a shared i32 scalar
+  // tensor_input (`__dropoutSeed`) the runtime updates per step.
+  | { kind: 'dropout'; out: number; a: number; seed: number; p: number; salt: number }
 
   // ---- Reductions (over last axis only; reshape if you need other axes) ----
   | { kind: 'mean_last'; out: number; a: number }   // keepdims=true

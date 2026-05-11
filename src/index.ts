@@ -13,6 +13,8 @@ export {
   // Element-wise unary
   sqrt, rsqrt, log, exp, relu,
   neg, abs, tanh, sigmoid, gelu, silu,
+  // Stochastic regularization (training-forward only; no mode flag)
+  dropout,
   // Comparisons + select
   less, greater, where,
   // Reductions over the last axis (other axes via reshape/transpose first)

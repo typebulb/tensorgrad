@@ -9,9 +9,9 @@
 //
 // No actual numeric work happens here. These calls just build the IR.
 
-import type { Tensor, Shape, Dtype, OpNode } from './ir.js'
+import type { Tensor, Shape, Dtype, OpNode, Graph } from './ir.js'
 import { addOp, captureSite } from './ir.js'
-import { currentGraph } from './trace.js'
+import { currentGraph, tensorInput } from './trace.js'
 import {
   inferElementwiseBinop, inferUnary, inferMeanLast, inferSumLast, inferArgmaxLast,
   inferReshape, inferTranspose, inferMatmul, inferMatmulBatched,
@@ -116,6 +116,60 @@ export const sigmoid = (a: Tensor): Tensor => unary('sigmoid', a)
 /** SiLU / Swish: `x * sigmoid(x)`. Composed from primitives. */
 export function silu(a: Tensor): Tensor {
   return mul(a, sigmoid(a))
+}
+
+/** Hidden tensor_input name for the per-step dropout RNG. The runtime
+ *  auto-injects this scalar before each step()/run() when the compiled
+ *  graph contains any `dropout` op; users do not pass it. Exposed as a
+ *  named constant so worker + proxy agree on the convention. */
+export const DROPOUT_SEED_INPUT = '__dropoutSeed'
+
+/** Inverted dropout: with probability `p`, zero an element; otherwise scale
+ *  it by `1 / (1 - p)`. `p` is a compile-time constant in `[0, 1)`. Calling
+ *  `dropout(x, 0)` is a no-op (returns `x` directly). The mask is
+ *  reproducible from `(per-step seed, this-call salt, thread id)` via a PCG
+ *  hash inside the kernel — backward recomputes the same mask, no buffer
+ *  capture needed.
+ *
+ *  Train-vs-eval handling: free-function form, no mode flag. Call `dropout`
+ *  inside your training forward (lossFn); omit it from your inference
+ *  forward (predictFn). The two are compiled separately by the
+ *  `compileModule` / `compileForward` pair. */
+export function dropout(x: Tensor, p: number): Tensor {
+  if (p === 0) return x
+  const site = captureSite('dropout')
+  if (p < 0 || p >= 1) throw new ShapeError(`dropout: p must be in [0, 1), got ${p}`, site)
+  if (x.dtype !== 'f32') throw new ShapeError(`dropout: requires f32, got ${x.dtype}`, site)
+  const g = currentGraph()
+  const seed = findOrCreateDropoutSeed(g)
+  // Salt = count of existing dropout ops in this graph. Stable per call —
+  // doesn't shift when unrelated ops get added/removed elsewhere, since
+  // we count only `dropout` kinds.
+  const salt = countDropoutOps(g)
+  return addOp(g, 'dropout', inferUnary('dropout', x.shape, site), 'f32', site, { a: x.id, seed: seed.id, p, salt })
+}
+
+/** Internal: emit a `dropout` op with an explicit salt. Used by grad.ts to
+ *  emit the backward kernel using the same (seed, salt, p) as the forward,
+ *  so the mask matches. */
+export function dropoutWithSalt(dy: Tensor, p: number, salt: number, seedId: number): Tensor {
+  const site = captureSite('dropout')
+  return addOp(currentGraph(), 'dropout', dy.shape, 'f32', site, { a: dy.id, seed: seedId, p, salt })
+}
+
+function findOrCreateDropoutSeed(g: Graph): Tensor {
+  for (const op of g.ops) {
+    if (op.kind === 'tensor_input' && op.name === DROPOUT_SEED_INPUT) {
+      return g.tensors[op.out]!
+    }
+  }
+  return tensorInput(DROPOUT_SEED_INPUT, [], 'i32')
+}
+
+function countDropoutOps(g: Graph): number {
+  let n = 0
+  for (const op of g.ops) if (op.kind === 'dropout') n++
+  return n
 }
 
 /** GELU using the GPT-2 tanh approximation:

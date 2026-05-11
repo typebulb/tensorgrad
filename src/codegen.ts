@@ -185,6 +185,39 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
 
+    // ---- Stochastic ------------------------------------------------------
+    case 'dropout': {
+      const out = tof(op.out)
+      const a = tof(op.a)
+      const total = shapeSize(out.shape)
+      const p = op.p
+      const scale = 1 / (1 - p)
+      // Per-dropout-call salt mixes into the PCG hash so two dropout ops in
+      // the same graph (and the same forward/backward pair across an op
+      // boundary) produce different masks but stay reproducible per
+      // (seed, salt, thread). Forward and backward share salt → same mask.
+      // Salt is baked into the kernel; the only per-step input is the seed.
+      const saltConst = ((op.salt * 0x9E3779B1) >>> 0).toString(10) + 'u'
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read> seed : array<i32>;
+@group(0) @binding(2) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  // PCG-style hash of (seed, salt, thread) — cheap, decorrelated enough.
+  var h : u32 = u32(seed[0]) ^ ${saltConst} ^ i;
+  h = h * 747796405u + 2891336453u;
+  h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+  h = (h >> 22u) ^ h;
+  let u : f32 = f32(h) / 4294967296.0;
+  let mask : f32 = select(0.0, ${scale.toFixed(8)}, u >= ${p.toFixed(8)});
+  out[i] = a[i] * mask;
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.seed), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
+
     // ---- Comparisons + select --------------------------------------------
     case 'less':
     case 'greater': {

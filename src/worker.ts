@@ -8,6 +8,7 @@
 
 import { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
 import { resolveLR, rebaseLR, type LR } from './adam.js'
+import { DROPOUT_SEED_INPUT } from './ops.js'
 import type { Req, Res, WireIR, WireAdamConfig, WireError } from './worker-protocol.js'
 import { wireError } from './worker-protocol.js'
 
@@ -29,6 +30,10 @@ interface GraphSlot {
    *  graph itself. Used by `handleDestroy` to cascade-destroy children when
    *  the parent goes away. */
   parentGraphId: number | null
+  /** Per-step dropout seed state, when the graph contains any `dropout` op.
+   *  `null` otherwise. The injected seed input is named DROPOUT_SEED_INPUT
+   *  ('__dropoutSeed') and updated before every step()/run(). */
+  dropout: DropoutState | null
 }
 
 interface AdamState {
@@ -36,6 +41,16 @@ interface AdamState {
   t: number
   lrtBuf: Float32Array
   decayShrinkBuf: Float32Array | null
+}
+
+interface DropoutState {
+  /** Per-graph step counter; mixes into the kernel's PCG hash. Starts at 1;
+   *  every step()/run() increments before dispatch so each call has a fresh
+   *  seed and reset() back to 1 reproduces an earlier run from the same
+   *  starting point. */
+  counter: number
+  /** Reused i32 single-element buffer for the per-step seed. */
+  seedBuf: Int32Array
 }
 
 const graphs = new Map<number, GraphSlot>()
@@ -91,6 +106,7 @@ async function handleCreateRuntime(payload: {
     captureShapes,
     adam: payload.adam ? createAdamState(payload.adam) : null,
     parentGraphId: null,
+    dropout: graphUsesDropout(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
   }
   graphs.set(payload.graphId, slot)
 
@@ -100,6 +116,13 @@ async function handleCreateRuntime(payload: {
     kernelCount: slot.kernelCount,
     captureShapes: slot.captureShapes,
   }
+}
+
+/** True iff the graph contains any `dropout` op. Drives whether the slot
+ *  carries a `DropoutState` and whether step/run inject the seed input. */
+function graphUsesDropout(graph: WireIR['graph']): boolean {
+  for (const op of graph.ops) if (op.kind === 'dropout') return true
+  return false
 }
 
 async function handleCompileForward(payload: {
@@ -131,6 +154,7 @@ async function handleCompileForward(payload: {
     captureShapes,
     adam: null,
     parentGraphId: payload.parentGraphId,
+    dropout: graphUsesDropout(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
   }
   graphs.set(payload.graphId, slot)
 
@@ -168,13 +192,24 @@ function injectAdamScalars(slot: GraphSlot, inputs: Record<string, Int32Array | 
   return merged
 }
 
+/** Inject the per-step dropout seed into `inputs` when this graph uses
+ *  dropout. Counter advances before every step()/run() so each call
+ *  produces a different mask, while same-counter dispatches reproduce. */
+function injectDropoutSeed(slot: GraphSlot, inputs: Record<string, Int32Array | Float32Array>): Record<string, Int32Array | Float32Array> {
+  const d = slot.dropout
+  if (!d) return inputs
+  d.counter++
+  d.seedBuf[0] = d.counter | 0
+  return { ...inputs, [DROPOUT_SEED_INPUT]: d.seedBuf }
+}
+
 async function handleStep(payload: {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
   withCaptures: boolean
 }): Promise<{ loss: number; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
-  const merged = injectAdamScalars(slot, payload.inputs)
+  const merged = injectDropoutSeed(slot, injectAdamScalars(slot, payload.inputs))
   if (payload.withCaptures) {
     const r = await slot.runtime.step(merged, { withCaptures: true })
     return { loss: r.loss, captures: capturesToRecord(r.captures, slot.captureShapes) }
@@ -189,11 +224,12 @@ async function handleRun(payload: {
   withCaptures: boolean
 }): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
+  const merged = injectDropoutSeed(slot, payload.inputs)
   if (payload.withCaptures) {
-    const r = await slot.runtime.run(payload.inputs, { withCaptures: true })
+    const r = await slot.runtime.run(merged, { withCaptures: true })
     return { output: r.output, captures: capturesToRecord(r.captures, slot.captureShapes) }
   }
-  const output = await slot.runtime.run(payload.inputs)
+  const output = await slot.runtime.run(merged)
   return { output, captures: null }
 }
 

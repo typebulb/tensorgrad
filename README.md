@@ -230,6 +230,7 @@ Imported from `'tensorgrad'`:
 - Unary math: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`
 - Activations: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`
 - Clamping: `clamp(x, lo, hi)` (scalar bounds)
+- Stochastic regularization: `dropout(x, p)` — inverted dropout, p ∈ [0, 1)
 - Comparisons / select: `less`, `greater`, `where`
 - Reductions (last axis / all): `meanLast`, `sumLast`, `sumAll`, `meanAll`, `argmaxLast`
 - Shape: `reshape`, `transpose`, `swapAxes`
@@ -328,6 +329,36 @@ this.param([D],    { init: init.literal(myFloat32Array) })
 Defaults: `'randn'` (std 0.02). AdamW weight decay defaults to `true` for
 randn/kaiming/literal init, `false` for zeros/ones — override per-param with
 `{ decay: true | false }`.
+
+### Dropout (no mode flag)
+
+`dropout(x, p)` is inverted dropout: elements survive with probability
+`1 - p` and are scaled by `1 / (1 - p)`; the rest are zeroed. The mask
+is reproducible from the (per-step seed, per-call salt, thread id) via
+a PCG hash inside the kernel — backward recomputes the same mask, no
+memory cost. The runtime auto-threads the per-step seed; users never
+plumb it.
+
+There is no `.train()/.eval()` mode flag. Instead, follow the
+free-function-forward pattern tensorgrad already encourages: call
+`dropout` inside your *training* forward (`lossFn`), and omit it from
+your *inference* forward (`predictFn`). The two functions compile into
+separate graphs — dropout is literally absent from the inference path.
+
+```ts
+function lossFn(m: Model, { x, y }: { x: Tensor; y: Tensor }) {
+  const h = relu(dropout(m.l1.fwd(x), 0.1))    // dropout in training
+  return meanAll(nn.crossEntropyLast(m.l2.fwd(h), y))
+}
+
+function predictFn(m: Model, { x }: { x: Tensor }) {
+  const h = relu(m.l1.fwd(x))                  // no dropout
+  return m.l2.fwd(h)
+}
+```
+
+`dropout(x, 0)` short-circuits to identity (no IR node emitted), so a
+config-driven `dropout(x, cfg.pDrop)` with `cfg.pDrop === 0` is free.
 
 ### Captures (debugging / mech-interp)
 
