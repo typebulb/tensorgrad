@@ -75,6 +75,56 @@ for (let step = 0; step < 1000; step++) {
   derives gradients, wires Adam, generates WGSL, spawns a worker, and
   returns a `CompiledModule`. Every method on it is async.
 
+## Porting from PyTorch
+
+If you're translating a PyTorch model or training loop. Assumes the
+**Mental model** above.
+
+### Direct mappings
+
+| PyTorch | tensorgrad |
+|---|---|
+| `class Net(nn.Module): def forward(self, x): ...` | `class Net extends Module { ... }` + a free `forward(m, x)` function |
+| `model(x)` | `forward(m, x)` |
+| `linear(x)` on `nn.Linear` / `nn.LayerNorm` | `linear.fwd(x)` (`.fwd` is the convention for built-in leaf modules) |
+| `model.parameters()` | `compiled.paramNames`, `compiled.downloadParams()` |
+| `optimizer.zero_grad(); out = model(x); loss = ...; loss.backward(); optimizer.step()` | `await compiled.step(inputs)` — forward + backward + Adam update are fused |
+| `optim.Adam(params, lr=...)` | `adam: { lr }` in `compileModule({ ... })` |
+| `optim.SGD(...)` | Not yet supported |
+| `nn.Dropout(p)` as a child module | `dropout(x, p)` as a free-function call inside the training forward |
+| `x.mean(dim=-1)` / `x.sum(dim=-1)` / `F.softmax(x, dim=-1)` | `meanLast(x)` / `sumLast(x)` / `softmaxLast(x)` |
+| `x.mean()` / `x.sum()` | `meanAll(x)` / `sumAll(x)` |
+| `x.mean(dim=k)` for non-last `k` | Transpose so axis `k` is last, then `meanLast`. Axis-param forms aren't supported yet. |
+| `torch.flatten(x, 1)` | `reshape(x, [B, dim])` with `dim` computed explicitly. No `-1` wildcard yet. |
+| `nn.Conv2d` / `nn.MaxPool2d` | Not yet supported. |
+
+### Things that aren't 1-to-1
+
+**Pass raw logits to the loss, not log-probs.** PyTorch tutorials often
+write `F.log_softmax(logits, dim=-1)` in `forward` and `F.nll_loss(...)`
+in the loss. Tensorgrad's `nn.crossEntropyLast(logits, targets)` fuses
+log-softmax + NLL into one call. Pass raw logits — don't apply
+log-softmax yourself. Applying it twice silently
+double-log-softmaxes; the model trains but converges to garbage. This
+is the worst class of bug: it runs.
+
+**No `.train()` / `.eval()` mode flag.** Write two forwards: a training
+one (`lossFn`, includes `dropout` etc.) and an inference one
+(`predictFn`, deterministic). Compile training with `compileModule`,
+then call `compiled.compileForward({ forward: predictFn, ... })` for the
+shared-params inference graph. Stochastic ops are physically absent from
+the inference graph.
+
+**No eager mode.** The forward is traced once and compiled. To read an
+intermediate, mark it with `capture(name, t)` inside the forward and
+call `step` / `run` with `{ withCaptures: true }`.
+
+**Tensorgrad runs in a worker.** Every method on a compiled module is
+async. Cancellation (e.g. `replaceModel` while a `step` is in flight)
+shows up as a rejected promise with `name === 'AbortError'`; pass
+`{ onAbort: 'value' }` to get a discriminated result instead of having
+to try/catch.
+
 ## Public API
 
 ### Compile entry points
