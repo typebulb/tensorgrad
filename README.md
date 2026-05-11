@@ -91,6 +91,9 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `optimizer.zero_grad(); out = model(x); loss = ...; loss.backward(); optimizer.step()` | `await compiled.step(inputs)` — forward + backward + Adam update are fused |
 | `optim.Adam(params, lr=...)` | `adam: { lr }` in `compileModule({ ... })` |
 | `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `sgd: { lr, momentum?, nesterov? }` in `compileModule({ ... })` |
+| `StepLR(opt, step_size=N, gamma=g)` | `lr.step({ peak, stepSize: N, gamma: g })` |
+| `MultiStepLR(opt, milestones=[..], gamma=g)` | `lr.multiStep({ peak, milestones: [..], gamma: g })` |
+| `CosineAnnealingLR(opt, T_max=N, eta_min=m)` | `lr.cosineDecay({ peak, final: m, steps: N })` |
 | `nn.Dropout(p)` as a child module | `dropout(x, p)` as a free-function call inside the training forward |
 | `x.mean(dim=k)` / `x.sum(dim=k)` | `mean(x, k)` / `sum(x, k)` — negative `k` counts from the end |
 | `x.mean()` / `x.sum()` | `mean(x)` / `sum(x)` — 0-d scalar |
@@ -380,6 +383,8 @@ adam: { lr: lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 }) }
 adam: { lr: lr.cosineDecay({ peak: 0.005, final: 0.0001, steps: 5000 }) }
 sgd:  { lr: lr.cosineDecay({ peak: 0.1, final: 0.001, steps: 10000 }), momentum: 0.9 }
 adam: { lr: lr.warmup({ peakLr: 0.001, warmupSteps: 200, after: lr.constant(0.001) }) }
+adam: { lr: lr.step({ peak: 1.0, stepSize: 1, gamma: 0.7 }) }            // PyTorch StepLR
+adam: { lr: lr.multiStep({ peak: 0.1, milestones: [30000, 60000], gamma: 0.1 }) }  // MultiStepLR
 ```
 
 LR schedules are serializable shapes, not closures (they cross the worker

@@ -395,4 +395,75 @@ try {
   console.log('  ✓ SGD with weightDecay: config preserved through appendSGD')
 }
 
+// ---- Verify lr.step / lr.multiStep resolveLR values ------------------------
+
+console.log('\nVerifying lr.step / lr.multiStep schedules...')
+
+const { lr, resolveLR } = await import('../src/index.js')
+
+function approxEq(a: number, b: number, eps = 1e-9): boolean {
+  return Math.abs(a - b) < eps
+}
+
+// lr.step: stepSize=1, gamma=0.7 → peak * 0.7^(step-1)
+{
+  const sched = lr.step({ peak: 1.0, stepSize: 1, gamma: 0.7 })
+  const cases = [
+    [1, 1.0],
+    [2, 0.7],
+    [3, 0.49],
+    [10, Math.pow(0.7, 9)],
+  ] as const
+  for (const [step, want] of cases) {
+    const got = resolveLR(sched, step)
+    if (!approxEq(got, want, 1e-7)) {
+      console.error(`FAIL: lr.step at step=${step} got ${got}, want ${want}`)
+      process.exit(1)
+    }
+  }
+  console.log('  ✓ lr.step(stepSize=1, gamma=0.7) decays geometrically per step')
+}
+
+// lr.step: stepSize=3, gamma=0.5 → peak * 0.5^floor((step-1)/3)
+{
+  const sched = lr.step({ peak: 0.1, stepSize: 3, gamma: 0.5 })
+  const cases = [
+    [1, 0.1],
+    [3, 0.1],
+    [4, 0.05],
+    [6, 0.05],
+    [7, 0.025],
+  ] as const
+  for (const [step, want] of cases) {
+    const got = resolveLR(sched, step)
+    if (!approxEq(got, want, 1e-9)) {
+      console.error(`FAIL: lr.step(stepSize=3) at step=${step} got ${got}, want ${want}`)
+      process.exit(1)
+    }
+  }
+  console.log('  ✓ lr.step(stepSize=3, gamma=0.5) holds for stepSize values then drops')
+}
+
+// lr.multiStep: milestones=[3, 7], gamma=0.1 → peak * 0.1^(milestones passed)
+{
+  const sched = lr.multiStep({ peak: 1.0, milestones: [3, 7], gamma: 0.1 })
+  const cases = [
+    [1, 1.0],
+    [2, 1.0],
+    [3, 0.1],
+    [4, 0.1],
+    [6, 0.1],
+    [7, 0.01],
+    [10, 0.01],
+  ] as const
+  for (const [step, want] of cases) {
+    const got = resolveLR(sched, step)
+    if (!approxEq(got, want, 1e-9)) {
+      console.error(`FAIL: lr.multiStep at step=${step} got ${got}, want ${want}`)
+      process.exit(1)
+    }
+  }
+  console.log('  ✓ lr.multiStep([3, 7], gamma=0.1) drops at each milestone')
+}
+
 console.log('\nPhase 1 smoke test complete.')

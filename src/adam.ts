@@ -56,6 +56,8 @@ export type LR =
   | { readonly kind: 'linearDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
   | { readonly kind: 'cosineDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
   | { readonly kind: 'warmup'; readonly peakLr: number; readonly warmupSteps: number; readonly after: LR; readonly startStep?: number }
+  | { readonly kind: 'step'; readonly peak: number; readonly stepSize: number; readonly gamma: number; readonly startStep?: number }
+  | { readonly kind: 'multiStep'; readonly peak: number; readonly milestones: readonly number[]; readonly gamma: number; readonly startStep?: number }
 
 /** Ergonomic constructors for LR shapes. */
 export const lr = {
@@ -75,6 +77,17 @@ export const lr = {
    *  `startStep` shifts the timeline. */
   warmup: (opts: { peakLr: number; warmupSteps: number; after: LR; startStep?: number }): LR =>
     ({ kind: 'warmup', ...opts }),
+  /** Geometric decay: `peak * gamma^floor(step / stepSize)`. PyTorch's
+   *  `torch.optim.lr_scheduler.StepLR`. With `stepSize: 1`, every step
+   *  multiplies lr by `gamma` (exponential decay). */
+  step: (opts: { peak: number; stepSize: number; gamma: number; startStep?: number }): LR =>
+    ({ kind: 'step', ...opts }),
+  /** Piecewise-constant decay at specific step milestones: `peak * gamma^(count
+   *  of milestones <= step)`. PyTorch's
+   *  `torch.optim.lr_scheduler.MultiStepLR`. Useful for "drop lr by 10x at
+   *  steps 30k and 60k" patterns. Milestones must be sorted ascending. */
+  multiStep: (opts: { peak: number; milestones: readonly number[]; gamma: number; startStep?: number }): LR =>
+    ({ kind: 'multiStep', ...opts }),
 }
 
 /** Apply a schedule's `startStep` offset to a current step and clamp to ≥ 1. */
@@ -101,6 +114,20 @@ export function resolveLR(schedule: LR, step: number): number {
       const s = intrinsicStep(schedule.startStep, step)
       if (s <= schedule.warmupSteps) return schedule.peakLr * (s / schedule.warmupSteps)
       return resolveLR(schedule.after, s - schedule.warmupSteps)
+    }
+    case 'step': {
+      // PyTorch StepLR uses 0-based epoch indexing; we keep 1-based to match
+      // the rest of the schedules. `(s - 1) / stepSize` mirrors the same
+      // boundary semantics as PyTorch (the first stepSize values are unscaled).
+      const s = intrinsicStep(schedule.startStep, step)
+      const k = Math.floor((s - 1) / schedule.stepSize)
+      return schedule.peak * Math.pow(schedule.gamma, k)
+    }
+    case 'multiStep': {
+      const s = intrinsicStep(schedule.startStep, step)
+      let k = 0
+      for (const m of schedule.milestones) if (s >= m) k++
+      return schedule.peak * Math.pow(schedule.gamma, k)
     }
   }
 }
