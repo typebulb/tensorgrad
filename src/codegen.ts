@@ -767,12 +767,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
-  let b      = i / ${cOut! * hOut! * wOut!}u;
-  let rem0   = i % ${cOut! * hOut! * wOut!}u;
-  let cOut_  = rem0 / ${hOut! * wOut!}u;
-  let rem1   = rem0 % ${hOut! * wOut!}u;
-  let h_out  = rem1 / ${wOut!}u;
-  let w_out  = rem1 % ${wOut!}u;
+${decompose4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_out', 'w_out'])}
   let inBase    = b * ${cIn! * H! * W!}u;
   let wBase     = cOut_ * ${cIn! * kH! * kW!}u;
   var s : f32 = 0.0;
@@ -815,12 +810,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
-  let b     = i / ${cIn! * inH! * inW!}u;
-  let rem0  = i % ${cIn! * inH! * inW!}u;
-  let c_in_ = rem0 / ${inH! * inW!}u;
-  let rem1  = rem0 % ${inH! * inW!}u;
-  let h_in  = rem1 / ${inW!}u;
-  let w_in  = rem1 % ${inW!}u;
+${decompose4d(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_in', 'w_in'])}
   var s : f32 = 0.0;
   for (var c_out : u32 = 0u; c_out < ${cOut!}u; c_out = c_out + 1u) {
     let wBase  = c_out * ${cIn! * kH! * kW!}u + c_in_ * ${kH! * kW!}u;
@@ -866,12 +856,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
-  let c_out_ = i / ${cIn! * kH! * kW!}u;
-  let rem0   = i % ${cIn! * kH! * kW!}u;
-  let c_in_  = rem0 / ${kH! * kW!}u;
-  let rem1   = rem0 % ${kH! * kW!}u;
-  let kh     = rem1 / ${kW!}u;
-  let kw     = rem1 % ${kW!}u;
+${decompose4d(out.shape as [number, number, number, number], ['c_out_', 'c_in_', 'kh', 'kw'])}
   var s : f32 = 0.0;
   for (var b : u32 = 0u; b < ${B!}u; b = b + 1u) {
     let inBase = b * ${cIn! * H! * W!}u + c_in_ * ${H! * W!}u;
@@ -909,12 +894,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
-  let b     = i / ${C! * hOut! * wOut!}u;
-  let rem0  = i % ${C! * hOut! * wOut!}u;
-  let c     = rem0 / ${hOut! * wOut!}u;
-  let rem1  = rem0 % ${hOut! * wOut!}u;
-  let h_out = rem1 / ${wOut!}u;
-  let w_out = rem1 % ${wOut!}u;
+${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_out', 'w_out'])}
   let inChan = b * ${C! * H! * W!}u + c * ${H! * W!}u;
   var m : f32 = ${NEG};
   for (var kh : u32 = 0u; kh < ${op.kH}u; kh = kh + 1u) {
@@ -952,12 +932,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
-  let b     = i / ${C! * H! * W!}u;
-  let rem0  = i % ${C! * H! * W!}u;
-  let c     = rem0 / ${H! * W!}u;
-  let rem1  = rem0 % ${H! * W!}u;
-  let h_in  = rem1 / ${W!}u;
-  let w_in  = rem1 % ${W!}u;
+${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 'w_in'])}
   let inChan = b * ${C! * H! * W!}u + c * ${H! * W!}u;
   let dyChan = b * ${C! * hOut! * wOut!}u + c * ${hOut! * wOut!}u;
   var s : f32 = 0.0;
@@ -1003,6 +978,24 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 // ============================================================================
 // WGSL helpers
 // ============================================================================
+
+/** Emit WGSL that decomposes a flat thread index `i` into 4 named axes per
+ *  the row-major flat layout of `shape`. Returns a multi-line WGSL string
+ *  ready to interpolate inside a kernel body. Each axis is a `u32` local. */
+function decompose4d(shape: readonly [number, number, number, number], names: readonly [string, string, string, string]): string {
+  const [, d1, d2, d3] = shape
+  const [n0, n1, n2, n3] = names
+  const stride0 = d1 * d2 * d3
+  const stride1 = d2 * d3
+  return [
+    `  let ${n0} = i / ${stride0}u;`,
+    `  let _r0 = i % ${stride0}u;`,
+    `  let ${n1} = _r0 / ${stride1}u;`,
+    `  let _r1 = _r0 % ${stride1}u;`,
+    `  let ${n2} = _r1 / ${d3}u;`,
+    `  let ${n3} = _r1 % ${d3}u;`,
+  ].join('\n')
+}
 
 function wgslDtype(d: 'f32' | 'i32' | 'bool'): string {
   // bool can't be in storage buffers in WGSL; we lower bool-typed tensors to

@@ -206,7 +206,7 @@ function injectOptimizerScalars(slot: GraphSlot, inputs: Record<string, Int32Arr
   if (o.kind === 'adam') {
     const a = o.state
     a.t++
-    const lrNow = resolveLR(a.config.lr as LR, a.t)
+    const lrNow = resolveLR(a.config.lr, a.t)
     a.lrtBuf[0] = lrNow * Math.sqrt(1 - Math.pow(a.config.b2, a.t)) / (1 - Math.pow(a.config.b1, a.t))
     const merged: Record<string, Int32Array | Float32Array> = { ...inputs, [a.config.lrtInputName]: a.lrtBuf }
     if (a.decayShrinkBuf && a.config.decayShrinkInputName) {
@@ -218,7 +218,7 @@ function injectOptimizerScalars(slot: GraphSlot, inputs: Record<string, Int32Arr
   // SGD
   const s = o.state
   s.t++
-  s.lrBuf[0] = resolveLR(s.config.lr as LR, s.t)
+  s.lrBuf[0] = resolveLR(s.config.lr, s.t)
   return { ...inputs, [s.config.lrInputName]: s.lrBuf }
 }
 
