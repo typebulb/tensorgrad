@@ -15,7 +15,7 @@
 import type { Graph } from './ir.js'
 import type { BufferPlan } from './buffers.js'
 import type { KernelSpec } from './codegen.js'
-import type { LRSchedule } from './adam.js'
+import type { LR } from './adam.js'
 
 // ============================================================================
 // Serializable config (subset of AdamResolvedConfig that crosses the wire).
@@ -25,7 +25,7 @@ import type { LRSchedule } from './adam.js'
 // ============================================================================
 
 export interface WireAdamConfig {
-  lr: LRSchedule
+  lr: LR
   b1: number
   b2: number
   eps: number
@@ -116,7 +116,7 @@ export interface UploadParamsPayload {
 export interface SetOptimizerConfigPayload {
   graphId: number
   update: {
-    lr?: LRSchedule
+    lr?: LR
     weightDecay?: number
     b1?: number
     b2?: number

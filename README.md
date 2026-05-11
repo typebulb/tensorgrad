@@ -2,16 +2,14 @@
 
 A tiny TypeScript-native tensor library with autograd that compiles to WebGPU.
 For training small models in the browser without hand-writing WGSL kernels and
-without dragging in a multi-megabyte ML framework.
+without dragging in a multi-megabyte ML framework. Zero dependencies. Static
+shapes, `f32` parameters with `i32` indices, Adam / AdamW optimizer, forward +
+reverse-mode autograd. Browser-only. All GPU work runs in a library-internal
+Web Worker — every method on a compiled module returns a `Promise`.
 
 ```sh
 npm i tensorgrad
 ```
-
-Roughly 3000 lines of zero-dependency TypeScript. Static shapes, `f32`, Adam
-optimizer, ~25 ops, forward + reverse-mode autograd. Browser-only (uses
-WebGPU). All training/inference work runs in a library-internal Web Worker —
-every method on a compiled module returns a `Promise`.
 
 ## Minimal example
 
@@ -20,7 +18,7 @@ A 2-layer MLP fitting `y = sin(x)`:
 ```ts
 import {
   Module, compileModule, init,
-  add, mul, sub, sumLast, reshape, matmul, relu,
+  add, mul, sub, meanAll, matmul, relu,
   type Tensor,
 } from 'tensorgrad'
 
@@ -49,7 +47,7 @@ function modelFwd(m: MLP, x: Tensor): Tensor {
 
 function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   const diff = sub(modelFwd(m, x), y)
-  return mul(sumLast(reshape(mul(diff, diff), [B])), 1 / B)
+  return meanAll(mul(diff, diff))
 }
 
 const compiled = await compileModule({
@@ -71,16 +69,11 @@ for (let step = 0; step < 1000; step++) {
 - A `Module` subclass declares parameters via `this.param([shape], opts)` and
   composes child modules as plain fields. The class is a tree of params.
 - A *forward function* takes the materialized module + a record of named
-  input tensors and returns a tensor (the loss for `compileModule`, or any
-  output for `compileForward`).
+  input tensors and returns a tensor — the loss for `compileModule`, or any
+  output for `compileForward`. Forwards are free functions, not methods.
 - `compileModule({ factory, loss, inputs, adam })` traces the forward,
-  derives gradients, wires Adam, plans buffers, generates WGSL, spawns a
-  worker, and returns a `CompiledModule`. The factory `() => new Model()`
-  is invoked once per compile (and again per shape variant of any
-  polymorphic sibling forward); the model instance is consumed (its
-  param sentinels are mutated into `Tensor`s).
-- Every method on the compiled module is async. `await compiled.step(...)`
-  resolves with the loss after the worker's GPU work finishes.
+  derives gradients, wires Adam, generates WGSL, spawns a worker, and
+  returns a `CompiledModule`. Every method on it is async.
 
 ## Public API
 
@@ -89,7 +82,8 @@ for (let step = 0; step < 1000; step++) {
 ```ts
 compileModule({ factory, loss, inputs, adam? }): Promise<CompiledModule>
 compiled.compileForward({ forward, inputs }): Promise<CompiledForwardModule>
-compiled.replaceModel(newFactory): Promise<void>
+compiled.replaceModel(newFactory, { seed? }): Promise<void>
+isWebGPUAvailable(): boolean              // friendly pre-flight check
 ```
 
 There's one entry point: `compileModule`. Inference graphs are created
@@ -130,9 +124,7 @@ Wildcards follow the TF/ONNX/MLIR convention: `null` for an inferred dim.
 One `null` per shape (multi-wildcard isn't exposed yet). The first `run()`
 at each new shape pays the trace + codegen cost; the cache grows
 unbounded, so for latency-sensitive paths warm the cache at startup with
-a dummy `run()` per expected shape. Before the first `run()`,
-`infer.kernelCount` reports `0`, `infer.outputShape` is `[]`, and
-`infer.ir` is `undefined`.
+a dummy `run()` per expected shape.
 
 **Replacing the model.** If your UI lets the user change the model
 topology (layer count, hidden width, etc.), `replaceModel(newFactory)`
@@ -142,12 +134,16 @@ caches are cleared and recompile lazily on the next `run()`:
 
 ```ts
 await compiled.replaceModel(() => new MLP(newLayerSpec))
-// compiled, infer, predictDebounced — all still valid.
+// compiled and any forward proxies are still valid.
 ```
 
-For live-preview patterns where stale intermediate inputs (earlier mouse
-positions, partial drawings) should be dropped in favor of the newest
-user state, wrap your `run` call with the `singleFlight` utility:
+### `singleFlight` (live-preview helper)
+
+For live-preview patterns where stale calls (earlier mouse positions,
+partial drawings) should be dropped in favor of the newest, wrap a
+promise-returning function with `singleFlight`. Matches RxJS `switchMap` /
+p-debounce semantics: displaced callers reject with `AbortError`; only
+the most recent call resolves.
 
 ```ts
 import { singleFlight } from 'tensorgrad'
@@ -155,21 +151,12 @@ import { singleFlight } from 'tensorgrad'
 const predict = singleFlight((tokens: Int32Array) => infer.run({ tokens }))
 
 canvas.addEventListener('pointermove', async () => {
-  try {
-    const out = await predict(latestTokens())
-    updateUI(out)
-  } catch (e: any) {
-    if (e?.name === 'AbortError') return  // superseded — newer call will update
-    throw e
-  }
+  try { updateUI(await predict(latestTokens())) }
+  catch (e: any) { if (e?.name !== 'AbortError') throw e }
 })
 ```
 
-`singleFlight` matches the RxJS `switchMap` / p-debounce convention:
-displaced callers reject with `AbortError`; only the most recent call
-actually runs when the in-flight one finishes. It's a generic async
-helper — works around `run`, `step`, or any other promise-returning
-function with a single argument.
+Generic — works around `run`, `step`, or any single-argument promise function.
 
 ### CompiledModule methods (all `Promise`-returning)
 
@@ -214,38 +201,25 @@ input (or a tuple shape, which defaults to f32) expects a `Float32Array`;
 a dtype-`'i32'` input expects an `Int32Array`. Passing the wrong array
 type is a compile-time error.
 
-**Wildcard consistency.** When more than one input declares a `null`
-wildcard, every wildcard in a single `run()` call must resolve to the
-same value (matches Keras `None` / ONNX dynamic-axis convention). If
-two inputs imply different parametric dims, the proxy throws at the
-call boundary rather than letting kernels run with mismatched shapes.
+**Wildcard consistency.** Every `null` wildcard across all inputs in a
+single `run()` must resolve to the same value (matches Keras `None` /
+ONNX dynamic-axis convention). Mismatched inferred dims throw at the
+call boundary, not deep in kernel dispatch.
 
-**Factory hygiene.** `compileModule({ factory: ... })` calls the factory
-once per compile (and once per shape variant of any polymorphic forward).
-Each call must return a *fresh* `Module` instance — the compile pipeline
-consumes the instance by mutating its `ParamSentinel` fields into
-`Tensor`s. If your factory returns the same instance twice, the second
-compile sees Tensors where sentinels are expected; the library detects
-this and throws a clear error.
+**Factory hygiene.** `factory` must return a *fresh* `Module` each call —
+the pipeline mutates `ParamSentinel` fields into `Tensor`s on first
+compile. Returning the same instance twice throws a clear error.
 
-**Reproducible init.** Param initialization uses a deterministic
-Mulberry32 PRNG seeded at compile time. Pass `seed` to control it; the
-seed actually used (yours, or a freshly-generated one) is exposed as
-`compiled.seed` so a non-deterministic run can be replayed later:
+**Reproducible init.** A deterministic Mulberry32 PRNG seeds compile-time
+init. Pass `seed` to control it; whatever seed was used is exposed as
+`compiled.seed` so you can replay later:
 
 ```ts
-const compiled = await compileModule({ ..., seed: 42 })
-// Same (topology, seed) — identical initial params across runs:
-compiled.seed === 42
-compiled.reset()  // also re-inits from this seed
-```
-
-`replaceModel` inherits the existing seed by default — deterministic per
-(topology, seed). Pass `{ seed }` to override:
-
-```ts
-await compiled.replaceModel(() => new MLP(newSpec))                // same seed
-await compiled.replaceModel(() => new MLP(newSpec), { seed: 7 })   // fresh
+const a = await compileModule({ ..., seed: 42 })   // pin
+const b = await compileModule({ ... })             // fresh; b.seed exposes it
+compiled.reset()                                   // re-inits with the current seed
+await compiled.replaceModel(newFactory)            // fresh seed by default
+await compiled.replaceModel(newFactory, { seed: compiled.seed })  // keep current
 ```
 
 ### Operators
@@ -254,22 +228,24 @@ Imported from `'tensorgrad'`:
 
 - Element-wise: `add`, `sub`, `mul`, `div`, `sqrt`, `rsqrt`, `log`, `exp`, `relu`
 - Comparisons / select: `less`, `greater`, `where`
-- Reductions (last axis): `meanLast`, `sumLast`, `sumAll`
+- Reductions (last axis / all): `meanLast`, `sumLast`, `sumAll`, `meanAll`
 - Shape: `reshape`, `transpose`, `swapAxes`
 - Linear algebra: `matmul`, `matmulBatched`
 - Indexing / casting: `oneHot`, `arange`, `embedding`
 - Slicing: `sliceLastRange`
-- Fused ML primitives: `softmaxCausalLast`, `logSoftmaxLast`, `whereCausal`
+- Fused ML primitives: `softmaxLast`, `logSoftmaxLast`, `softmaxCausalLast`, `whereCausal`
 
-`add`, `sub`, `mul`, `div` accept `(Tensor, Tensor)` or `(Tensor, number)`.
+`add`, `sub`, `mul`, `div`, `less`, `greater` all accept `(Tensor, Tensor)`
+or `(Tensor, number)` — scalar broadcasts. The standard loss tail is
+`meanAll(crossEntropyLast(logits, targets))`.
 
 ### `nn` namespace
 
 ```ts
 import { nn } from 'tensorgrad'
 
-nn.Linear(inDim, outDim, { bias? }) // .fwd(x)
-nn.LayerNorm(dim)                    // .fwd(x)
+nn.Linear(inDim, outDim, { bias? })  // .fwd(x); W: [inDim, outDim], b: [outDim]
+nn.LayerNorm(dim)                    // .fwd(x); g (gain) and b (bias) both [dim]
 nn.splitHeads(x, nHeads)             // [B, T, D] → [B, H, T, D/H]
 nn.mergeHeads(x)                     // inverse of splitHeads
 nn.unsplitHeads(captures, name)      // pull per-head slices off a capture
@@ -294,32 +270,23 @@ adam: { lr: lr.warmup({ peakLr: 0.001, warmupSteps: 200, after: lr.constant(0.00
 LR schedules are serializable shapes, not closures (they cross the worker
 boundary). Use a `number` for constant LR, or one of the constructors above.
 
-Mutate Adam hyperparameters mid-training without recompiling via
-`compiled.setOptimizerConfig({ ... })`. Pass any subset; absent fields
-stay put. The step counter is preserved.
+### `setOptimizerConfig` (mid-training)
+
+Mutate Adam hyperparameters live, without recompiling. Pass any subset;
+absent fields stay put. The step counter is preserved.
 
 ```ts
 await compiled.setOptimizerConfig({ lr: 0.001 })
-await compiled.setOptimizerConfig({ weightDecay: 0.01 })
-await compiled.setOptimizerConfig({ lr: 0.0005, b2: 0.99 })  // any subset
-```
-
-When you set a non-constant schedule mid-training (cosine, linear decay,
-warmup), the runtime auto-rebases it so its step 1 lines up with the next
-training step ("decay from now"). Numbers and `constant` schedules don't
-need rebasing. If you pass a schedule with an explicit `startStep`, that
-takes precedence — the auto-rebase only fills in a missing one.
-
-```ts
+await compiled.setOptimizerConfig({ lr: 0.0005, b2: 0.99 })
 await compiled.setOptimizerConfig({
   lr: lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }),
-})
+})  // non-constant schedules auto-rebase so step 1 = next training step
 ```
 
-Note: which params receive weight decay is baked at compile time (via
-per-param `{ decay: true | false }` metadata). `setOptimizerConfig`
-changes the shrink magnitude on already-decayed params; it doesn't
-add decay to params that didn't have it.
+Which params receive weight decay is baked at compile time (per-param
+`{ decay: true | false }` metadata). `setOptimizerConfig` changes the
+shrink magnitude on already-decayed params; it doesn't add decay to
+params that didn't have it.
 
 ### Param init (`init` namespace)
 

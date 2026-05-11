@@ -15,7 +15,7 @@ export {
   // Comparisons + select
   less, greater, where,
   // Reductions over the last axis (other axes via reshape/transpose first)
-  meanLast, sumLast, sumAll,
+  meanLast, sumLast, sumAll, meanAll,
   // Shape ops
   reshape, transpose, swapAxes,
   // Linear algebra
@@ -23,7 +23,7 @@ export {
   // Indexing / casting
   oneHot, arange, embedding,
   // ML primitives — fused for the transformer
-  softmaxCausalLast, logSoftmaxLast, whereCausal,
+  softmaxCausalLast, logSoftmaxLast, softmaxLast, whereCausal,
   // Slicing
   sliceLastRange,
 } from './ops.js'
@@ -33,7 +33,7 @@ export {
 // adam.ts can import them) but aren't part of the public API — `add`/`mul`
 // overload on JS numbers, `where` subsumes the rest.
 export { appendGrad, type GradResult } from './grad.js'
-export { appendAdam, lr, resolveLR, type AdamConfig, type AdamResult, type LRSchedule } from './adam.js'
+export { appendAdam, lr, resolveLR, type AdamConfig, type AdamResult, type LR } from './adam.js'
 export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
 export { emitKernels, type KernelSpec } from './codegen.js'
 // Runtime types: only the user-facing pieces. CompiledRuntime/CompiledForward
@@ -42,7 +42,7 @@ export { emitKernels, type KernelSpec } from './codegen.js'
 // compileModule/compileForward instead.
 export { Captures, type RunOptions, type StepResult, type RunResult, type UploadParamsOptions } from './runtime.js'
 export {
-  compileToIR, compileModule,
+  compileToIR, compileModule, isWebGPUAvailable,
   type CompiledIR, type CompileModuleOptions, type CompileForwardMethodOptions, type OptimizerConfigUpdate,
   type CompiledModule, type CompiledForwardModule,
   type InputDecl, type InputDeclObject, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,

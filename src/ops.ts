@@ -117,6 +117,15 @@ export function sumAll(a: Tensor): Tensor {
   return sumLast(reshape(a, [-1]))
 }
 
+/** Mean of every element, returning a 0-d scalar. Equivalent to
+ *  `mul(sumAll(a), 1 / numel(a))` but spells the intent. The standard tail
+ *  of any scalar loss. */
+export function meanAll(a: Tensor): Tensor {
+  const n = a.shape.reduce((p, d) => p * d, 1)
+  if (n === 0) throw new ShapeError(`meanAll: cannot mean over zero elements`, captureSite('meanAll'))
+  return mulScalar(sumAll(a), 1 / n)
+}
+
 // ----------------------------------------------------------------------------
 // Shape ops.
 // ----------------------------------------------------------------------------
@@ -234,6 +243,16 @@ export function logSoftmaxLast(a: Tensor): Tensor {
   return addOp(currentGraph(), 'log_softmax_last', a.shape, 'f32', site, { a: a.id })
 }
 
+/** Numerically-stable softmax along the last axis. Composes `exp` with
+ *  `logSoftmaxLast` — the stabilization happens inside the fused log-softmax
+ *  kernel. Output is `[..., V]` of probabilities summing to 1 along the last
+ *  axis. For classifiers that want explicit class probabilities, and for
+ *  visualization of attention-like distributions. Use `crossEntropyLast` if
+ *  you actually want the training loss. */
+export function softmaxLast(a: Tensor): Tensor {
+  return exp(logSoftmaxLast(a))
+}
+
 // Pre-softmax causal mask. Sets cells where (i < j) on the last two axes to
 // `fillValue` (typically -1e30). Lower-triangle entries pass through.
 // Use this when you want the masked scores explicitly (e.g. for capture);
@@ -292,9 +311,17 @@ export function constScalar(value: number, dtype: Dtype = 'f32'): Tensor {
 // Comparisons and selection.
 // ----------------------------------------------------------------------------
 
-// Comparisons reuse the binop helper but return bool.
-export const less    = (a: Tensor, b: Tensor): Tensor => binopOp('less',    'less',    a, b, 'bool')
-export const greater = (a: Tensor, b: Tensor): Tensor => binopOp('greater', 'greater', a, b, 'bool')
+// Comparisons reuse the binop helper but return bool. Second arg accepts a
+// Tensor or a JS number — the scalar form composes constScalar with the binop's
+// broadcasting, parallel to add/sub/mul/div's scalar overload.
+export function less(a: Tensor, b: Tensor | number): Tensor {
+  const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
+  return binopOp('less', 'less', a, rhs, 'bool')
+}
+export function greater(a: Tensor, b: Tensor | number): Tensor {
+  const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
+  return binopOp('greater', 'greater', a, rhs, 'bool')
+}
 
 // where(cond, a, b): elementwise select. cond is bool; a and b can be any matching dtype.
 export function where(cond: Tensor, a: Tensor, b: Tensor): Tensor {

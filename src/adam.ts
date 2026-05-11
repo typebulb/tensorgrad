@@ -50,30 +50,30 @@ import { adamUpdateM, adamUpdateV, adamUpdateP } from './ops.js'
  * schedule's "step 1" lines up with the Adam step it took effect. If the
  * caller sets `startStep` explicitly, it's respected as-is.
  */
-export type LRSchedule =
+export type LR =
   | number
   | { readonly kind: 'constant'; readonly value: number }
   | { readonly kind: 'linearDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
   | { readonly kind: 'cosineDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
-  | { readonly kind: 'warmup'; readonly peakLr: number; readonly warmupSteps: number; readonly after: LRSchedule; readonly startStep?: number }
+  | { readonly kind: 'warmup'; readonly peakLr: number; readonly warmupSteps: number; readonly after: LR; readonly startStep?: number }
 
-/** Ergonomic constructors for LRSchedule shapes. */
+/** Ergonomic constructors for LR shapes. */
 export const lr = {
-  constant: (value: number): LRSchedule => ({ kind: 'constant', value }),
+  constant: (value: number): LR => ({ kind: 'constant', value }),
   /** Linearly interpolate from `peak` at intrinsic step 1 to `final` at
    *  intrinsic step `steps`, then hold at `final`. Optional `startStep` shifts
    *  the timeline (intrinsic = current - startStep + 1). */
-  linearDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LRSchedule =>
+  linearDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LR =>
     ({ kind: 'linearDecay', ...opts }),
   /** Half-cosine from `peak` at intrinsic step 1 down to `final` at intrinsic
    *  step `steps`, then hold at `final`. Optional `startStep` shifts the
    *  timeline. */
-  cosineDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LRSchedule =>
+  cosineDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LR =>
     ({ kind: 'cosineDecay', ...opts }),
   /** Linear ramp from 0 to `peakLr` over `warmupSteps`, then hand off to
    *  `after` (offset so step 1 of `after` = first post-warmup step). Optional
    *  `startStep` shifts the timeline. */
-  warmup: (opts: { peakLr: number; warmupSteps: number; after: LRSchedule; startStep?: number }): LRSchedule =>
+  warmup: (opts: { peakLr: number; warmupSteps: number; after: LR; startStep?: number }): LR =>
     ({ kind: 'warmup', ...opts }),
 }
 
@@ -83,7 +83,7 @@ function intrinsicStep(startStep: number | undefined, currentStep: number): numb
 }
 
 /** Resolve a schedule to its scalar value at a given 1-based step. */
-export function resolveLR(schedule: LRSchedule, step: number): number {
+export function resolveLR(schedule: LR, step: number): number {
   if (typeof schedule === 'number') return schedule
   switch (schedule.kind) {
     case 'constant': return schedule.value
@@ -110,7 +110,7 @@ export function resolveLR(schedule: LRSchedule, step: number): number {
  *  aligns with the user's `baseStep`). Numbers and `{kind:'constant'}` have
  *  no notion of time and pass through unchanged. Schedules that already
  *  have an explicit `startStep` also pass through — caller intent wins. */
-export function rebaseLR(schedule: LRSchedule, baseStep: number): LRSchedule {
+export function rebaseLR(schedule: LR, baseStep: number): LR {
   if (typeof schedule === 'number' || schedule.kind === 'constant') return schedule
   if (schedule.startStep !== undefined) return schedule
   return { ...schedule, startStep: baseStep - 1 }
@@ -119,7 +119,7 @@ export function rebaseLR(schedule: LRSchedule, baseStep: number): LRSchedule {
 /** True for shapes that produce different values at different steps (so the
  *  AdamW decayShrink scalar must be a per-step input rather than baked).
  *  Numbers and `{kind:'constant'}` are static; everything else varies. */
-export function isLRDynamic(schedule: LRSchedule): boolean {
+export function isLRDynamic(schedule: LR): boolean {
   if (typeof schedule === 'number') return false
   return schedule.kind !== 'constant'
 }
@@ -127,7 +127,7 @@ export function isLRDynamic(schedule: LRSchedule): boolean {
 export interface AdamConfig {
   /** Learning rate schedule. Pass a number for fixed lr, or a shape from
    *  the `lr` helpers (e.g., `lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 })`). */
-  lr: LRSchedule
+  lr: LR
   b1?: number   // default 0.9
   b2?: number   // default 0.999
   eps?: number  // default 1e-8
@@ -145,7 +145,7 @@ export interface AdamConfig {
 /** Resolved hyperparameters with all fields populated. `lr` stays as the
  *  shape (not pre-resolved) so the runtime can compute per-step values. */
 export interface AdamResolvedConfig {
-  lr: LRSchedule
+  lr: LR
   b1: number
   b2: number
   eps: number

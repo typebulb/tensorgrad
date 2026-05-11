@@ -7,7 +7,7 @@
 // exist. WebGPU IS available in workers (Chrome 113+, Safari 17.4+).
 
 import { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
-import { resolveLR, rebaseLR, type LRSchedule } from './adam.js'
+import { resolveLR, rebaseLR, type LR } from './adam.js'
 import type { Req, Res, WireIR, WireAdamConfig, WireError } from './worker-protocol.js'
 import { wireError } from './worker-protocol.js'
 
@@ -158,7 +158,7 @@ function injectAdamScalars(slot: GraphSlot, inputs: Record<string, Int32Array | 
   const a = slot.adam
   if (!a) return inputs
   a.t++
-  const lrNow = resolveLR(a.config.lr as LRSchedule, a.t)
+  const lrNow = resolveLR(a.config.lr as LR, a.t)
   a.lrtBuf[0] = lrNow * Math.sqrt(1 - Math.pow(a.config.b2, a.t)) / (1 - Math.pow(a.config.b1, a.t))
   const merged: Record<string, Int32Array | Float32Array> = { ...inputs, [a.config.lrtInputName]: a.lrtBuf }
   if (a.decayShrinkBuf && a.config.decayShrinkInputName) {
@@ -239,7 +239,7 @@ function handleResetOptimizer(payload: { graphId: number }): void {
 
 function handleSetOptimizerConfig(payload: {
   graphId: number
-  update: { lr?: LRSchedule; weightDecay?: number; b1?: number; b2?: number }
+  update: { lr?: LR; weightDecay?: number; b1?: number; b2?: number }
 }): void {
   const slot = mustGet(payload.graphId)
   if (!slot.adam) {

@@ -23,7 +23,7 @@ import { trace, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
 import {
   appendAdam, resolveLR,
-  type AdamConfig, type AdamResult, type AdamResolvedConfig, type LRSchedule,
+  type AdamConfig, type AdamResult, type AdamResolvedConfig, type LR,
 } from './adam.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
@@ -170,7 +170,7 @@ export interface CompileForwardMethodOptions<M extends Module, I extends InputDe
  *  `setOptimizerConfig`. Any subset is allowed; absent fields keep their
  *  current values. */
 export interface OptimizerConfigUpdate {
-  lr?: LRSchedule
+  lr?: LR
   weightDecay?: number
   b1?: number
   b2?: number
@@ -233,8 +233,10 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
    *  forward proxies created via `compileForward` stay registered: their
    *  per-shape kernel caches are cleared and recompile lazily on next `run()`.
    *
-   *  By default, inherits the current `seed` — deterministic per
-   *  (topology, seed). Pass `{ seed }` to override and get fresh init.
+   *  Defaults to a *fresh* seed — replaceModel is for "different model now,"
+   *  so fresh init is the natural expectation. Pass `{ seed }` to pin (for
+   *  reproducible topology comparisons). Use the existing seed explicitly via
+   *  `{ seed: compiled.seed }` if you want strict determinism across the swap.
    *
    *  Use when the user changes layer count, hidden width, or any other
    *  shape-affecting model parameter — you don't need to re-create the
@@ -307,6 +309,13 @@ export async function compileModule<M extends Module, I extends InputDecls>(
  *  on the returned `CompiledModule.seed` so users can reproduce. */
 function randomSeed(): number {
   return (Math.random() * 0x100000000) >>> 0
+}
+
+/** True when this environment has WebGPU. Use as a friendly gate before
+ *  `compileModule` so you can surface a "WebGPU required" message rather
+ *  than crash deep inside the worker. */
+export function isWebGPUAvailable(): boolean {
+  return typeof navigator !== 'undefined' && 'gpu' in navigator
 }
 
 interface BuiltTrainingGraph {
@@ -501,7 +510,7 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
     for (const child of this.children) child._invalidateForReplace()
     this.proxy.send({ kind: 'destroy', payload: { graphId: this.graphId } })
     const newOpts: CompileModuleOptions<M, I> = {
-      ...this.opts, factory: newFactory, seed: replaceOpts?.seed ?? this.opts.seed!,
+      ...this.opts, factory: newFactory, seed: replaceOpts?.seed ?? randomSeed(),
     }
     const built = await buildTrainingGraph(this.proxy, newOpts, this.graphId)
     this.ir = built.ir

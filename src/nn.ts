@@ -28,11 +28,15 @@ export interface LinearOptions {
 }
 
 export class Linear extends Module {
+  /** Weight matrix, shape `[inDim, outDim]`. Applied as `x @ W` so input
+   *  features are along the input axis and rows are not transposed. */
   W: Tensor
+  /** Bias, shape `[outDim]`, or null if `bias: false`. Broadcasts over the
+   *  leading axes of `x @ W`. */
   b: Tensor | null
   constructor(public readonly inDim: number, public readonly outDim: number, opts: LinearOptions = {}) {
     super()
-    this.W = this.param([inDim, outDim])                      // randn, scale 0.02
+    this.W = this.param([inDim, outDim])
     this.b = opts.bias === false ? null : this.param([outDim], { init: 'zeros' })
   }
   fwd(x: Tensor): Tensor {
@@ -46,7 +50,9 @@ export class Linear extends Module {
 // ----------------------------------------------------------------------------
 
 export class LayerNorm extends Module {
+  /** Gain (gamma), shape `[d]`, init `ones`. Scales the normalized output. */
   g: Tensor
+  /** Bias (beta), shape `[d]`, init `zeros`. Shifts the normalized output. */
   b: Tensor
   constructor(public readonly d: number, public readonly eps: number = 1e-5) {
     super()
