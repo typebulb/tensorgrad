@@ -5,7 +5,7 @@
 
 import {
   Module, compileModule, init,
-  add, mul, sub, meanAll, matmul, relu,
+  add, mul, sub, mean, matmul, relu,
   type Tensor,
 } from 'tensorgrad'
 
@@ -51,7 +51,7 @@ function modelFwd(p: MLP, x: Tensor): Tensor {
 function lossFn(p: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   // Inputs are [B, 1] each; loss is mean squared error.
   const diff = sub(modelFwd(p, x), y)
-  return meanAll(mul(diff, diff))
+  return mean(mul(diff, diff))
 }
 
 // ---------- Batch generation ----------------------------------------------

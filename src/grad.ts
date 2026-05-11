@@ -22,7 +22,7 @@ import {
   exp,
   broadcastTo, sumToShape,
   constScalar, reluGrad,
-  sumLast, where, less, greater,
+  sum, where, less, greater,
   dropoutWithSalt,
   sliceRange,
 } from './ops.js'
@@ -58,7 +58,7 @@ export function appendGrad(graph: Graph): GradResult {
   if (lossTensor.shape.length !== 0) {
     throw new Error(
       `autograd: loss must be a rank-0 scalar; got shape [${lossTensor.shape.join(', ')}]. ` +
-      `Reduce with sumLast / mulScalar to a scalar before calling appendGrad.`,
+      `Reduce with sum / mulScalar to a scalar before calling appendGrad.`,
     )
   }
 
@@ -424,10 +424,7 @@ function runTransposeRule(
       // dL/dA = dL/dC - softmax(a) * sum_last_keepdims(dL/dC)
       const c = tensorOf(op.out)
       const sm = exp(c)  // softmax(a)
-      // sum_last with keepdims via reshape: sum_last drops the dim, then
-      // reshape to add a trailing 1 back, then broadcast multiplies.
-      const sumDc = sumLast(outCotan)            // shape: [..., ] (rank-1 less)
-      const sumDcKeep = reshape(sumDc, [...sumDc.shape, 1])
+      const sumDcKeep = sum(outCotan, -1, { keepDims: true })
       const term = mul(sm, broadcastTo(sumDcKeep, c.shape))
       accumulate(cotangents, op.a, sub(outCotan, term))
       return
@@ -439,8 +436,7 @@ function runTransposeRule(
       // dL/dA = (dL/dC - sum_last_keep(dL/dC * c)) * c
       const c = tensorOf(op.out)
       const dcXc = mul(outCotan, c)
-      const s = sumLast(dcXc)
-      const sKeep = reshape(s, [...s.shape, 1])
+      const sKeep = sum(dcXc, -1, { keepDims: true })
       const inner = sub(outCotan, broadcastTo(sKeep, c.shape))
       accumulate(cotangents, op.a, mul(inner, c))
       return

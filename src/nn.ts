@@ -13,7 +13,7 @@
 
 import { Module } from './module.js'
 import type { Tensor } from './ir.js'
-import { add, matmul, sub, mul, div, sqrt, meanLast, sumLast, reshape, swapAxes, oneHot, logSoftmaxLast } from './ops.js'
+import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmaxLast } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
 import type { Captures } from './runtime.js'
@@ -60,9 +60,9 @@ export class LayerNorm extends Module {
     this.b = this.param([d], { init: 'zeros' })
   }
   fwd(x: Tensor): Tensor {
-    const m = meanLast(x)
+    const m = mean(x, -1, { keepDims: true })
     const c = sub(x, m)
-    const v = meanLast(mul(c, c))
+    const v = mean(mul(c, c), -1, { keepDims: true })
     const stdev = sqrt(add(v, this.eps))
     return add(mul(div(c, stdev), this.g), this.b)
   }
@@ -151,7 +151,7 @@ export function nllLoss(logProbs: Tensor, targets: Tensor): Tensor {
     throw new ShapeError(`nllLoss: targets must be i32, got ${targets.dtype}`, site)
   }
   const vocab = logProbs.shape[logProbs.shape.length - 1]!
-  const targetLp = sumLast(mul(logProbs, oneHot(targets, vocab, 'f32')))   // [...]
+  const targetLp = sum(mul(logProbs, oneHot(targets, vocab, 'f32')), -1)   // [...]
   return mul(targetLp, -1)
 }
 

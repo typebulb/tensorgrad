@@ -30,7 +30,7 @@ import type { Tensor } from './ir.js'
 import type { Graph } from './ir.js'
 import type { WritebackDecl } from './buffers.js'
 import { traceInto, stateInput, tensorInput } from './trace.js'
-import { adamUpdateM, adamUpdateV, adamUpdateP, add, mul, sqrt, sumAll, div, min, broadcastTo, constScalar } from './ops.js'
+import { adamUpdateM, adamUpdateV, adamUpdateP, add, mul, sqrt, sum, div, min, broadcastTo, constScalar } from './ops.js'
 
 /** Per-step learning-rate schedule. Either a fixed number or one of the
  *  serializable shape forms below. Functions/closures are not supported —
@@ -142,7 +142,7 @@ export interface AdamConfig {
   decayFilter?: (paramName: string) => boolean
   /** Global L2-norm gradient clipping. When set, every gradient is scaled
    *  by `min(1, maxNorm / (totalNorm + 1e-6))` before the Adam update,
-   *  where `totalNorm = sqrt(sum_p sumAll(grad_p ** 2))`. Standard
+   *  where `totalNorm = sqrt(sum_p sum(grad_p ** 2))`. Standard
    *  training-stability hygiene; matches PyTorch's `clip_grad_norm_` and
    *  optax's `clip_by_global_norm`. Use `appendGradClip` directly if you
    *  need to compose clipping with a custom optimizer. */
@@ -201,10 +201,10 @@ export function appendGradClip(
   return traceInto(graph, () => {
     const entries = Object.entries(paramGrads)
     if (entries.length === 0) return paramGrads
-    // sum_p sumAll(grad_p²) — chained adds across params; each summand is rank-0.
-    let sumSq: Tensor = sumAll(mul(entries[0]![1], entries[0]![1]))
+    // sum_p sum(grad_p²) — chained adds across params; each summand is rank-0.
+    let sumSq: Tensor = sum(mul(entries[0]![1], entries[0]![1]))
     for (let i = 1; i < entries.length; i++) {
-      sumSq = add(sumSq, sumAll(mul(entries[i]![1], entries[i]![1])))
+      sumSq = add(sumSq, sum(mul(entries[i]![1], entries[i]![1])))
     }
     const scale = min(div(constScalar(maxNorm, 'f32'), add(sqrt(sumSq), 1e-6)), 1)
     const clipped: Record<string, Tensor> = {}

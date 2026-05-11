@@ -7,7 +7,7 @@
 
 import {
   Module, compileModule, lr, nn, capture,
-  add, mul, sumAll, swapAxes,
+  add, mul, sum, swapAxes,
   relu, matmul, matmulBatched, embedding, arange,
   softmaxCausalLast,
   type Tensor,
@@ -117,7 +117,7 @@ function modelFwd(p: Transformer, tokens: Tensor): Tensor {
 
 function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tensor; targets: Tensor; mask: Tensor }): Tensor {
   const ce = nn.crossEntropyLast(modelFwd(p, tokens), targets)   // [B, T] of -log p(target)
-  return mul(sumAll(mul(ce, mask)), 1 / (B * N_RESULT_DIGITS))
+  return mul(sum(mul(ce, mask)), 1 / (B * N_RESULT_DIGITS))
 }
 
 function predictFwd(p: Transformer, { tokens }: { tokens: Tensor }): Tensor {

@@ -18,7 +18,7 @@ A 2-layer MLP fitting `y = sin(x)`:
 ```ts
 import {
   Module, compileModule, init,
-  add, mul, sub, meanAll, matmul, relu,
+  add, mul, sub, mean, matmul, relu,
   type Tensor,
 } from 'tensorgrad'
 
@@ -47,7 +47,7 @@ function modelFwd(m: MLP, x: Tensor): Tensor {
 
 function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   const diff = sub(modelFwd(m, x), y)
-  return meanAll(mul(diff, diff))
+  return mean(mul(diff, diff))
 }
 
 const compiled = await compileModule({
@@ -92,9 +92,10 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `optim.Adam(params, lr=...)` | `adam: { lr }` in `compileModule({ ... })` |
 | `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `sgd: { lr, momentum?, nesterov? }` in `compileModule({ ... })` |
 | `nn.Dropout(p)` as a child module | `dropout(x, p)` as a free-function call inside the training forward |
-| `x.mean(dim=-1)` / `x.sum(dim=-1)` / `F.softmax(x, dim=-1)` | `meanLast(x)` / `sumLast(x)` / `softmaxLast(x)` |
-| `x.mean()` / `x.sum()` | `meanAll(x)` / `sumAll(x)` |
-| `x.mean(dim=k)` for non-last `k` | Transpose so axis `k` is last, then `meanLast`. Axis-param forms aren't supported yet. |
+| `x.mean(dim=k)` / `x.sum(dim=k)` | `mean(x, k)` / `sum(x, k)` — negative `k` counts from the end |
+| `x.mean()` / `x.sum()` | `mean(x)` / `sum(x)` — 0-d scalar |
+| `x.mean(dim=k, keepdim=True)` | `mean(x, k, { keepDims: true })` |
+| `F.softmax(x, dim=-1)` | `softmaxLast(x)` (last axis only; transpose for other axes) |
 | `torch.flatten(x, 1)` | `reshape(x, [B, dim])` with `dim` computed explicitly. No `-1` wildcard yet. |
 | `nn.Conv2d` / `nn.MaxPool2d` | Not yet supported. |
 
@@ -313,7 +314,7 @@ Imported from `'tensorgrad'`:
 - Clamping: `clamp(x, lo, hi)` (scalar bounds)
 - Stochastic regularization: `dropout(x, p)` — inverted dropout, p ∈ [0, 1)
 - Comparisons / select: `less`, `greater`, `where`
-- Reductions (last axis / all): `meanLast`, `sumLast`, `sumAll`, `meanAll`, `argmaxLast`
+- Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmaxLast`
 - Shape: `reshape`, `transpose`, `swapAxes`
 - Linear algebra: `matmul`, `matmulBatched`
 - Indexing / casting: `oneHot`, `arange`, `embedding`
@@ -323,7 +324,7 @@ Imported from `'tensorgrad'`:
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
 `(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmaxLast`
 returns `i32` and is non-differentiable. The standard loss tail is
-`meanAll(crossEntropyLast(logits, targets))`.
+`mean(crossEntropyLast(logits, targets))`.
 
 **Structural ops.** `concat([a, b], axis)` joins along an existing axis;
 `stack([a, b], axis)` joins along a new axis (sugar for
@@ -459,7 +460,7 @@ separate graphs — dropout is literally absent from the inference path.
 ```ts
 function lossFn(m: Model, { x, y }: { x: Tensor; y: Tensor }) {
   const h = relu(dropout(m.l1.fwd(x), 0.1))    // dropout in training
-  return meanAll(nn.crossEntropyLast(m.l2.fwd(h), y))
+  return mean(nn.crossEntropyLast(m.l2.fwd(h), y))
 }
 
 function predictFn(m: Model, { x }: { x: Tensor }) {

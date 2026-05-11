@@ -17,8 +17,10 @@ export {
   dropout,
   // Comparisons + select
   less, greater, where,
-  // Reductions over the last axis (other axes via reshape/transpose first)
-  meanLast, sumLast, sumAll, meanAll, argmaxLast,
+  // Reductions: `mean(x, axis?, { keepDims? })` / `sum(x, axis?, { keepDims? })`.
+  // Negative axis counts from the end; omit `axis` to reduce all → 0-d scalar.
+  mean, sum, argmaxLast,
+  type ReduceOpts,
   // Shape ops
   reshape, transpose, swapAxes,
   // Linear algebra

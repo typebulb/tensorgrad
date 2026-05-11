@@ -18,7 +18,7 @@
 //   * singleFlight wrapping the canvas predict so rapid-stroke predictions
 //     don't queue up — only the latest call resolves; older callers reject
 //     with AbortError.
-//   * meanAll(crossEntropyLast(logits, targets)) as the canonical
+//   * mean(crossEntropyLast(logits, targets)) as the canonical
 //     classification loss tail.
 //
 // MNIST data is served from solenya-media S3 — same URLs the in-repo bulbs
@@ -26,7 +26,7 @@
 
 import {
   Module, compileModule, isWebGPUAvailable, nn,
-  meanAll, relu, dropout, softmaxLast, singleFlight,
+  mean, relu, dropout, softmaxLast, singleFlight,
   type Tensor, type CompiledModule, type CompiledForwardModule,
 } from 'tensorgrad'
 
@@ -104,7 +104,7 @@ function netFwd(m: MLP, x: Tensor, applyDropout: boolean): Tensor {
 function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   // Training-only: dropout active on hidden activations.
   const logits = netFwd(m, x, true)
-  return meanAll(nn.crossEntropyLast(logits, y))
+  return mean(nn.crossEntropyLast(logits, y))
 }
 
 function predictFn(m: MLP, { x }: { x: Tensor }): Tensor {

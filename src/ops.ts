@@ -182,27 +182,39 @@ export function gelu(a: Tensor): Tensor {
 }
 
 // ----------------------------------------------------------------------------
-// Reductions over the last axis. To reduce along other axes, transpose first.
-// (This is intentional — keeps codegen and autograd small.)
+// Reductions.
+//
+// Public surface: `mean(x, axis?, opts?)` and `sum(x, axis?, opts?)`. Both
+// follow PyTorch's `dim=` convention: negative indices count from the end,
+// `axis` omitted reduces all axes to a 0-d scalar, and `keepDims=false` is
+// the default (the axis is removed from the output shape).
+//
+// The IR-level kernels (`mean_last`, `sum_last`) are last-axis only. Other
+// axes compose as `transpose-axis-to-end` + `*_last` + (reshape or
+// transpose-back), so there's no new codegen for arbitrary-axis reduction.
+// `meanLastIR` / `sumLastIR` are local helpers — not part of the public
+// API; consumers always go through `mean`/`sum`.
 // ----------------------------------------------------------------------------
 
-export function meanLast(a: Tensor): Tensor {
-  const site = captureSite('meanLast')
-  if (a.dtype !== 'f32') throw new ShapeError(`meanLast: requires f32, got ${a.dtype}`, site)
-  const outShape = inferMeanLast('meanLast', a.shape, site)
+export interface ReduceOpts {
+  /** Preserve the reduced axis as size 1 (PyTorch's `keepdim=True`).
+   *  Default false (axis is removed from the output shape). Ignored when
+   *  `axis` is omitted — the no-axis form always returns a 0-d scalar. */
+  keepDims?: boolean
+}
+
+function meanLastIR(a: Tensor): Tensor {
+  const site = captureSite('mean')
+  if (a.dtype !== 'f32') throw new ShapeError(`mean: requires f32, got ${a.dtype}`, site)
+  const outShape = inferMeanLast('mean', a.shape, site)
   return addOp(currentGraph(), 'mean_last', outShape, a.dtype, site, { a: a.id })
 }
 
-export function sumLast(a: Tensor): Tensor {
-  const site = captureSite('sumLast')
-  if (a.dtype !== 'f32') throw new ShapeError(`sumLast: requires f32, got ${a.dtype}`, site)
-  const outShape = inferSumLast('sumLast', a.shape, site)
+function sumLastIR(a: Tensor): Tensor {
+  const site = captureSite('sum')
+  if (a.dtype !== 'f32') throw new ShapeError(`sum: requires f32, got ${a.dtype}`, site)
+  const outShape = inferSumLast('sum', a.shape, site)
   return addOp(currentGraph(), 'sum_last', outShape, a.dtype, site, { a: a.id })
-}
-
-/** Reduce all elements to a 0-d scalar. Composes `reshape` + `sumLast`. */
-export function sumAll(a: Tensor): Tensor {
-  return sumLast(reshape(a, [-1]))
 }
 
 /** Index of the maximum value along the last axis. Returns `i32`, one rank
@@ -216,13 +228,70 @@ export function argmaxLast(a: Tensor): Tensor {
   return addOp(currentGraph(), 'argmax_last', outShape, 'i32', site, { a: a.id })
 }
 
-/** Mean of every element, returning a 0-d scalar. Equivalent to
- *  `mul(sumAll(a), 1 / numel(a))` but spells the intent. The standard tail
- *  of any scalar loss. */
-export function meanAll(a: Tensor): Tensor {
-  const n = a.shape.reduce((p, d) => p * d, 1)
-  if (n === 0) throw new ShapeError(`meanAll: cannot mean over zero elements`, captureSite('meanAll'))
-  return mulScalar(sumAll(a), 1 / n)
+/** Mean along an axis (or all axes). Negative axis counts from the end.
+ *  `keepDims` (default false) preserves the reduced axis as size 1.
+ *  With no `axis`, reduces all elements to a 0-d scalar.
+ *
+ *  ```
+ *  mean(x)                          // 0-d scalar
+ *  mean(x, -1)                      // PyTorch's x.mean(dim=-1)
+ *  mean(x, -1, { keepDims: true })  // preserve the trailing axis as size 1
+ *  mean(x, 1)                       // reduce middle axis (transposes internally)
+ *  ``` */
+export function mean(a: Tensor, axis?: number, opts?: ReduceOpts): Tensor {
+  if (axis === undefined) {
+    const n = a.shape.reduce((p, d) => p * d, 1)
+    if (n === 0) throw new ShapeError(`mean: cannot mean over zero elements`, captureSite('mean'))
+    return mulScalar(sumLastIR(reshape(a, [-1])), 1 / n)
+  }
+  return reduceAxis(a, axis, !!opts?.keepDims, 'mean')
+}
+
+/** Sum along an axis (or all axes). Negative axis counts from the end.
+ *  `keepDims` (default false) preserves the reduced axis as size 1.
+ *  With no `axis`, reduces all elements to a 0-d scalar.
+ *
+ *  ```
+ *  sum(x)                          // 0-d scalar
+ *  sum(x, -1)                      // PyTorch's x.sum(dim=-1)
+ *  sum(x, -1, { keepDims: true })  // preserve the trailing axis as size 1
+ *  ``` */
+export function sum(a: Tensor, axis?: number, opts?: ReduceOpts): Tensor {
+  if (axis === undefined) return sumLastIR(reshape(a, [-1]))
+  return reduceAxis(a, axis, !!opts?.keepDims, 'sum')
+}
+
+function reduceAxis(a: Tensor, axisArg: number, keepDims: boolean, kind: 'mean' | 'sum'): Tensor {
+  const r = a.shape.length
+  const k = axisArg < 0 ? r + axisArg : axisArg
+  if (k < 0 || k >= r) {
+    throw new ShapeError(`${kind}: axis ${axisArg} out of range for shape [${a.shape.join(',')}]`, captureSite(kind))
+  }
+  const isLast = k === r - 1
+  // Reduce: produce a tensor with the reduced axis at position r-1 (size 1
+  // for mean, dropped for sum). Transpose first when k isn't already last.
+  const input = isLast ? a : transpose(a, [...Array(r).keys()].filter(i => i !== k).concat(k))
+  if (kind === 'mean') {
+    const reduced = meanLastIR(input)  // shape: [...others, 1]
+    if (isLast) return keepDims ? reduced : reshape(reduced, reduced.shape.slice(0, -1))
+    if (!keepDims) return reshape(reduced, reduced.shape.slice(0, -1))
+    return transpose(reduced, backPerm(k, r))
+  }
+  // sum
+  const dropped = sumLastIR(input)  // shape: [...others]
+  if (isLast) return keepDims ? reshape(dropped, [...dropped.shape, 1]) : dropped
+  if (!keepDims) return dropped
+  return transpose(reshape(dropped, [...dropped.shape, 1]), backPerm(k, r))
+}
+
+/** Inverse of `[everyone-but-k, k]`: the perm that moves the trailing axis
+ *  back to original position k. Used for `keepDims=true` with non-last axis. */
+function backPerm(k: number, r: number): number[] {
+  const out: number[] = []
+  for (let i = 0; i < k; i++) out.push(i)
+  out.push(r - 1)
+  for (let i = k; i < r - 1; i++) out.push(i)
+  return out
 }
 
 // ----------------------------------------------------------------------------

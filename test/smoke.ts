@@ -16,7 +16,7 @@
 import {
   trace, traceInto, paramInput, tensorInput, capture,
   add, sub, mul, div,
-  sqrt, relu, meanLast, sumLast, reshape, transpose,
+  sqrt, relu, mean, sum, reshape, transpose,
   matmul,
   oneHot, arange,
   logSoftmaxLast,
@@ -54,10 +54,10 @@ function declareParams(): Params {
 }
 
 function layerNorm(x: Tensor, gamma: Tensor, beta: Tensor): Tensor {
-  const m = meanLast(x)                    // [..., 1]
-  const c = sub(x, m)                      // [..., D]
-  const v = meanLast(mul(c, c))            // [..., 1]
-  const stdev = sqrt(add(v, 1e-5))         // [..., 1]
+  const m = mean(x, -1, { keepDims: true })          // [..., 1]
+  const c = sub(x, m)                                // [..., D]
+  const v = mean(mul(c, c), -1, { keepDims: true })  // [..., 1]
+  const stdev = sqrt(add(v, 1e-5))                   // [..., 1]
   return add(mul(div(c, stdev), gamma), beta)
 }
 
@@ -87,16 +87,15 @@ function lossFn(p: Params, tokens: Tensor, targets: Tensor): Tensor {
   const logits = forward(p, tokens)                            // [B, T, V]
   const lp = logSoftmaxLast(logits)                            // [B, T, V]
   const targetOneHot = oneHot(targets, VOCAB)                  // [B, T, V]
-  const targetLp = sumLast(mul(lp, targetOneHot))              // [B, T]
+  const targetLp = sum(mul(lp, targetOneHot), -1)              // [B, T]
 
   // The result-position mask is constant per training run; pass it as a
   // tensor_input so the user's training loop fills it in once at compile time.
   const mask = tensorInput('result_mask', [T], 'f32')          // [T]
   const masked = mul(targetLp, mask)                           // [B, T] (broadcast)
 
-  // Reduce to a scalar via reshape to 1-D then sumLast.
-  const flat = reshape(masked, [B * T])                        // [B*T]
-  const total = sumLast(flat)                                  // scalar
+  // Reduce to a scalar.
+  const total = sum(masked)                                    // scalar
   const numMaskedPositions = T - (RESULT_START - 1)            // = 3 result digits
   return mul(total, -1 / (B * numMaskedPositions))
 }
@@ -325,17 +324,13 @@ console.log('\nVerifying appendSGD...')
 
 import { appendSGD } from '../src/index.js'
 
-// Build a trivial training graph: one param p, loss = sumAll(p * p).
-// (sumAll isn't imported above — bring it in via a local import to avoid
-// reorganizing the file header.)
-const { sumAll } = await import('../src/index.js')
-
+// Build a trivial training graph: one param p, loss = sum(p * p).
 function buildTrivialTrainingGraph(): { graph: Graph; paramGrads: Record<string, Tensor>; paramTensors: Record<string, Tensor> } {
   let pTensor: Tensor | null = null
   const g = trace(() => {
     const p = paramInput('p', [4])
     pTensor = p
-    return sumAll(mul(p, p))
+    return sum(mul(p, p))
   })
   const { paramGrads } = appendGrad(g)
   return { graph: g, paramGrads, paramTensors: { p: pTensor! } }
