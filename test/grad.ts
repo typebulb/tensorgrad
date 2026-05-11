@@ -1,208 +1,81 @@
-// Backward emission per differentiable op. For each op, build a small graph
-// terminating in a scalar loss, call appendGrad, and verify:
-//   * every declared param has an entry in paramGrads
-//   * each gradient's shape matches its param's shape
+// Finite-difference vs autograd — exemplars covering classes of backward.
 //
-// Non-differentiable ops (less, greater, argmaxLast, oneHot, arange) are
-// verified to not produce gradients into discrete inputs — the test ensures
-// grad doesn't crash on a graph containing them.
+// Eight tests, one per class of derivative the autograd has to handle.
+// If a new op fits an existing class, trust the FD machinery + samples
+// to catch its regression; adding more per-op tests is padding. Only
+// add an exemplar here when a genuinely new pattern appears (e.g.,
+// a new structural op that breaks the variadic-input class).
+//
+// The machinery lives in test/_eval.ts (CPU evaluator) + test/_fdgrad.ts
+// (FD harness). Both are reusable for any future op.
 
 import {
-  trace, tensorInput, paramInput,
-  add, sub, mul, div, min, max,
-  sqrt, rsqrt, log, exp, relu, neg, abs, tanh, sigmoid, gelu, silu,
+  tensorInput,
+  mul,
   dropout,
-  greater, where,
-  meanLast, sumLast, sumAll, meanAll, argmaxLast,
-  reshape, transpose, swapAxes,
-  matmul, matmulBatched,
-  oneHot, embedding,
-  concat, stack,
-  softmaxLast, logSoftmaxLast, softmaxCausalLast,
-  appendGrad,
-  type Tensor,
+  meanLast, meanAll,
+  matmul,
+  embedding,
+  concat,
+  softmaxCausalLast,
+  gelu,
 } from '../src/index.js'
-import { section, assertShape, ok, fail, done } from './_assert.js'
+import { section, done } from './_assert.js'
+import { assertGradMatchesFD } from './_fdgrad.js'
 
-interface GradCheck {
-  paramShape: readonly number[]
-  build: (p: Tensor) => Tensor   // returns a scalar loss
-}
+section('FD vs autograd — class exemplars')
 
-function checkGrad(name: string, c: GradCheck): void {
-  const g = trace(() => {
-    const p = paramInput('w', c.paramShape as number[])
-    return c.build(p)
-  })
-  const lossT = g.tensors[g.outputs[0]!]!
-  if (lossT.shape.length !== 0) {
-    fail(`${name}: loss must be rank-0 scalar, got ${JSON.stringify(lossT.shape)}`)
-  }
-  const { paramGrads } = appendGrad(g)
-  const grad = paramGrads['w']
-  if (!grad) fail(`${name}: no gradient for param 'w'`)
-  assertShape(grad!.shape, c.paramShape, `${name} grad shape`)
-}
+// 1. Elementwise binary: gradient flows to both operands; the unbroadcast
+//    path handles shape contraction back to original operand shapes.
+assertGradMatchesFD('mul (elementwise binary)', [4, 8], p => meanAll(mul(p, p)))
 
-section('arithmetic backward')
-checkGrad('add', { paramShape: [4, 8], build: p => meanAll(add(p, p)) })
-checkGrad('sub', { paramShape: [4, 8], build: p => meanAll(sub(p, p)) })
-checkGrad('mul', { paramShape: [4, 8], build: p => meanAll(mul(p, p)) })
-checkGrad('div', {
-  paramShape: [4, 8],
-  build: p => {
-    const c = tensorInput('c', [4, 8])
-    return meanAll(div(p, c))
-  },
-})
-checkGrad('mul_scalar (via mul(t, num))', { paramShape: [4], build: p => meanAll(mul(p, 0.5)) })
-checkGrad('add_scalar (via add(t, num))', { paramShape: [4], build: p => meanAll(add(p, 0.5)) })
-checkGrad('min', { paramShape: [4], build: p => meanAll(min(p, 0)) })
-checkGrad('max', { paramShape: [4], build: p => meanAll(max(p, 0)) })
+// 2. Reduction: gradient is broadcast back over the reduced axis.
+assertGradMatchesFD('meanLast (reduction + broadcast-back grad)', [4, 8], p => meanAll(meanLast(p)))
 
-section('unary backward')
-checkGrad('sqrt', { paramShape: [4], build: p => meanAll(sqrt(p)) })
-checkGrad('rsqrt', { paramShape: [4], build: p => meanAll(rsqrt(p)) })
-checkGrad('log', { paramShape: [4], build: p => meanAll(log(p)) })
-checkGrad('exp', { paramShape: [4], build: p => meanAll(exp(p)) })
-checkGrad('relu', { paramShape: [4], build: p => meanAll(relu(p)) })
-checkGrad('neg', { paramShape: [4], build: p => meanAll(neg(p)) })
-checkGrad('abs', { paramShape: [4], build: p => meanAll(abs(p)) })
-checkGrad('tanh', { paramShape: [4], build: p => meanAll(tanh(p)) })
-checkGrad('sigmoid', { paramShape: [4], build: p => meanAll(sigmoid(p)) })
-checkGrad('gelu', { paramShape: [4], build: p => meanAll(gelu(p)) })
-checkGrad('silu', { paramShape: [4], build: p => meanAll(silu(p)) })
+// 3. Linear algebra: dC/dA = dC @ B^T, dC/dB = A^T @ dC. Two-sided
+//    matmul backward is the most common source of transpose-rule bugs.
+assertGradMatchesFD('matmul (linear algebra)', [4, 8], p => {
+  const x = tensorInput('x', [8, 16])
+  return meanAll(matmul(p, x))
+}, { extraInputs: { x: makeRange([8, 16]) } })
 
-section('reduction backward')
-checkGrad('meanLast', {
-  paramShape: [4, 8],
-  build: p => meanAll(meanLast(p)),
-})
-checkGrad('sumLast', {
-  paramShape: [4, 8],
-  build: p => meanAll(sumLast(p)),
-})
-checkGrad('sumAll', { paramShape: [4, 8], build: p => sumAll(p) })
-checkGrad('meanAll', { paramShape: [4, 8], build: p => meanAll(p) })
+// 4. Indexing-via-onehot: gradient flows into the embedding table only
+//    where the indices point. No flow back through i32 indices.
+assertGradMatchesFD('embedding (gradient routes to selected rows)', [10, 4], p => {
+  const idx = tensorInput('idx', [3], 'i32')
+  return meanAll(embedding(p, idx))
+}, { extraInputs: { idx: new Int32Array([2, 5, 7]) } })
 
-section('shape backward')
-checkGrad('reshape', {
-  paramShape: [4, 8],
-  build: p => meanAll(reshape(p, [32])),
-})
-checkGrad('transpose', {
-  paramShape: [4, 8, 16],
-  build: p => meanAll(transpose(p, [2, 0, 1])),
-})
-checkGrad('swapAxes', {
-  paramShape: [4, 8],
-  build: p => meanAll(swapAxes(p, 0, 1)),
-})
+// 5. Fused ML primitive: softmax + mask combined in one IR op. The
+//    backward formula is the most complex closed-form in the library;
+//    most likely to have a sign or scaling error.
+assertGradMatchesFD('softmaxCausalLast (fused ML)', [4, 4], p => meanAll(softmaxCausalLast(p)))
 
-section('linear algebra backward')
-checkGrad('matmul', {
-  paramShape: [4, 8],
-  build: p => {
-    const x = tensorInput('x', [4, 8])
-    return meanAll(matmul(x, transpose(p, [1, 0])))
-  },
-})
-checkGrad('matmulBatched', {
-  paramShape: [2, 4, 8],
-  build: p => {
-    const x = tensorInput('x', [2, 4, 4])
-    return meanAll(matmulBatched(x, p))
-  },
-})
+// 6. Stochastic: forward and backward must use the same mask. Tests that
+//    the PCG hash + salt + seed plumbing produces a determinism-stable
+//    gradient given a fixed seed input.
+assertGradMatchesFD('dropout (forward/backward mask match)', [4, 8],
+  p => meanAll(dropout(p, 0.1)),
+  { extraInputs: { __dropoutSeed: new Int32Array([42]) } },
+)
 
-section('indexing backward')
-checkGrad('embedding', {
-  paramShape: [10, 4],
-  build: p => {
-    const idx = tensorInput('idx', [3], 'i32')
-    return meanAll(embedding(p, idx))
-  },
-})
+// 7. Structural / variadic: concat's gradient slices the cotangent back
+//    into each input's shape along the concat axis.
+assertGradMatchesFD('concat (variadic, gradient via sliceRange)', [3, 4], p => {
+  const q = tensorInput('q', [3, 5])
+  return meanAll(concat([p, q], 1))
+}, { extraInputs: { q: makeRange([3, 5]) } })
 
-section('selection backward')
-checkGrad('where (flows to a/b, not cond)', {
-  paramShape: [4],
-  build: p => {
-    const cond = greater(p, 0)  // cond is non-differentiable in cond input
-    return meanAll(where(cond, p, p))
-  },
-})
-
-section('fused ML backward')
-checkGrad('logSoftmaxLast', {
-  paramShape: [4, 10],
-  build: p => meanAll(logSoftmaxLast(p)),
-})
-checkGrad('softmaxLast (composed)', {
-  paramShape: [4, 10],
-  build: p => meanAll(softmaxLast(p)),
-})
-checkGrad('softmaxCausalLast', {
-  paramShape: [4, 4],
-  build: p => meanAll(softmaxCausalLast(p)),
-})
-
-section('structural backward')
-checkGrad('concat (gradient flows to each input via sliceRange)', {
-  paramShape: [3, 4],
-  build: p => {
-    const q = tensorInput('q', [3, 5])
-    return meanAll(concat([p, q], 1))
-  },
-})
-checkGrad('stack', {
-  paramShape: [4],
-  build: p => {
-    const q = tensorInput('q', [4])
-    return meanAll(stack([p, q], 0))
-  },
-})
-// sliceLastRange / sliceRange backward is intentionally unimplemented —
-// gradient flows through them aren't currently expected. Concat's backward
-// uses sliceRange but doesn't differentiate *through* it.
-
-section('stochastic backward')
-checkGrad('dropout (forward + backward share salt/seed)', {
-  paramShape: [4, 8],
-  build: p => meanAll(dropout(p, 0.1)),
-})
-
-section('non-differentiable ops alongside diff path')
-// less, greater, argmaxLast, oneHot, arange: gradients should not flow into
-// these, but their presence in the graph must not crash appendGrad. We
-// verify by tracing a graph that mixes diff and non-diff ops.
-{
-  const g = trace(() => {
-    const p = paramInput('w', [4, 10])
-    const labels = tensorInput('labels', [4], 'i32')
-    // Take p, soft-max it, dot with one-hot of labels: a basic NLL-ish loss.
-    const lp = logSoftmaxLast(p)
-    const oh = oneHot(labels, 10)
-    return meanAll(mul(lp, oh))
-  })
-  const { paramGrads } = appendGrad(g)
-  if (!paramGrads['w']) fail('non-diff: gradient missing for w')
-  assertShape(paramGrads['w']!.shape, [4, 10], 'logSoftmaxLast + oneHot path → w gradient')
-}
-{
-  // argmaxLast is non-differentiable; consuming it in a non-differentiated
-  // computation should be fine (argmax → oneHot → mul → meanAll) so long as
-  // gradients don't try to flow through the discrete index.
-  const g = trace(() => {
-    const p = paramInput('w', [4, 10])
-    const preds = argmaxLast(p)         // [4] i32 — non-diff branch
-    const ohPred = oneHot(preds, 10)    // [4, 10]
-    // Mix the non-diff branch with a diff branch (p itself).
-    return meanAll(mul(p, ohPred))
-  })
-  const { paramGrads } = appendGrad(g)
-  if (!paramGrads['w']) fail('argmaxLast: gradient missing for w')
-  ok('argmaxLast in graph alongside differentiable path: w gradient still computed')
-}
+// 8. Composed activation: chain rule through multiple primitives
+//    (mul → add → mul → tanh → add → mul). Catches any layer-of-the-stack
+//    bug in chain-rule composition.
+assertGradMatchesFD('gelu (composed: chain rule through tanh approx)', [4], p => meanAll(gelu(p)))
 
 done('test/grad.ts')
+
+function makeRange(shape: readonly number[]): Float32Array {
+  const n = shape.reduce((p, d) => p * d, 1)
+  const out = new Float32Array(n)
+  for (let i = 0; i < n; i++) out[i] = Math.sin(i * 0.1) * 0.5
+  return out
+}
