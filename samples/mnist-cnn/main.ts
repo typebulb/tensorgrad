@@ -83,18 +83,11 @@ async function loadSet(imgFile: string, lblFile: string): Promise<MnistSet> {
 // ---------------------------------------------------------------------------
 
 class CNN extends Module {
-  conv1: nn.Conv2d
-  conv2: nn.Conv2d
-  fc1: nn.Linear
-  fc2: nn.Linear
-  constructor() {
-    super()
-    this.conv1 = new nn.Conv2d(1, CONV1_OUT, 3, { padding: 1 })
-    this.conv2 = new nn.Conv2d(CONV1_OUT, CONV2_OUT, 3, { padding: 1 })
-    // After two 2x2 pools: 28 → 14 → 7. Conv2 output is [B, 32, 7, 7] → 1568.
-    this.fc1 = new nn.Linear(CONV2_OUT * 7 * 7, HIDDEN)
-    this.fc2 = new nn.Linear(HIDDEN, N_CLASSES)
-  }
+  conv1 = new nn.Conv2d(1, CONV1_OUT, 3, { padding: 1 })
+  conv2 = new nn.Conv2d(CONV1_OUT, CONV2_OUT, 3, { padding: 1 })
+  // After two 2x2 pools: 28 → 14 → 7. Conv2 output is [B, 32, 7, 7] → 1568.
+  fc1 = new nn.Linear(CONV2_OUT * 7 * 7, HIDDEN)
+  fc2 = new nn.Linear(HIDDEN, N_CLASSES)
 }
 
 function forwardLogits(m: CNN, x: Tensor): Tensor {

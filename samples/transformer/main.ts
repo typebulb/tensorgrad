@@ -35,35 +35,22 @@ const SCALE_QK = 1 / Math.sqrt(D_HEAD)
 // ---------- Modules: structure of the param tree ---------------------------
 
 class Attention extends Module {
-  q: nn.Linear; k: nn.Linear; v: nn.Linear; o: nn.Linear
-  constructor() {
-    super()
-    this.q = new nn.Linear(D, D, { bias: false })
-    this.k = new nn.Linear(D, D, { bias: false })
-    this.v = new nn.Linear(D, D, { bias: false })
-    this.o = new nn.Linear(D, D, { bias: false })
-  }
+  q = new nn.Linear(D, D, { bias: false })
+  k = new nn.Linear(D, D, { bias: false })
+  v = new nn.Linear(D, D, { bias: false })
+  o = new nn.Linear(D, D, { bias: false })
 }
 
 class MLP extends Module {
-  up: nn.Linear; down: nn.Linear
-  constructor() {
-    super()
-    this.up   = new nn.Linear(D, 4 * D)
-    this.down = new nn.Linear(4 * D, D)
-  }
+  up   = new nn.Linear(D, 4 * D)
+  down = new nn.Linear(4 * D, D)
 }
 
 class Block extends Module {
-  ln1: nn.LayerNorm; attn: Attention
-  ln2: nn.LayerNorm; mlp: MLP
-  constructor() {
-    super()
-    this.ln1 = new nn.LayerNorm(D)
-    this.attn = new Attention()
-    this.ln2 = new nn.LayerNorm(D)
-    this.mlp = new MLP()
-  }
+  ln1  = new nn.LayerNorm(D)
+  attn = new Attention()
+  ln2  = new nn.LayerNorm(D)
+  mlp  = new MLP()
 }
 
 class Transformer extends Module {
@@ -104,8 +91,8 @@ function blockFwd(p: Block, x: Tensor, layerIdx: number): Tensor {
 }
 
 function modelFwd(p: Transformer, tokens: Tensor): Tensor {
-  const tokE = embedding(p.tok_emb, tokens)
-  const posE = embedding(p.pos_emb, arange(T))
+  const tokE = embedding(tokens, p.tok_emb)
+  const posE = embedding(arange(T), p.pos_emb)
   let x = add(tokE, posE)
   for (let i = 0; i < p.layers.length; i++) {
     x = capture(`residual.${i}`, x)

@@ -23,12 +23,6 @@ import type { Captures } from './runtime.js'
 // Conv2d: NCHW 2D convolution. Matches PyTorch's `nn.Conv2d` shape.
 // ----------------------------------------------------------------------------
 
-export interface Conv2dLayerOptions extends Conv2dOptions {
-  /** Include a bias term (default true). Shape `[outC]`, broadcast over
-   *  (B, H_out, W_out). */
-  bias?: boolean
-}
-
 export class Conv2d extends Module {
   /** Weight, shape `[outC, inC, kH, kW]`. Default init is `randn` with
    *  scale 0.02 (the tensorgrad default). For Kaiming init, pass
@@ -44,7 +38,7 @@ export class Conv2d extends Module {
     public readonly inC: number,
     public readonly outC: number,
     kernelSize: number | readonly [number, number],
-    opts: Conv2dLayerOptions = {},
+    opts: Conv2dOptions = {},
   ) {
     super()
     const [kH, kW] = typeof kernelSize === 'number' ? [kernelSize, kernelSize] : [kernelSize[0], kernelSize[1]]
@@ -81,7 +75,7 @@ export class Embedding extends Module {
   }
   /** Lookup: `idx` is `[...]` of i32, returns `[..., dim]` f32. */
   fwd(idx: Tensor): Tensor {
-    return embedding(this.W, idx)
+    return embedding(idx, this.W)
   }
 }
 

@@ -318,10 +318,14 @@ export function reshape(a: Tensor, newShape: Shape): Tensor {
   return addOp(currentGraph(), 'reshape', outShape, a.dtype, site, { a: a.id, newShape: outShape })
 }
 
-/** Flatten axes `[startAxis, end)` into a single trailing axis. PyTorch's
- *  `torch.flatten(x, start_dim)`. Default `startAxis=1` collapses everything
- *  but the leading batch dim — the canonical CNN classifier-head transition
- *  from `[B, C, H, W]` to `[B, C*H*W]`. Pure reshape; no new IR op. */
+/** Flatten axes `[startAxis, end)` into a single trailing axis. Pure
+ *  reshape; no new IR op.
+ *
+ *  **Default differs from PyTorch.** Tensorgrad defaults to `startAxis=1`
+ *  (preserve the batch dim — the canonical CNN classifier-head transition
+ *  from `[B, C, H, W]` to `[B, C*H*W]`). PyTorch's `torch.flatten` defaults
+ *  to `start_dim=0` (collapse everything to 1-d). Pass `0` explicitly if
+ *  you want full flattening. */
 export function flatten(a: Tensor, startAxis: number = 1): Tensor {
   const r = a.shape.length
   const s = startAxis < 0 ? r + startAxis : startAxis
@@ -399,7 +403,7 @@ export function oneHot(indices: Tensor, depth: number, dtype: Dtype = 'f32'): Te
  *  scatter-with-atomic-add backward — the matmul transpose rule handles it.
  *  `table` is `[vocab, dim]`; `indices` is any shape `[...]` of i32; result
  *  is `[..., dim]`. The vocab size is taken from `table.shape[0]`. */
-export function embedding(table: Tensor, indices: Tensor): Tensor {
+export function embedding(indices: Tensor, table: Tensor): Tensor {
   const site = captureSite('embedding')
   if (table.shape.length !== 2) {
     throw new ShapeError(`embedding: table must be 2-d [vocab, dim], got ${showShape(table.shape)}`, site)
@@ -691,6 +695,10 @@ export interface Conv2dOptions {
   stride?: number | readonly [number, number]
   /** Per-side padding along H and W (zero-padding). Default 0. */
   padding?: number | readonly [number, number]
+  /** Include a bias term (default true; only consulted by the `nn.Conv2d`
+   *  layer wrapper, not by the free `conv2d` function which has no bias
+   *  input). Shape `[outC]`, broadcast over (B, H_out, W_out). */
+  bias?: boolean
 }
 
 function pairOpt(v: number | readonly [number, number] | undefined, defaultVal: number): [number, number] {
