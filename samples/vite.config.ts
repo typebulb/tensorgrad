@@ -34,6 +34,7 @@ export default defineConfig({
         transformer: 'transformer/index.html',
         'mlp-sin': 'mlp-sin/index.html',
         'digit-canvas': 'digit-canvas/index.html',
+        'mnist-cnn': 'mnist-cnn/index.html',
       },
     },
   },

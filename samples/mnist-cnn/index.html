@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>MNIST CNN (tensorgrad)</title>
+  <style>
+    body {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      max-width: 720px;
+      margin: 3rem auto;
+      padding: 0 1rem;
+      color: #222;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .subtitle { color: #666; margin-top: 0; margin-bottom: 1.5rem; }
+    #status {
+      font-family: ui-monospace, monospace;
+      font-size: 0.95rem;
+      background: #f7f7f7;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      min-height: 1.4em;
+    }
+    p.help { color: #555; font-size: 0.9rem; margin-top: 1rem; }
+    p.help code { background: #f3f3f3; padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>MNIST CNN</h1>
+  <p class="subtitle">
+    Two conv+pool blocks, dense head, trained from scratch on MNIST. Primary
+    purpose: end-to-end GPU verification of <code>nn.Conv2D</code>,
+    <code>maxPool2D</code>, and <code>flatten</code>.
+  </p>
+
+  <div id="status">initializing…</div>
+
+  <p class="help">
+    Expected: test accuracy reaches &gt;97% within a couple thousand batches.
+    Status updates also stream to the vite dev-server console via
+    <code>POST /__log</code>.
+  </p>
+
+  <p><a href="/">← back to samples</a></p>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

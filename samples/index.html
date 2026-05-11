@@ -24,6 +24,10 @@
       <p>MNIST classifier you can draw against in real time. Trains in the background while you watch; predictions update on every stroke. Exercises the widest slice of the API: polymorphic batch, dropout/no-dropout split, replaceModel, setOptimizerConfig, clipGradNorm, singleFlight.</p>
     </li>
     <li>
+      <a href="/mnist-cnn/">MNIST CNN</a>
+      <p>Two-block CNN trained from scratch on MNIST. Verifies the <code>conv2d</code> / <code>maxPool2D</code> / <code>flatten</code> path end-to-end on GPU. Status streams to the dev-server console.</p>
+    </li>
+    <li>
       <a href="/transformer/">Transformer learns addition</a>
       <p>Multi-layer transformer training from scratch on 2-digit addition. Full forward + backward + Adam compiled to WGSL via tensorgrad. ~1000 examples/sec.</p>
     </li>
