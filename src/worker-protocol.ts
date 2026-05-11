@@ -136,9 +136,6 @@ export interface SetOptimizerConfigPayload {
   graphId: number
   update: {
     lr?: LR
-    weightDecay?: number
-    b1?: number
-    b2?: number
   }
 }
 

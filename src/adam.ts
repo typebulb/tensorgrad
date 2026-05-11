@@ -52,16 +52,16 @@ import { adamUpdateM, adamUpdateV, adamUpdateP, add, mul, sqrt, sum, div, min, b
  */
 export type LR =
   | number
-  | { readonly kind: 'constant'; readonly value: number }
   | { readonly kind: 'linearDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
   | { readonly kind: 'cosineDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
-  | { readonly kind: 'warmup'; readonly peakLr: number; readonly warmupSteps: number; readonly after: LR; readonly startStep?: number }
+  | { readonly kind: 'warmup'; readonly peak: number; readonly warmupSteps: number; readonly after: LR; readonly startStep?: number }
   | { readonly kind: 'step'; readonly peak: number; readonly stepSize: number; readonly gamma: number; readonly startStep?: number }
   | { readonly kind: 'multiStep'; readonly peak: number; readonly milestones: readonly number[]; readonly gamma: number; readonly startStep?: number }
 
-/** Ergonomic constructors for LR shapes. */
+/** Ergonomic constructors for LR schedule shapes. For constant lr, pass a
+ *  raw number — every LR field on `compileModule` / `setOptimizerConfig`
+ *  accepts `number | LR`. */
 export const lr = {
-  constant: (value: number): LR => ({ kind: 'constant', value }),
   /** Linearly interpolate from `peak` at intrinsic step 1 to `final` at
    *  intrinsic step `steps`, then hold at `final`. Optional `startStep` shifts
    *  the timeline (intrinsic = current - startStep + 1). */
@@ -72,10 +72,10 @@ export const lr = {
    *  timeline. */
   cosineDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LR =>
     ({ kind: 'cosineDecay', ...opts }),
-  /** Linear ramp from 0 to `peakLr` over `warmupSteps`, then hand off to
-   *  `after` (offset so step 1 of `after` = first post-warmup step). Optional
-   *  `startStep` shifts the timeline. */
-  warmup: (opts: { peakLr: number; warmupSteps: number; after: LR; startStep?: number }): LR =>
+  /** Linear ramp from 0 to `peak` over `warmupSteps`, then hand off to
+   *  `after` (offset so step 1 of `after` = first post-warmup step).
+   *  Optional `startStep` shifts the timeline. */
+  warmup: (opts: { peak: number; warmupSteps: number; after: LR; startStep?: number }): LR =>
     ({ kind: 'warmup', ...opts }),
   /** Geometric decay: `peak * gamma^floor(step / stepSize)`. PyTorch's
    *  `torch.optim.lr_scheduler.StepLR`. With `stepSize: 1`, every step
@@ -99,7 +99,6 @@ function intrinsicStep(startStep: number | undefined, currentStep: number): numb
 export function resolveLR(schedule: LR, step: number): number {
   if (typeof schedule === 'number') return schedule
   switch (schedule.kind) {
-    case 'constant': return schedule.value
     case 'linearDecay': {
       const s = intrinsicStep(schedule.startStep, step)
       const f = Math.min(s / schedule.steps, 1)
@@ -112,7 +111,7 @@ export function resolveLR(schedule: LR, step: number): number {
     }
     case 'warmup': {
       const s = intrinsicStep(schedule.startStep, step)
-      if (s <= schedule.warmupSteps) return schedule.peakLr * (s / schedule.warmupSteps)
+      if (s <= schedule.warmupSteps) return schedule.peak * (s / schedule.warmupSteps)
       return resolveLR(schedule.after, s - schedule.warmupSteps)
     }
     case 'step': {
@@ -134,21 +133,20 @@ export function resolveLR(schedule: LR, step: number): number {
 
 /** Rewrite a schedule to start its timeline at `baseStep` (sets startStep on
  *  the outer shape to `baseStep - 1`, so the schedule's intrinsic step 1
- *  aligns with the user's `baseStep`). Numbers and `{kind:'constant'}` have
- *  no notion of time and pass through unchanged. Schedules that already
- *  have an explicit `startStep` also pass through — caller intent wins. */
+ *  aligns with the user's `baseStep`). Raw numbers have no notion of time
+ *  and pass through unchanged. Schedules that already have an explicit
+ *  `startStep` also pass through — caller intent wins. */
 export function rebaseLR(schedule: LR, baseStep: number): LR {
-  if (typeof schedule === 'number' || schedule.kind === 'constant') return schedule
+  if (typeof schedule === 'number') return schedule
   if (schedule.startStep !== undefined) return schedule
   return { ...schedule, startStep: baseStep - 1 }
 }
 
 /** True for shapes that produce different values at different steps (so the
  *  AdamW decayShrink scalar must be a per-step input rather than baked).
- *  Numbers and `{kind:'constant'}` are static; everything else varies. */
+ *  Raw numbers are static; every schedule shape varies. */
 export function isLRDynamic(schedule: LR): boolean {
-  if (typeof schedule === 'number') return false
-  return schedule.kind !== 'constant'
+  return typeof schedule !== 'number'
 }
 
 export interface AdamConfig {

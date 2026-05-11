@@ -1,14 +1,14 @@
 // MNIST CNN — primary purpose is GPU verification of the conv2d /
-// maxPool2D / nn.Conv2D / flatten path. If anything in the WGSL is broken,
+// maxPool2d / nn.Conv2d / flatten path. If anything in the WGSL is broken,
 // training either crashes at compile, NaNs, or fails to converge.
 //
 // Architecture: two conv+pool blocks → flatten → MLP head. Standard
 // MNIST-CNN template (the kind of model an LLM would write from a PyTorch
 // tutorial port).
 //
-//   [B, 1, 28, 28] -> Conv2D(1,16,3,pad=1) + ReLU
+//   [B, 1, 28, 28] -> Conv2d(1,16,3,pad=1) + ReLU
 //                  -> MaxPool2D(2)          [B, 16, 14, 14]
-//                  -> Conv2D(16,32,3,pad=1) + ReLU
+//                  -> Conv2d(16,32,3,pad=1) + ReLU
 //                  -> MaxPool2D(2)          [B, 32, 7, 7]
 //                  -> flatten               [B, 1568]
 //                  -> Linear(1568, 64) + ReLU
@@ -21,7 +21,7 @@
 
 import {
   Module, compileModule, isWebGPUAvailable, nn,
-  mean, relu, flatten, maxPool2D,
+  mean, relu, flatten, maxPool2d,
   type Tensor, type CompiledModule, type CompiledForwardModule,
 } from 'tensorgrad'
 
@@ -83,14 +83,14 @@ async function loadSet(imgFile: string, lblFile: string): Promise<MnistSet> {
 // ---------------------------------------------------------------------------
 
 class CNN extends Module {
-  conv1: nn.Conv2D
-  conv2: nn.Conv2D
+  conv1: nn.Conv2d
+  conv2: nn.Conv2d
   fc1: nn.Linear
   fc2: nn.Linear
   constructor() {
     super()
-    this.conv1 = new nn.Conv2D(1, CONV1_OUT, 3, { padding: 1 })
-    this.conv2 = new nn.Conv2D(CONV1_OUT, CONV2_OUT, 3, { padding: 1 })
+    this.conv1 = new nn.Conv2d(1, CONV1_OUT, 3, { padding: 1 })
+    this.conv2 = new nn.Conv2d(CONV1_OUT, CONV2_OUT, 3, { padding: 1 })
     // After two 2x2 pools: 28 → 14 → 7. Conv2 output is [B, 32, 7, 7] → 1568.
     this.fc1 = new nn.Linear(CONV2_OUT * 7 * 7, HIDDEN)
     this.fc2 = new nn.Linear(HIDDEN, N_CLASSES)
@@ -99,16 +99,16 @@ class CNN extends Module {
 
 function forwardLogits(m: CNN, x: Tensor): Tensor {
   let h = relu(m.conv1.fwd(x))     // [B, 16, 28, 28]
-  h = maxPool2D(h, 2)              // [B, 16, 14, 14]
+  h = maxPool2d(h, 2)              // [B, 16, 14, 14]
   h = relu(m.conv2.fwd(h))         // [B, 32, 14, 14]
-  h = maxPool2D(h, 2)              // [B, 32, 7, 7]
+  h = maxPool2d(h, 2)              // [B, 32, 7, 7]
   h = flatten(h, 1)                // [B, 1568]
   h = relu(m.fc1.fwd(h))           // [B, 64]
   return m.fc2.fwd(h)              // [B, 10] logits
 }
 
 function lossFn(m: CNN, { x, y }: { x: Tensor; y: Tensor }): Tensor {
-  return mean(nn.crossEntropyLast(forwardLogits(m, x), y))
+  return mean(nn.crossEntropy(forwardLogits(m, x), y))
 }
 
 function predictFn(m: CNN, { x }: { x: Tensor }): Tensor {

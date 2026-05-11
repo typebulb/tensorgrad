@@ -6,7 +6,7 @@
 //
 //   function attentionFwd(p, x) {
 //     const scores = mul(matmulBatched(q, kT), SCALE_QK)
-//     const attn = capture(`attn.${layerIdx}`, softmaxCausalLast(scores))
+//     const attn = capture(`attn.${layerIdx}`, softmaxCausal(scores))
 //     return matmulBatched(attn, v)
 //   }
 //

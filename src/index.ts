@@ -19,7 +19,7 @@ export {
   less, greater, where,
   // Reductions: `mean(x, axis?, { keepDims? })` / `sum(x, axis?, { keepDims? })`.
   // Negative axis counts from the end; omit `axis` to reduce all → 0-d scalar.
-  mean, sum, argmaxLast,
+  mean, sum, argmax,
   type ReduceOpts,
   // Shape ops
   reshape, transpose, swapAxes,
@@ -29,14 +29,15 @@ export {
   matmul, matmulBatched,
   // Indexing / casting
   oneHot, arange, embedding,
-  // ML primitives — fused for the transformer
-  softmaxCausalLast, logSoftmaxLast, softmaxLast, whereCausal,
-  // 2D convolution + pooling (NCHW, PyTorch-shape). conv2d/maxPool2D are the
+  // ML primitives. `softmax` / `logSoftmax` take an optional axis (default
+  // -1); `softmaxCausal` is always last-axis (mask is over a seq-seq matrix).
+  softmaxCausal, logSoftmax, softmax, whereCausal,
+  // 2D convolution + pooling (NCHW, PyTorch-shape). conv2d/maxPool2d are the
   // user surface; the *Grad helpers are emitted by autograd.
-  conv2d, maxPool2D,
+  conv2d, maxPool2d,
   type Conv2dOptions, type MaxPool2dOptions,
   // Slicing / structural
-  sliceLastRange, sliceRange, concat, stack, split,
+  sliceRange, concat, stack, split,
 } from './ops.js'
 
 // Note: addScalar/mulScalar/broadcastTo/sumToShape/constScalar/reluGrad/adam_update_*

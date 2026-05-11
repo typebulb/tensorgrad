@@ -328,39 +328,22 @@ function handleResetOptimizer(payload: { graphId: number }): void {
 
 function handleSetOptimizerConfig(payload: {
   graphId: number
-  update: { lr?: LR; weightDecay?: number; b1?: number; b2?: number }
+  update: { lr?: LR }
 }): void {
   const slot = mustGet(payload.graphId)
   if (!slot.optimizer) {
     throw new Error(`setOptimizerConfig: graph ${payload.graphId} has no optimizer (compileForward graphs don't take optimizer state)`)
   }
+  if (payload.update.lr === undefined) return
+  // The next step will increment t from its current value, so the schedule
+  // takes effect at t+1 — that's the step we rebase against.
+  const state = slot.optimizer.state
+  const nextStep = state.t + 1
+  const newLR = rebaseLR(payload.update.lr, nextStep)
   if (slot.optimizer.kind === 'adam') {
-    const a = slot.optimizer.state
-    const cur = a.config
-    // The next step will increment t from its current value, so the schedule
-    // takes effect at t+1 — that's the step we rebase against.
-    const nextStep = a.t + 1
-    const newLR = payload.update.lr !== undefined
-      ? rebaseLR(payload.update.lr, nextStep)
-      : cur.lr
-    a.config = {
-      ...cur,
-      lr: newLR,
-      weightDecay: payload.update.weightDecay !== undefined ? payload.update.weightDecay : cur.weightDecay,
-      b1: payload.update.b1 !== undefined ? payload.update.b1 : cur.b1,
-      b2: payload.update.b2 !== undefined ? payload.update.b2 : cur.b2,
-    }
-    return
-  }
-  // SGD: only `lr` is mutable mid-training. b1/b2 are ignored; weightDecay
-  // is baked at compile time (which params get it via decayFilter).
-  const s = slot.optimizer.state
-  if (payload.update.b1 !== undefined || payload.update.b2 !== undefined) {
-    throw new Error('setOptimizerConfig: b1/b2 are Adam-only; this graph uses SGD')
-  }
-  if (payload.update.lr !== undefined) {
-    const nextStep = s.t + 1
-    s.config = { ...s.config, lr: rebaseLR(payload.update.lr, nextStep) }
+    state.config = { ...(state.config as WireAdamConfig), lr: newLR }
+  } else {
+    state.config = { ...(state.config as WireSGDConfig), lr: newLR }
   }
 }
 

@@ -13,23 +13,23 @@
 
 import { Module } from './module.js'
 import type { Tensor } from './ir.js'
-import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmaxLast, embedding, conv2d } from './ops.js'
+import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmax, embedding, conv2d } from './ops.js'
 import type { Conv2dOptions } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
 import type { Captures } from './runtime.js'
 
 // ----------------------------------------------------------------------------
-// Conv2D: NCHW 2D convolution. Like `nn.Conv2d` in PyTorch.
+// Conv2d: NCHW 2D convolution. Matches PyTorch's `nn.Conv2d` shape.
 // ----------------------------------------------------------------------------
 
-export interface Conv2DOptions extends Conv2dOptions {
+export interface Conv2dLayerOptions extends Conv2dOptions {
   /** Include a bias term (default true). Shape `[outC]`, broadcast over
    *  (B, H_out, W_out). */
   bias?: boolean
 }
 
-export class Conv2D extends Module {
+export class Conv2d extends Module {
   /** Weight, shape `[outC, inC, kH, kW]`. Default init is `randn` with
    *  scale 0.02 (the tensorgrad default). For Kaiming init, pass
    *  `{ init: init.kaiming() }` to a custom param() override — or rely on
@@ -44,7 +44,7 @@ export class Conv2D extends Module {
     public readonly inC: number,
     public readonly outC: number,
     kernelSize: number | readonly [number, number],
-    opts: Conv2DOptions = {},
+    opts: Conv2dLayerOptions = {},
   ) {
     super()
     const [kH, kW] = typeof kernelSize === 'number' ? [kernelSize, kernelSize] : [kernelSize[0], kernelSize[1]]
@@ -220,18 +220,17 @@ export function unsplitHeads(captures: Captures, name: string): Float32Array[] {
 // Loss helpers
 // ----------------------------------------------------------------------------
 
-/** Per-position negative log-likelihood along the last axis: returns
+/** Per-position negative log-likelihood along the last (vocab) axis: returns
  *  `-logProbs[target]` at each position. `logProbs` is `[..., V]` (already
  *  log-softmaxed); `targets` is `[...]` of i32; result is `[...]` (one
  *  rank less than `logProbs`).
  *
- *  Mirrors PyTorch's `F.nll_loss` *before* reduction. Pair with
- *  `logSoftmaxLast` when you need the log-probability intermediate visible
- *  (e.g. to `capture` it for inspection). Otherwise prefer
- *  `crossEntropyLast(logits, targets)` which takes raw logits and fuses
- *  log-softmax + NLL — same numerics, fewer ops, no risk of accidentally
- *  passing logits twice (a silent miscompose if you also wrote
- *  `log_softmax` upstream). */
+ *  Mirrors PyTorch's `F.nll_loss` *before* reduction. Pair with `logSoftmax`
+ *  when you need the log-probability intermediate visible (e.g. to `capture`
+ *  it for inspection). Otherwise prefer `crossEntropy(logits, targets)`
+ *  which takes raw logits and fuses log-softmax + NLL — same numerics,
+ *  fewer ops, no risk of accidentally passing logits twice (a silent
+ *  miscompose if you also wrote `logSoftmax` upstream). */
 export function nllLoss(logProbs: Tensor, targets: Tensor): Tensor {
   const site = captureSite('nllLoss')
   if (targets.dtype !== 'i32') {
@@ -249,15 +248,15 @@ export function nllLoss(logProbs: Tensor, targets: Tensor): Tensor {
  *  reduction downstream — useful when only some positions contribute
  *  (e.g. result-digit masking) or for label smoothing.
  *
- *  Fused log-softmax + NLL. Pass raw logits — don't apply `logSoftmaxLast`
+ *  Fused log-softmax + NLL. Pass raw logits — don't apply `logSoftmax`
  *  yourself first or the model silently double-log-softmaxes (a common
  *  miscompose when porting PyTorch code that uses `log_softmax` in the
  *  model and `F.nll_loss` in the loss). If you need the log-probability
- *  intermediate visible, use `logSoftmaxLast` + `nllLoss` instead. */
-export function crossEntropyLast(logits: Tensor, targets: Tensor): Tensor {
-  const site = captureSite('crossEntropyLast')
+ *  intermediate visible, use `logSoftmax` + `nllLoss` instead. */
+export function crossEntropy(logits: Tensor, targets: Tensor): Tensor {
+  const site = captureSite('crossEntropy')
   if (targets.dtype !== 'i32') {
-    throw new ShapeError(`crossEntropyLast: targets must be i32, got ${targets.dtype}`, site)
+    throw new ShapeError(`crossEntropy: targets must be i32, got ${targets.dtype}`, site)
   }
-  return nllLoss(logSoftmaxLast(logits), targets)
+  return nllLoss(logSoftmax(logits), targets)
 }

@@ -25,7 +25,7 @@ import {
   sum, where, less, greater,
   dropoutWithSalt,
   sliceRange,
-  conv2dInputGrad, conv2dWeightGrad, maxPool2DGrad,
+  conv2dInputGrad, conv2dWeightGrad, maxPool2dGrad,
 } from './ops.js'
 import { traceInto } from './trace.js'
 import { shapesEqual } from './shape.js'
@@ -483,7 +483,7 @@ function runTransposeRule(
     case 'adam_update_p':
       throw new Error(`autograd: cannot differentiate through ${op.kind}`)
 
-    // ---- Conv2D + MaxPool2D ----------------------------------------------
+    // ---- Conv2d + MaxPool2d ----------------------------------------------
     case 'conv2d': {
       // c = conv2d(input, weight) with stride+padding.
       // dInput = transposed-conv(weight, dy). dWeight = correlation(input, dy).
@@ -504,7 +504,7 @@ function runTransposeRule(
     }
     case 'max_pool_2d': {
       const input = tensorOf(op.input)
-      accumulate(cotangents, op.input, maxPool2DGrad(
+      accumulate(cotangents, op.input, maxPool2dGrad(
         input, outCotan, op.kH, op.kW, op.strideH, op.strideW, op.padH, op.padW,
       ))
       return

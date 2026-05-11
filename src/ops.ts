@@ -15,7 +15,7 @@ import { currentGraph, tensorInput } from './trace.js'
 import {
   inferElementwiseBinop, inferUnary, inferMeanLast, inferSumLast, inferArgmaxLast,
   inferReshape, inferTranspose, inferMatmul, inferMatmulBatched,
-  inferOneHot, inferWhereCausal, inferSliceLastRange, inferSliceRange, inferConcat,
+  inferOneHot, inferWhereCausal, inferSliceRange, inferConcat,
   inferBroadcastTo, inferSumToShape, inferReluGrad, inferWhere,
   inferConv2d, inferMaxPool2d,
   ShapeError, showShape,
@@ -218,15 +218,28 @@ function sumLastIR(a: Tensor): Tensor {
   return addOp(currentGraph(), 'sum_last', outShape, a.dtype, site, { a: a.id })
 }
 
-/** Index of the maximum value along the last axis. Returns `i32`, one rank
- *  less than input (keepdims=false). Non-differentiable: gradients do not
- *  flow back through this op. Useful for greedy decode, accuracy probes,
- *  and any in-graph classification where you don't want a CPU readback. */
-export function argmaxLast(a: Tensor): Tensor {
-  const site = captureSite('argmaxLast')
-  if (a.dtype !== 'f32') throw new ShapeError(`argmaxLast: requires f32, got ${a.dtype}`, site)
-  const outShape = inferArgmaxLast('argmaxLast', a.shape, site)
+function argmaxLastIR(a: Tensor): Tensor {
+  const site = captureSite('argmax')
+  if (a.dtype !== 'f32') throw new ShapeError(`argmax: requires f32, got ${a.dtype}`, site)
+  const outShape = inferArgmaxLast('argmax', a.shape, site)
   return addOp(currentGraph(), 'argmax_last', outShape, 'i32', site, { a: a.id })
+}
+
+/** Index of the maximum value along an axis. Returns `i32`, one rank less
+ *  than input (no keepDims option — argmax of a multi-axis reduction is
+ *  meaningless). Negative axis counts from the end; default is `-1`. With
+ *  no `axis`, argmax over the flattened tensor (0-d i32 result).
+ *  Non-differentiable: gradients do not flow back through this op. */
+export function argmax(a: Tensor, axis?: number): Tensor {
+  if (axis === undefined) return argmaxLastIR(reshape(a, [-1]))
+  const r = a.shape.length
+  const k = axis < 0 ? r + axis : axis
+  if (k < 0 || k >= r) {
+    throw new ShapeError(`argmax: axis ${axis} out of range for shape [${a.shape.join(',')}]`, captureSite('argmax'))
+  }
+  if (k === r - 1) return argmaxLastIR(a)
+  const perm = [...Array(r).keys()].filter(i => i !== k).concat(k)
+  return argmaxLastIR(transpose(a, perm))
 }
 
 /** Mean along an axis (or all axes). Negative axis counts from the end.
@@ -411,36 +424,62 @@ export function arange(n: number, dtype: Dtype = 'i32'): Tensor {
 // kernels can be hand-tuned for our specific shapes.
 // ----------------------------------------------------------------------------
 
-// Causal-masked softmax along the last axis. Shape preserved. Last two axes
-// must be square (TxT attention scores).
-export function softmaxCausalLast(a: Tensor): Tensor {
-  const site = captureSite('softmaxCausalLast')
-  if (a.dtype !== 'f32') throw new ShapeError(`softmaxCausalLast: requires f32, got ${a.dtype}`, site)
-  inferWhereCausal('softmaxCausalLast', a.shape, site)  // shape check (square last 2 axes)
+// Causal-masked softmax along the last axis. Shape preserved. Last two
+// axes must be square (TxT attention scores). Always last-axis by
+// construction — the causal mask is over a sequence-by-sequence matrix.
+export function softmaxCausal(a: Tensor): Tensor {
+  const site = captureSite('softmaxCausal')
+  if (a.dtype !== 'f32') throw new ShapeError(`softmaxCausal: requires f32, got ${a.dtype}`, site)
+  inferWhereCausal('softmaxCausal', a.shape, site)
   return addOp(currentGraph(), 'softmax_causal_last', a.shape, 'f32', site, { a: a.id })
 }
 
-// Numerically-stable log-softmax along the last axis. Shape preserved.
-export function logSoftmaxLast(a: Tensor): Tensor {
-  const site = captureSite('logSoftmaxLast')
-  if (a.dtype !== 'f32') throw new ShapeError(`logSoftmaxLast: requires f32, got ${a.dtype}`, site)
+function logSoftmaxLastIR(a: Tensor): Tensor {
+  const site = captureSite('logSoftmax')
+  if (a.dtype !== 'f32') throw new ShapeError(`logSoftmax: requires f32, got ${a.dtype}`, site)
   return addOp(currentGraph(), 'log_softmax_last', a.shape, 'f32', site, { a: a.id })
 }
 
-/** Numerically-stable softmax along the last axis. Composes `exp` with
- *  `logSoftmaxLast` — the stabilization happens inside the fused log-softmax
- *  kernel. Output is `[..., V]` of probabilities summing to 1 along the last
- *  axis. For classifiers that want explicit class probabilities, and for
- *  visualization of attention-like distributions. Use `crossEntropyLast` if
- *  you actually want the training loss. */
-export function softmaxLast(a: Tensor): Tensor {
-  return exp(logSoftmaxLast(a))
+/** Numerically-stable log-softmax along an axis. Shape preserved.
+ *  Negative axis counts from the end; default is `-1`. Non-last axes
+ *  transpose internally. */
+export function logSoftmax(a: Tensor, axis: number = -1): Tensor {
+  return axisPreserving(a, axis, 'logSoftmax', logSoftmaxLastIR)
+}
+
+/** Numerically-stable softmax along an axis. Composes `exp(logSoftmax(...))`
+ *  — the stabilization happens inside the fused log-softmax kernel.
+ *  Negative axis counts from the end; default is `-1`. For classifiers
+ *  that want explicit class probabilities and for attention-distribution
+ *  visualization. Use `nn.crossEntropy` for the training loss. */
+export function softmax(a: Tensor, axis: number = -1): Tensor {
+  return exp(logSoftmax(a, axis))
+}
+
+/** Internal helper: apply a last-axis op `f` along an arbitrary axis by
+ *  transposing the axis to last, applying `f`, then transposing back.
+ *  Output shape matches input (axis-preserving op). */
+function axisPreserving(
+  a: Tensor, axisArg: number, opName: string,
+  applyLast: (t: Tensor) => Tensor,
+): Tensor {
+  const r = a.shape.length
+  if (r === 0) {
+    throw new ShapeError(`${opName}: cannot apply to 0-d tensor`, captureSite(opName))
+  }
+  const k = axisArg < 0 ? r + axisArg : axisArg
+  if (k < 0 || k >= r) {
+    throw new ShapeError(`${opName}: axis ${axisArg} out of range for shape [${a.shape.join(',')}]`, captureSite(opName))
+  }
+  if (k === r - 1) return applyLast(a)
+  const perm = [...Array(r).keys()].filter(i => i !== k).concat(k)
+  return transpose(applyLast(transpose(a, perm)), backPerm(k, r))
 }
 
 // Pre-softmax causal mask. Sets cells where (i < j) on the last two axes to
 // `fillValue` (typically -1e30). Lower-triangle entries pass through.
 // Use this when you want the masked scores explicitly (e.g. for capture);
-// for the common case, prefer softmaxCausalLast which fuses both.
+// for the common case, prefer softmaxCausal which fuses both.
 export function whereCausal(a: Tensor, fillValue: number): Tensor {
   const site = captureSite('whereCausal')
   if (a.dtype !== 'f32') throw new ShapeError(`whereCausal: requires f32, got ${a.dtype}`, site)
@@ -452,17 +491,8 @@ export function whereCausal(a: Tensor, fillValue: number): Tensor {
 // Slicing.
 // ----------------------------------------------------------------------------
 
-// sliceLastRange(a, start, end): slice [start, end) along the last axis.
-// Used for splitting Q/K/V from a fused QKV matmul.
-export function sliceLastRange(a: Tensor, start: number, end: number): Tensor {
-  const site = captureSite('sliceLastRange')
-  const outShape = inferSliceLastRange('sliceLastRange', a.shape, start, end, site)
-  return addOp(currentGraph(), 'slice_last_range', outShape, a.dtype, site, { a: a.id, start, end })
-}
-
 /** General-axis slice: take elements `[start, end)` along `axis`. Negative
- *  `axis` indexes from the end (Python convention). Backward not yet
- *  implemented — same as `sliceLastRange`. */
+ *  `axis` indexes from the end (Python convention). */
 export function sliceRange(a: Tensor, axis: number, start: number, end: number): Tensor {
   const site = captureSite('sliceRange')
   const ax = axis < 0 ? a.shape.length + axis : axis
@@ -653,7 +683,7 @@ export function adamUpdateP(
 // ----------------------------------------------------------------------------
 // 2D convolution and pooling (NCHW). Layout matches PyTorch so 1-shot ports
 // don't need a transpose. Bias is added separately (via `add` + broadcast) so
-// the IR op stays pure; see `nn.Conv2D` for the standard wrapper.
+// the IR op stays pure; see `nn.Conv2d` for the standard wrapper.
 // ----------------------------------------------------------------------------
 
 export interface Conv2dOptions {
@@ -671,7 +701,7 @@ function pairOpt(v: number | readonly [number, number] | undefined, defaultVal: 
 
 /** 2D convolution. Input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
  *  -> [B, C_out, H_out, W_out]. Bias is added separately via `add`; see
- *  `nn.Conv2D` for the canonical layer wrapper. */
+ *  `nn.Conv2d` for the canonical layer wrapper. */
 export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOptions = {}): Tensor {
   const site = captureSite('conv2d')
   if (input.dtype !== 'f32') throw new ShapeError(`conv2d: input must be f32, got ${input.dtype}`, site)
@@ -732,15 +762,17 @@ export interface MaxPool2dOptions {
  *  are treated as -inf for argmax. `kernelSize` is `[K_h, K_w]`; pass a number
  *  for a square kernel. Default stride equals kernel size (non-overlapping).
  *  PyTorch's `F.max_pool2d` convention. */
-export function maxPool2D(input: Tensor, kernelSize: number | readonly [number, number], opts: MaxPool2dOptions = {}): Tensor {
-  const site = captureSite('maxPool2D')
-  if (input.dtype !== 'f32') throw new ShapeError(`maxPool2D: input must be f32, got ${input.dtype}`, site)
+export function maxPool2d(input: Tensor, kernelSize: number | readonly [number, number], opts: MaxPool2dOptions = {}): Tensor {
+  const site = captureSite('maxPool2d')
+  if (input.dtype !== 'f32') throw new ShapeError(`maxPool2d: input must be f32, got ${input.dtype}`, site)
   const [kH, kW] = typeof kernelSize === 'number' ? [kernelSize, kernelSize] : [kernelSize[0], kernelSize[1]]
-  // Default stride = kernel (non-overlapping pooling, matching PyTorch).
-  const [sH, sW] = pairOpt(opts.stride, 0)
-  const [strideH, strideW] = sH === 0 ? [kH, kW] : [sH, sW]
+  // Default stride = kernel size (non-overlapping pooling, matching PyTorch).
+  const [strideH, strideW] = opts.stride === undefined
+    ? [kH, kW]
+    : typeof opts.stride === 'number' ? [opts.stride, opts.stride]
+    : [opts.stride[0], opts.stride[1]]
   const [pH, pW] = pairOpt(opts.padding, 0)
-  const outShape = inferMaxPool2d('maxPool2D', input.shape, kH, kW, strideH, strideW, pH, pW, site)
+  const outShape = inferMaxPool2d('maxPool2d', input.shape, kH, kW, strideH, strideW, pH, pW, site)
   return addOp(currentGraph(), 'max_pool_2d', outShape, 'f32', site, {
     input: input.id, kH, kW, strideH, strideW, padH: pH, padW: pW,
   })
@@ -748,11 +780,11 @@ export function maxPool2D(input: Tensor, kernelSize: number | readonly [number, 
 
 /** max_pool_2d backward op. Internal: emitted by autograd. Recomputes the
  *  argmax on the fly to avoid needing a saved-indices buffer. */
-export function maxPool2DGrad(
+export function maxPool2dGrad(
   input: Tensor, dy: Tensor,
   kH: number, kW: number, strideH: number, strideW: number, padH: number, padW: number,
 ): Tensor {
-  const site = captureSite('maxPool2DGrad')
+  const site = captureSite('maxPool2dGrad')
   // Output shape matches `input`.
   return addOp(currentGraph(), 'max_pool_2d_grad', input.shape, 'f32', site, {
     input: input.id, dy: dy.id, kH, kW, strideH, strideW, padH, padW,

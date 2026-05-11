@@ -98,28 +98,29 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `x.mean(dim=k)` / `x.sum(dim=k)` | `mean(x, k)` / `sum(x, k)` — negative `k` counts from the end |
 | `x.mean()` / `x.sum()` | `mean(x)` / `sum(x)` — 0-d scalar |
 | `x.mean(dim=k, keepdim=True)` | `mean(x, k, { keepDims: true })` |
-| `F.softmax(x, dim=-1)` | `softmaxLast(x)` (last axis only; transpose for other axes) |
-| Causal-masked softmax (`tril` + `masked_fill` + `softmax`) | `softmaxCausalLast(scores)` (fused; preferred over composing the mask yourself) |
+| `F.softmax(x, dim=k)` / `F.log_softmax(x, dim=k)` | `softmax(x, k)` / `logSoftmax(x, k)` — both default to last axis |
+| Causal-masked softmax (`tril` + `masked_fill` + `softmax`) | `softmaxCausal(scores)` (fused; preferred over composing the mask yourself) |
+| `x.argmax(dim=k)` | `argmax(x, k)` (defaults to last axis; flat argmax over the whole tensor if no axis) |
 | `x.transpose(a, b)` | `swapAxes(x, a, b)` |
 | `x.view(B, T, H, -1)` / `x.reshape(B, -1)` | `reshape(x, [B, T, H, -1])` — exactly one `-1` allowed, inferred from total size |
 | `torch.split(x, sizes, dim)` | `split(x, dim, sizes)` (note argument order) |
 | `nn.Embedding(V, D)` | `new nn.Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
 | `torch.flatten(x, start_dim=1)` | `flatten(x, 1)` (or `reshape(x, [B, -1])`) |
-| `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new nn.Conv2D(in, out, k, { stride: s, padding: p })` |
-| `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2D(x, k, { stride: s, padding: p })` |
+| `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new nn.Conv2d(in, out, k, { stride: s, padding: p })` |
+| `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2d(x, k, { stride: s, padding: p })` |
 
 ### Things that aren't 1-to-1
 
 **Pass raw logits to the loss, not log-probs.** PyTorch tutorials often
 write `F.log_softmax(logits, dim=-1)` in `forward` and `F.nll_loss(...)`
-in the loss. Tensorgrad's `nn.crossEntropyLast(logits, targets)` fuses
+in the loss. Tensorgrad's `nn.crossEntropy(logits, targets)` fuses
 log-softmax + NLL into one call. Pass raw logits — don't apply
 log-softmax yourself. Applying it twice silently
 double-log-softmaxes; the model trains but converges to garbage. This
 is the worst class of bug: it runs.
 
 If you specifically want the log-probability intermediate visible (e.g.
-to `capture` it for inspection), use `nn.nllLoss(logSoftmaxLast(logits),
+to `capture` it for inspection), use `nn.nllLoss(logSoftmax(logits),
 targets)` instead — same numerics, just unfused.
 
 **No `.train()` / `.eval()` mode flag.** Write two forwards: a training
@@ -323,18 +324,18 @@ Imported from `'tensorgrad'`:
 - Clamping: `clamp(x, lo, hi)` (scalar bounds)
 - Stochastic regularization: `dropout(x, p)` — inverted dropout, p ∈ [0, 1)
 - Comparisons / select: `less`, `greater`, `where`
-- Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmaxLast`
+- Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax(x, axis?)`
 - Shape: `reshape`, `transpose`, `swapAxes`
 - Linear algebra: `matmul`, `matmulBatched`
 - Indexing / casting: `oneHot`, `arange`, `embedding`
-- Slicing / structural: `sliceLastRange`, `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, axis, sizes)`
-- Fused ML primitives: `softmaxLast`, `logSoftmaxLast`, `softmaxCausalLast`, `whereCausal`
-- 2D conv / pool (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2D(x, k, { stride?, padding? })`, `flatten(x, startAxis?)`
+- Slicing / structural: `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, axis, sizes)`
+- Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x)`, `whereCausal`
+- 2D conv / pool (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `flatten(x, startAxis?)`
 
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
-`(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmaxLast`
+`(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmax`
 returns `i32` and is non-differentiable. The standard loss tail is
-`mean(crossEntropyLast(logits, targets))`.
+`mean(nn.crossEntropy(logits, targets))`.
 
 **Structural ops.** `concat([a, b], axis)` joins along an existing axis;
 `stack([a, b], axis)` joins along a new axis (sugar for
@@ -353,13 +354,13 @@ nn.Linear(inDim, outDim, { bias? })  // .fwd(x); W: [inDim, outDim], b: [outDim]
 nn.LayerNorm(dim)                    // .fwd(x); g (gain) and b (bias) both [dim]
 nn.RMSNorm(dim, eps?)                // .fwd(x); g (gain) only — Llama-style
 nn.Embedding(vocab, dim)             // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
-nn.Conv2D(inC, outC, k, { stride?, padding?, bias? }) // .fwd(x); NCHW
+nn.Conv2d(inC, outC, k, { stride?, padding?, bias? }) // .fwd(x); NCHW
                                      // x: [B, inC, H, W] -> [B, outC, H', W']
 nn.splitHeads(x, nHeads)             // [B, T, D] → [B, H, T, D/H]
 nn.mergeHeads(x)                     // inverse of splitHeads
 nn.unsplitHeads(captures, name)      // pull per-head slices off a capture
-nn.crossEntropyLast(logits, targets) // fused log-softmax + NLL (pass raw logits)
-nn.nllLoss(logProbs, targets)        // NLL only — pair with logSoftmaxLast if you need the log-prob intermediate
+nn.crossEntropy(logits, targets)     // fused log-softmax + NLL (pass raw logits)
+nn.nllLoss(logProbs, targets)        // NLL only — pair with logSoftmax if you need the log-prob intermediate
 ```
 
 Convention: leaf modules (`Linear`, `LayerNorm`) expose `.fwd(x)` for ergonomic
@@ -393,7 +394,7 @@ sgd: { lr: 0.05, weightDecay: 5e-4 }   // PyTorch-style L2 (injected into gradie
 adam: { lr: lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 }) }
 adam: { lr: lr.cosineDecay({ peak: 0.005, final: 0.0001, steps: 5000 }) }
 sgd:  { lr: lr.cosineDecay({ peak: 0.1, final: 0.001, steps: 10000 }), momentum: 0.9 }
-adam: { lr: lr.warmup({ peakLr: 0.001, warmupSteps: 200, after: lr.constant(0.001) }) }
+adam: { lr: lr.warmup({ peak: 0.001, warmupSteps: 200, after: 0.001 }) }
 adam: { lr: lr.step({ peak: 1.0, stepSize: 1, gamma: 0.7 }) }            // PyTorch StepLR
 adam: { lr: lr.multiStep({ peak: 0.1, milestones: [30000, 60000], gamma: 0.1 }) }  // MultiStepLR
 ```

@@ -19,7 +19,7 @@ import {
   sqrt, relu, mean, sum, reshape, transpose,
   matmul,
   oneHot, arange,
-  logSoftmaxLast,
+  logSoftmax,
   appendGrad,
   planBuffers, emitKernels,
   type Tensor, type Graph,
@@ -85,7 +85,7 @@ function forward(p: Params, tokens: Tensor): Tensor {
 
 function lossFn(p: Params, tokens: Tensor, targets: Tensor): Tensor {
   const logits = forward(p, tokens)                            // [B, T, V]
-  const lp = logSoftmaxLast(logits)                            // [B, T, V]
+  const lp = logSoftmax(logits)                            // [B, T, V]
   const targetOneHot = oneHot(targets, VOCAB)                  // [B, T, V]
   const targetLp = sum(mul(lp, targetOneHot), -1)              // [B, T]
 

@@ -170,14 +170,12 @@ export interface CompileForwardMethodOptions<M extends Module, I extends InputDe
   inputs: I
 }
 
-/** Optional fields to mutate on a CompiledModule's Adam state via
- *  `setOptimizerConfig`. Any subset is allowed; absent fields keep their
- *  current values. */
+/** Live-mutable optimizer fields for `setOptimizerConfig`. Only `lr` is
+ *  mutable mid-training — for anything else (weightDecay, b1, b2, momentum,
+ *  nesterov), use `replaceModel({ adam })` or `replaceModel({ sgd })` to
+ *  rebuild the optimizer atomically. */
 export interface OptimizerConfigUpdate {
   lr?: LR
-  weightDecay?: number
-  b1?: number
-  b2?: number
 }
 
 /** Returned by `compileModule`. Proxies all GPU work to an internal worker;

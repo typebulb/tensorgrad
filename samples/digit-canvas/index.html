@@ -121,7 +121,7 @@
     <code>replaceModel</code> for swapping hidden size without losing the
     worker, <code>clipGradNorm</code> for training stability,
     <code>singleFlight</code> so rapid-stroke predictions don't queue up,
-    and <code>meanAll(crossEntropyLast(...))</code> as the canonical
+    and <code>mean(nn.crossEntropy(...))</code> as the canonical
     classification loss tail.
   </p>
 

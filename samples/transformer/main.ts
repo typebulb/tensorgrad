@@ -9,7 +9,7 @@ import {
   Module, compileModule, lr, nn, capture,
   add, mul, sum, swapAxes,
   relu, matmul, matmulBatched, embedding, arange,
-  softmaxCausalLast,
+  softmaxCausal,
   type Tensor,
 } from 'tensorgrad'
 
@@ -89,7 +89,7 @@ function attentionFwd(p: Attention, x: Tensor, layerIdx: number): Tensor {
   const k = nn.splitHeads(p.k.fwd(x), N_HEADS)
   const v = nn.splitHeads(p.v.fwd(x), N_HEADS)
   const scores = mul(matmulBatched(q, swapAxes(k, -1, -2)), SCALE_QK)
-  const attn = capture(`attn.${layerIdx}`, softmaxCausalLast(scores))
+  const attn = capture(`attn.${layerIdx}`, softmaxCausal(scores))
   return p.o.fwd(nn.mergeHeads(matmulBatched(attn, v)))
 }
 
@@ -116,7 +116,7 @@ function modelFwd(p: Transformer, tokens: Tensor): Tensor {
 }
 
 function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tensor; targets: Tensor; mask: Tensor }): Tensor {
-  const ce = nn.crossEntropyLast(modelFwd(p, tokens), targets)   // [B, T] of -log p(target)
+  const ce = nn.crossEntropy(modelFwd(p, tokens), targets)   // [B, T] of -log p(target)
   return mul(sum(mul(ce, mask)), 1 / (B * N_RESULT_DIGITS))
 }
 
