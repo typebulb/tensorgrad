@@ -108,10 +108,11 @@ export function resolveLR(schedule: LRSchedule, step: number): number {
 /** Rewrite a schedule to start its timeline at `baseStep` (sets startStep on
  *  the outer shape to `baseStep - 1`, so the schedule's intrinsic step 1
  *  aligns with the user's `baseStep`). Numbers and `{kind:'constant'}` have
- *  no notion of time and pass through unchanged. Used by the worker to
- *  auto-rebase non-constant schedules handed to `setOptimizerConfig`. */
+ *  no notion of time and pass through unchanged. Schedules that already
+ *  have an explicit `startStep` also pass through — caller intent wins. */
 export function rebaseLR(schedule: LRSchedule, baseStep: number): LRSchedule {
   if (typeof schedule === 'number' || schedule.kind === 'constant') return schedule
+  if (schedule.startStep !== undefined) return schedule
   return { ...schedule, startStep: baseStep - 1 }
 }
 

@@ -250,7 +250,7 @@ function handleSetOptimizerConfig(payload: {
   // takes effect at t+1 — that's the step we rebase against.
   const nextStep = slot.adam.t + 1
   const newLR = payload.update.lr !== undefined
-    ? autoRebaseLR(payload.update.lr, nextStep)
+    ? rebaseLR(payload.update.lr, nextStep)
     : cur.lr
   slot.adam.config = {
     ...cur,
@@ -259,16 +259,6 @@ function handleSetOptimizerConfig(payload: {
     b1: payload.update.b1 !== undefined ? payload.update.b1 : cur.b1,
     b2: payload.update.b2 !== undefined ? payload.update.b2 : cur.b2,
   }
-}
-
-/** Auto-rebase a schedule passed mid-training: non-constant schedules with no
- *  explicit `startStep` get rebased so step 1 aligns with the next training
- *  step ("decay from now"). Numbers, `constant`, and schedules with an
- *  explicit `startStep` pass through unchanged. */
-function autoRebaseLR(schedule: LRSchedule, baseStep: number): LRSchedule {
-  if (typeof schedule === 'number' || schedule.kind === 'constant') return schedule
-  if (schedule.startStep !== undefined) return schedule
-  return rebaseLR(schedule, baseStep)
 }
 
 function handleDestroy(payload: { graphId: number }): void {

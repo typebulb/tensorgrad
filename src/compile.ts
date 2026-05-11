@@ -291,15 +291,11 @@ export async function compileModule<M extends Module, I extends InputDecls>(
   opts: CompileModuleOptions<M, I>,
 ): Promise<CompiledModule<M, I>> {
   const proxy = new WorkerProxy(__WORKER_SOURCE__)
-  const seed = opts.seed ?? randomSeed()
+  const optsWithSeed: CompileModuleOptions<M, I> = { ...opts, seed: opts.seed ?? randomSeed() }
   try {
-    const built = await buildTrainingGraph(proxy, opts, /* graphId */ 0, seed)
+    const built = await buildTrainingGraph(proxy, optsWithSeed, 0)
     return new CompiledModuleProxy<M, I>(
-      proxy, /* graphId */ 0, built.ir, built.meta,
-      { ...opts, seed },
-      built.initFns,
-      seed,
-      /* nextGraphId */ { v: 1 },
+      proxy, 0, built.ir, built.meta, optsWithSeed, built.initFns, { v: 1 },
     )
   } catch (e) {
     proxy.terminate()
@@ -326,7 +322,6 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   proxy: WorkerProxy,
   opts: CompileModuleOptions<M, I>,
   graphId: number,
-  seed: number,
 ): Promise<BuiltTrainingGraph> {
   const loss = opts.loss as unknown as ForwardFn<M, InputDecls>
   const inputs = opts.inputs as InputDecls
@@ -340,7 +335,7 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   const kernels = emitKernels(graph, plan)
   const ir: CompiledIR = { graph, paramGrads, loss: lossTensor, plan, kernels }
 
-  const initialParams = buildInitialParams(plan, materialized.initFns, mulberry32(seed))
+  const initialParams = buildInitialParams(plan, materialized.initFns, mulberry32(opts.seed!))
   const wireIR: WireIR = { graph, plan, kernels }
   const wireAdam = adamResult ? wireAdamConfig(adamResult) : null
   const transfers = transferablesOfRecord(initialParams)
@@ -384,14 +379,13 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
    *  their per-shape kernel caches without unregistering them. */
   private readonly children = new Set<ChildProxy>()
 
-  // Mutable: `replaceModel` swaps these in place so callers' references
-  // (and any sibling ForwardProxy holding `this`) stay valid.
+  // `replaceModel` swaps these in place so callers' references (and any
+  // sibling ForwardProxy holding `this`) stay valid across topology changes.
+  // `opts.seed` is always populated (compileModule fills it before construction).
   ir: CompiledIR
   private meta: CreateRuntimeResult
   private opts: CompileModuleOptions<M, I>
   private initFns: Record<string, InitFn>
-  /** Seed used for the most recent (re)build of the training graph. */
-  private currentSeed: number
 
   constructor(
     private readonly proxy: WorkerProxy,
@@ -400,23 +394,21 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
     meta: CreateRuntimeResult,
     opts: CompileModuleOptions<M, I>,
     initFns: Record<string, InitFn>,
-    seed: number,
     private readonly nextGraphId: { v: number },
   ) {
     this.ir = ir
     this.meta = meta
     this.opts = opts
     this.initFns = initFns
-    this.currentSeed = seed
   }
 
   get kernelCount(): number { return this.meta.kernelCount }
   get outputShape(): readonly number[] { return this.meta.outputShape }
   get paramNames(): readonly string[] { return this.meta.paramNames }
-  get seed(): number { return this.currentSeed }
+  get seed(): number { return this.opts.seed! }
 
-  /** Current model factory. Sibling ForwardProxies read this through the
-   *  proxy ref so they always re-trace against the latest topology. */
+  /** Sibling ForwardProxies read this through the proxy ref so they always
+   *  re-trace against the latest topology. */
   currentFactory(): M { return this.opts.factory() }
 
   step(inputs: LooseInputs): Promise<number>
@@ -452,31 +444,27 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
   }
 
   async downloadParams(): Promise<ParamTree<M>> {
-    const r = await this.proxy.request<DownloadParamsResult>(
-      { kind: 'downloadParams', payload: { graphId: this.graphId } },
-    )
-    return buildParamTree(r.params) as ParamTree<M>
+    return buildParamTree(await this.fetchParams('downloadParams')) as ParamTree<M>
   }
 
-  async downloadParamsFlat(): Promise<Record<string, Float32Array>> {
+  downloadParamsFlat(): Promise<Record<string, Float32Array>> {
+    return this.fetchParams('downloadParams')
+  }
+
+  async downloadParamGrads(): Promise<ParamTree<M>> {
+    return buildParamTree(await this.fetchParams('downloadParamGrads')) as ParamTree<M>
+  }
+
+  private async fetchParams(kind: 'downloadParams' | 'downloadParamGrads'): Promise<Record<string, Float32Array>> {
     const r = await this.proxy.request<DownloadParamsResult>(
-      { kind: 'downloadParams', payload: { graphId: this.graphId } },
+      { kind, payload: { graphId: this.graphId } },
     )
     return r.params
   }
 
-  async downloadParamGrads(): Promise<ParamTree<M>> {
-    const r = await this.proxy.request<DownloadParamsResult>(
-      { kind: 'downloadParamGrads', payload: { graphId: this.graphId } },
-    )
-    return buildParamTree(r.params) as ParamTree<M>
-  }
-
   async reset(): Promise<void> {
-    // Re-init using the *same* seed → reset is reproducible per (topology, seed).
-    const initialParams = buildInitialParams(this.ir.plan, this.initFns, mulberry32(this.currentSeed))
-    await this.uploadParams(initialParams)
-    await this.resetOptimizerState()
+    const initialParams = buildInitialParams(this.ir.plan, this.initFns, mulberry32(this.opts.seed!))
+    await Promise.all([this.uploadParams(initialParams), this.resetOptimizerState()])
   }
 
   resetOptimizerState(): Promise<void> {
@@ -507,23 +495,19 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
   }
 
   async replaceModel(newFactory: () => M, replaceOpts?: { seed?: number }): Promise<void> {
-    // 1. Invalidate sibling caches: their per-shape kernels are model-specific
-    //    so the worker-side graphs must go, but the proxy objects stay alive
-    //    (callers hold references to them) and recompile lazily on next run().
+    // Invalidate (don't destroy) sibling forward proxies: their per-shape
+    // kernels are model-specific, but the proxy objects stay alive so callers'
+    // references remain valid — caches recompile lazily on the next run().
     for (const child of this.children) child._invalidateForReplace()
-    // 2. Destroy current training graph in worker.
     this.proxy.send({ kind: 'destroy', payload: { graphId: this.graphId } })
-    // 3. Rebuild the training graph on the same worker, same graphId. Inherit
-    //    the current seed by default; the caller can override for fresh init.
-    const newSeed = replaceOpts?.seed ?? this.currentSeed
-    const newOpts: CompileModuleOptions<M, I> = { ...this.opts, factory: newFactory, seed: newSeed }
-    const built = await buildTrainingGraph(this.proxy, newOpts, this.graphId, newSeed)
-    // 4. Mutate this proxy in place — same object, new internals.
+    const newOpts: CompileModuleOptions<M, I> = {
+      ...this.opts, factory: newFactory, seed: replaceOpts?.seed ?? this.opts.seed!,
+    }
+    const built = await buildTrainingGraph(this.proxy, newOpts, this.graphId)
     this.ir = built.ir
     this.meta = built.meta
     this.initFns = built.initFns
     this.opts = newOpts
-    this.currentSeed = newSeed
   }
 
   destroy(): void {
@@ -589,13 +573,14 @@ class ForwardProxy<M extends Module, I extends InputDecls>
   }
 
   async downloadParams(): Promise<ParamTree<M>> {
-    const r = await this.proxy.request<DownloadParamsResult>(
-      { kind: 'downloadParams', payload: { graphId: this.parent.graphId } },
-    )
-    return buildParamTree(r.params) as ParamTree<M>
+    return buildParamTree(await this.fetchParams()) as ParamTree<M>
   }
 
-  async downloadParamsFlat(): Promise<Record<string, Float32Array>> {
+  downloadParamsFlat(): Promise<Record<string, Float32Array>> {
+    return this.fetchParams()
+  }
+
+  private async fetchParams(): Promise<Record<string, Float32Array>> {
     const r = await this.proxy.request<DownloadParamsResult>(
       { kind: 'downloadParams', payload: { graphId: this.parent.graphId } },
     )
