@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Makemore (tensorgrad)</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; }
+    button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+    #log { background: #111; color: #ddd; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12px; height: 400px; overflow-y: auto; white-space: pre-wrap; margin-top: 1rem; }
+    .err { color: #f88; }
+    .ok { color: #8f8; }
+  </style>
+</head>
+<body>
+  <h1>Makemore (tensorgrad / WebGPU)</h1>
+  <p>Char-level transformer trained from scratch on ~32K real names. Generates plausible new names by sampling from the learned distribution — no algorithm to imitate, the rule only exists in the data.</p>
+  <button id="run">Train</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="log"></div>
+  <p><a href="/">← back to samples</a></p>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

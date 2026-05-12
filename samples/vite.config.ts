@@ -32,6 +32,7 @@ export default defineConfig({
       input: {
         index: 'index.html',
         transformer: 'transformer/index.html',
+        makemore: 'makemore/index.html',
         'mlp-sin': 'mlp-sin/index.html',
         'digit-canvas': 'digit-canvas/index.html',
         'mnist-cnn': 'mnist-cnn/index.html',

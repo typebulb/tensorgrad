@@ -347,7 +347,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
 
-    case 'transpose': {
+    case 'permute': {
       const out = tof(op.out)
       const a = tof(op.a)
       const total = shapeSize(out.shape)

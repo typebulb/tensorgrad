@@ -14,7 +14,7 @@ import { addOp, captureSite } from './ir.js'
 import { currentGraph, tensorInput } from './trace.js'
 import {
   inferElementwiseBinop, inferUnary, inferMeanLast, inferSumLast, inferArgmaxLast,
-  inferReshape, inferTranspose, inferMatmul, inferMatmulBatched,
+  inferReshape, inferPermute, inferMatmul, inferMatmulBatched,
   inferOneHot, inferWhereCausal, inferSliceRange, inferConcat,
   inferBroadcastTo, inferSumToShape, inferReluGrad, inferWhere,
   inferConv2d, inferMaxPool2d,
@@ -191,8 +191,8 @@ export function gelu(a: Tensor): Tensor {
 // the default (the axis is removed from the output shape).
 //
 // The IR-level kernels (`mean_last`, `sum_last`) are last-axis only. Other
-// axes compose as `transpose-axis-to-end` + `*_last` + (reshape or
-// transpose-back), so there's no new codegen for arbitrary-axis reduction.
+// axes compose as `permute-axis-to-end` + `*_last` + (reshape or
+// permute-back), so there's no new codegen for arbitrary-axis reduction.
 // `meanLastIR` / `sumLastIR` are local helpers — not part of the public
 // API; consumers always go through `mean`/`sum`.
 // ----------------------------------------------------------------------------
@@ -239,7 +239,7 @@ export function argmax(a: Tensor, axis?: number): Tensor {
   }
   if (k === r - 1) return argmaxLastIR(a)
   const perm = [...Array(r).keys()].filter(i => i !== k).concat(k)
-  return argmaxLastIR(transpose(a, perm))
+  return argmaxLastIR(permute(a, perm))
 }
 
 /** Mean along an axis (or all axes). Negative axis counts from the end.
@@ -250,7 +250,7 @@ export function argmax(a: Tensor, axis?: number): Tensor {
  *  mean(x)                          // 0-d scalar
  *  mean(x, -1)                      // PyTorch's x.mean(dim=-1)
  *  mean(x, -1, { keepDims: true })  // preserve the trailing axis as size 1
- *  mean(x, 1)                       // reduce middle axis (transposes internally)
+ *  mean(x, 1)                       // reduce middle axis (permutes internally)
  *  ``` */
 export function mean(a: Tensor, axis?: number, opts?: ReduceOpts): Tensor {
   if (axis === undefined) {
@@ -283,19 +283,19 @@ function reduceAxis(a: Tensor, axisArg: number, keepDims: boolean, kind: 'mean' 
   }
   const isLast = k === r - 1
   // Reduce: produce a tensor with the reduced axis at position r-1 (size 1
-  // for mean, dropped for sum). Transpose first when k isn't already last.
-  const input = isLast ? a : transpose(a, [...Array(r).keys()].filter(i => i !== k).concat(k))
+  // for mean, dropped for sum). Permute first when k isn't already last.
+  const input = isLast ? a : permute(a, [...Array(r).keys()].filter(i => i !== k).concat(k))
   if (kind === 'mean') {
     const reduced = meanLastIR(input)  // shape: [...others, 1]
     if (isLast) return keepDims ? reduced : reshape(reduced, reduced.shape.slice(0, -1))
     if (!keepDims) return reshape(reduced, reduced.shape.slice(0, -1))
-    return transpose(reduced, backPerm(k, r))
+    return permute(reduced, backPerm(k, r))
   }
   // sum
   const dropped = sumLastIR(input)  // shape: [...others]
   if (isLast) return keepDims ? reshape(dropped, [...dropped.shape, 1]) : dropped
   if (!keepDims) return dropped
-  return transpose(reshape(dropped, [...dropped.shape, 1]), backPerm(k, r))
+  return permute(reshape(dropped, [...dropped.shape, 1]), backPerm(k, r))
 }
 
 /** Inverse of `[everyone-but-k, k]`: the perm that moves the trailing axis
@@ -337,15 +337,19 @@ export function flatten(a: Tensor, startAxis: number = 1): Tensor {
   return reshape(a, [...a.shape.slice(0, s), -1])
 }
 
-export function transpose(a: Tensor, perm: readonly number[]): Tensor {
-  const site = captureSite('transpose')
-  const outShape = inferTranspose('transpose', a.shape, perm, site)
-  return addOp(currentGraph(), 'transpose', outShape, a.dtype, site, { a: a.id, perm })
+/** Permute the axes of a tensor by `perm`. Matches PyTorch's `x.permute(*dims)`
+ *  / JAX's `jnp.transpose(x, axes)` / NumPy's `np.transpose(x, axes)`. For the
+ *  common case of swapping two axes (PyTorch's `x.transpose(a, b)`), use
+ *  `swapAxes`. */
+export function permute(a: Tensor, perm: readonly number[]): Tensor {
+  const site = captureSite('permute')
+  const outShape = inferPermute('permute', a.shape, perm, site)
+  return addOp(currentGraph(), 'permute', outShape, a.dtype, site, { a: a.id, perm })
 }
 
 /** Swap two axes of a tensor. Negative indices count from the end (so
  *  `swapAxes(x, -1, -2)` swaps the last two — the common attention pattern).
- *  All other axes keep their position. Implemented as `transpose` with the
+ *  All other axes keep their position. Implemented as `permute` with the
  *  permutation `[0, 1, ..., axis2, ..., axis1, ..., n-1]`. */
 export function swapAxes(a: Tensor, axis1: number, axis2: number): Tensor {
   const r = a.shape.length
@@ -360,28 +364,45 @@ export function swapAxes(a: Tensor, axis1: number, axis2: number): Tensor {
   const perm = Array.from({ length: r }, (_, k) => k)
   perm[i1] = i2
   perm[i2] = i1
-  return transpose(a, perm)
+  return permute(a, perm)
 }
 
 // ----------------------------------------------------------------------------
 // Linear algebra.
 // ----------------------------------------------------------------------------
 
+/** Matrix multiplication. Dispatches on input rank:
+ *  - `a [..., M, K] · b [K, N] → [..., M, N]`   (rhs rank 2: broadcast lhs batch)
+ *  - `a [..., M, K] · b [..., K, N] → [..., M, N]`  (both batched, same rank)
+ *
+ *  Broadcasting beyond these two cases (e.g. mismatched batch ranks) isn't
+ *  supported — reshape explicitly. The two cases lower to different fused
+ *  kernels under the hood; the public surface is one function. */
 export function matmul(a: Tensor, b: Tensor): Tensor {
   const site = captureSite('matmul')
   if (a.dtype !== 'f32' || b.dtype !== 'f32') {
     throw new ShapeError(`matmul: requires f32, got ${a.dtype} and ${b.dtype}`, site)
   }
-  const outShape = inferMatmul('matmul', a.shape, b.shape, site)
-  return addOp(currentGraph(), 'matmul', outShape, 'f32', site, { a: a.id, b: b.id })
-}
-
-export function matmulBatched(a: Tensor, b: Tensor): Tensor {
-  const site = captureSite('matmulBatched')
-  if (a.dtype !== 'f32' || b.dtype !== 'f32') {
-    throw new ShapeError(`matmulBatched: requires f32, got ${a.dtype} and ${b.dtype}`, site)
+  if (a.shape.length < 2) {
+    throw new ShapeError(`matmul: lhs must have rank >= 2, got ${showShape(a.shape)}`, site)
   }
-  const outShape = inferMatmulBatched('matmulBatched', a.shape, b.shape, site)
+  if (b.shape.length < 2) {
+    throw new ShapeError(`matmul: rhs must have rank >= 2, got ${showShape(b.shape)}`, site)
+  }
+  // rhs rank 2 → unbatched matmul (lhs's leading axes are batch).
+  if (b.shape.length === 2) {
+    const outShape = inferMatmul('matmul', a.shape, b.shape, site)
+    return addOp(currentGraph(), 'matmul', outShape, 'f32', site, { a: a.id, b: b.id })
+  }
+  // Both batched: ranks must match.
+  if (a.shape.length !== b.shape.length) {
+    throw new ShapeError(
+      `matmul: rank mismatch — lhs ${showShape(a.shape)} vs rhs ${showShape(b.shape)}. ` +
+      `When rhs is batched (rank > 2), lhs must have the same rank. Reshape explicitly if needed.`,
+      site,
+    )
+  }
+  const outShape = inferMatmulBatched('matmul', a.shape, b.shape, site)
   return addOp(currentGraph(), 'matmul_batched', outShape, 'f32', site, { a: a.id, b: b.id })
 }
 
@@ -400,7 +421,7 @@ export function oneHot(indices: Tensor, depth: number, dtype: Dtype = 'f32'): Te
 
 /** Embedding lookup: pull rows from `table` indexed by `indices`. Decomposes
  *  to `oneHot(indices, vocab) @ table` so autograd works without a dedicated
- *  scatter-with-atomic-add backward — the matmul transpose rule handles it.
+ *  scatter-with-atomic-add backward — the matmul adjoint rule handles it.
  *  `table` is `[vocab, dim]`; `indices` is any shape `[...]` of i32; result
  *  is `[..., dim]`. The vocab size is taken from `table.shape[0]`. */
 export function embedding(indices: Tensor, table: Tensor): Tensor {
@@ -424,7 +445,7 @@ export function arange(n: number, dtype: Dtype = 'i32'): Tensor {
 }
 
 // ----------------------------------------------------------------------------
-// ML primitives. Fused so autograd's transpose rule is straightforward and the
+// ML primitives. Fused so autograd's adjoint rule is straightforward and the
 // kernels can be hand-tuned for our specific shapes.
 // ----------------------------------------------------------------------------
 
@@ -446,7 +467,7 @@ function logSoftmaxLastIR(a: Tensor): Tensor {
 
 /** Numerically-stable log-softmax along an axis. Shape preserved.
  *  Negative axis counts from the end; default is `-1`. Non-last axes
- *  transpose internally. */
+ *  permute internally. */
 export function logSoftmax(a: Tensor, axis: number = -1): Tensor {
   return axisPreserving(a, axis, 'logSoftmax', logSoftmaxLastIR)
 }
@@ -461,7 +482,7 @@ export function softmax(a: Tensor, axis: number = -1): Tensor {
 }
 
 /** Internal helper: apply a last-axis op `f` along an arbitrary axis by
- *  transposing the axis to last, applying `f`, then transposing back.
+ *  permuting the axis to last, applying `f`, then permuting back.
  *  Output shape matches input (axis-preserving op). */
 function axisPreserving(
   a: Tensor, axisArg: number, opName: string,
@@ -477,7 +498,7 @@ function axisPreserving(
   }
   if (k === r - 1) return applyLast(a)
   const perm = [...Array(r).keys()].filter(i => i !== k).concat(k)
-  return transpose(applyLast(transpose(a, perm)), backPerm(k, r))
+  return permute(applyLast(permute(a, perm)), backPerm(k, r))
 }
 
 // Pre-softmax causal mask. Sets cells where (i < j) on the last two axes to
@@ -587,7 +608,7 @@ export function constScalar(value: number, dtype: Dtype = 'f32'): Tensor {
 }
 
 // ----------------------------------------------------------------------------
-// Autograd-internal helpers (exposed for users writing custom transpose rules).
+// Autograd-internal helpers (exposed for users writing custom adjoint rules).
 // ----------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------
@@ -616,7 +637,7 @@ export function where(cond: Tensor, a: Tensor, b: Tensor): Tensor {
 }
 
 // reluGrad(x, dy) = dy where x > 0, else 0. Same shape as x. This is the
-// transpose rule for relu, exposed as an op so codegen can emit it.
+// adjoint rule for relu, exposed as an op so codegen can emit it.
 export function reluGrad(x: Tensor, dy: Tensor): Tensor {
   const site = captureSite('reluGrad')
   if (x.dtype !== 'f32' || dy.dtype !== 'f32') {

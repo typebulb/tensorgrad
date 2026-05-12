@@ -5,9 +5,9 @@
 //   import { capture } from 'tensorgrad'
 //
 //   function attentionFwd(p, x) {
-//     const scores = mul(matmulBatched(q, kT), SCALE_QK)
+//     const scores = mul(matmul(q, kT), SCALE_QK)
 //     const attn = capture(`attn.${layerIdx}`, softmaxCausal(scores))
-//     return matmulBatched(attn, v)
+//     return matmul(attn, v)
 //   }
 //
 // Pass-through return type: `capture(name, t)` returns `t` unchanged so it

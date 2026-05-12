@@ -16,7 +16,7 @@
 import {
   trace, traceInto, paramInput, tensorInput, capture,
   add, sub, mul, div,
-  sqrt, relu, mean, sum, reshape, transpose,
+  sqrt, relu, mean, sum, reshape, permute,
   matmul,
   oneHot, arange,
   logSoftmax,
@@ -79,7 +79,7 @@ function forward(p: Params, tokens: Tensor): Tensor {
   }
 
   const xn = layerNorm(x, p['lnf_g']!, p['lnf_b']!)
-  const logits = matmul(xn, transpose(p['tok_emb']!, [1, 0]))  // [B, T, V]
+  const logits = matmul(xn, permute(p['tok_emb']!, [1, 0]))  // [B, T, V]
   return logits
 }
 

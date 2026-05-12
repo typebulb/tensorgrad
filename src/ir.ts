@@ -37,8 +37,8 @@ export interface CallSite {
 // Discriminated union over every op the IR knows about. Adding an op means:
 //   1. add a variant here,
 //   2. add a shape rule in src/shape.ts,
-//   3. add a transpose rule in src/grad.ts (later),
-//   4. add a kernel template in src/codegen.ts (later).
+//   3. add an adjoint (autograd "transpose") rule in src/grad.ts,
+//   4. add a kernel template in src/codegen.ts.
 // The kinds intentionally match the surface API in src/ops.ts one-to-one.
 export type OpNode =
   // ---- Leaves ----------------------------------------------------------------
@@ -87,12 +87,15 @@ export type OpNode =
 
   // ---- Shape ---------------------------------------------------------------
   | { kind: 'reshape'; out: number; a: number; newShape: Shape }
-  | { kind: 'transpose'; out: number; a: number; perm: readonly number[] }
+  | { kind: 'permute'; out: number; a: number; perm: readonly number[] }
 
   // ---- Linear algebra -----------------------------------------------------
+  // Public `matmul(a, b)` (src/ops.ts) dispatches between the two kinds below
+  // based on rhs rank — rank-2 rhs uses 'matmul', rank-matched batched rhs
+  // uses 'matmul_batched'. Two kinds for two distinct kernel shapes; one
+  // public name. Kept separate so autograd adjoint rules stay simple.
+  //
   // matmul: a [..., M, K] · b [K, N] -> [..., M, N]. b is unbatched.
-  // (Batched-on-both-sides matmul, e.g. for attention scores, is a separate kind
-  //  to keep autograd transpose rules simple.)
   | { kind: 'matmul'; out: number; a: number; b: number }
   // matmul_batched: a [..., M, K] · b [..., K, N] -> [..., M, N]. Used by attention.
   | { kind: 'matmul_batched'; out: number; a: number; b: number }

@@ -22,11 +22,12 @@ export {
   mean, sum, argmax,
   type ReduceOpts,
   // Shape ops
-  reshape, transpose, swapAxes,
+  reshape, permute, swapAxes,
   // PyTorch-style flatten — collapse trailing axes into one. Sugar for reshape(-1).
   flatten,
-  // Linear algebra
-  matmul, matmulBatched,
+  // Linear algebra — single `matmul` dispatches between unbatched + batched
+  // kernels on rhs rank.
+  matmul,
   // Indexing / casting
   oneHot, arange, embedding,
   // ML primitives. `softmax` / `logSoftmax` take an optional axis (default

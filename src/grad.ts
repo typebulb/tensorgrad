@@ -9,7 +9,7 @@
 // contributions from each. We add them as we encounter them, so by the time
 // reverse iteration reaches a tensor's producer op, its cotangent is complete.
 //
-// Why this works as "more graph nodes": the transpose rule for an op like
+// Why this works as "more graph nodes": the adjoint rule for an op like
 // mul(a, b)→c is `da += dc * b; db += dc * a`. The right-hand sides are
 // expressible in terms of existing forward ops (mul) plus accumulation (add).
 // We just call those op functions, which append nodes to the current graph
@@ -18,7 +18,7 @@
 import type { Graph, OpNode, Tensor, Shape } from './ir.js'
 import {
   add, sub, mul, div, mulScalar,
-  matmul, matmulBatched, transpose, swapAxes, reshape,
+  matmul, permute, swapAxes, reshape,
   exp,
   broadcastTo, sumToShape,
   constScalar, reluGrad,
@@ -48,7 +48,7 @@ export interface GradResult {
 // ops. Returns gradients for every param_input.
 //
 // Internally re-enters the graph as the active trace context, so backward ops
-// emitted by transpose rules append to it. The caller doesn't need to manage
+// emitted by adjoint rules append to it. The caller doesn't need to manage
 // trace state.
 export function appendGrad(graph: Graph): GradResult {
   if (graph.outputs.length !== 1) {
@@ -80,7 +80,7 @@ export function appendGrad(graph: Graph): GradResult {
       const op = forwardOps[i]!
       const outCotan = cotangents.get(op.out)
       if (!outCotan) continue
-      runTransposeRule(op, outCotan, graph, cotangents)
+      runAdjointRule(op, outCotan, graph, cotangents)
     }
 
     // Collect param gradients by name. Skip non-param leaves.
@@ -127,7 +127,8 @@ function unbroadcast(cotan: Tensor, toShape: Shape): Tensor {
 
 
 // ============================================================================
-// Transpose rules
+// Adjoint rules (a.k.a. autograd "transpose" rules — adjoint of the linear
+// operator linearized at this op's inputs)
 // ============================================================================
 //
 // One per OpNode kind. Each rule:
@@ -135,7 +136,7 @@ function unbroadcast(cotan: Tensor, toShape: Shape): Tensor {
 //   * builds the backward expression(s) in graph terms (calling ops.ts functions)
 //   * accumulates cotangent contributions onto each input tensor
 
-function runTransposeRule(
+function runAdjointRule(
   op: OpNode,
   outCotan: Tensor,
   graph: Graph,
@@ -332,10 +333,10 @@ function runTransposeRule(
       accumulate(cotangents, op.a, reshape(outCotan, a.shape))
       return
     }
-    case 'transpose': {
-      // c = transpose(a, perm). Backward: transpose outCotan with inverse perm.
+    case 'permute': {
+      // c = permute(a, perm). Backward: permute outCotan with inverse perm.
       const inv = invertPerm(op.perm)
-      accumulate(cotangents, op.a, transpose(outCotan, inv))
+      accumulate(cotangents, op.a, permute(outCotan, inv))
       return
     }
 
@@ -345,24 +346,14 @@ function runTransposeRule(
       // dA = dC @ B^T  (matmul, since b is unbatched)
       // dB = sum_over_batch( A^T @ dC )
       //
-      // Implementation note: dA uses the same `matmul` (a [...,M,N] · b [N,K])
-      // because b is rank-2. dB needs A^T which has shape [..., K, M], then
-      // matmul with dC ([..., M, N]) gives [..., K, N], which we sum over
-      // leading batch dims to get [K, N].
+      // dB needs A^T which has shape [..., K, M], then a matmul with dC
+      // ([..., M, N]) gives [..., K, N], which we sum over leading batch dims
+      // to get [K, N]. The public `matmul` dispatches to the batched kernel
+      // when both operands have rank > 2, and the plain kernel otherwise.
       const a = tensorOf(op.a), b = tensorOf(op.b)
-      // dA = dC @ B^T
       accumulate(cotangents, op.a, matmul(outCotan, swapAxes(b, -1, -2)))
-      // dB: per-batch A^T @ dC, then sum over batch dims.
-      // A is [..., M, K]; transpose last two axes.
       const aT = swapAxes(a, -1, -2)  // [..., K, M]
-      // matmul_batched needs same rank on both sides. dC has rank `a.rank`;
-      // aT has rank `a.rank`; use matmul_batched if rank > 2, else matmul.
-      let perBatchDb: Tensor
-      if (a.shape.length > 2) {
-        perBatchDb = matmulBatched(aT, outCotan)  // [..., K, N]
-      } else {
-        perBatchDb = matmul(aT, outCotan)  // [K, N]
-      }
+      const perBatchDb = matmul(aT, outCotan)  // [..., K, N] or [K, N]
       // Sum over leading batch dims to collapse to b's shape [K, N].
       accumulate(cotangents, op.b, sumToShape(perBatchDb, b.shape))
       return
@@ -372,8 +363,8 @@ function runTransposeRule(
       // dA = dC @ B^T   (per-batch, all batch dims preserved)
       // dB = A^T @ dC   (per-batch)
       const a = tensorOf(op.a), b = tensorOf(op.b)
-      accumulate(cotangents, op.a, matmulBatched(outCotan, swapAxes(b, -1, -2)))
-      accumulate(cotangents, op.b, matmulBatched(swapAxes(a, -1, -2), outCotan))
+      accumulate(cotangents, op.a, matmul(outCotan, swapAxes(b, -1, -2)))
+      accumulate(cotangents, op.b, matmul(swapAxes(a, -1, -2), outCotan))
       return
     }
 

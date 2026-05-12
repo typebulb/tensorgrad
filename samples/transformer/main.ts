@@ -8,7 +8,7 @@
 import {
   Module, compileModule, lr, nn, capture,
   add, mul, sum, swapAxes,
-  relu, matmul, matmulBatched, embedding, arange,
+  relu, matmul, embedding, arange,
   softmaxCausal,
   type Tensor,
 } from 'tensorgrad'
@@ -70,14 +70,14 @@ class Transformer extends Module {
 // ---------- View functions: pure forward computation -----------------------
 
 function attentionFwd(p: Attention, x: Tensor, layerIdx: number): Tensor {
-  // `splitHeads(p.q.fwd(x), H)` does the multi-head reshape+transpose pattern
+  // `splitHeads(p.q.fwd(x), H)` does the multi-head reshape+permute pattern
   // ([B, T, D] → [B, H, T, D/H]) in one call. `mergeHeads` is its inverse.
   const q = nn.splitHeads(p.q.fwd(x), N_HEADS)
   const k = nn.splitHeads(p.k.fwd(x), N_HEADS)
   const v = nn.splitHeads(p.v.fwd(x), N_HEADS)
-  const scores = mul(matmulBatched(q, swapAxes(k, -1, -2)), SCALE_QK)
+  const scores = mul(matmul(q, swapAxes(k, -1, -2)), SCALE_QK)
   const attn = capture(`attn.${layerIdx}`, softmaxCausal(scores))
-  return p.o.fwd(nn.mergeHeads(matmulBatched(attn, v)))
+  return p.o.fwd(nn.mergeHeads(matmul(attn, v)))
 }
 
 function mlpFwd(p: MLP, x: Tensor): Tensor {

@@ -32,6 +32,10 @@
       <p>Multi-layer transformer training from scratch on 2-digit addition. Full forward + backward + Adam compiled to WGSL via tensorgrad. ~1000 examples/sec.</p>
     </li>
     <li>
+      <a href="/makemore/">Makemore (name generation)</a>
+      <p>Same transformer architecture as the addition demo, retargeted to Karpathy's makemore task: train on ~32K real first names, sample novel plausible names. The genuine ML payoff — outputs are defined by the data distribution, not by any specifiable algorithm.</p>
+    </li>
+    <li>
       <a href="/mlp-sin/">MLP fits sin(x)</a>
       <p>Tiny 2-layer MLP regressor. Demonstrates the same library on a much smaller model — lets you see autograd, Adam, and the Module abstraction work in a different shape of problem.</p>
     </li>

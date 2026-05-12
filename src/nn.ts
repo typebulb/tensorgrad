@@ -153,7 +153,7 @@ export class RMSNorm extends Module {
 // ----------------------------------------------------------------------------
 
 /** [..., T, D] → [..., H, T, D/H]. Folds the standard
- *  `transpose(reshape(x, [..., T, H, d]), [..., H, T, d])` pattern into one
+ *  `permute(reshape(x, [..., T, H, d]), [..., H, T, d])` pattern into one
  *  call. Last dim of `x` must divide evenly by `nHeads`. */
 export function splitHeads(x: Tensor, nHeads: number): Tensor {
   const site = captureSite('splitHeads')

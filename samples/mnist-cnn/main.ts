@@ -37,17 +37,9 @@ const CONV1_OUT = 16
 const CONV2_OUT = 32
 const HIDDEN = 64
 
-const statusEl = document.getElementById('status') as HTMLDivElement
-
-function log(msg: string): void {
-  statusEl.textContent = msg
-  // Stream to dev server so it lands in terminal stdout.
-  void fetch('/__log', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ msg }),
-  })
-}
+// UI-supplied sink; assigned in the UI section so the ML side has zero DOM
+// dependencies. Default no-op lets this section behave in isolation.
+let log: (msg: string) => void = () => {}
 
 // ---------------------------------------------------------------------------
 // MNIST loading. Pixels are stored as flat Float32Array; the compileModule
@@ -184,8 +176,20 @@ async function runTraining(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Boot
+// UI + boot
 // ---------------------------------------------------------------------------
+
+const statusEl = document.getElementById('status') as HTMLDivElement
+
+log = (msg) => {
+  statusEl.textContent = msg
+  // Stream to dev server so it lands in terminal stdout.
+  void fetch('/__log', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ msg }),
+  })
+}
 
 async function boot(): Promise<void> {
   if (!isWebGPUAvailable()) {

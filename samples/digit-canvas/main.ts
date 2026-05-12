@@ -23,6 +23,11 @@
 //
 // MNIST data is served from solenya-media S3 — same URLs the in-repo bulbs
 // use. ~11 MB on first load; cached after that.
+//
+// File layout: model + training above, UI below. The ML section exposes a
+// small set of entry points (loadMnist, compile, startTraining, …) and emits
+// status via the `onStatus` hook the UI registers at boot. DOM access lives
+// entirely in the UI section.
 
 import {
   Module, compileModule, isWebGPUAvailable, nn,
@@ -30,9 +35,9 @@ import {
   type Tensor, type CompiledModule, type CompiledForwardModule,
 } from 'tensorgrad'
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+// ============================================================================
+//                          MODEL / TRAINING
+// ============================================================================
 
 const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
 const INPUT_DIM = 784       // 28 * 28 grayscale pixels
@@ -114,20 +119,9 @@ function predictFn(m: MLP, { x }: { x: Tensor }): Tensor {
 }
 
 // ---------------------------------------------------------------------------
-// DOM references + state
+// Training state + lifecycle. The UI calls into these entry points; status
+// flows back out through the `onStatus` hook the UI registers at boot.
 // ---------------------------------------------------------------------------
-
-const canvas = document.getElementById('draw') as HTMLCanvasElement
-const ctx = canvas.getContext('2d')!
-const trainBtn = document.getElementById('train') as HTMLButtonElement
-const stopBtn = document.getElementById('stop') as HTMLButtonElement
-const clearBtn = document.getElementById('clear') as HTMLButtonElement
-const resetBtn = document.getElementById('reset-weights') as HTMLButtonElement
-const layerSelect = document.getElementById('layer-size') as HTMLSelectElement
-const lrSelect = document.getElementById('lr') as HTMLSelectElement
-const statusEl = document.getElementById('status') as HTMLDivElement
-const predEl = document.getElementById('prediction') as HTMLDivElement
-const probsEl = document.getElementById('probs') as HTMLDivElement
 
 let trainData: MnistSet
 let testData: MnistSet
@@ -144,119 +138,9 @@ let running = false
 let trainingActive = false
 let step = 0
 
-// ---------------------------------------------------------------------------
-// Canvas drawing — pointer events, white strokes on a black background.
-// ---------------------------------------------------------------------------
-
-function resetCanvas(): void {
-  ctx.fillStyle = '#000'
-  ctx.fillRect(0, 0, canvas.width, canvas.height)
-}
-resetCanvas()
-ctx.strokeStyle = '#fff'
-ctx.lineWidth = 20
-ctx.lineCap = 'round'
-ctx.lineJoin = 'round'
-
-let drawing = false
-function pos(e: PointerEvent): { x: number; y: number } {
-  const r = canvas.getBoundingClientRect()
-  return {
-    x: (e.clientX - r.left) * (canvas.width / r.width),
-    y: (e.clientY - r.top) * (canvas.height / r.height),
-  }
-}
-canvas.addEventListener('pointerdown', e => {
-  drawing = true
-  canvas.setPointerCapture(e.pointerId)
-  const p = pos(e)
-  ctx.beginPath()
-  ctx.moveTo(p.x, p.y)
-  // Single tap should leave a dot — draw a tiny segment.
-  ctx.lineTo(p.x + 0.1, p.y + 0.1)
-  ctx.stroke()
-  schedulePredict()
-})
-canvas.addEventListener('pointermove', e => {
-  if (!drawing) return
-  const p = pos(e)
-  ctx.lineTo(p.x, p.y)
-  ctx.stroke()
-  schedulePredict()
-})
-canvas.addEventListener('pointerup', e => {
-  drawing = false
-  try { canvas.releasePointerCapture(e.pointerId) } catch { /* ignore */ }
-  schedulePredict()
-})
-clearBtn.addEventListener('click', () => {
-  resetCanvas()
-  predEl.textContent = ''
-  probsEl.innerHTML = ''
-})
-
-// Capture the 280×280 canvas as a 28×28 Float32Array in [0, 1]. Browser
-// downscaling handles the antialiasing; we read the red channel (== green
-// == blue since we drew white on black).
-function captureInput(): Float32Array {
-  const small = document.createElement('canvas')
-  small.width = 28
-  small.height = 28
-  const sctx = small.getContext('2d')!
-  sctx.imageSmoothingEnabled = true
-  sctx.drawImage(canvas, 0, 0, 28, 28)
-  const data = sctx.getImageData(0, 0, 28, 28).data
-  const out = new Float32Array(INPUT_DIM)
-  for (let i = 0; i < INPUT_DIM; i++) out[i] = data[i * 4]! / 255
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// Prediction — schedule on each pointermove via rAF, run via singleFlight so
-// rapid strokes never queue. Older calls reject with AbortError when a
-// newer one supersedes; we ignore those.
-// ---------------------------------------------------------------------------
-
-let predictScheduled = false
-function schedulePredict(): void {
-  if (predictScheduled || !predictCanvas) return
-  predictScheduled = true
-  requestAnimationFrame(async () => {
-    predictScheduled = false
-    if (!predictCanvas) return
-    try {
-      const probs = await predictCanvas(captureInput())
-      updatePredictionUI(probs)
-    } catch (e: unknown) {
-      const err = e as { name?: string }
-      if (err?.name === 'AbortError') return  // superseded — newer call will paint
-      console.error('predict error:', e)
-    }
-  })
-}
-
-function updatePredictionUI(probs: Float32Array): void {
-  let best = 0
-  for (let i = 1; i < N_CLASSES; i++) if (probs[i]! > probs[best]!) best = i
-  predEl.textContent = String(best)
-  const rows: string[] = []
-  for (let i = 0; i < N_CLASSES; i++) {
-    const p = probs[i]!
-    rows.push(
-      `<div><span class="d">${i}</span>` +
-      `<span class="bar" style="width:${(p * 100).toFixed(1)}%"></span>` +
-      `<span class="pct">${(p * 100).toFixed(1)}%</span></div>`,
-    )
-  }
-  probsEl.innerHTML = rows.join('')
-}
-
-// ---------------------------------------------------------------------------
-// Training loop — assembles a batch from the shuffled order, calls
-// compiled.step(), yields to the UI between dispatches. Periodic accuracy
-// probe via the same predict graph at B=EVAL_BATCH (parametric batch
-// triggers a sibling compile on first call, then cache-hits forever).
-// ---------------------------------------------------------------------------
+// UI-supplied sinks; assigned in the UI section so the ML side has zero DOM
+// dependencies. Default no-ops let this section compile and behave in isolation.
+let onStatus: (msg: string) => void = () => {}
 
 function shuffleOrder(arr: number[]): void {
   for (let i = arr.length - 1; i > 0; i--) {
@@ -315,10 +199,9 @@ async function runTraining(): Promise<void> {
       if (now - lastEval > 1000) {
         lastEval = now
         const acc = await probeAccuracy()
-        statusEl.textContent =
-          `step ${step}  loss ${lastLoss.toFixed(4)}  test acc ${(acc * 100).toFixed(1)}%`
+        onStatus(`step ${step}  loss ${lastLoss.toFixed(4)}  test acc ${(acc * 100).toFixed(1)}%`)
       } else if (step % 10 === 0) {
-        statusEl.textContent = `step ${step}  loss ${lastLoss.toFixed(4)}`
+        onStatus(`step ${step}  loss ${lastLoss.toFixed(4)}`)
       }
       // Yield every few steps so the canvas predict + UI stay responsive.
       if (step % 4 === 0) await new Promise(r => setTimeout(r, 0))
@@ -328,29 +211,23 @@ async function runTraining(): Promise<void> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Compile / lifecycle. Build the training graph + one polymorphic inference
-// graph at startup. Layer-size dropdown calls replaceModel; LR dropdown
-// calls setOptimizerConfig.
-// ---------------------------------------------------------------------------
-
-function currentLayerSpec(): number[] {
-  const hidden = parseInt(layerSelect.value, 10)
-  return [INPUT_DIM, hidden, N_CLASSES]
+async function loadMnist(): Promise<void> {
+  ;[trainData, testData] = await Promise.all([
+    loadSet('train-images-idx3-ubyte.gz', 'train-labels-idx1-ubyte.gz'),
+    loadSet('t10k-images-idx3-ubyte.gz', 't10k-labels-idx1-ubyte.gz'),
+  ])
+  trainOrder = Array.from({ length: trainData.count }, (_, i) => i)
+  shuffleOrder(trainOrder)
 }
 
-async function compile(): Promise<void> {
-  const layers = currentLayerSpec()
-  statusEl.textContent = `compiling MLP ${layers.join(' → ')}…`
+async function compile(hidden: number, lr: number): Promise<void> {
+  const layers = [INPUT_DIM, hidden, N_CLASSES]
+  onStatus(`compiling MLP ${layers.join(' → ')}…`)
   const t0 = performance.now()
   compiled = await compileModule({
     factory: () => new MLP(layers),
     loss: lossFn,
-    adam: {
-      lr: parseFloat(lrSelect.value),
-      weightDecay: 0.01,
-      clipGradNorm: 1.0,
-    },
+    adam: { lr, weightDecay: 0.01, clipGradNorm: 1.0 },
     inputs: {
       x: [BATCH_SIZE, INPUT_DIM],
       y: { shape: [BATCH_SIZE], dtype: 'i32' },
@@ -368,31 +245,29 @@ async function compile(): Promise<void> {
   const inferRef = predict
   predictCanvas = singleFlight(async (input: Float32Array) => inferRef.run({ x: input }))
   step = 0
-  statusEl.textContent =
-    `ready (${compiled.kernelCount} kernels, ${(performance.now() - t0).toFixed(0)} ms, seed ${compiled.seed})`
+  onStatus(`ready (${compiled.kernelCount} kernels, ${(performance.now() - t0).toFixed(0)} ms, seed ${compiled.seed})`)
 }
 
-async function changeLayerSize(): Promise<void> {
+async function changeLayerSize(hidden: number): Promise<void> {
   if (!compiled) return
   const wasRunning = running
   running = false
   // Wait one tick so any in-flight step finishes and the training loop exits.
   await new Promise<void>(r => setTimeout(r, 0))
-  const layers = currentLayerSpec()
-  statusEl.textContent = `replacing model with ${layers.join(' → ')}…`
+  const layers = [INPUT_DIM, hidden, N_CLASSES]
+  onStatus(`replacing model with ${layers.join(' → ')}…`)
   await compiled.replaceModel(() => new MLP(layers))
   // The forward proxy (predict) stays the same object — its per-shape kernel
   // cache was invalidated, so the next run() recompiles against the new
   // topology. predictCanvas (singleFlight wrapper) is still valid.
   step = 0
-  statusEl.textContent = `replaced (seed ${compiled.seed})`
-  resetBtn.disabled = false
+  onStatus(`replaced (seed ${compiled.seed})`)
   if (wasRunning) { running = true; void runTraining() }
 }
 
-async function changeLR(): Promise<void> {
+async function changeLR(lr: number): Promise<void> {
   if (!compiled) return
-  await compiled.setOptimizerConfig({ lr: parseFloat(lrSelect.value) })
+  await compiled.setOptimizerConfig({ lr })
 }
 
 async function resetWeights(): Promise<void> {
@@ -402,35 +277,182 @@ async function resetWeights(): Promise<void> {
   await new Promise<void>(r => setTimeout(r, 0))
   await compiled.reset()
   step = 0
-  statusEl.textContent = `weights re-initialized (seed ${compiled.seed})`
+  onStatus(`weights re-initialized (seed ${compiled.seed})`)
   if (wasRunning) { running = true; void runTraining() }
 }
 
+function startTraining(): void {
+  if (running) return
+  running = true
+  void runTraining()
+}
+
+function stopTraining(): void {
+  running = false
+}
+
+// Predict for a 28×28 input. Returns null if the model isn't compiled yet or
+// the call was superseded by a newer one (singleFlight AbortError).
+async function predictDrawing(input: Float32Array): Promise<Float32Array | null> {
+  if (!predictCanvas) return null
+  try {
+    return await predictCanvas(input)
+  } catch (e: unknown) {
+    const err = e as { name?: string }
+    if (err?.name === 'AbortError') return null
+    throw e
+  }
+}
+
+// ============================================================================
+//                                   UI
+// ============================================================================
+
+const canvas = document.getElementById('draw') as HTMLCanvasElement
+const ctx = canvas.getContext('2d')!
+const trainBtn = document.getElementById('train') as HTMLButtonElement
+const stopBtn = document.getElementById('stop') as HTMLButtonElement
+const clearBtn = document.getElementById('clear') as HTMLButtonElement
+const resetBtn = document.getElementById('reset-weights') as HTMLButtonElement
+const layerSelect = document.getElementById('layer-size') as HTMLSelectElement
+const lrSelect = document.getElementById('lr') as HTMLSelectElement
+const statusEl = document.getElementById('status') as HTMLDivElement
+const predEl = document.getElementById('prediction') as HTMLDivElement
+const probsEl = document.getElementById('probs') as HTMLDivElement
+
+onStatus = (msg) => { statusEl.textContent = msg }
+
 // ---------------------------------------------------------------------------
-// UI wiring
+// Canvas drawing — pointer events, white strokes on a black background.
+// ---------------------------------------------------------------------------
+
+function resetCanvas(): void {
+  ctx.fillStyle = '#000'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+}
+resetCanvas()
+ctx.strokeStyle = '#fff'
+ctx.lineWidth = 20
+ctx.lineCap = 'round'
+ctx.lineJoin = 'round'
+
+let drawing = false
+function pos(e: PointerEvent): { x: number; y: number } {
+  const r = canvas.getBoundingClientRect()
+  return {
+    x: (e.clientX - r.left) * (canvas.width / r.width),
+    y: (e.clientY - r.top) * (canvas.height / r.height),
+  }
+}
+canvas.addEventListener('pointerdown', e => {
+  drawing = true
+  canvas.setPointerCapture(e.pointerId)
+  const p = pos(e)
+  ctx.beginPath()
+  ctx.moveTo(p.x, p.y)
+  // Single tap should leave a dot — draw a tiny segment.
+  ctx.lineTo(p.x + 0.1, p.y + 0.1)
+  ctx.stroke()
+  schedulePredict()
+})
+canvas.addEventListener('pointermove', e => {
+  if (!drawing) return
+  const p = pos(e)
+  ctx.lineTo(p.x, p.y)
+  ctx.stroke()
+  schedulePredict()
+})
+canvas.addEventListener('pointerup', e => {
+  drawing = false
+  try { canvas.releasePointerCapture(e.pointerId) } catch { /* ignore */ }
+  schedulePredict()
+})
+
+// Capture the 280×280 canvas as a 28×28 Float32Array in [0, 1]. Browser
+// downscaling handles the antialiasing; we read the red channel (== green
+// == blue since we drew white on black).
+function captureInput(): Float32Array {
+  const small = document.createElement('canvas')
+  small.width = 28
+  small.height = 28
+  const sctx = small.getContext('2d')!
+  sctx.imageSmoothingEnabled = true
+  sctx.drawImage(canvas, 0, 0, 28, 28)
+  const data = sctx.getImageData(0, 0, 28, 28).data
+  const out = new Float32Array(INPUT_DIM)
+  for (let i = 0; i < INPUT_DIM; i++) out[i] = data[i * 4]! / 255
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Prediction display — schedule on each pointermove via rAF; the singleFlight
+// wrapper inside predictDrawing coalesces rapid strokes for us.
+// ---------------------------------------------------------------------------
+
+let predictScheduled = false
+function schedulePredict(): void {
+  if (predictScheduled) return
+  predictScheduled = true
+  requestAnimationFrame(async () => {
+    predictScheduled = false
+    try {
+      const probs = await predictDrawing(captureInput())
+      if (probs) updatePredictionUI(probs)
+    } catch (e) {
+      console.error('predict error:', e)
+    }
+  })
+}
+
+function updatePredictionUI(probs: Float32Array): void {
+  let best = 0
+  for (let i = 1; i < N_CLASSES; i++) if (probs[i]! > probs[best]!) best = i
+  predEl.textContent = String(best)
+  const rows: string[] = []
+  for (let i = 0; i < N_CLASSES; i++) {
+    const p = probs[i]!
+    rows.push(
+      `<div><span class="d">${i}</span>` +
+      `<span class="bar" style="width:${(p * 100).toFixed(1)}%"></span>` +
+      `<span class="pct">${(p * 100).toFixed(1)}%</span></div>`,
+    )
+  }
+  probsEl.innerHTML = rows.join('')
+}
+
+// ---------------------------------------------------------------------------
+// Button wiring — reads current dropdown values and calls into the ML section.
 // ---------------------------------------------------------------------------
 
 trainBtn.addEventListener('click', () => {
-  if (running) return
-  running = true
   trainBtn.disabled = true
   stopBtn.disabled = false
-  void runTraining()
+  startTraining()
 })
 
 stopBtn.addEventListener('click', () => {
-  running = false
+  stopTraining()
   trainBtn.disabled = false
   stopBtn.disabled = true
 })
 
-layerSelect.addEventListener('change', () => { void changeLayerSize() })
-lrSelect.addEventListener('change', () => { void changeLR() })
+clearBtn.addEventListener('click', () => {
+  resetCanvas()
+  predEl.textContent = ''
+  probsEl.innerHTML = ''
+})
+
+layerSelect.addEventListener('change', () => {
+  void changeLayerSize(parseInt(layerSelect.value, 10))
+})
+lrSelect.addEventListener('change', () => {
+  void changeLR(parseFloat(lrSelect.value))
+})
 resetBtn.addEventListener('click', () => { void resetWeights() })
 
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
+// ============================================================================
+//                                  BOOT
+// ============================================================================
 
 async function boot(): Promise<void> {
   if (!isWebGPUAvailable()) {
@@ -439,13 +461,8 @@ async function boot(): Promise<void> {
     return
   }
   statusEl.textContent = 'loading MNIST (~11 MB, cached after first load)…'
-  ;[trainData, testData] = await Promise.all([
-    loadSet('train-images-idx3-ubyte.gz', 'train-labels-idx1-ubyte.gz'),
-    loadSet('t10k-images-idx3-ubyte.gz', 't10k-labels-idx1-ubyte.gz'),
-  ])
-  trainOrder = Array.from({ length: trainData.count }, (_, i) => i)
-  shuffleOrder(trainOrder)
-  await compile()
+  await loadMnist()
+  await compile(parseInt(layerSelect.value, 10), parseFloat(lrSelect.value))
 }
 
 boot().catch((e: unknown) => {

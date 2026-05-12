@@ -224,7 +224,7 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       const a = v(op.a)
       return a.slice() as Val
     }
-    case 'transpose': {
+    case 'permute': {
       const a = v(op.a)
       const aShape = graph.tensors[op.a]!.shape
       const aStr = strides(aShape)

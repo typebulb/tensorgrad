@@ -146,7 +146,7 @@ export function inferReshape(opName: string, aShape: Shape, newShape: Shape, sit
   return out
 }
 
-export function inferTranspose(opName: string, aShape: Shape, perm: readonly number[], site: CallSite | null): Shape {
+export function inferPermute(opName: string, aShape: Shape, perm: readonly number[], site: CallSite | null): Shape {
   if (perm.length !== aShape.length) {
     fail(`${opName}: perm length ${perm.length} must equal input rank ${aShape.length}`, site)
   }
@@ -159,10 +159,10 @@ export function inferTranspose(opName: string, aShape: Shape, perm: readonly num
   return perm.map(p => aShape[p]!)
 }
 
-// matmul: a [..., M, K] · b [K, N]  →  [..., M, N].  b is unbatched.
+// matmul (rank-2 rhs): a [..., M, K] · b [K, N]  →  [..., M, N].
 export function inferMatmul(opName: string, aShape: Shape, bShape: Shape, site: CallSite | null): Shape {
   if (aShape.length < 2) fail(`${opName}: lhs must have rank >= 2, got ${showShape(aShape)}`, site)
-  if (bShape.length !== 2) fail(`${opName}: rhs must have rank 2, got ${showShape(bShape)} — use matmulBatched for batched rhs`, site)
+  if (bShape.length !== 2) fail(`${opName}: internal: inferMatmul expects rank-2 rhs, got ${showShape(bShape)}`, site)
   const M = aShape[aShape.length - 2]!
   const Ka = aShape[aShape.length - 1]!
   const Kb = bShape[0]!

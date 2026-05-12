@@ -102,7 +102,9 @@ If you're translating a PyTorch model or training loop. Assumes the
 | Causal-masked softmax (`tril` + `masked_fill` + `softmax`) | `softmaxCausal(scores)` (fused; preferred over composing the mask yourself) |
 | `x.argmax(dim=k)` | `argmax(x, k)` (defaults to last axis; flat argmax over the whole tensor if no axis) |
 | `x.transpose(a, b)` | `swapAxes(x, a, b)` |
+| `x.permute(*dims)` | `permute(x, [...])` (NumPy/JAX semantics: full-axis reorder) |
 | `x.view(B, T, H, -1)` / `x.reshape(B, -1)` | `reshape(x, [B, T, H, -1])` — exactly one `-1` allowed, inferred from total size |
+| `torch.matmul(a, b)` / `a @ b` | `matmul(a, b)` — dispatches between unbatched and batched on rhs rank |
 | `torch.split(x, sizes, dim)` | `split(x, sizes, dim)` |
 | `nn.Embedding(V, D)` | `new nn.Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
 | `torch.flatten(x, start_dim=1)` | `flatten(x, 1)` (or `reshape(x, [B, -1])`) |
@@ -325,8 +327,8 @@ Imported from `'tensorgrad'`:
 - Stochastic regularization: `dropout(x, p)` — inverted dropout, p ∈ [0, 1)
 - Comparisons / select: `less`, `greater`, `where`
 - Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax(x, axis?)`
-- Shape: `reshape`, `transpose`, `swapAxes`
-- Linear algebra: `matmul`, `matmulBatched`
+- Shape: `reshape`, `permute`, `swapAxes` (`permute` is full-axis reorder, like PyTorch's `permute` / JAX's `jnp.transpose`)
+- Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank)
 - Indexing / casting: `oneHot`, `arange`, `embedding`
 - Slicing / structural: `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x)`, `whereCausal`
