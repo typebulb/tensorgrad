@@ -92,7 +92,7 @@ export function addScalar(a: Tensor, scalar: number): Tensor {
 // Unary ops.
 // ----------------------------------------------------------------------------
 
-type UnaryKind = 'sqrt' | 'rsqrt' | 'log' | 'exp' | 'relu' | 'neg' | 'abs' | 'tanh' | 'sigmoid'
+type UnaryKind = 'sqrt' | 'rsqrt' | 'log' | 'exp' | 'relu' | 'neg' | 'abs' | 'tanh' | 'sigmoid' | 'sin' | 'cos'
 
 function unary(name: UnaryKind, a: Tensor): Tensor {
   const site = captureSite(name)
@@ -120,17 +120,29 @@ export const abs     = (a: Tensor): Tensor => unary('abs',     a)
 export const tanh    = (a: Tensor): Tensor => unary('tanh',    a)
 /** Element-wise logistic sigmoid (`1 / (1 + e^-x)`). Requires `f32`. */
 export const sigmoid = (a: Tensor): Tensor => unary('sigmoid', a)
+/** Element-wise sine. Requires `f32`. */
+export const sin     = (a: Tensor): Tensor => unary('sin',     a)
+/** Element-wise cosine. Requires `f32`. */
+export const cos     = (a: Tensor): Tensor => unary('cos',     a)
+
+/** Element-wise square (`x * x`). Reads better than `mul(x, x)` for the
+ *  common MSE / L2-regularization / variance patterns. Pure sugar — no new
+ *  kernel, identical IR to `mul(x, x)`. */
+export function square(a: Tensor): Tensor {
+  return mul(a, a)
+}
 
 /** SiLU / Swish: `x * sigmoid(x)`. Composed from primitives. */
 export function silu(a: Tensor): Tensor {
   return mul(a, sigmoid(a))
 }
 
-/** Hidden tensor_input name for the per-step dropout RNG. The runtime
- *  auto-injects this scalar before each step()/run() when the compiled
- *  graph contains any `dropout` op; users do not pass it. Exposed as a
- *  named constant so worker + proxy agree on the convention. */
-export const DROPOUT_SEED_INPUT = '__dropoutSeed'
+/** Hidden tensor_input name for the per-step PRNG seed shared by `dropout`
+ *  and `randn`. The runtime auto-injects this scalar before each
+ *  `step()`/`run()` when the compiled graph contains any stochastic op;
+ *  users do not pass it. Exposed as a named constant so worker + proxy
+ *  agree on the convention. */
+export const PRNG_SEED_INPUT = '__prngSeed'
 
 /** Inverted dropout: with probability `p`, zero an element; otherwise scale
  *  it by `1 / (1 - p)`. `p` is a compile-time constant in `[0, 1)`. Calling
@@ -142,19 +154,52 @@ export const DROPOUT_SEED_INPUT = '__dropoutSeed'
  *  Train-vs-eval handling: free-function form, no mode flag. Call `dropout`
  *  inside your training forward (lossFn); omit it from your inference
  *  forward (predictFn). The two are compiled separately by the
- *  `compileModule` / `compileForward` pair. */
+ *  `compileModule` / `compileForward` pair.
+ *
+ *  **Salt ordering.** Salts are assigned by graph-construction order across
+ *  `dropout` and `randn` calls combined. Adding or removing a stochastic op
+ *  upstream shifts the salts (and therefore the random streams) of every
+ *  later stochastic call. The forward / backward pair of a single dropout
+ *  always shares its salt, so masks line up correctly. Refactor-induced
+ *  stream shifts don't break correctness, just reproducibility across
+ *  refactors. */
 export function dropout(x: Tensor, p: number): Tensor {
   if (p === 0) return x
   const site = captureSite('dropout')
   if (p < 0 || p >= 1) throw new ShapeError(`dropout: p must be in [0, 1), got ${p}`, site)
   if (x.dtype !== 'f32') throw new ShapeError(`dropout: requires f32, got ${x.dtype}`, site)
   const g = currentGraph()
-  const seed = findOrCreateDropoutSeed(g)
-  // Salt = count of existing dropout ops in this graph. Stable per call —
-  // doesn't shift when unrelated ops get added/removed elsewhere, since
-  // we count only `dropout` kinds.
-  const salt = countDropoutOps(g)
+  const seed = findOrCreatePrngSeed(g)
+  // Salt counts both dropout and randn ops so independent stochastic sites
+  // get independent PCG streams. Forward/backward of a single dropout share
+  // their salt; see `dropoutWithSalt`.
+  const salt = countStochasticOps(g)
   return addOp(g, 'dropout', inferUnary('dropout', x.shape, site), 'f32', site, { a: x.id, seed: seed.id, p, salt })
+}
+
+/** Sample a tensor of the given shape from N(0, 1). Reuses the shared
+ *  per-step PRNG seed — each `step()`/`run()` advances the seed so each call
+ *  sees a fresh draw. The output has zero gradient (sampling from a fixed
+ *  distribution carries no gradient information), so this is the right
+ *  primitive for VAE reparameterization, DDPM training noise, or any
+ *  stochastic regularization beyond dropout.
+ *
+ *  **Salt ordering.** Salts are assigned by graph-construction order across
+ *  `randn` and `dropout` combined. Adding or removing a stochastic op
+ *  upstream shifts the random streams of every later stochastic call — not
+ *  a correctness issue, but a reproducibility-across-refactors gotcha to
+ *  know about. */
+export function randn(shape: Shape): Tensor {
+  const site = captureSite('randn')
+  for (const d of shape) {
+    if (!Number.isInteger(d) || d <= 0) {
+      throw new ShapeError(`randn: shape must be positive integers, got ${showShape(shape)}`, site)
+    }
+  }
+  const g = currentGraph()
+  const seed = findOrCreatePrngSeed(g)
+  const salt = countStochasticOps(g)
+  return addOp(g, 'randn', shape, 'f32', site, { seed: seed.id, salt, shape })
 }
 
 /** Internal: emit a `dropout` op with an explicit salt. Used by grad.ts to
@@ -165,18 +210,20 @@ export function dropoutWithSalt(dy: Tensor, p: number, salt: number, seedId: num
   return addOp(currentGraph(), 'dropout', dy.shape, 'f32', site, { a: dy.id, seed: seedId, p, salt })
 }
 
-function findOrCreateDropoutSeed(g: Graph): Tensor {
+function findOrCreatePrngSeed(g: Graph): Tensor {
   for (const op of g.ops) {
-    if (op.kind === 'tensor_input' && op.name === DROPOUT_SEED_INPUT) {
+    if (op.kind === 'tensor_input' && op.name === PRNG_SEED_INPUT) {
       return g.tensors[op.out]!
     }
   }
-  return tensorInput(DROPOUT_SEED_INPUT, [], 'i32')
+  return tensorInput(PRNG_SEED_INPUT, [], 'i32')
 }
 
-function countDropoutOps(g: Graph): number {
+// Counts every stochastic op in the graph so each new dropout / randn site
+// receives a unique salt and an independent PCG stream.
+function countStochasticOps(g: Graph): number {
   let n = 0
-  for (const op of g.ops) if (op.kind === 'dropout') n++
+  for (const op of g.ops) if (op.kind === 'dropout' || op.kind === 'randn') n++
   return n
 }
 
@@ -237,6 +284,12 @@ export function argmax(a: Tensor, axis?: number): Tensor {
   if (k === r - 1) return argmaxLastIR(a)
   const perm = [...Array(r).keys()].filter(i => i !== k).concat(k)
   return argmaxLastIR(permute(a, perm))
+}
+
+/** Index of the minimum value along an axis. Mirrors `argmax` exactly;
+ *  implemented as `argmax(neg(x), axis)` so no new kernel is needed. */
+export function argmin(a: Tensor, axis?: number): Tensor {
+  return argmax(neg(a), axis)
 }
 
 /** Mean along an axis (or all axes). Negative axis counts from the end.
@@ -417,6 +470,32 @@ export function oneHot(indices: Tensor, depth: number, dtype: Dtype = 'f32'): Te
   return addOp(currentGraph(), 'one_hot', outShape, dtype, site, { indices: indices.id, depth, dtype })
 }
 
+/** Gather from a 1-D table by index. `table` is `[V]` f32; `indices` is any
+ *  shape `[...]` of i32; result is `[...]` (same shape as indices). Used for
+ *  per-sample lookups into precomputed schedules (DDPM α-schedule, RL value
+ *  tables indexed along a single axis, etc.).
+ *
+ *  Composes from `oneHot` + `matmul` (the same trick `embedding` uses for
+ *  `[V, D]` tables) — autograd flows through the matmul adjoint, no new
+ *  kernel. For 2-D table lookups (`embedding` semantics) use `embedding`. */
+export function take(table: Tensor, indices: Tensor): Tensor {
+  const site = captureSite('take')
+  if (table.shape.length !== 1) {
+    throw new ShapeError(`take: table must be 1-d [V], got ${showShape(table.shape)}`, site)
+  }
+  if (table.dtype !== 'f32') {
+    throw new ShapeError(`take: table must be f32, got ${table.dtype}`, site)
+  }
+  if (indices.dtype !== 'i32') {
+    throw new ShapeError(`take: indices must be i32, got ${indices.dtype}`, site)
+  }
+  const V = table.shape[0]!
+  const oh = oneHot(indices, V, 'f32')       // [...indices.shape, V]
+  const t2d = reshape(table, [V, 1])         // [V, 1]
+  const result = matmul(oh, t2d)             // [...indices.shape, 1]
+  return reshape(result, indices.shape)      // [...indices.shape]
+}
+
 /** Embedding lookup: pull rows from `table` indexed by `indices`. Decomposes
  *  to `oneHot(indices, vocab) @ table` so autograd works without a dedicated
  *  scatter-with-atomic-add backward — the matmul adjoint rule handles it.
@@ -446,16 +525,20 @@ export function arange(n: number, dtype: Dtype = 'i32'): Tensor {
 
 // ---- ML primitives (fused for cleaner autograd + hand-tuned kernels) ------
 
-/** Causal-masked softmax along the last axis (fused mask + softmax). Shape
- *  preserved. The last two axes must be square (T×T attention scores).
- *  Always last-axis by construction — the causal mask is over a
- *  sequence-by-sequence matrix. Prefer this over composing
- *  `whereCausal` + `softmax` yourself. */
-export function softmaxCausal(a: Tensor): Tensor {
+function softmaxCausalLastIR(a: Tensor): Tensor {
   const site = captureSite('softmaxCausal')
   if (a.dtype !== 'f32') throw new ShapeError(`softmaxCausal: requires f32, got ${a.dtype}`, site)
   inferWhereCausal('softmaxCausal', a.shape, site)
   return addOp(currentGraph(), 'softmax_causal_last', a.shape, 'f32', site, { a: a.id })
+}
+
+/** Causal-masked softmax along an axis (fused mask + softmax). Shape
+ *  preserved. The last two axes (after permuting to put `axis` last) must be
+ *  square (T×T attention scores). Default `axis = -1`; pass an explicit
+ *  axis for non-trailing layouts. Prefer this over composing
+ *  `whereCausal` + `softmax` yourself. */
+export function softmaxCausal(a: Tensor, axis: number = -1): Tensor {
+  return axisPreserving(a, axis, 'softmaxCausal', softmaxCausalLastIR)
 }
 
 function logSoftmaxLastIR(a: Tensor): Tensor {
@@ -480,9 +563,8 @@ export function softmax(a: Tensor, axis: number = -1): Tensor {
   return exp(logSoftmax(a, axis))
 }
 
-/** Internal helper: apply a last-axis op `f` along an arbitrary axis by
- *  permuting the axis to last, applying `f`, then permuting back.
- *  Output shape matches input (axis-preserving op). */
+// Apply a last-axis-only IR op along an arbitrary axis by permuting in,
+// applying, permuting back. Output shape matches input.
 function axisPreserving(
   a: Tensor, axisArg: number, opName: string,
   applyLast: (t: Tensor) => Tensor,
@@ -564,6 +646,36 @@ export function stack(tensors: readonly Tensor[], axis: number): Tensor {
   const newShape = [...t0.shape.slice(0, ax), 1, ...t0.shape.slice(ax)]
   const expanded = tensors.map(t => reshape(t, newShape))
   return concat(expanded, ax)
+}
+
+/** `[..., T, D] → [..., H, T, D/H]`. Folds the standard
+ *  `permute(reshape(x, [..., T, H, d]), [..., H, T, d])` pattern into one
+ *  call. Last dim of `x` must divide evenly by `nHeads`. */
+export function splitHeads(x: Tensor, nHeads: number): Tensor {
+  const site = captureSite('splitHeads')
+  const r = x.shape.length
+  if (r < 2) throw new ShapeError(`splitHeads: requires rank >= 2, got ${r}`, site)
+  const T = x.shape[r - 2]!
+  const D = x.shape[r - 1]!
+  if (D % nHeads !== 0) {
+    throw new ShapeError(`splitHeads: last dim ${D} not divisible by nHeads ${nHeads}`, site)
+  }
+  const lead = x.shape.slice(0, r - 2)
+  const reshaped = reshape(x, [...lead, T, nHeads, D / nHeads])
+  return swapAxes(reshaped, lead.length, lead.length + 1)
+}
+
+/** Inverse of `splitHeads`: `[..., H, T, d] → [..., T, H*d]`. */
+export function mergeHeads(x: Tensor): Tensor {
+  const site = captureSite('mergeHeads')
+  const r = x.shape.length
+  if (r < 3) throw new ShapeError(`mergeHeads: requires rank >= 3, got ${r}`, site)
+  const H = x.shape[r - 3]!
+  const T = x.shape[r - 2]!
+  const d = x.shape[r - 1]!
+  const lead = x.shape.slice(0, r - 3)
+  const swapped = swapAxes(x, r - 3, r - 2)
+  return reshape(swapped, [...lead, T, H * d])
 }
 
 /** Inverse of `concat`: split into pieces along `axis` with the given
@@ -795,6 +907,25 @@ export function maxPool2d(input: Tensor, kernelSize: number | readonly [number, 
   return addOp(currentGraph(), 'max_pool_2d', outShape, 'f32', site, {
     input: input.id, kH, kW, strideH, strideW, padH: pH, padW: pW,
   })
+}
+
+/** Nearest-neighbor 2D upsample by an integer factor. Input `[B, C, H, W]`
+ *  → `[B, C, H*factor, W*factor]`. Each input pixel is replicated to a
+ *  `factor × factor` block. Composes from reshape + broadcast + reshape —
+ *  no new IR kernel. Pair with `conv2d` for upsample-then-conv (the modern
+ *  alternative to transposed convolution in image-generation U-Nets). */
+export function nearestUpsample2d(x: Tensor, factor: number): Tensor {
+  const site = captureSite('nearestUpsample2d')
+  if (x.shape.length !== 4) {
+    throw new ShapeError(`nearestUpsample2d: input must be rank-4 [B, C, H, W], got ${showShape(x.shape)}`, site)
+  }
+  if (!Number.isInteger(factor) || factor < 1) {
+    throw new ShapeError(`nearestUpsample2d: factor must be a positive integer, got ${factor}`, site)
+  }
+  if (factor === 1) return x
+  const [B, C, H, W] = x.shape as [number, number, number, number]
+  const expanded = broadcastTo(reshape(x, [B, C, H, 1, W, 1]), [B, C, H, factor, W, factor])
+  return reshape(expanded, [B, C, H * factor, W * factor])
 }
 
 /** max_pool_2d backward op. Internal: emitted by autograd. Recomputes the

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>NeRF-tiny (tensorgrad)</title>
+  <style>
+    body {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      max-width: 720px;
+      margin: 3rem auto;
+      padding: 0 1rem;
+      color: #222;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .subtitle { color: #666; margin-top: 0; margin-bottom: 1.5rem; }
+    #status {
+      font-family: ui-monospace, monospace;
+      font-size: 0.95rem;
+      background: #f7f7f7;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      min-height: 1.4em;
+      margin-bottom: 1rem;
+    }
+    .controls { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+    button, label.upload {
+      font: inherit;
+      padding: 0.5rem 1rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fafafa;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled), label.upload:hover { background: #f0f0f0; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    label.upload input { display: none; }
+    .canvases { display: flex; gap: 1.5rem; align-items: flex-start; }
+    .canvases figure { margin: 0; }
+    .canvases figcaption { font-size: 0.85rem; color: #666; margin-top: 0.4rem; text-align: center; }
+    canvas {
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      background: #000;
+      image-rendering: pixelated;
+      display: block;
+    }
+    p.help { color: #555; font-size: 0.9rem; margin-top: 1rem; }
+    p.help code { background: #f3f3f3; padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>NeRF-tiny</h1>
+  <p class="subtitle">
+    A 4-layer MLP that learns the mapping <code>(x, y) → (r, g, b)</code> for
+    one image. Watch reconstruction quality climb as the network fits the
+    target. The headline trick is sinusoidal positional encoding —
+    <code>sin</code> / <code>cos</code> at <em>L</em> frequency bands — without
+    which a plain MLP can only fit the low-frequency part of the signal.
+  </p>
+
+  <div id="status">initializing…</div>
+
+  <div class="controls">
+    <button id="train"  disabled>Train</button>
+    <button id="stop"   disabled>Stop</button>
+    <button id="reset"  disabled>Reset weights</button>
+    <label class="upload">
+      Upload image…
+      <input id="upload" type="file" accept="image/*" disabled />
+    </label>
+  </div>
+
+  <div class="canvases">
+    <figure>
+      <canvas id="target-canvas"></canvas>
+      <figcaption>target</figcaption>
+    </figure>
+    <figure>
+      <canvas id="recon-canvas"></canvas>
+      <figcaption>reconstruction</figcaption>
+    </figure>
+  </div>
+
+  <p class="help">
+    Architecture: positional encoding (<code>L = 8</code> bands, 32 features)
+    → 3 × Linear(64) + ReLU → Linear(3) + sigmoid. Adam, MSE loss in pixel
+    space, batches of 1024 random pixels. The model has ~10K parameters and
+    converges to a recognisable image in a few seconds.
+  </p>
+
+  <p><a href="/">← back to samples</a></p>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

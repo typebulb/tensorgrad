@@ -150,7 +150,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     case 'neg':
     case 'abs':
     case 'tanh':
-    case 'sigmoid': {
+    case 'sigmoid':
+    case 'sin':
+    case 'cos': {
       const out = tof(op.out)
       const a = tof(op.a)
       const total = shapeSize(out.shape)
@@ -163,6 +165,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         op.kind === 'neg'     ? '-x' :
         op.kind === 'abs'     ? 'abs(x)' :
         op.kind === 'tanh'    ? 'tanh(x)' :
+        op.kind === 'sin'     ? 'sin(x)' :
+        op.kind === 'cos'     ? 'cos(x)' :
         // tanh identity for numerical stability: sigmoid(x) = 0.5 + 0.5 * tanh(0.5x)
         /* sigmoid */           '0.5 + 0.5 * tanh(0.5 * x)'
       const wgsl = `
@@ -179,6 +183,35 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
 
     // ---- Stochastic ------------------------------------------------------
+    case 'randn': {
+      const total = shapeSize(op.shape)
+      // Per-call salt mixes into the PCG hash so independent randn / dropout
+      // sites get independent streams. Two PCG draws per thread → Box-Muller.
+      const saltConst = ((op.salt * 0x9E3779B1) >>> 0).toString(10) + 'u'
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> seed : array<i32>;
+@group(0) @binding(1) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  // First PCG draw seeded from (seed, salt, thread).
+  var h1 : u32 = u32(seed[0]) ^ ${saltConst} ^ i;
+  h1 = h1 * 747796405u + 2891336453u;
+  h1 = ((h1 >> ((h1 >> 28u) + 4u)) ^ h1) * 277803737u;
+  h1 = (h1 >> 22u) ^ h1;
+  // Second PCG draw chained off the first.
+  var h2 : u32 = h1 * 747796405u + 2891336453u;
+  h2 = ((h2 >> ((h2 >> 28u) + 4u)) ^ h2) * 277803737u;
+  h2 = (h2 >> 22u) ^ h2;
+  let u1 : f32 = max(1.0e-10, f32(h1) / 4294967296.0);
+  let u2 : f32 = f32(h2) / 4294967296.0;
+  // Box-Muller; the sin pair is discarded — we want one N(0,1) per thread.
+  out[i] = sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.seed), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
+
     case 'dropout': {
       const out = tof(op.out)
       const a = tof(op.a)

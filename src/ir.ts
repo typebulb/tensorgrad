@@ -98,12 +98,19 @@ export type OpNode =
   | { kind: 'abs'; out: number; a: number }
   | { kind: 'tanh'; out: number; a: number }
   | { kind: 'sigmoid'; out: number; a: number }
+  | { kind: 'sin'; out: number; a: number }
+  | { kind: 'cos'; out: number; a: number }
   // Inverted dropout. Same kernel runs forward (a = x) and backward (a = dy):
   // mask value is 0 or 1/(1-p), reproducible from (seed, salt, thread_id).
   // `salt` is a per-call counter; backward emits a matching `dropout` op with
   // the same (seed, salt) so masks line up. `seed` is the id of the shared
-  // i32 scalar tensor_input (`__dropoutSeed`) the runtime updates per step.
+  // i32 scalar tensor_input (`__prngSeed`) the runtime updates per step.
   | { kind: 'dropout'; out: number; a: number; seed: number; p: number; salt: number }
+  // Standard-normal sampler. Shares dropout's per-step seed; `salt` is unique
+  // per call (counted across both dropout and randn). Each thread does two
+  // PCG draws + Box-Muller to emit one N(0, 1) value. Output shape is baked
+  // into the op (no input tensor — randn synthesizes its values).
+  | { kind: 'randn'; out: number; seed: number; salt: number; shape: Shape }
 
   // ---- Reductions (over last axis only; permute first for other axes) -----
   | { kind: 'mean_last'; out: number; a: number }   // keepdims=true
@@ -249,7 +256,7 @@ export type OpNode =
  *
  * Once tracing is done a `Graph` should be treated as immutable — though
  * `traceInto` may re-enter it to append more ops (used by autograd and the
- * optimizer passes). `compiled.ir.graph` exposes the final graph for
+ * optimizer passes). `compiled.graph` exposes the final graph for
  * inspection (op list, tensor metadata, capture registry).
  */
 export interface Graph {

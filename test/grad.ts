@@ -58,7 +58,7 @@ assertGradMatchesFD('softmaxCausal (fused ML)', [4, 4], p => mean(softmaxCausal(
 //    gradient given a fixed seed input.
 assertGradMatchesFD('dropout (forward/backward mask match)', [4, 8],
   p => mean(dropout(p, 0.1)),
-  { extraInputs: { __dropoutSeed: new Int32Array([42]) } },
+  { extraInputs: { __prngSeed: new Int32Array([42]) } },
 )
 
 // 7. Structural / variadic: concat's gradient slices the cotangent back

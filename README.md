@@ -17,32 +17,21 @@ A 2-layer MLP fitting `y = sin(x)`:
 
 ```ts
 import {
-  Module, compileModule, init,
-  add, mul, sub, mean, matmul, relu,
+  Module, compileModule, nn,
+  mul, sub, mean, relu,
   type Tensor,
 } from 'tensorgrad'
 
 const B = 256
 
-class Linear extends Module {
-  W: Tensor; b: Tensor
-  constructor(public inDim: number, public outDim: number) {
-    super()
-    this.W = this.param([inDim, outDim], { init: init.kaiming() })
-    this.b = this.param([outDim], { init: 'zeros' })
-  }
-}
-
 class MLP extends Module {
-  l1 = new Linear(1, 64)
-  l2 = new Linear(64, 64)
-  l3 = new Linear(64, 1)
+  l1 = new nn.Linear(1, 64)
+  l2 = new nn.Linear(64, 64)
+  l3 = new nn.Linear(64, 1)
 }
-
-const linearFwd = (p: Linear, x: Tensor) => add(matmul(x, p.W), p.b)
 
 function modelFwd(m: MLP, x: Tensor): Tensor {
-  return linearFwd(m.l3, relu(linearFwd(m.l2, relu(linearFwd(m.l1, x)))))
+  return m.l3.fwd(relu(m.l2.fwd(relu(m.l1.fwd(x)))))
 }
 
 function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
@@ -53,7 +42,7 @@ function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
 const compiled = await compileModule({
   factory: () => new MLP(),
   loss: lossFn,
-  adam: { lr: 0.005 },
+  optimizer: { kind: 'adam', lr: 0.005 },
   inputs: { x: [B, 1], y: [B, 1] },   // shape tuples; dtype defaults to f32
 })
 
@@ -89,8 +78,8 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `linear(x)` on `nn.Linear` / `nn.LayerNorm` | `linear.fwd(x)` (`.fwd` is the convention for built-in leaf modules) |
 | `model.parameters()` | `compiled.paramNames`, `compiled.downloadParams()` |
 | `optimizer.zero_grad(); out = model(x); loss = ...; loss.backward(); optimizer.step()` | `await compiled.step(inputs)` — forward + backward + Adam update are fused |
-| `optim.Adam(params, lr=...)` | `adam: { lr }` in `compileModule({ ... })` |
-| `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `sgd: { lr, momentum?, nesterov? }` in `compileModule({ ... })` |
+| `optim.Adam(params, lr=...)` | `optimizer: { kind: 'adam', lr }` in `compileModule({ ... })` |
+| `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `optimizer: { kind: 'sgd', lr, momentum?, nesterov? }` in `compileModule({ ... })` |
 | `StepLR(opt, step_size=N, gamma=g)` | `lr.step({ peak, stepSize: N, gamma: g })` |
 | `MultiStepLR(opt, milestones=[..], gamma=g)` | `lr.multiStep({ peak, milestones: [..], gamma: g })` |
 | `CosineAnnealingLR(opt, T_max=N, eta_min=m)` | `lr.cosineDecay({ peak, final: m, steps: N })` |
@@ -100,8 +89,8 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `x.mean(dim=k, keepdim=True)` | `mean(x, k, { keepDims: true })` |
 | `F.softmax(x, dim=k)` / `F.log_softmax(x, dim=k)` | `softmax(x, k)` / `logSoftmax(x, k)` — both default to last axis |
 | Causal-masked softmax (`tril` + `masked_fill` + `softmax`) | `softmaxCausal(scores)` (fused; preferred over composing the mask yourself) |
-| `x.argmax(dim=k)` | `argmax(x, k)` (defaults to last axis; flat argmax over the whole tensor if no axis) |
-| `x.transpose(a, b)` | `swapAxes(x, a, b)` |
+| `x.argmax(dim=k)` / `x.argmin(dim=k)` | `argmax(x, k)` / `argmin(x, k)` (default to last axis; flat over the whole tensor with no axis) |
+| `x.transpose(a, b)` | `swapAxes(x, a, b)` (NumPy/JAX call this `swapaxes`; tensorgrad matches them — PyTorch's `transpose` is the cross-library outlier) |
 | `x.permute(*dims)` | `permute(x, [...])` (NumPy/JAX semantics: full-axis reorder) |
 | `x.view(B, T, H, -1)` / `x.reshape(B, -1)` | `reshape(x, [B, T, H, -1])` — exactly one `-1` allowed, inferred from total size |
 | `torch.matmul(a, b)` / `a @ b` | `matmul(a, b)` — dispatches between unbatched and batched on rhs rank |
@@ -110,6 +99,11 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `torch.flatten(x, start_dim=1)` | `flatten(x, 1)` (or `reshape(x, [B, -1])`) |
 | `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new nn.Conv2d(in, out, k, { stride: s, padding: p })` |
 | `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2d(x, k, { stride: s, padding: p })` |
+| `F.interpolate(x, scale_factor=k, mode='nearest')` | `nearestUpsample2d(x, k)` |
+| `torch.randn(shape)` | `randn(shape)` — uses the per-step PRNG; zero gradient |
+| `x ** 2` / `x.square()` | `square(x)` |
+| `torch.sin(x)` / `torch.cos(x)` | `sin(x)` / `cos(x)` |
+| `torch.take(t, idx)` / 1-D `torch.gather` | `take(table, indices)` — for 1-D tables; use `embedding` for 2-D |
 
 ### Things that aren't 1-to-1
 
@@ -147,9 +141,9 @@ to try/catch.
 ### Compile entry points
 
 ```ts
-compileModule({ factory, loss, inputs, adam? | sgd? }): Promise<CompiledModule>
+compileModule({ factory, loss, inputs, optimizer? }): Promise<CompiledModule>
 compiled.compileForward({ forward, inputs }): Promise<CompiledForwardModule>
-compiled.replaceModel(newFactory, { seed?, adam? }): Promise<void>
+compiled.replaceModel(newFactory, { seed?, optimizer? }): Promise<void>
 isWebGPUAvailable(): boolean              // friendly pre-flight check
 ```
 
@@ -163,7 +157,7 @@ const train = await compileModule({
   factory: () => new Model(),
   loss: lossFn,
   inputs: { tokens: [B, T], targets: [B, T], mask: [T] },
-  adam: { lr: 0.001 },
+  optimizer: { kind: 'adam', lr: 0.001 },
 })
 
 const infer = await train.compileForward({
@@ -207,7 +201,7 @@ await compiled.replaceModel(() => new MLP(newLayerSpec))
 // changed LR via a UI control):
 await compiled.replaceModel(
   () => new MLP(newLayerSpec),
-  { adam: { lr: 0.005 } },
+  { optimizer: { kind: 'adam', lr: 0.005 } },
 )
 ```
 
@@ -256,26 +250,25 @@ compiled.replaceModel(newFactory)               // swap topology, same worker
 compiled.destroy()                              // tear down worker + GPU
 ```
 
-`compiled.kernelCount`, `compiled.outputShape`, `compiled.paramNames`,
-`compiled.seed`, and `compiled.ir` are sync properties for inspection.
-Forward proxies expose only `paramNames` (the same names as the parent
-training graph) — kernel count and output shape aren't stable on a proxy
-that caches multiple shape variants.
+`compiled.graph`, `compiled.kernels`, `compiled.outputShape`,
+`compiled.paramNames`, and `compiled.seed` are sync properties for
+inspection. Forward proxies expose only `paramNames` (the same names as
+the parent training graph) — output shape isn't stable on a proxy that
+caches multiple shape variants.
 
-**Inspecting the compiled IR.** `compiled.ir.graph` gives you the
-compiled IR: ops, tensors, connectivity, captures, outputs. `Graph`,
-`OpNode`, `Tensor`, `Shape`, `Dtype`, and `CallSite` are exported for
-walking it. Each `Tensor.site` carries the user-frame stack from
-op-call time, useful for "where in user code did this op come from"
-displays.
+**Inspecting the compiled IR.** `compiled.graph` exposes ops, tensors,
+connectivity, captures, and outputs. `Graph`, `OpNode`, `Tensor`,
+`Shape`, `Dtype`, and `CallSite` are exported for walking it. Each
+`Tensor.site` carries the user-frame stack from op-call time, useful for
+"where in user code did this op come from" displays.
 
 ```ts
 import type { Graph } from 'tensorgrad'
 
 // List parameters with shapes.
-const params = compiled.ir.graph.ops
+const params = compiled.graph.ops
   .filter(op => op.kind === 'param_input')
-  .map(op => ({ name: op.name, shape: compiled.ir.graph.tensors[op.out].shape }))
+  .map(op => ({ name: op.name, shape: compiled.graph.tensors[op.out].shape }))
 // [{ name: 'l1.W', shape: [1, 64] }, { name: 'l1.b', shape: [64] }, ...]
 ```
 
@@ -359,23 +352,25 @@ await compiled.replaceModel(newFactory, { seed: compiled.seed })  // keep curren
 Imported from `'tensorgrad'`:
 
 - Arithmetic (binary): `add`, `sub`, `mul`, `div`, `min`, `max`
-- Unary math: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`
+- Unary math: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`
 - Activations: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`
 - Clamping: `clamp(x, lo, hi)` (scalar bounds)
-- Stochastic regularization: `dropout(x, p)` — inverted dropout, p ∈ [0, 1)
+- Stochastic: `dropout(x, p)` (inverted dropout, p ∈ [0, 1)), `randn(shape)` (N(0, 1) sampler, zero gradient)
 - Comparisons / select: `less`, `greater`, `where`
-- Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax(x, axis?)`
+- Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax(x, axis?)`, `argmin(x, axis?)`
 - Shape: `reshape`, `permute`, `swapAxes` (`permute` is full-axis reorder, like PyTorch's `permute` / JAX's `jnp.transpose`)
+- Attention layout: `splitHeads(x, nHeads)`, `mergeHeads(x)`
 - Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank)
-- Indexing / casting: `oneHot`, `arange`, `embedding`
+- Indexing / casting: `oneHot`, `arange`, `embedding`, `take(table, indices)` (1-D-table gather)
 - Slicing / structural: `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
-- Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x)`, `whereCausal`
-- 2D conv / pool (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `flatten(x, startAxis?)`
+- Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal`
+- 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`, `flatten(x, startAxis?)`
 
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
 `(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmax`
-returns `i32` and is non-differentiable. The standard loss tail is
-`mean(nn.crossEntropy(logits, targets))`.
+and `argmin` return `i32` and are non-differentiable. The standard loss
+tail is `nn.crossEntropy(logits, targets)` (reduces to scalar mean by
+default).
 
 **Structural ops.** `concat([a, b], axis)` joins along an existing axis;
 `stack([a, b], axis)` joins along a new axis (sugar for
@@ -396,47 +391,53 @@ nn.RMSNorm(dim, eps?)                // .fwd(x); g (gain) only — Llama-style
 nn.Embedding(vocab, dim)             // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
 nn.Conv2d(inC, outC, k, { stride?, padding?, bias? }) // .fwd(x); NCHW
                                      // x: [B, inC, H, W] -> [B, outC, H', W']
-nn.splitHeads(x, nHeads)             // [B, T, D] → [B, H, T, D/H]
-nn.mergeHeads(x)                     // inverse of splitHeads
-nn.unsplitHeads(captures, name)      // pull per-head slices off a capture
-nn.crossEntropy(logits, targets)     // fused log-softmax + NLL (pass raw logits)
-nn.nllLoss(logProbs, targets)        // NLL only — pair with logSoftmax if you need the log-prob intermediate
+nn.crossEntropy(logits, targets, { reduction? })  // fused log-softmax + NLL; default mean
+nn.nllLoss(logProbs, targets, { reduction? })     // NLL only; pair with logSoftmax for the log-prob intermediate
 ```
 
 Convention: leaf modules (`Linear`, `LayerNorm`) expose `.fwd(x)` for ergonomic
 chaining. Composite modules you write yourself are typically free functions
 taking `(p: ModuleType, x: Tensor)`.
 
+`crossEntropy` and `nllLoss` reduce to a scalar mean by default (matches
+PyTorch's `F.cross_entropy(..., reduction='mean')`). Pass `{ reduction:
+'none' }` for a per-position tensor when you need to mask or weight
+positions yourself before reducing; `'sum'` for an unscaled sum.
+
+Multi-head shape helpers (`splitHeads(x, nHeads)`, `mergeHeads(x)`) and
+the captures-side `unsplitHeads(captures, name)` live at the top level
+(not under `nn`) — they're pure tensor / readback ops, not modules.
+
 ### Optimizers
 
-`compileModule` takes either `adam:` or `sgd:` (not both). Both accept
-the same LR schedule shapes from the `lr` namespace.
+`compileModule` takes an `optimizer` discriminated by `kind: 'adam' | 'sgd'`.
+Both kinds accept the same LR schedule shapes from the `lr` namespace.
 
 ```ts
 import { lr } from 'tensorgrad'
 
 // Adam / AdamW
-adam: { lr: 0.005 }
-adam: { lr: 0.005, weightDecay: 0.01 }
-adam: { lr: 0.005, weightDecay: 0.01, decayFilter: n => n.endsWith('.W') }
-adam: { lr: 0.005, clipGradNorm: 1.0 }
+optimizer: { kind: 'adam', lr: 0.005 }
+optimizer: { kind: 'adam', lr: 0.005, weightDecay: 0.01 }
+optimizer: { kind: 'adam', lr: 0.005, weightDecay: 0.01, decayFilter: n => n.endsWith('.W') }
+optimizer: { kind: 'adam', lr: 0.005, clipGradNorm: 1.0 }
 
 // SGD / SGD-with-momentum / Nesterov. Plain SGD when momentum is 0 (default).
-sgd: { lr: 0.05 }
-sgd: { lr: 0.05, momentum: 0.9 }
-sgd: { lr: 0.05, momentum: 0.9, nesterov: true }
-sgd: { lr: 0.05, weightDecay: 5e-4 }   // PyTorch-style L2 (injected into gradient)
+optimizer: { kind: 'sgd', lr: 0.05 }
+optimizer: { kind: 'sgd', lr: 0.05, momentum: 0.9 }
+optimizer: { kind: 'sgd', lr: 0.05, momentum: 0.9, nesterov: true }
+optimizer: { kind: 'sgd', lr: 0.05, weightDecay: 5e-4 }   // PyTorch-style L2 (injected into gradient)
 ```
 
 ### LR schedules (`lr` namespace)
 
 ```ts
-adam: { lr: lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 }) }
-adam: { lr: lr.cosineDecay({ peak: 0.005, final: 0.0001, steps: 5000 }) }
-sgd:  { lr: lr.cosineDecay({ peak: 0.1, final: 0.001, steps: 10000 }), momentum: 0.9 }
-adam: { lr: lr.warmup({ peak: 0.001, warmupSteps: 200, after: 0.001 }) }
-adam: { lr: lr.step({ peak: 1.0, stepSize: 1, gamma: 0.7 }) }            // PyTorch StepLR
-adam: { lr: lr.multiStep({ peak: 0.1, milestones: [30000, 60000], gamma: 0.1 }) }  // MultiStepLR
+optimizer: { kind: 'adam', lr: lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 }) }
+optimizer: { kind: 'adam', lr: lr.cosineDecay({ peak: 0.005, final: 0.0001, steps: 5000 }) }
+optimizer: { kind: 'sgd',  lr: lr.cosineDecay({ peak: 0.1, final: 0.001, steps: 10000 }), momentum: 0.9 }
+optimizer: { kind: 'adam', lr: lr.warmup({ peak: 0.001, warmupSteps: 200, after: 0.001 }) }
+optimizer: { kind: 'adam', lr: lr.step({ peak: 1.0, stepSize: 1, gamma: 0.7 }) }            // PyTorch StepLR
+optimizer: { kind: 'adam', lr: lr.multiStep({ peak: 0.1, milestones: [30000, 60000], gamma: 0.1 }) }  // MultiStepLR
 ```
 
 LR schedules are serializable shapes, not closures (they cross the worker
@@ -466,7 +467,7 @@ Global L2-norm clipping matches PyTorch's `clip_grad_norm_` and optax's
 ```ts
 const compiled = await compileModule({
   ...,
-  adam: { lr: 0.001, clipGradNorm: 1.0 },   // bake clipping into the graph
+  optimizer: { kind: 'adam', lr: 0.001, clipGradNorm: 1.0 },   // bake clipping into the graph
 })
 ```
 
@@ -485,15 +486,15 @@ import { init } from 'tensorgrad'
 
 this.param([D, D], { init: init.kaiming() })           // gain=sqrt(2), fan_in=D
 this.param([D, D], { init: init.kaiming({ gain: 1 }) })
-this.param([D],    { init: 'zeros' })
-this.param([D],    { init: 'ones' })
+this.param([D],    { init: init.zeros() })
+this.param([D],    { init: init.ones() })
 this.param([D, D], { init: init.randn({ scale: 0.02 }) })
 this.param([D],    { init: init.literal(myFloat32Array) })
 ```
 
-Defaults: `'randn'` (std 0.02). AdamW weight decay defaults to `true` for
-randn/kaiming/literal init, `false` for zeros/ones — override per-param with
-`{ decay: true | false }`.
+Default init is `init.randn()` (std 0.02). AdamW weight decay defaults to
+`true` for randn/kaiming/literal init, `false` for zeros/ones — override
+per-param with `{ decay: true | false }`.
 
 ### Dropout (no mode flag)
 
@@ -513,7 +514,7 @@ separate graphs — dropout is literally absent from the inference path.
 ```ts
 function lossFn(m: Model, { x, y }: { x: Tensor; y: Tensor }) {
   const h = relu(dropout(m.l1.fwd(x), 0.1))    // dropout in training
-  return mean(nn.crossEntropy(m.l2.fwd(h), y))
+  return nn.crossEntropy(m.l2.fwd(h), y)
 }
 
 function predictFn(m: Model, { x }: { x: Tensor }) {

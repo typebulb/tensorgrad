@@ -15,7 +15,7 @@ import {
   Module, compileModule, isWebGPUAvailable, lr, nn,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
-  softmaxCausal,
+  softmaxCausal, splitHeads, mergeHeads,
   type Tensor,
 } from 'tensorgrad'
 
@@ -73,11 +73,11 @@ class Transformer extends Module {
 // ---------- Forward functions ----------------------------------------------
 
 function attentionFwd(p: Attention, x: Tensor): Tensor {
-  const q = nn.splitHeads(p.q.fwd(x), N_HEADS)
-  const k = nn.splitHeads(p.k.fwd(x), N_HEADS)
-  const v = nn.splitHeads(p.v.fwd(x), N_HEADS)
+  const q = splitHeads(p.q.fwd(x), N_HEADS)
+  const k = splitHeads(p.k.fwd(x), N_HEADS)
+  const v = splitHeads(p.v.fwd(x), N_HEADS)
   const scores = mul(matmul(q, swapAxes(k, -1, -2)), SCALE_QK)
-  return p.o.fwd(nn.mergeHeads(matmul(softmaxCausal(scores), v)))
+  return p.o.fwd(mergeHeads(matmul(softmaxCausal(scores), v)))
 }
 
 function mlpFwd(p: MLP, x: Tensor): Tensor {
@@ -105,7 +105,7 @@ function modelFwd(p: Transformer, tokens: Tensor): Tensor {
 // references (~2.0 at convergence) instead of being diluted ~2x by trivial
 // '.'-from-'.' pad positions.
 function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tensor; targets: Tensor; mask: Tensor }): Tensor {
-  return sum(mul(nn.crossEntropy(modelFwd(p, tokens), targets), mask))
+  return sum(mul(nn.crossEntropy(modelFwd(p, tokens), targets, { reduction: 'none' }), mask))
 }
 
 function predictFwd(p: Transformer, { tokens }: { tokens: Tensor }): Tensor {
@@ -226,14 +226,14 @@ async function run() {
   const compiled = await compileModule({
     factory: () => new Transformer(),
     loss: lossFn,
-    adam: { lr: LR, weightDecay: 0.01 },
+    optimizer: { kind: 'adam', lr: LR, weightDecay: 0.01 },
     inputs: {
       tokens:  { shape: [B, T], dtype: 'i32' },
       targets: { shape: [B, T], dtype: 'i32' },
       mask:    [B, T],
     },
   })
-  log(`  ${compiled.paramNames.length} params, ${compiled.kernelCount} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
+  log(`  ${compiled.paramNames.length} params, ${compiled.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
 
   log('Compiling inference + val-loss graphs...')
   const tInfer = performance.now()

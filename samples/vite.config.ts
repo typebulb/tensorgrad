@@ -26,6 +26,10 @@ function logTap(): Plugin {
 
 export default defineConfig({
   server: { port: 4000, strictPort: true },
+  // Skip Vite's dep-prebundle for the workspace lib so dist/index.js changes
+  // are picked up on the next request rather than baked into .vite/deps until
+  // the dev server restarts.
+  optimizeDeps: { exclude: ['tensorgrad'] },
   build: {
     target: 'es2022',
     rollupOptions: {
@@ -36,6 +40,11 @@ export default defineConfig({
         'mlp-sin': 'mlp-sin/index.html',
         'digit-canvas': 'digit-canvas/index.html',
         'mnist-cnn': 'mnist-cnn/index.html',
+        'diffusion-tiny': 'diffusion-tiny/index.html',
+        'nerf-tiny': 'nerf-tiny/index.html',
+        cartpole: 'cartpole/index.html',
+        vae: 'vae/index.html',
+        'tic-tac-toe': 'tic-tac-toe/index.html',
       },
     },
   },

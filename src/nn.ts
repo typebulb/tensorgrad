@@ -2,13 +2,12 @@
 // declares its params and exposes `.fwd(x)`; the forward is regular ops so
 // autograd traces through it like any other call.
 
-import { Module } from './module.js'
+import { Module, init } from './module.js'
 import type { Tensor } from './ir.js'
-import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, swapAxes, oneHot, logSoftmax, embedding, conv2d, pairOpt } from './ops.js'
+import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, oneHot, logSoftmax, embedding, conv2d, pairOpt } from './ops.js'
 import type { Conv2dOptions } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
-import type { Captures } from './runtime.js'
 
 /** 2D convolution layer (NCHW). Shape and option names match PyTorch's
  *  `nn.Conv2d` so 1-shot ports don't need transposes. Wraps the pure
@@ -37,7 +36,7 @@ export class Conv2d extends Module {
     this.strideH = sH; this.strideW = sW
     this.padH = pH; this.padW = pW
     this.W = this.param([outC, inC, kH, kW])
-    this.b = opts.bias === false ? null : this.param([outC], { init: 'zeros' })
+    this.b = opts.bias === false ? null : this.param([outC], { init: init.zeros() })
   }
   /** Apply this conv to `x`: `[B, inC, H, W] → [B, outC, H', W']`. Adds
    *  bias (broadcast over the spatial axes) when present. */
@@ -86,7 +85,7 @@ export class Linear extends Module {
   constructor(public readonly inDim: number, public readonly outDim: number, opts: LinearOptions = {}) {
     super()
     this.W = this.param([inDim, outDim])
-    this.b = opts.bias === false ? null : this.param([outDim], { init: 'zeros' })
+    this.b = opts.bias === false ? null : this.param([outDim], { init: init.zeros() })
   }
   /** Apply: `x @ W` (+ `b` when present). Broadcasts bias over leading axes. */
   fwd(x: Tensor): Tensor {
@@ -105,8 +104,8 @@ export class LayerNorm extends Module {
   b: Tensor
   constructor(public readonly d: number, public readonly eps: number = 1e-5) {
     super()
-    this.g = this.param([d], { init: 'ones' })
-    this.b = this.param([d], { init: 'zeros' })
+    this.g = this.param([d], { init: init.ones() })
+    this.b = this.param([d], { init: init.zeros() })
   }
   /** Normalize over the last axis; affine-scale and shift. Shape preserved. */
   fwd(x: Tensor): Tensor {
@@ -126,7 +125,7 @@ export class RMSNorm extends Module {
   g: Tensor
   constructor(public readonly d: number, public readonly eps: number = 1e-6) {
     super()
-    this.g = this.param([d], { init: 'ones' })
+    this.g = this.param([d], { init: init.ones() })
   }
   /** RMS-normalize over the last axis; affine-scale by `g`. Shape preserved. */
   fwd(x: Tensor): Tensor {
@@ -136,100 +135,62 @@ export class RMSNorm extends Module {
   }
 }
 
-// ---- Multi-head attention shape helpers ----------------------------------
-
-/** [..., T, D] → [..., H, T, D/H]. Folds the standard
- *  `permute(reshape(x, [..., T, H, d]), [..., H, T, d])` pattern into one
- *  call. Last dim of `x` must divide evenly by `nHeads`. */
-export function splitHeads(x: Tensor, nHeads: number): Tensor {
-  const site = captureSite('splitHeads')
-  const r = x.shape.length
-  if (r < 2) throw new ShapeError(`splitHeads: requires rank >= 2, got ${r}`, site)
-  const T = x.shape[r - 2]!
-  const D = x.shape[r - 1]!
-  if (D % nHeads !== 0) {
-    throw new ShapeError(`splitHeads: last dim ${D} not divisible by nHeads ${nHeads}`, site)
-  }
-  const lead = x.shape.slice(0, r - 2)
-  const reshaped = reshape(x, [...lead, T, nHeads, D / nHeads])
-  return swapAxes(reshaped, lead.length, lead.length + 1)
-}
-
-/** Inverse of `splitHeads`: [..., H, T, d] → [..., T, H*d]. */
-export function mergeHeads(x: Tensor): Tensor {
-  const site = captureSite('mergeHeads')
-  const r = x.shape.length
-  if (r < 3) throw new ShapeError(`mergeHeads: requires rank >= 3, got ${r}`, site)
-  const H = x.shape[r - 3]!
-  const T = x.shape[r - 2]!
-  const d = x.shape[r - 1]!
-  const lead = x.shape.slice(0, r - 3)
-  const swapped = swapAxes(x, r - 3, r - 2)
-  return reshape(swapped, [...lead, T, H * d])
-}
-
-/** Slice a captured tensor named `name` into one Float32Array per head, using
- *  the static shape registered at compile time. The leading axis is treated as
- *  heads (matching `splitHeads` layout at B=1); a leading singleton batch is
- *  stripped if present so callers can pass capture names directly. Throws if
- *  the capture isn't registered or wasn't read back this call. */
-export function unsplitHeads(captures: Captures, name: string): Float32Array[] {
-  const flat = captures.get(name)
-  const shape = captures.shapeOf(name)
-  if (shape.length < 2) {
-    throw new Error(`unsplitHeads: '${name}' shape needs >= 2 dims, got [${shape.join(', ')}]`)
-  }
-  // Inference at B=1 captures as [1, H, ...]; strip the leading singleton.
-  const s = shape[0] === 1 ? shape.slice(1) : shape
-  const H = s[0]!
-  let stride = 1
-  for (let i = 1; i < s.length; i++) stride *= s[i]!
-  const expected = H * stride
-  if (flat.length !== expected) {
-    throw new Error(`unsplitHeads: '${name}' length ${flat.length} doesn't match shape product ${expected}`)
-  }
-  return Array.from({ length: H }, (_, h) => flat.slice(h * stride, (h + 1) * stride))
-}
-
 // ---- Loss helpers --------------------------------------------------------
 
-/** Per-position negative log-likelihood along the last (vocab) axis: returns
- *  `-logProbs[target]` at each position. `logProbs` is `[..., V]` (already
- *  log-softmaxed); `targets` is `[...]` of i32; result is `[...]` (one
- *  rank less than `logProbs`).
+/** How a loss reduces across leading axes:
+ *  - `'mean'` (default) — scalar; mean over all leading positions.
+ *  - `'sum'` — scalar; sum over all leading positions.
+ *  - `'none'` — per-position tensor (one rank less than the input logits).
  *
- *  Mirrors PyTorch's `F.nll_loss` *before* reduction. Pair with `logSoftmax`
- *  when you need the log-probability intermediate visible (e.g. to `capture`
- *  it for inspection). Otherwise prefer `crossEntropy(logits, targets)`
- *  which takes raw logits and fuses log-softmax + NLL — same numerics,
- *  fewer ops, no risk of accidentally passing logits twice (a silent
- *  miscompose if you also wrote `logSoftmax` upstream). */
-export function nllLoss(logProbs: Tensor, targets: Tensor): Tensor {
+ *  Matches PyTorch's `F.cross_entropy(..., reduction=...)`. Pass `'none'`
+ *  when you want to mask or weight positions yourself before reducing. */
+export interface LossOptions {
+  reduction?: 'mean' | 'sum' | 'none'
+}
+
+function reduceLoss(t: Tensor, reduction: 'mean' | 'sum' | 'none'): Tensor {
+  if (reduction === 'none') return t
+  return reduction === 'mean' ? mean(t) : sum(t)
+}
+
+/** Negative log-likelihood along the last (vocab) axis. `logProbs` is
+ *  `[..., V]` (already log-softmaxed); `targets` is `[...]` of i32.
+ *  Default reduction is `'mean'` (scalar). Pass `{ reduction: 'none' }` for
+ *  a per-position tensor (`[...]`, one rank less than `logProbs`) — use
+ *  this when masking or weighting positions before reducing yourself.
+ *
+ *  Pair with `logSoftmax` only when you need the log-probability intermediate
+ *  visible (e.g. to `capture` it for inspection). Otherwise prefer
+ *  `crossEntropy(logits, targets)` which takes raw logits and fuses
+ *  log-softmax + NLL — same numerics, fewer ops, no risk of accidentally
+ *  passing logits twice (a silent miscompose if you also wrote `logSoftmax`
+ *  upstream). */
+export function nllLoss(logProbs: Tensor, targets: Tensor, opts: LossOptions = {}): Tensor {
   const site = captureSite('nllLoss')
   if (targets.dtype !== 'i32') {
     throw new ShapeError(`nllLoss: targets must be i32, got ${targets.dtype}`, site)
   }
   const vocab = logProbs.shape[logProbs.shape.length - 1]!
   const targetLp = sum(mul(logProbs, oneHot(targets, vocab, 'f32')), -1)
-  return mul(targetLp, -1)
+  const perPos = mul(targetLp, -1)
+  return reduceLoss(perPos, opts.reduction ?? 'mean')
 }
 
-/** Per-position cross-entropy along the last (vocab) axis: returns
- *  `-log p(target)` at each position. `logits` is `[..., V]` (raw, NOT
- *  pre-log-softmaxed); `targets` is `[...]` of i32; result is `[...]`
- *  (one rank less than logits). The user applies their own masking +
- *  reduction downstream — useful when only some positions contribute
- *  (e.g. result-digit masking) or for label smoothing.
+/** Cross-entropy along the last (vocab) axis. `logits` is `[..., V]` (raw,
+ *  NOT pre-log-softmaxed); `targets` is `[...]` of i32. Default reduction
+ *  is `'mean'` (scalar) — matches PyTorch's `F.cross_entropy`. Pass
+ *  `{ reduction: 'none' }` for a per-position tensor (`[...]`, one rank less
+ *  than `logits`) when masking positions yourself.
  *
  *  Fused log-softmax + NLL. Pass raw logits — don't apply `logSoftmax`
  *  yourself first or the model silently double-log-softmaxes (a common
  *  miscompose when porting PyTorch code that uses `log_softmax` in the
  *  model and `F.nll_loss` in the loss). If you need the log-probability
  *  intermediate visible, use `logSoftmax` + `nllLoss` instead. */
-export function crossEntropy(logits: Tensor, targets: Tensor): Tensor {
+export function crossEntropy(logits: Tensor, targets: Tensor, opts: LossOptions = {}): Tensor {
   const site = captureSite('crossEntropy')
   if (targets.dtype !== 'i32') {
     throw new ShapeError(`crossEntropy: targets must be i32, got ${targets.dtype}`, site)
   }
-  return nllLoss(logSoftmax(logits), targets)
+  return nllLoss(logSoftmax(logits), targets, opts)
 }

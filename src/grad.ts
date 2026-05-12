@@ -9,7 +9,7 @@ import type { Graph, OpNode, Tensor, Shape } from './ir.js'
 import {
   add, sub, mul, div, mulScalar,
   matmul, permute, swapAxes, reshape,
-  exp,
+  exp, sin, cos,
   broadcastTo, sumToShape,
   constScalar, reluGrad,
   sum, where, less, greater,
@@ -224,12 +224,27 @@ function runAdjointRule(
       accumulate(cotangents, op.a, mul(outCotan, cMinusCSq))
       return
     }
+    case 'sin': {
+      // dc/da = cos(a).
+      const a = tensorOf(op.a)
+      accumulate(cotangents, op.a, mul(outCotan, cos(a)))
+      return
+    }
+    case 'cos': {
+      // dc/da = -sin(a).
+      const a = tensorOf(op.a)
+      accumulate(cotangents, op.a, mul(outCotan, mulScalar(sin(a), -1)))
+      return
+    }
     case 'dropout': {
       // Same kernel, same (seed, salt, p) — the PCG hash reproduces the
       // forward mask. 1/(1-p) scaling is baked into the kernel.
       accumulate(cotangents, op.a, dropoutWithSalt(outCotan, op.p, op.salt, op.seed))
       return
     }
+    case 'randn':
+      // Samples from a fixed distribution; no differentiable inputs.
+      return
     case 'concat': {
       // Slice the gradient back into each input's piece along the concat axis.
       let cursor = 0

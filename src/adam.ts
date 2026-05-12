@@ -128,9 +128,9 @@ export function isLRDynamic(schedule: LR): boolean {
   return typeof schedule !== 'number'
 }
 
-/** Adam / AdamW configuration. Pass via `compileModule({ adam: ... })`.
- *  Only `lr` is required; everything else has PyTorch-matching defaults.
- *  For pure Adam, leave `weightDecay` at 0; non-zero turns this into AdamW
+/** Adam / AdamW hyperparameters. Pass via `compileModule({ optimizer:
+ *  { kind: 'adam', ... } })`. Only `lr` is required; everything else has
+ *  PyTorch-matching defaults. Non-zero `weightDecay` turns Adam into AdamW
  *  (decoupled decay, Loshchilov & Hutter). */
 export interface AdamConfig {
   /** Learning rate schedule. Pass a number for fixed lr, or a shape from

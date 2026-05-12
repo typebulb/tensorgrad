@@ -107,8 +107,9 @@ export type ForwardFn<M extends Module, I extends InputDecls = InputDecls> =
 
 /** The compile pipeline's IR bundle: the augmented graph, per-param
  *  gradient tensors, the loss output, the buffer plan, and the emitted
- *  kernel specs. Exposed on `compiled.ir` for inspection (see the
- *  "Inspecting the compiled IR" section in the README). */
+ *  kernel specs. Returned by `compileToIR` for offline inspection.
+ *  On a runtime handle, `compiled.graph` and `compiled.kernels` surface
+ *  the equivalent fields. */
 export interface CompiledIR {
   graph: GradResult['graph']
   paramGrads: GradResult['paramGrads']
@@ -126,6 +127,13 @@ export function compileToIR(traceFn: () => Tensor): CompiledIR {
   return { graph, paramGrads, loss, plan, kernels }
 }
 
+/** Optimizer config — discriminated by `kind`. Adam/AdamW or SGD/Nesterov
+ *  share `compileModule`'s `optimizer` slot. When omitted, the module
+ *  compiles forward-only (no `step()`). */
+export type OptimizerConfig =
+  | ({ readonly kind: 'adam' } & AdamConfig)
+  | ({ readonly kind: 'sgd'  } & SGDConfig)
+
 /** Options to `compileModule`. Generic over `M` (the model class) and `I`
  *  (the inputs decl) so the resulting `CompiledModule<M, I>` carries enough
  *  type info for `downloadParams` to mirror the model tree and for `step`
@@ -139,13 +147,10 @@ export interface CompileModuleOptions<M extends Module, I extends InputDecls = I
   loss: ForwardFn<M, I>
   /** Input shape declarations (one per named tensor input). */
   inputs: I
-  /** Adam / AdamW optimizer. Mutually exclusive with `sgd`. When neither is
-   *  present, the module compiles but has no optimizer — `step()` will fail.
-   *  (Used internally for `compileToIR`-like flows where the user only wants
-   *  the forward pass.) */
-  adam?: AdamConfig
-  /** SGD / SGD-with-momentum / Nesterov optimizer. Mutually exclusive with `adam`. */
-  sgd?: SGDConfig
+  /** Optimizer. Discriminated by `kind: 'adam' | 'sgd'`. When omitted, the
+   *  module compiles but has no optimizer — `step()` will fail (used for
+   *  `compileToIR`-style forward-only inspection). */
+  optimizer?: OptimizerConfig
   /** 32-bit integer seed for the param-init RNG. Same seed + same model
    *  topology → identical initial params, every time. If omitted, a seed
    *  is generated and exposed as `compiled.seed` so you can reproduce a
@@ -171,11 +176,15 @@ export interface CompileForwardMethodOptions<M extends Module, I extends InputDe
  *  every method returns a Promise. Generic over the declared inputs shape
  *  `I` so `step` / `run` accept inputs with the right TypedArray per dtype. */
 export interface CompiledModule<M extends Module, I extends InputDecls = InputDecls> {
-  /** The compiled IR: forward graph, autograd, optimizer ops, buffer plan,
-   *  kernels. Use `compiled.ir.graph` to inspect ops, tensors, and
-   *  captures (see README). Swapped in place by `replaceModel`. */
-  readonly ir: CompiledIR
-  readonly kernelCount: number
+  /** The compiled IR graph: ops, tensors, connectivity, captures, outputs.
+   *  Walk it to inspect what `compileModule` produced (see README). Swapped
+   *  in place by `replaceModel`. */
+  readonly graph: GradResult['graph']
+  /** Emitted WGSL kernels (one per dispatch). `kernels.length` is the kernel
+   *  count surfaced for status displays. */
+  readonly kernels: readonly KernelSpec[]
+  /** Shape of the loss output (always `[]` for a training graph — loss is
+   *  required to be scalar). Exposed for symmetry with forward graphs. */
   readonly outputShape: readonly number[]
   /** Names of the model's parameters, in materialization order. */
   readonly paramNames: readonly string[]
@@ -234,17 +243,17 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
   /** Swap the model topology in place: destroy the current training graph in
    *  the worker, compile a fresh one with the same loss/inputs config and
    *  the new factory. This handle remains valid (same object, same `I`
-   *  generic, same `paramNames`/`kernelCount`/`ir` after the call). Sibling
-   *  forward proxies created via `compileForward` stay registered: their
-   *  per-shape kernel caches are cleared and recompile lazily on next `run()`.
+   *  generic, same `paramNames`/`graph` after the call). Sibling forward
+   *  proxies created via `compileForward` stay registered: their per-shape
+   *  kernel caches are cleared and recompile lazily on next `run()`.
    *
    *  Defaults to a *fresh* seed — replaceModel is for "different model now,"
    *  so fresh init is the natural expectation. Pass `{ seed }` to pin (for
    *  reproducible topology comparisons). Use the existing seed explicitly via
    *  `{ seed: compiled.seed }` if you want strict determinism across the swap.
    *
-   *  Pass `{ adam }` or `{ sgd }` to update optimizer config atomically with
-   *  the topology swap (must match the optimizer kind used at compileModule
+   *  Pass `{ optimizer }` to update optimizer config atomically with the
+   *  topology swap (must match the optimizer kind used at compileModule
    *  time). Without it, the existing optimizer config carries over. For
    *  mid-training LR changes without a topology swap, use `setOptimizerConfig`.
    *
@@ -253,7 +262,7 @@ export interface CompiledModule<M extends Module, I extends InputDecls = InputDe
    *  worker or re-wire siblings. */
   replaceModel(
     newFactory: () => M,
-    opts?: { seed?: number; adam?: AdamConfig; sgd?: SGDConfig },
+    opts?: { seed?: number; optimizer?: OptimizerConfig },
   ): Promise<void>
 
   /** Tear down the worker + GPU resources. */
@@ -299,7 +308,7 @@ export interface CompiledForwardModule<M extends Module = Module, I extends Inpu
  *   factory: () => new MLP(),
  *   loss: (m, { x, y }) => mse(m(x), y),
  *   inputs: { x: [128, 784], y: [128] },
- *   adam: { lr: 0.001 },
+ *   optimizer: { kind: 'adam', lr: 0.001 },
  * })
  * ```
  */
@@ -338,26 +347,23 @@ interface BuiltTrainingGraph {
   initFns: Record<string, InitFn>
 }
 
-/** Trace + autograd + Adam + buffer-plan + codegen + worker createRuntime,
- *  using an existing worker proxy. Used both by `compileModule` (fresh worker)
- *  and by `replaceModel` (existing worker, same graphId). */
+// Trace + autograd + optimizer + buffer-plan + codegen + worker createRuntime,
+// using an existing worker proxy. Shared by `compileModule` (fresh worker)
+// and `replaceModel` (existing worker, same graphId).
 async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   proxy: WorkerProxy,
   opts: CompileModuleOptions<M, I>,
   graphId: number,
 ): Promise<BuiltTrainingGraph> {
-  if (opts.adam && opts.sgd) {
-    throw new Error('compileModule: pass either `adam` or `sgd`, not both')
-  }
   const loss = opts.loss as unknown as ForwardFn<M, InputDecls>
   const inputs = opts.inputs as InputDecls
   const { graph, materialized } = traceModule(opts.factory(), loss, inputs)
   const { paramGrads, loss: lossTensor } = appendGrad(graph)
-  const adamResult = opts.adam
-    ? appendAdam(graph, paramGrads, materialized.tensors, opts.adam, materialized.decayFlags)
+  const adamResult = opts.optimizer?.kind === 'adam'
+    ? appendAdam(graph, paramGrads, materialized.tensors, opts.optimizer, materialized.decayFlags)
     : undefined
-  const sgdResult = opts.sgd
-    ? appendSGD(graph, paramGrads, materialized.tensors, opts.sgd, materialized.decayFlags)
+  const sgdResult = opts.optimizer?.kind === 'sgd'
+    ? appendSGD(graph, paramGrads, materialized.tensors, opts.optimizer, materialized.decayFlags)
     : undefined
 
   const optimizerWritebacks =
@@ -408,7 +414,7 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
   // Swapped in place by `replaceModel` so callers' references (and any
   // sibling ForwardProxy holding `this`) stay valid across topology changes.
   // `opts.seed` is always populated (compileModule fills it before construction).
-  ir: CompiledIR
+  private _ir: CompiledIR
   private meta: CreateRuntimeResult
   private opts: CompileModuleOptions<M, I>
   private initFns: Record<string, InitFn>
@@ -422,13 +428,14 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
     initFns: Record<string, InitFn>,
     private readonly nextGraphId: { v: number },
   ) {
-    this.ir = ir
+    this._ir = ir
     this.meta = meta
     this.opts = opts
     this.initFns = initFns
   }
 
-  get kernelCount(): number { return this.meta.kernelCount }
+  get graph(): GradResult['graph'] { return this._ir.graph }
+  get kernels(): readonly KernelSpec[] { return this._ir.kernels }
   get outputShape(): readonly number[] { return this.meta.outputShape }
   get paramNames(): readonly string[] { return this.meta.paramNames }
   get seed(): number { return this.opts.seed! }
@@ -523,7 +530,7 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
   }
 
   async reset(): Promise<void> {
-    const initialParams = buildInitialParams(this.ir.plan, this.initFns, mulberry32(this.opts.seed!))
+    const initialParams = buildInitialParams(this._ir.plan, this.initFns, mulberry32(this.opts.seed!))
     await Promise.all([this.uploadParams(initialParams), this.resetOptimizerState()])
   }
 
@@ -556,11 +563,8 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
 
   async replaceModel(
     newFactory: () => M,
-    replaceOpts?: { seed?: number; adam?: AdamConfig; sgd?: SGDConfig },
+    replaceOpts?: { seed?: number; optimizer?: OptimizerConfig },
   ): Promise<void> {
-    if (replaceOpts?.adam && replaceOpts?.sgd) {
-      throw new Error('replaceModel: pass either `adam` or `sgd`, not both')
-    }
     // Invalidate (don't destroy) siblings — their kernels are model-specific
     // but the proxy objects must outlive the swap so callers' references stay
     // valid. Each sibling recompiles lazily on its next run().
@@ -570,11 +574,10 @@ class CompiledModuleProxy<M extends Module, I extends InputDecls> implements Com
       ...this.opts,
       factory: newFactory,
       seed: replaceOpts?.seed ?? randomSeed(),
-      ...(replaceOpts?.adam !== undefined ? { adam: replaceOpts.adam } : {}),
-      ...(replaceOpts?.sgd !== undefined ? { sgd: replaceOpts.sgd } : {}),
+      ...(replaceOpts?.optimizer !== undefined ? { optimizer: replaceOpts.optimizer } : {}),
     }
     const built = await buildTrainingGraph(this.proxy, newOpts, this.graphId)
-    this.ir = built.ir
+    this._ir = built.ir
     this.meta = built.meta
     this.initFns = built.initFns
     this.opts = newOpts

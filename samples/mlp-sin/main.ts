@@ -128,10 +128,10 @@ async function run() {
   const compiled = await compileModule({
     factory: () => new MLP(),
     loss: lossFn,
-    adam: { lr: LR },
+    optimizer: { kind: 'adam', lr: LR },
     inputs: { x: [B, 1], y: [B, 1] },
   })
-  log(`  ${compiled.kernelCount} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
+  log(`  ${compiled.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
 
   // Inference graph for plotting: shares param buffers with the training
   // graph, polymorphic over the batch dim so we can run it at PLOT_N=200

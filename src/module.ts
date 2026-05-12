@@ -8,43 +8,41 @@ import { paramInput } from './trace.js'
 
 /** How a parameter's initial values are produced. Serializable shape — no
  *  closures, since the initial values cross the worker boundary at compile
- *  time. Use the `init` helpers for ergonomic construction.
+ *  time. Construct via the `init` helpers.
  *
- *  String shorthands:
- *  - `'randn'` — Gaussian with std 0.02 (the common weight-matrix init).
- *  - `'zeros'` — fill with 0 (biases, LayerNorm beta).
- *  - `'ones'`  — fill with 1 (LayerNorm gain).
- *
- *  Object shapes:
- *  - `{ kind: 'randn', scale }` — randn with explicit std.
- *  - `{ kind: 'kaiming', gain? }` — `std = gain / sqrt(fan_in)`. Default
- *    gain `sqrt(2)` (good for ReLU). `fan_in = shape[0]`.
- *  - `{ kind: 'literal', data }` — explicit Float32Array; length must
- *    match the parameter's element count.
+ *  Kinds:
+ *  - `init.randn({ scale? })` — Gaussian with given std (default 0.02).
+ *  - `init.zeros()` — fill with 0 (biases, LayerNorm beta).
+ *  - `init.ones()` — fill with 1 (LayerNorm gain).
+ *  - `init.kaiming({ gain? })` — `std = gain / sqrt(fan_in)`. Default gain
+ *    `sqrt(2)` (good for ReLU); `fan_in = shape[0]`.
+ *  - `init.literal(data)` — explicit Float32Array; length must match the
+ *    parameter's element count.
  */
 export type InitSpec =
-  | 'randn'
-  | 'zeros'
-  | 'ones'
   | { readonly kind: 'randn'; readonly scale: number }
+  | { readonly kind: 'zeros' }
+  | { readonly kind: 'ones' }
   | { readonly kind: 'kaiming'; readonly gain?: number }
   | { readonly kind: 'literal'; readonly data: Float32Array }
 
-/** Ergonomic constructors for InitSpec object shapes. */
+/** Ergonomic constructors for InitSpec. */
 export const init = {
   randn: (opts: { scale?: number } = {}): InitSpec => ({ kind: 'randn', scale: opts.scale ?? 0.02 }),
+  zeros: (): InitSpec => ({ kind: 'zeros' }),
+  ones: (): InitSpec => ({ kind: 'ones' }),
   kaiming: (opts: { gain?: number } = {}): InitSpec =>
     opts.gain !== undefined ? { kind: 'kaiming', gain: opts.gain } : { kind: 'kaiming' },
   literal: (data: Float32Array): InitSpec => ({ kind: 'literal', data }),
 }
 
 /** Per-parameter options accepted by `Module.param(shape, opts)`. All
- *  fields are optional; sensible defaults apply (`f32` dtype, `'randn'`
- *  init, decay-true for weight-shaped inits). */
+ *  fields are optional; sensible defaults apply (`f32` dtype, `init.randn()`,
+ *  decay-true for weight-shaped inits). */
 export interface ParamOptions {
   /** Element type. Default `'f32'`. */
   dtype?: Dtype
-  /** Init shape. Default: `'randn'` (std 0.02). */
+  /** Init spec. Default: `init.randn()` (std 0.02). */
   init?: InitSpec
   /** Whether AdamW (when `weightDecay > 0`) should apply decoupled weight
    *  decay to this param. Default: `true` for randn/kaiming/literal init
@@ -92,11 +90,11 @@ function randnFn(scale: number): InitFn {
  *  generates the initial Float32Array for a given parameter shape. Runs
  *  on the main thread before initial values are transferred to the worker. */
 function resolveInit(spec: InitSpec | undefined): InitFn {
-  if (!spec || spec === 'randn') return randnFn(0.02)
-  if (spec === 'zeros') return (size) => new Float32Array(size)
-  if (spec === 'ones') return (size) => { const a = new Float32Array(size); a.fill(1); return a }
+  if (!spec) return randnFn(0.02)
   switch (spec.kind) {
     case 'randn': return randnFn(spec.scale)
+    case 'zeros': return (size) => new Float32Array(size)
+    case 'ones': return (size) => { const a = new Float32Array(size); a.fill(1); return a }
     case 'kaiming': {
       const gain = spec.gain ?? Math.sqrt(2)
       return (size, shape, rng) => {
@@ -124,8 +122,8 @@ function resolveInit(spec: InitSpec | undefined): InitFn {
  *  (biases, LN gains). Explicit `decay` opt overrides. */
 function resolveDecay(opts: ParamOptions | undefined): boolean {
   if (opts?.decay !== undefined) return opts.decay
-  const spec = opts?.init ?? 'randn'
-  return spec !== 'zeros' && spec !== 'ones'
+  const kind = opts?.init?.kind
+  return kind !== 'zeros' && kind !== 'ones'
 }
 
 // Placeholder produced by `this.param(...)`. Replaced by a real Tensor in
@@ -151,7 +149,7 @@ class ParamSentinel {
  *   constructor(inDim: number, outDim: number) {
  *     super()
  *     this.W = this.param([inDim, outDim])
- *     this.b = this.param([outDim], { init: 'zeros' })
+ *     this.b = this.param([outDim], { init: init.zeros() })
  *   }
  * }
  * ```

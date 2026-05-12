@@ -166,7 +166,9 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
     case 'neg':
     case 'abs':
     case 'tanh':
-    case 'sigmoid': {
+    case 'sigmoid':
+    case 'sin':
+    case 'cos': {
       const a = v(op.a) as Float32Array
       const out = new Float32Array(a.length)
       const fn =
@@ -178,6 +180,8 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
         op.kind === 'neg'     ? (x: number) => -x :
         op.kind === 'abs'     ? Math.abs :
         op.kind === 'tanh'    ? Math.tanh :
+        op.kind === 'sin'     ? Math.sin :
+        op.kind === 'cos'     ? Math.cos :
         /* sigmoid via tanh identity — matches the WGSL kernel exactly */
                                 (x: number) => 0.5 + 0.5 * Math.tanh(0.5 * x)
       for (let i = 0; i < a.length; i++) out[i] = fn(a[i]!)
@@ -527,6 +531,27 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
     }
 
     // ---- Stochastic -----------------------------------------------------
+    case 'randn': {
+      // Mirrors the codegen kernel: two chained PCG draws + Box-Muller, take cos.
+      const seedBuf = v(op.seed) as Int32Array
+      const seed = seedBuf[0]! >>> 0
+      const saltConst = (op.salt * 0x9E3779B1) >>> 0
+      const total = shapeSize(shape)
+      const out = new Float32Array(total)
+      for (let i = 0; i < total; i++) {
+        let h1 = ((seed ^ saltConst ^ i) >>> 0)
+        h1 = ((Math.imul(h1, 747796405) + 2891336453) >>> 0)
+        h1 = (Math.imul((((h1 ^ (h1 >>> ((h1 >>> 28) + 4))) >>> 0)), 277803737) >>> 0)
+        h1 = (h1 ^ (h1 >>> 22)) >>> 0
+        let h2 = (Math.imul(h1, 747796405) + 2891336453) >>> 0
+        h2 = (Math.imul((((h2 ^ (h2 >>> ((h2 >>> 28) + 4))) >>> 0)), 277803737) >>> 0)
+        h2 = (h2 ^ (h2 >>> 22)) >>> 0
+        const u1 = Math.max(1e-10, h1 / 4294967296)
+        const u2 = h2 / 4294967296
+        out[i] = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2)
+      }
+      return out
+    }
     case 'dropout': {
       // Mirrors codegen.ts's PCG hash exactly so CPU + GPU produce the same
       // mask given the same (seed, salt, thread). Seed comes from the input

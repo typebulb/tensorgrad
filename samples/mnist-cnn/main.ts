@@ -21,7 +21,7 @@
 
 import {
   Module, compileModule, isWebGPUAvailable, nn,
-  mean, relu, flatten, maxPool2d,
+  relu, flatten, maxPool2d,
   type Tensor, type CompiledModule, type CompiledForwardModule,
 } from 'tensorgrad'
 
@@ -93,7 +93,7 @@ function forwardLogits(m: CNN, x: Tensor): Tensor {
 }
 
 function lossFn(m: CNN, { x, y }: { x: Tensor; y: Tensor }): Tensor {
-  return mean(nn.crossEntropy(forwardLogits(m, x), y))
+  return nn.crossEntropy(forwardLogits(m, x), y)
 }
 
 function predictFn(m: CNN, { x }: { x: Tensor }): Tensor {
@@ -209,7 +209,7 @@ async function boot(): Promise<void> {
   compiled = await compileModule({
     factory: () => new CNN(),
     loss: lossFn,
-    adam: { lr: 1e-3, weightDecay: 0.01, clipGradNorm: 1.0 },
+    optimizer: { kind: 'adam', lr: 1e-3, weightDecay: 0.01, clipGradNorm: 1.0 },
     inputs: {
       x: [BATCH_SIZE, 1, 28, 28],
       y: { shape: [BATCH_SIZE], dtype: 'i32' },
@@ -219,7 +219,7 @@ async function boot(): Promise<void> {
     forward: predictFn,
     inputs: { x: [EVAL_BATCH, 1, 28, 28] },
   })
-  log(`compiled in ${(performance.now() - t0).toFixed(0)} ms (${compiled.kernelCount} kernels) — training…`)
+  log(`compiled in ${(performance.now() - t0).toFixed(0)} ms (${compiled.kernels.length} kernels) — training…`)
 
   void runTraining()
 }

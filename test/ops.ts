@@ -22,7 +22,7 @@ section('dropout — auto-managed per-op salt + shared seed input')
   ok('dropout(x, 0) short-circuits (no IR emitted)')
 }
 
-// 2. Multiple dropouts in one graph share a single __dropoutSeed input
+// 2. Multiple dropouts in one graph share a single __prngSeed input
 //    AND each gets a unique salt. The shared seed is what lets the
 //    runtime auto-inject one i32 per step; the unique salt is what
 //    makes different dropout calls produce different masks while
@@ -32,8 +32,8 @@ section('dropout — auto-managed per-op salt + shared seed input')
     const x = tensorInput('x', [4])
     return dropout(dropout(x, 0.1), 0.2)
   })
-  const seedCount = g.ops.filter(o => o.kind === 'tensor_input' && o.name === '__dropoutSeed').length
-  if (seedCount !== 1) fail(`__dropoutSeed should be shared; got ${seedCount} occurrences`)
+  const seedCount = g.ops.filter(o => o.kind === 'tensor_input' && o.name === '__prngSeed').length
+  if (seedCount !== 1) fail(`__prngSeed should be shared; got ${seedCount} occurrences`)
 
   const dropoutOps = g.ops.filter(o => o.kind === 'dropout') as Array<{ kind: 'dropout'; salt: number }>
   const salts = dropoutOps.map(o => o.salt)

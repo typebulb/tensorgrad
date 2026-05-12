@@ -28,6 +28,26 @@
       <p>Two-block CNN trained from scratch on MNIST. Verifies the <code>conv2d</code> / <code>maxPool2D</code> / <code>flatten</code> path end-to-end on GPU. Status streams to the dev-server console.</p>
     </li>
     <li>
+      <a href="/diffusion-tiny/">Diffusion-tiny (MNIST)</a>
+      <p>A small DDPM trained from scratch on MNIST. Train for a few thousand steps then watch a digit emerge from noise as the model iteratively denoises. Conv-stack model (no U-Net), learnable timestep embedding, CPU-side noise generation.</p>
+    </li>
+    <li>
+      <a href="/nerf-tiny/">NeRF-tiny (image INR)</a>
+      <p>A 4-layer MLP fits a single image as an implicit function <code>(x, y) → (r, g, b)</code>. Live reconstruction next to the target as the model trains. Demonstrates sinusoidal positional encoding (<code>sin</code> / <code>cos</code> at multiple frequency bands), without which the network can only fit the low-frequency part of the image. Upload your own image to swap targets.</p>
+    </li>
+    <li>
+      <a href="/cartpole/">CartPole REINFORCE</a>
+      <p>Reinforcement learning: a tiny policy MLP learns to balance an inverted pendulum via discounted-return-weighted log-policy gradients. K parallel environments per rollout, fixed-length rollouts with episode-done masking. No supervised target — the gradient comes from the agent's own actions weighted by how well things went after taking them.</p>
+    </li>
+    <li>
+      <a href="/vae/">VAE (MNIST)</a>
+      <p>Variational autoencoder with the reparameterization trick. Watch random samples become recognisable digits as training proceeds, then slide between two test digits in latent space to see the model's learned manifold morph one into the other.</p>
+    </li>
+    <li>
+      <a href="/tic-tac-toe/">Tic-Tac-Toe self-play</a>
+      <p>A policy MLP plays itself; the gradient signal is just the terminal outcome of each game. Play the model while it trains and watch it get harder. Reaches optimal play (every game vs another optimal player ends in a draw) in a few hundred rollouts.</p>
+    </li>
+    <li>
       <a href="/transformer/">Transformer learns addition</a>
       <p>Multi-layer transformer training from scratch on 2-digit addition. Full forward + backward + Adam compiled to WGSL via tensorgrad. ~1000 examples/sec.</p>
     </li>

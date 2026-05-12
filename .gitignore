@@ -16,5 +16,6 @@ typebulbs
 .claude/
 specs/
 
-# Lab phase — experimental, not for publication. See specs/Explorer.md.
+# experimental, not for publication
 samples/explorer-lab/
+samples/diffusion-tiny/

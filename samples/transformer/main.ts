@@ -9,7 +9,7 @@ import {
   Module, compileModule, lr, nn, capture,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
-  softmaxCausal,
+  softmaxCausal, splitHeads, mergeHeads,
   type Tensor,
 } from 'tensorgrad'
 
@@ -72,12 +72,12 @@ class Transformer extends Module {
 function attentionFwd(p: Attention, x: Tensor, layerIdx: number): Tensor {
   // `splitHeads(p.q.fwd(x), H)` does the multi-head reshape+permute pattern
   // ([B, T, D] → [B, H, T, D/H]) in one call. `mergeHeads` is its inverse.
-  const q = nn.splitHeads(p.q.fwd(x), N_HEADS)
-  const k = nn.splitHeads(p.k.fwd(x), N_HEADS)
-  const v = nn.splitHeads(p.v.fwd(x), N_HEADS)
+  const q = splitHeads(p.q.fwd(x), N_HEADS)
+  const k = splitHeads(p.k.fwd(x), N_HEADS)
+  const v = splitHeads(p.v.fwd(x), N_HEADS)
   const scores = mul(matmul(q, swapAxes(k, -1, -2)), SCALE_QK)
   const attn = capture(`attn.${layerIdx}`, softmaxCausal(scores))
-  return p.o.fwd(nn.mergeHeads(matmul(attn, v)))
+  return p.o.fwd(mergeHeads(matmul(attn, v)))
 }
 
 function mlpFwd(p: MLP, x: Tensor): Tensor {
@@ -103,7 +103,7 @@ function modelFwd(p: Transformer, tokens: Tensor): Tensor {
 }
 
 function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tensor; targets: Tensor; mask: Tensor }): Tensor {
-  const ce = nn.crossEntropy(modelFwd(p, tokens), targets)   // [B, T] of -log p(target)
+  const ce = nn.crossEntropy(modelFwd(p, tokens), targets, { reduction: 'none' })   // [B, T] of -log p(target)
   return mul(sum(mul(ce, mask)), 1 / (B * N_RESULT_DIGITS))
 }
 
@@ -175,7 +175,7 @@ async function run() {
   const compiled = await compileModule({
     factory: () => new Transformer(),
     loss: lossFn,
-    adam: { lr: LR, weightDecay: 0.01 },
+    optimizer: { kind: 'adam', lr: LR, weightDecay: 0.01 },
     inputs: {
       tokens:  { shape: [B, T], dtype: 'i32' },
       targets: { shape: [B, T], dtype: 'i32' },
@@ -184,7 +184,7 @@ async function run() {
   })
   const compileMs = performance.now() - t0
 
-  log(`  ${compiled.paramNames.length} params, ${compiled.kernelCount} kernels, compile ${compileMs.toFixed(0)} ms`, 'ok')
+  log(`  ${compiled.paramNames.length} params, ${compiled.kernels.length} kernels, compile ${compileMs.toFixed(0)} ms`, 'ok')
 
   log('Compiling inference graph (B=1)...')
   const tInfer = performance.now()

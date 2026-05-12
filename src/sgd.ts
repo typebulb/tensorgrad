@@ -16,10 +16,10 @@ import { appendGradClip } from './adam.js'
 import type { LR } from './adam.js'
 import { isLRDynamic, resolveLR } from './adam.js'
 
-/** SGD configuration. Pass via `compileModule({ sgd: ... })`. Only `lr` is
- *  required. With `momentum: 0` (default) you get plain SGD; non-zero adds
- *  per-param velocity state; `nesterov: true` (requires `momentum > 0`)
- *  switches to Nesterov momentum. */
+/** SGD hyperparameters. Pass via `compileModule({ optimizer:
+ *  { kind: 'sgd', ... } })`. Only `lr` is required. With `momentum: 0`
+ *  (default) you get plain SGD; non-zero adds per-param velocity state;
+ *  `nesterov: true` (requires `momentum > 0`) switches to Nesterov momentum. */
 export interface SGDConfig {
   /** Learning rate schedule. Pass a number for fixed lr, or a shape from
    *  the `lr` helpers (e.g. `lr.cosineDecay({ peak: 0.05, final: 0.001, steps: 10000 })`). */

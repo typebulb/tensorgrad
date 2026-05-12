@@ -3,7 +3,7 @@
 
 import { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
 import { resolveLR, rebaseLR, type LR } from './adam.js'
-import { DROPOUT_SEED_INPUT } from './ops.js'
+import { PRNG_SEED_INPUT } from './ops.js'
 import type { Req, Res, WireIR, WireAdamConfig, WireSGDConfig, WireOptimizerConfig, WireError } from './worker-protocol.js'
 import { wireError } from './worker-protocol.js'
 
@@ -18,8 +18,9 @@ interface GraphSlot {
   /** Set for sibling forward graphs (those sharing params via `sharedParams`);
    *  null for the training graph itself. Used to cascade-destroy children. */
   parentGraphId: number | null
-  /** Set when the graph contains any `dropout` op. */
-  dropout: DropoutState | null
+  /** Per-step PRNG state, set when the graph contains any stochastic op
+   *  (`dropout` or `randn`). Null otherwise — saves the per-step inject. */
+  prng: PrngState | null
 }
 
 type OptimizerState =
@@ -39,10 +40,10 @@ interface SGDState {
   lrBuf: Float32Array
 }
 
-interface DropoutState {
+interface PrngState {
   /** Per-graph step counter that mixes into the kernel's PCG hash. Bumped
-   *  before each dispatch so successive calls draw different masks while
-   *  staying reproducible from a known starting counter. */
+   *  before each dispatch so successive calls draw different masks /
+   *  noise while staying reproducible from a known starting counter. */
   counter: number
   seedBuf: Int32Array
 }
@@ -96,7 +97,7 @@ async function handleCreateRuntime(payload: {
     captureShapes,
     optimizer: createOptimizerState(payload.optimizer),
     parentGraphId: null,
-    dropout: graphUsesDropout(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
+    prng: graphUsesPrng(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
   }
   graphs.set(payload.graphId, slot)
 
@@ -114,8 +115,8 @@ function createOptimizerState(cfg: WireOptimizerConfig | null): OptimizerState |
   return { kind: 'sgd', state: createSGDState(cfg.config) }
 }
 
-function graphUsesDropout(graph: WireIR['graph']): boolean {
-  for (const op of graph.ops) if (op.kind === 'dropout') return true
+function graphUsesPrng(graph: WireIR['graph']): boolean {
+  for (const op of graph.ops) if (op.kind === 'dropout' || op.kind === 'randn') return true
   return false
 }
 
@@ -147,7 +148,7 @@ async function handleCompileForward(payload: {
     captureShapes,
     optimizer: null,
     parentGraphId: payload.parentGraphId,
-    dropout: graphUsesDropout(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
+    prng: graphUsesPrng(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
   }
   graphs.set(payload.graphId, slot)
 
@@ -195,12 +196,12 @@ function injectOptimizerScalars(slot: GraphSlot, inputs: Record<string, Int32Arr
   return { ...inputs, [s.config.lrInputName]: s.lrBuf }
 }
 
-function injectDropoutSeed(slot: GraphSlot, inputs: Record<string, Int32Array | Float32Array>): Record<string, Int32Array | Float32Array> {
-  const d = slot.dropout
-  if (!d) return inputs
-  d.counter++
-  d.seedBuf[0] = d.counter | 0
-  return { ...inputs, [DROPOUT_SEED_INPUT]: d.seedBuf }
+function injectPrngSeed(slot: GraphSlot, inputs: Record<string, Int32Array | Float32Array>): Record<string, Int32Array | Float32Array> {
+  const p = slot.prng
+  if (!p) return inputs
+  p.counter++
+  p.seedBuf[0] = p.counter | 0
+  return { ...inputs, [PRNG_SEED_INPUT]: p.seedBuf }
 }
 
 async function handleStep(payload: {
@@ -209,7 +210,7 @@ async function handleStep(payload: {
   withCaptures: boolean
 }): Promise<{ loss: number; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
-  const merged = injectDropoutSeed(slot, injectOptimizerScalars(slot, payload.inputs))
+  const merged = injectPrngSeed(slot, injectOptimizerScalars(slot, payload.inputs))
   try {
     if (payload.withCaptures) {
       const r = await slot.runtime.step(merged, { withCaptures: true })
@@ -232,7 +233,7 @@ async function handleRun(payload: {
   withCaptures: boolean
 }): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
-  const merged = injectDropoutSeed(slot, payload.inputs)
+  const merged = injectPrngSeed(slot, payload.inputs)
   try {
     if (payload.withCaptures) {
       const r = await slot.runtime.run(merged, { withCaptures: true })

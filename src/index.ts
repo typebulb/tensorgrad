@@ -5,29 +5,31 @@
 export type { Tensor, Shape, Dtype, OpNode, Graph, CallSite } from './ir.js'
 export { ShapeError } from './shape.js'
 export { trace, traceInto, paramInput, tensorInput, stateInput } from './trace.js'
-export { capture } from './capture.js'
+export { capture, unsplitHeads } from './capture.js'
 export {
   // Element-wise arithmetic (binops accept Tensor or JS number)
   add, sub, mul, div, min, max, clamp,
   // Unary
-  sqrt, rsqrt, log, exp, relu, neg, abs, tanh, sigmoid, gelu, silu,
+  sqrt, rsqrt, log, exp, relu, neg, abs, tanh, sigmoid, sin, cos, gelu, silu,
+  square,
   // Stochastic regularization
-  dropout,
+  dropout, randn,
   // Comparisons + select
   less, greater, where,
   // Reductions
-  mean, sum, argmax,
+  mean, sum, argmax, argmin,
   type ReduceOpts,
   // Shape
   reshape, permute, swapAxes, flatten,
+  splitHeads, mergeHeads,
   // Linear algebra
   matmul,
   // Indexing / casting
-  oneHot, arange, embedding,
+  oneHot, arange, embedding, take,
   // ML primitives
   softmaxCausal, logSoftmax, softmax, whereCausal,
   // 2D conv + pool (NCHW)
-  conv2d, maxPool2d,
+  conv2d, maxPool2d, nearestUpsample2d,
   type Conv2dOptions, type MaxPool2dOptions,
   // Slicing / structural
   sliceRange, concat, stack, split,
@@ -42,7 +44,7 @@ export { Captures, type RunOptions, type StepResult, type RunResult, type Outcom
 export {
   compileToIR, compileModule, isWebGPUAvailable,
   type CompiledIR, type CompileModuleOptions, type CompileForwardMethodOptions,
-  type CompiledModule, type CompiledForwardModule,
+  type CompiledModule, type CompiledForwardModule, type OptimizerConfig,
   type InputDecl, type InputDeclObject, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,
   type DtypeOf, type TypedArrayFor, type TypedInputs, type ParamTree,
 } from './compile.js'

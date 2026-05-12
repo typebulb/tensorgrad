@@ -18,8 +18,8 @@
 //   * singleFlight wrapping the canvas predict so rapid-stroke predictions
 //     don't queue up — only the latest call resolves; older callers reject
 //     with AbortError.
-//   * mean(crossEntropy(logits, targets)) as the canonical
-//     classification loss tail.
+//   * crossEntropy(logits, targets) as the canonical classification loss
+//     tail (reduces to scalar mean by default).
 //
 // MNIST data is served from solenya-media S3 — same URLs the in-repo bulbs
 // use. ~11 MB on first load; cached after that.
@@ -31,7 +31,7 @@
 
 import {
   Module, compileModule, isWebGPUAvailable, nn,
-  mean, relu, dropout, softmax, singleFlight,
+  relu, dropout, softmax, singleFlight,
   type Tensor, type CompiledModule, type CompiledForwardModule,
 } from 'tensorgrad'
 
@@ -109,7 +109,7 @@ function netFwd(m: MLP, x: Tensor, applyDropout: boolean): Tensor {
 function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   // Training-only: dropout active on hidden activations.
   const logits = netFwd(m, x, true)
-  return mean(nn.crossEntropy(logits, y))
+  return nn.crossEntropy(logits, y)
 }
 
 function predictFn(m: MLP, { x }: { x: Tensor }): Tensor {
@@ -227,7 +227,7 @@ async function compile(hidden: number, lr: number): Promise<void> {
   compiled = await compileModule({
     factory: () => new MLP(layers),
     loss: lossFn,
-    adam: { lr, weightDecay: 0.01, clipGradNorm: 1.0 },
+    optimizer: { kind: 'adam', lr, weightDecay: 0.01, clipGradNorm: 1.0 },
     inputs: {
       x: [BATCH_SIZE, INPUT_DIM],
       y: { shape: [BATCH_SIZE], dtype: 'i32' },
@@ -245,7 +245,7 @@ async function compile(hidden: number, lr: number): Promise<void> {
   const inferRef = predict
   predictCanvas = singleFlight(async (input: Float32Array) => inferRef.run({ x: input }))
   step = 0
-  onStatus(`ready (${compiled.kernelCount} kernels, ${(performance.now() - t0).toFixed(0)} ms, seed ${compiled.seed})`)
+  onStatus(`ready (${compiled.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms, seed ${compiled.seed})`)
 }
 
 async function changeLayerSize(hidden: number): Promise<void> {
