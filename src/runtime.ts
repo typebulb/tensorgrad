@@ -6,13 +6,6 @@ import type { KernelSpec } from './codegen.js'
 // lib.dom declares the WebGPU types but not this runtime constant.
 declare const GPUMapMode: { readonly READ: number; readonly WRITE: number }
 
-export interface UploadParamsOptions {
-  /** Skip the "missing param" check, allowing the caller to update only some
-   *  params and leave the rest at their current GPU values. Extra (unknown)
-   *  keys are still rejected — that's always a typo. Default: false. */
-  partial?: boolean
-}
-
 /**
  * Activation readbacks for one `step()`/`run()` call. Keyed by the names
  * passed to `capture(name, t)` during the trace. `get(name)` throws if the
@@ -92,10 +85,10 @@ export interface CompiledBase {
   /** Shape of the graph's output (loss scalar `[]` for training; the user's
    *  returned tensor for forward-only compiles). */
   outputShape: readonly number[]
-  /** Upload parameter Float32Arrays to their GPU buffers. By default, requires
-   *  *all* params to be present; throws on any unknown or missing key. Pass
-   *  `{ partial: true }` to skip the missing-key check. */
-  uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): void
+  /** Upload parameter Float32Arrays to their GPU buffers. Partial by default:
+   *  missing keys leave the existing GPU values unchanged. Unknown keys throw
+   *  — that's always a typo. */
+  uploadParams(params: Record<string, Float32Array>): void
   /** Read all parameters back as Float32Arrays — used for UI panels. */
   downloadParams(): Promise<Record<string, Float32Array>>
   /** Free GPU resources. */
@@ -412,24 +405,13 @@ export async function createRuntime(
   }
 
   // ---- uploadParams ---------------------------------------------------------
-  function uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions) {
-    const partial = opts?.partial ?? false
+  function uploadParams(params: Record<string, Float32Array>) {
     for (const name of Object.keys(params)) {
       if (!plan.paramsByName.has(name)) {
         throw new Error(
           `uploadParams: unknown param '${name}'. ` +
           `Known: ${[...plan.paramsByName.keys()].sort().join(', ')}`,
         )
-      }
-    }
-    if (!partial) {
-      for (const name of plan.paramsByName.keys()) {
-        if (!(name in params)) {
-          throw new Error(
-            `uploadParams: missing param '${name}'. ` +
-            `Pass { partial: true } if you mean to update only some params.`,
-          )
-        }
       }
     }
     for (const [name, bufId] of plan.paramsByName) {

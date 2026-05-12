@@ -102,7 +102,6 @@ export interface RunPayload {
 export interface UploadParamsPayload {
   graphId: number
   params: Record<string, Float32Array>  // transferred
-  partial: boolean
 }
 
 /** Update the lr on a training graph at runtime, without recompiling. The

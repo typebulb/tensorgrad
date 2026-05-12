@@ -15,6 +15,7 @@ typebulbs
 .github/
 .claude/
 specs/
+temp/
 
 # experimental, not for publication
 samples/explorer-lab/

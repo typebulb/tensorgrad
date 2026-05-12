@@ -3,7 +3,7 @@
 // This sample is intended as the broadest demonstration of the tensorgrad
 // API surface in one place. It exercises:
 //
-//   * Forward spec attached via `compile(spec({ forward, ... }), { shareWith })`
+//   * Forward spec attached via `train.attach(forwardSpec({ forward, ... }))`
 //     with a parametric batch dim (`null` wildcard) — the same predict graph
 //     serves B=1 for the canvas and B=EVAL_BATCH for the periodic accuracy
 //     probe. One forward proxy, two resolved shapes (lazily compiled).
@@ -17,8 +17,8 @@
 //   * setLR for changing the learning rate mid-training.
 //   * clipGradNorm for training stability, baked into AdamConfig.
 //   * singleFlight wrapping the canvas predict so rapid-stroke predictions
-//     don't queue up — only the latest call resolves; older callers reject
-//     with AbortError.
+//     don't queue up — only the latest call resolves; older callers receive
+//     a `{ kind: 'aborted' }` result.
 //   * crossEntropy(logits, targets) as the canonical classification loss
 //     tail (reduces to scalar mean by default).
 //
@@ -31,7 +31,7 @@
 // entirely in the UI section.
 
 import {
-  Module, compile, spec, isWebGPUAvailable, nn,
+  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, nn,
   relu, dropout, softmax, singleFlight,
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
@@ -228,7 +228,7 @@ async function buildGraphs(hidden: number, lr: number): Promise<void> {
   onStatus(`compiling MLP ${layers.join(' → ')}…`)
   const t0 = performance.now()
   const model = new MLP(layers)
-  train = await compile(spec({
+  train = await compile(trainingSpec({
     model,
     loss: lossFn,
     optimizer: { kind: 'adamw', lr, weightDecay: 0.01, clipGradNorm: 1.0 },
@@ -239,11 +239,11 @@ async function buildGraphs(hidden: number, lr: number): Promise<void> {
   }))
   // One polymorphic inference graph — the same infer serves the canvas
   // (B=1) and the accuracy probe (B=EVAL_BATCH).
-  infer = await compile(spec({
+  infer = await train.attach(forwardSpec({
     model,
     forward: predictFn,
     inputs: { x: [null, INPUT_DIM] },
-  }), { shareWith: train })
+  }))
   // singleFlight: rapid strokes supersede each other; only the latest call
   // resolves. Captured via closure so the wrapper survives replaceModel
   // (which invalidates the per-shape kernel cache, not the proxy object).
@@ -300,16 +300,11 @@ function stopTraining(): void {
 }
 
 // Predict for a 28×28 input. Returns null if the model isn't compiled yet or
-// the call was superseded by a newer one (singleFlight AbortError).
+// the call was superseded by a newer one.
 async function predictDrawing(input: Float32Array): Promise<Float32Array | null> {
   if (!predictCanvas) return null
-  try {
-    return await predictCanvas(input)
-  } catch (e: unknown) {
-    const err = e as { name?: string }
-    if (err?.name === 'AbortError') return null
-    throw e
-  }
+  const r = await predictCanvas(input)
+  return r.kind === 'completed' ? r.value : null
 }
 
 // ============================================================================

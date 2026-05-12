@@ -292,10 +292,9 @@ function capturesToRecord(
 function handleUploadParams(payload: {
   graphId: number
   params: Record<string, Float32Array>
-  partial: boolean
 }): void {
   const slot = mustGet(payload.graphId)
-  slot.runtime.uploadParams(payload.params, { partial: payload.partial })
+  slot.runtime.uploadParams(payload.params)
 }
 
 async function handleDownloadParams(payload: { graphId: number }): Promise<{ params: Record<string, Float32Array> }> {

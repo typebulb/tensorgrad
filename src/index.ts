@@ -1,5 +1,5 @@
 // Public surface — `tensorgrad`. Documented end-user API: ops, modules,
-// the `nn` namespace, `spec`/`compile`/`compileIR`, runtime helpers.
+// the `nn` namespace, `trainingSpec`/`forwardSpec`/`compile`, runtime helpers.
 // Extension hooks (custom optimizers, IR walks, codegen visualization)
 // live in the sibling `tensorgrad/internal` barrel.
 
@@ -39,15 +39,15 @@ export {
 
 export { lr, type AdamConfig, type AdamWConfig, type LR } from './adam.js'
 export { type SGDConfig } from './sgd.js'
-export { Captures, type UploadParamsOptions } from './runtime.js'
+export { Captures } from './runtime.js'
 export {
-  spec, compile, compileIR, isWebGPUAvailable,
+  trainingSpec, forwardSpec, compile, isWebGPUAvailable,
   type CompiledIR, type TrainingSpecOptions, type ForwardSpecOptions,
   type TrainingSpec, type ForwardSpec, type Spec,
   type CompiledTraining, type CompiledForward, type OptimizerConfig,
-  type StepResult, type RunResult, type QueueResult,
+  type StepResult, type RunResult,
   type InputDecl, type InputDecls, type TypedInputs, type ParamTree,
 } from './compile.js'
 export { Module, init, type InitSpec, type ParamOptions } from './module.js'
-export { singleFlight } from './single-flight.js'
+export { singleFlight, type SingleFlightResult } from './single-flight.js'
 export * as nn from './nn.js'

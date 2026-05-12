@@ -16,7 +16,7 @@
 // as the other samples.
 
 import {
-  Module, compile, spec, isWebGPUAvailable, init,
+  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, init,
   add, sub, mul, mean, abs, neg, max, where, less, square,
   silu, reshape, swapAxes, matmul, arange,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -159,17 +159,17 @@ async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
   const model = new KAN()
-  train = await compile(spec({
+  train = await compile(trainingSpec({
     model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR },
     inputs: { x: [BATCH, 1], y: [BATCH, 1] },
   }))
-  infer = await compile(spec({
+  infer = await train.attach(forwardSpec({
     model,
     forward: predictFn,
     inputs: { x: [null, 1] },
-  }), { shareWith: train })
+  }))
   step = 0
   onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
 }

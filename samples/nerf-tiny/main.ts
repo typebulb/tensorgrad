@@ -18,7 +18,7 @@
 // as the other samples.
 
 import {
-  Module, compile, spec, isWebGPUAvailable, nn,
+  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, nn,
   mul, sub, mean, reshape, relu, sigmoid, concat,
   sin, cos, square,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -158,7 +158,7 @@ async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
   const model = new NeRFTiny()
-  train = await compile(spec({
+  train = await compile(trainingSpec({
     model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: 1e-3 },
@@ -168,14 +168,14 @@ async function buildGraphs(): Promise<void> {
       freqs:  [L_FREQS],
     },
   }))
-  infer = await compile(spec({
+  infer = await train.attach(forwardSpec({
     model,
     forward: predictFn,
     inputs: {
       coords: [N_PIXELS, 2],
       freqs:  [L_FREQS],
     },
-  }), { shareWith: train })
+  }))
   step = 0
   onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
 }

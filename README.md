@@ -17,7 +17,7 @@ A 2-layer MLP fitting `y = sin(x)`:
 
 ```ts
 import {
-  Module, compile, spec, nn,
+  Module, compile, trainingSpec, nn,
   sub, mean, square, relu,
   type Tensor,
 } from 'tensorgrad'
@@ -38,7 +38,7 @@ function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   return mean(square(sub(modelFwd(m, x), y)))
 }
 
-const train = await compile(spec({
+const train = await compile(trainingSpec({
   model: new MLP(),
   loss: lossFn,
   optimizer: { kind: 'adam', lr: 0.005 },
@@ -61,10 +61,11 @@ for (let step = 0; step < 1000; step++) {
 - A *forward function* takes the materialized module + a record of named
   input tensors and returns a tensor — the loss for a training spec, or
   any output for a forward spec. Forwards are free functions, not methods.
-- `spec({ factory, loss, inputs, optimizer })` builds a value (no side
-  effects). `compile(spec)` traces the forward, derives gradients, wires
-  the optimizer, generates WGSL, spawns a worker, and returns a
-  `CompiledTraining`. Every method on it is async.
+- `trainingSpec({ model, loss, inputs, optimizer })` builds a value (no
+  side effects). `compile(spec)` traces the forward, derives gradients,
+  wires the optimizer, generates WGSL, spawns a worker, and returns a
+  `CompiledTraining`. Every method on it is async. For inference compiles
+  that share the training graph's params, use `train.attach(forwardSpec({...}))`.
 
 ## Porting from PyTorch
 
@@ -80,9 +81,9 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `linear(x)` on `nn.Linear` / `nn.LayerNorm` | `linear.fwd(x)` (`.fwd` is the convention for built-in leaf modules) |
 | `model.parameters()` | `train.paramNames`, `train.downloadParams()` |
 | `optimizer.zero_grad(); out = model(x); loss = ...; loss.backward(); optimizer.step()` | `await train.step(inputs)` — forward + backward + Adam update are fused |
-| `optim.Adam(params, lr=...)` | `optimizer: { kind: 'adam', lr }` in `spec({ ... })` |
+| `optim.Adam(params, lr=...)` | `optimizer: { kind: 'adam', lr }` in `trainingSpec({ ... })` |
 | `optim.AdamW(params, lr=..., weight_decay=w)` | `optimizer: { kind: 'adamw', lr, weightDecay: w }` |
-| `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `optimizer: { kind: 'sgd', lr, momentum?, nesterov? }` in `spec({ ... })` |
+| `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `optimizer: { kind: 'sgd', lr, momentum?, nesterov? }` in `trainingSpec({ ... })` |
 | `StepLR(opt, step_size=N, gamma=g)` | `lr.step({ peak, stepSize: N, gamma: g })` |
 | `MultiStepLR(opt, milestones=[..], gamma=g)` | `lr.multiStep({ peak, milestones: [..], gamma: g })` |
 | `CosineAnnealingLR(opt, T_max=N, eta_min=m)` | `lr.cosineAnnealing({ peak, final: m, steps: N })` |
@@ -128,17 +129,14 @@ targets)` instead — same numerics, just unfused.
 **No `.train()` / `.eval()` mode flag.** Write two forwards: a training
 one (`lossFn`, includes `dropout` etc.) and an inference one
 (`predictFn`, deterministic). Compile each as its own spec; attach the
-inference spec via `{ shareWith }` so it reuses the training compile's
-param buffers. Stochastic ops are physically absent from the inference
-graph.
+inference spec to the training compile via `train.attach(forwardSpec(...))`
+so it reuses the training compile's param buffers. Stochastic ops are
+physically absent from the inference graph.
 
 ```ts
 const model = new Model()
-const train = await compile(spec({ model, loss: lossFn, inputs, optimizer }))
-const infer = await compile(
-  spec({ model, forward: predictFn, inputs: inferInputs }),
-  { shareWith: train },
-)
+const train = await compile(trainingSpec({ model, loss: lossFn, inputs, optimizer }))
+const infer = await train.attach(forwardSpec({ model, forward: predictFn, inputs: inferInputs }))
 ```
 
 **No eager mode.** The forward is traced once and compiled. To read an
@@ -158,49 +156,46 @@ switch (r.kind) {
 ```
 
 No try/catch on `AbortError` needed — the cancellation surfaces as the
-`'aborted'` discriminator. The `singleFlight` helper (below) still
-rejects with `AbortError` for displaced live-preview callers; that's
-the only place you'll touch `AbortError.name` in normal use.
+`'aborted'` discriminator across `step`, `run`, `readLoss`, and even
+the `singleFlight` helper (below) for displaced live-preview callers.
+One vocabulary for the whole library.
 
 ## Public API
 
 ### Compile entry points
 
 ```ts
-spec({ factory, loss, inputs, optimizer }): TrainingSpec
-spec({ factory, forward, inputs }): ForwardSpec
+trainingSpec({ model, loss, inputs, optimizer }): TrainingSpec
+forwardSpec({ model, forward, inputs }): ForwardSpec
 compile(trainingSpec): Promise<CompiledTraining>
-compile(forwardSpec, { shareWith: trainingCompile }): Promise<CompiledForward>
-compileIR(spec): CompiledIR                       // sync, no worker, no GPU
+train.attach(forwardSpec): Promise<CompiledForward>      // shares worker + param buffers
 train.replaceModel(newModel, { seed?, optimizer? }): Promise<void>
-isWebGPUAvailable(): boolean                       // friendly pre-flight check
+isWebGPUAvailable(): boolean                             // friendly pre-flight check
 ```
 
-`spec()` is a pure value builder. `compile()` is the worker-spawning
-executor:
+`trainingSpec()` / `forwardSpec()` are pure value builders. `compile()`
+is the worker-spawning executor; `train.attach()` adds a sibling forward
+graph that shares the training compile's worker and param buffers:
 
 ```ts
 const model = new Model()
 
-const train = await compile(spec({
+const train = await compile(trainingSpec({
   model,
   loss: lossFn,
   inputs: { tokens: [B, T], targets: [B, T], mask: [T] },
   optimizer: { kind: 'adam', lr: 0.001 },
 }))
 
-const infer = await compile(
-  spec({
-    model,
-    forward: predictFn,
-    inputs: { tokens: { shape: [null, T], dtype: 'i32' } },  // null = parametric batch
-  }),
-  { shareWith: train },   // share worker + param GPUBuffers
-)
+const infer = await train.attach(forwardSpec({
+  model,
+  forward: predictFn,
+  inputs: { tokens: { shape: [null, T], dtype: 'i32' } },  // null = parametric batch
+}))
 ```
 
-The same `model` instance feeds both specs; `compile` clones internally
-before tracing, so the user's instance is never mutated.
+The same `model` instance feeds both specs; the pipeline clones
+internally before tracing, so the user's instance is never mutated.
 
 Training-step updates are immediately visible through `infer.run()` —
 the forward compile binds the training compile's actual param buffers,
@@ -212,10 +207,9 @@ mark the dim as `null` and the proxy compiles + caches a sibling graph
 per actual size on demand:
 
 ```ts
-const infer = await compile(
-  spec({ model, forward: predictFn, inputs: { x: [null, 784] } }),
-  { shareWith: train },
-)
+const infer = await train.attach(forwardSpec({
+  model, forward: predictFn, inputs: { x: [null, 784] },
+}))
 await infer.run({ x: arr1 })       // first call at B=1 → compile + cache
 await infer.run({ x: arr256 })     // first call at B=256 → compile + cache
 await infer.run({ x: arr1Again })  // cache hit
@@ -230,9 +224,8 @@ a dummy `run()` per expected shape.
 **Replacing the model.** If your UI lets the user change the model
 topology (layer count, hidden width, etc.), `replaceModel(newModel)`
 swaps it in place — same handle, same worker. Forward compiles attached
-via `compile(forwardSpec, { shareWith: train })` stay registered; their
-per-shape kernel caches are cleared and recompile lazily on the next
-`run()`:
+via `train.attach(forwardSpec)` stay registered; their per-shape kernel
+caches are cleared and recompile lazily on the next `run()`:
 
 ```ts
 await train.replaceModel(new MLP(newLayerSpec))
@@ -254,8 +247,9 @@ schedule update on the existing weights), use `setLR`.
 For live-preview patterns where stale calls (earlier mouse positions,
 partial drawings) should be dropped in favor of the newest, wrap a
 promise-returning function with `singleFlight`. Matches RxJS `switchMap` /
-p-debounce semantics: displaced callers reject with `AbortError`; only
-the most recent call resolves.
+p-debounce semantics: at most one in-flight, at most one queued; only
+the most recent call resolves with `'completed'`, displaced callers
+resolve with `'aborted'` — same discriminated vocabulary as `step` / `run`.
 
 ```ts
 import { singleFlight } from 'tensorgrad'
@@ -263,8 +257,8 @@ import { singleFlight } from 'tensorgrad'
 const predict = singleFlight((tokens: Int32Array) => infer.run({ tokens }))
 
 canvas.addEventListener('pointermove', async () => {
-  try { updateUI(await predict(latestTokens())) }
-  catch (e: any) { if (e?.name !== 'AbortError') throw e }
+  const r = await predict(latestTokens())
+  if (r.kind === 'completed') updateUI(r.value)
 })
 ```
 
@@ -274,13 +268,14 @@ Generic — works around `run`, `step`, or any single-argument promise function.
 
 ```ts
 train.step(inputs)                           // → { kind: 'completed', loss, captures } | { kind: 'aborted' }
-train.queueStep(inputs)                      // → { kind: 'queued' | 'aborted' }; fire-and-forget
+train.queueStep(inputs)                      // → void; fire-and-forget
 train.readLoss()                             // → number; pair with queueStep
 train.run(inputs)                            // → { kind: 'completed', output, captures } | { kind: 'aborted' }
-train.uploadParams(record, { partial? })
+train.uploadParams(record)                   // partial by default; missing keys keep current values
 train.downloadParams()                       // → ParamTree<M> (typed tree, mirrors class)
 train.downloadParamsFlat()                   // → Record<'layers.0.W' | …, Float32Array>
 train.downloadParamGrads()                   // → ParamTree<M> (same tree shape)
+train.attach(forwardSpec)                    // → CompiledForward; sibling that shares params + worker
 train.reset()                                // re-init params + zero optimizer state
 train.resetOptimizerState()
 train.setLR(lr)                              // mutate LR without recompile
@@ -288,10 +283,10 @@ train.replaceModel(newModel)                 // swap topology, same worker
 train.destroy()                              // tear down worker + GPU (cascades to attached forwards)
 ```
 
-`CompiledForward` (from `compile(forwardSpec, { shareWith })`) exposes a
-narrower surface: `run`, `uploadParams`, `downloadParams` /
-`downloadParamsFlat`, `destroy`, and `paramNames`. Params are shared
-with the parent training compile, so reads/writes are visible there too.
+`CompiledForward` (from `train.attach(forwardSpec)`) exposes a narrower
+surface: `run`, `uploadParams`, `downloadParams` / `downloadParamsFlat`,
+`destroy`, and `paramNames`. Params are shared with the parent training
+compile, so reads/writes are visible there too.
 
 **Fire-and-forget training.** Each `mapAsync` loss readback costs ~1 ms
 on desktop but 10–30 ms on Android Chrome. For mobile UI responsiveness,
@@ -334,29 +329,6 @@ const params = train.graph.ops
   .filter(op => op.kind === 'param_input')
   .map(op => ({ name: op.name, shape: train.graph.tensors[op.out].shape }))
 // [{ name: 'l1.W', shape: [1, 64] }, { name: 'l1.b', shape: [64] }, ...]
-```
-
-**Standalone IR (no worker, no GPU).** `compileIR(spec)` runs the same
-trace + autograd + buffer-plan + codegen pipeline but synchronously,
-without spawning a worker. Useful for unit tests that walk the graph,
-op-count regressions in CI, or environments without WebGPU.
-
-```ts
-import { Module, compileIR, spec, nn, matmul, mean, square, type Tensor } from 'tensorgrad'
-
-class Tiny extends Module { W = this.param([4, 8]) }
-
-const ir = compileIR(spec({
-  model: new Tiny(),
-  loss: (m, { x }: { x: Tensor }) => mean(square(matmul(x, m.W))),
-  inputs: { x: [16, 4] },
-  optimizer: { kind: 'adam', lr: 0.01 },
-}))
-
-ir.graph.ops.length             // count of fwd + bwd ops
-ir.kernels.length               // emitted WGSL kernels
-Object.keys(ir.paramGrads)      // [ 'W' ] — gradient tensors keyed by param name
-ir.paramGrads.W.shape           // [4, 8] — matches the param
 ```
 
 **Typed param tree.** `downloadParams()` returns a tree that mirrors the
@@ -411,21 +383,21 @@ switch (r.kind) {
 makes it inaccessible from `'aborted'` paths.
 
 **Model is a value, not a factory.** Pass a `model: new Model()`
-instance to `spec()`. The compile pipeline clones the module tree
-before tracing, so the same instance can feed both a training spec and
-a forward spec — and a subsequent `replaceModel` — without surprising
-mutation.
+instance to `trainingSpec()` / `forwardSpec()`. The compile pipeline
+clones the module tree before tracing, so the same instance can feed
+both a training spec and a forward spec — and a subsequent `replaceModel`
+— without surprising mutation.
 
 **Reproducible init.** A deterministic Mulberry32 PRNG seeds compile-time
 init. Pass `seed` to control it; whatever seed was used is exposed as
 `train.seed` so you can replay later:
 
 ```ts
-const a = await compile(spec({ ..., seed: 42 }))   // pin
-const b = await compile(spec({ ... }))             // fresh; b.seed exposes it
-b.reset()                                          // re-inits with the current seed
-await b.replaceModel(newModel)                     // fresh seed by default
-await b.replaceModel(newModel, { seed: b.seed })   // keep current
+const a = await compile(trainingSpec({ ..., seed: 42 }))   // pin
+const b = await compile(trainingSpec({ ... }))             // fresh; b.seed exposes it
+b.reset()                                                  // re-inits with the current seed
+await b.replaceModel(newModel)                             // fresh seed by default
+await b.replaceModel(newModel, { seed: b.seed })           // keep current
 ```
 
 ### Operators
@@ -493,7 +465,7 @@ capture into one `Float32Array` per head.
 
 ### Optimizers
 
-`spec()` takes an `optimizer` discriminated by
+`trainingSpec()` takes an `optimizer` discriminated by
 `kind: 'adam' | 'adamw' | 'sgd'`. Splits mirror PyTorch:
 `torch.optim.Adam` (no decay) vs `torch.optim.AdamW` (decoupled decay).
 All kinds accept the same LR schedule shapes from the `lr` namespace.
@@ -553,7 +525,7 @@ Global L2-norm clipping matches PyTorch's `clip_grad_norm_` and optax's
 optimizer config:
 
 ```ts
-const compiled = await compile(spec({
+const compiled = await compile(trainingSpec({
   ...,
   optimizer: { kind: 'adam', lr: 0.001, clipGradNorm: 1.0 },   // bake clipping into the graph
 }))
@@ -652,8 +624,8 @@ The library is small because of what it doesn't do. Plan accordingly:
   serializable shapes, not functions. Anything per-step you write into a
   user-defined optimizer (see *Extending* below) follows the same rule.
 - **One model per training compile.** Forward specs attach via
-  `compile(forwardSpec, { shareWith: train })` to share params; otherwise
-  each `compile()` of a training spec spawns its own worker.
+  `train.attach(forwardSpec)` to share params; otherwise each `compile()`
+  of a training spec spawns its own worker.
 
 ## Extending
 
@@ -662,7 +634,7 @@ point — other optimizers, custom losses, or extra ops are user code following
 the same pattern as `appendAdam`:
 
 ```ts
-import { appendAdam, appendGrad, compileIR } from 'tensorgrad'
+import { appendAdam, appendGrad } from 'tensorgrad/internal'
 ```
 
 A custom optimizer is a function that takes the autograd output (graph +

@@ -39,7 +39,7 @@ export type LR =
   | { readonly kind: 'multiStep'; readonly peak: number; readonly milestones: readonly number[]; readonly gamma: number; readonly startStep?: number }
 
 /** Ergonomic constructors for LR schedule shapes. For constant lr, pass a
- *  raw number — every LR field on `spec({ optimizer })` / `setLR`
+ *  raw number — every LR field on `trainingSpec({ optimizer })` / `setLR`
  *  accepts `number | LR`. Names mirror PyTorch's `torch.optim.lr_scheduler`. */
 export const lr = {
   /** Linearly interpolate from `peak` at intrinsic step 1 to `final` at
@@ -129,7 +129,7 @@ export function isLRDynamic(schedule: LR): boolean {
   return typeof schedule !== 'number'
 }
 
-/** Plain Adam hyperparameters. Pass via `spec({ ..., optimizer:
+/** Plain Adam hyperparameters. Pass via `trainingSpec({ ..., optimizer:
  *  { kind: 'adam', ... } })`. Only `lr` is required; the rest match PyTorch
  *  `torch.optim.Adam`'s defaults. For decoupled weight decay, use the
  *  separate `kind: 'adamw'` variant + `AdamWConfig`. */
@@ -150,7 +150,7 @@ export interface AdamConfig {
 }
 
 /** AdamW hyperparameters (Loshchilov & Hutter — decoupled weight decay).
- *  Pass via `spec({ ..., optimizer: { kind: 'adamw', ... } })`. `weightDecay`
+ *  Pass via `trainingSpec({ ..., optimizer: { kind: 'adamw', ... } })`. `weightDecay`
  *  is required (use plain `{ kind: 'adam' }` if you don't want decay). Every
  *  step shrinks each decayed param by `1 - lr * weightDecay` before the
  *  Adam gradient update. PyTorch parity: `torch.optim.AdamW`. */

@@ -1,50 +1,57 @@
+/** Discriminated result of a `singleFlight`-wrapped call. `'completed'`
+ *  carries the wrapped function's value; `'aborted'` means a newer call
+ *  superseded this one before it resolved. Same vocabulary as
+ *  `step` / `run` so callers use one cancellation pattern across the
+ *  library. */
+export type SingleFlightResult<R> =
+  | { kind: 'completed'; value: R }
+  | { kind: 'aborted' }
+
 interface PendingCall<A, R> {
   arg: A
-  resolver: { resolve: (r: R) => void; reject: (e: Error) => void }
+  resolve: (r: SingleFlightResult<R>) => void
 }
 
 /**
  * Wrap an async function so overlapping calls coalesce to "latest wins."
  * Matches RxJS `switchMap` / p-debounce: at most one call is in flight,
- * at most one is queued, and any displaced waiter rejects with `AbortError`.
+ * at most one is queued, and any displaced waiter resolves with
+ * `{ kind: 'aborted' }`.
  *
  * ```ts
  * const predict = singleFlight(b => infer.run({ x: b }))
- * try { updateUI(await predict(bytes)) }
- * catch (e) { if (e?.name !== 'AbortError') throw e }
+ * const r = await predict(bytes)
+ * if (r.kind === 'completed') updateUI(r.value)
  * ```
  *
  * Single-argument only — pack multiple args into one object.
  */
-export function singleFlight<A, R>(fn: (arg: A) => Promise<R>): (arg: A) => Promise<R> {
+export function singleFlight<A, R>(
+  fn: (arg: A) => Promise<R>,
+): (arg: A) => Promise<SingleFlightResult<R>> {
   let active: Promise<R> | null = null
   let pending: PendingCall<A, R> | null = null
 
-  function call(arg: A): Promise<R> {
+  function call(arg: A): Promise<SingleFlightResult<R>> {
     if (!active) {
       const p = fn(arg)
       active = p
+      const result = p.then<SingleFlightResult<R>>(value => ({ kind: 'completed', value }))
       p.finally(() => {
         active = null
         if (pending) {
           const next = pending
           pending = null
-          call(next.arg).then(next.resolver.resolve, next.resolver.reject)
+          call(next.arg).then(next.resolve)
         }
       })
-      return p
+      return result
     }
-    if (pending) pending.resolver.reject(abortErr('singleFlight: superseded by newer call'))
-    return new Promise<R>((resolve, reject) => {
-      pending = { arg, resolver: { resolve, reject } }
+    if (pending) pending.resolve({ kind: 'aborted' })
+    return new Promise<SingleFlightResult<R>>(resolve => {
+      pending = { arg, resolve }
     })
   }
 
   return call
-}
-
-function abortErr(msg: string): Error {
-  const e = new Error(msg)
-  e.name = 'AbortError'
-  return e
 }

@@ -17,7 +17,7 @@
 // as the other samples.
 
 import {
-  Module, compile, spec, isWebGPUAvailable, nn,
+  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, nn,
   add, sub, mul, sum, exp, sigmoid, relu,
   randn, square,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -235,7 +235,7 @@ async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
   const model = new VAE()
-  train = await compile(spec({
+  train = await compile(trainingSpec({
     model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: 1e-3, clipGradNorm: 1.0 },
@@ -244,16 +244,16 @@ async function buildGraphs(): Promise<void> {
   // Polymorphic batch for both inference proxies: encode is called at B=2
   // (interpolation endpoints), decode at B=1 (interpolation output) and
   // B=N_SAMPLES (random grid).
-  encode = await compile(spec({
+  encode = await train.attach(forwardSpec({
     model,
     forward: encodeFn,
     inputs: { x: [null, INPUT_DIM] },
-  }), { shareWith: train })
-  decode = await compile(spec({
+  }))
+  decode = await train.attach(forwardSpec({
     model,
     forward: decodeFn,
     inputs: { z: [null, LATENT_DIM] },
-  }), { shareWith: train })
+  }))
   step = 0
   onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
 }

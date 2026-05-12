@@ -6,7 +6,7 @@
 // and computation.
 
 import {
-  Module, compile, spec, lr, nn, capture,
+  Module, compile, trainingSpec, forwardSpec, lr, nn, capture,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
   softmaxCausal, splitHeads, mergeHeads,
@@ -173,7 +173,7 @@ async function run() {
   log('Building model + compiling...')
   const t0 = performance.now()
   const model = new Transformer()
-  const train = await compile(spec({
+  const train = await compile(trainingSpec({
     model,
     loss: lossFn,
     optimizer: { kind: 'adamw', lr: LR, weightDecay: 0.01 },
@@ -189,11 +189,11 @@ async function run() {
 
   log('Compiling inference graph (B=1)...')
   const tInfer = performance.now()
-  const infer = await compile(spec({
+  const infer = await train.attach(forwardSpec({
     model,
     forward: predictFwd,
     inputs: { tokens: { shape: [1, T], dtype: 'i32' } },
-  }), { shareWith: train })
+  }))
   log(`  compile ${(performance.now() - tInfer).toFixed(0)} ms`, 'ok')
 
   // One-row test input for the per-100-step shape check.

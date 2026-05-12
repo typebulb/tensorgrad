@@ -4,7 +4,7 @@
 // test that the library works for non-transformer shapes of problem.
 
 import {
-  Module, compile, spec, nn,
+  Module, compile, trainingSpec, forwardSpec, nn,
   mul, sub, mean, relu,
   type Tensor,
 } from 'tensorgrad'
@@ -126,7 +126,7 @@ async function run() {
   log('Compiling MLP + Adam...')
   const t0 = performance.now()
   const model = new MLP()
-  const train = await compile(spec({
+  const train = await compile(trainingSpec({
     model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR },
@@ -137,11 +137,11 @@ async function run() {
   // Inference graph for plotting: shares param buffers with the training
   // graph, polymorphic over the batch dim so we can run it at PLOT_N=200
   // without recompiling per-shape.
-  const infer = await compile(spec({
+  const infer = await train.attach(forwardSpec({
     model,
     forward: predictFn,
     inputs: { x: [null, 1] },
-  }), { shareWith: train })
+  }))
 
   // Stretch the plot x's into [PLOT_N, 1] for the [B, 1] input shape.
   const plotInput = new Float32Array(PLOT_N)

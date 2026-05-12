@@ -168,7 +168,7 @@ export const PRNG_SEED_INPUT = '__prngSeed'
  *  Train-vs-eval handling: free-function form, no mode flag. Call `dropout`
  *  inside your training forward (lossFn); omit it from your inference
  *  forward (predictFn). The two are compiled separately as a training spec
- *  and a forward spec attached via `compile(spec, { shareWith })`.
+ *  and a forward spec attached via `train.attach(forwardSpec)`.
  *
  *  **Salt ordering.** Salts are assigned by graph-construction order across
  *  `dropout` and `randn` calls combined. Adding or removing a stochastic op

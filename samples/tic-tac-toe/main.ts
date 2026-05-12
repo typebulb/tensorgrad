@@ -21,7 +21,7 @@
 // as the other samples.
 
 import {
-  Module, compile, spec, isWebGPUAvailable, nn,
+  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, nn,
   mul, sum,
   tanh, oneHot, logSoftmax, softmax,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -306,7 +306,7 @@ async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
   const model = new Policy()
-  train = await compile(spec({
+  train = await compile(trainingSpec({
     model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR },
@@ -318,11 +318,11 @@ async function buildGraphs(): Promise<void> {
     },
   }))
   // Polymorphic batch dim: K=16 during rollouts, B=1 for human-vs-AI moves.
-  infer = await compile(spec({
+  infer = await train.attach(forwardSpec({
     model,
     forward: predictFn,
     inputs: { state: [null, STATE_DIM] },
-  }), { shareWith: train })
+  }))
   rolloutCount = 0
   lastWinRate = 0
   onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)

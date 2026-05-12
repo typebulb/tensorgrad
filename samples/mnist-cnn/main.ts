@@ -20,7 +20,7 @@
 // tail it in the terminal instead of copying from the browser console.
 
 import {
-  Module, compile, spec, isWebGPUAvailable, nn,
+  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, nn,
   relu, flatten, maxPool2d,
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
@@ -42,7 +42,7 @@ const HIDDEN = 64
 let log: (msg: string) => void = () => {}
 
 // ---------------------------------------------------------------------------
-// MNIST loading. Pixels are stored as flat Float32Array; the spec()
+// MNIST loading. Pixels are stored as flat Float32Array; the trainingSpec
 // declared input shape is [B, 1, 28, 28], so per batch we just slice the
 // flat buffer — WGSL reads contiguously regardless of declared shape.
 // ---------------------------------------------------------------------------
@@ -211,7 +211,7 @@ async function boot(): Promise<void> {
   log('compiling CNN…')
   const t0 = performance.now()
   const model = new CNN()
-  train = await compile(spec({
+  train = await compile(trainingSpec({
     model,
     loss: lossFn,
     optimizer: { kind: 'adamw', lr: 1e-3, weightDecay: 0.01, clipGradNorm: 1.0 },
@@ -220,11 +220,11 @@ async function boot(): Promise<void> {
       y: { shape: [BATCH_SIZE], dtype: 'i32' },
     },
   }))
-  infer = await compile(spec({
+  infer = await train.attach(forwardSpec({
     model,
     forward: predictFn,
     inputs: { x: [EVAL_BATCH, 1, 28, 28] },
-  }), { shareWith: train })
+  }))
   log(`compiled in ${(performance.now() - t0).toFixed(0)} ms (${train.kernels.length} kernels) — training…`)
 
   void runTraining()
