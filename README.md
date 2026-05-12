@@ -262,6 +262,23 @@ Forward proxies expose only `paramNames` (the same names as the parent
 training graph) — kernel count and output shape aren't stable on a proxy
 that caches multiple shape variants.
 
+**Inspecting the compiled IR.** `compiled.ir.graph` gives you the
+compiled IR: ops, tensors, connectivity, captures, outputs. `Graph`,
+`OpNode`, `Tensor`, `Shape`, `Dtype`, and `CallSite` are exported for
+walking it. Each `Tensor.site` carries the user-frame stack from
+op-call time, useful for "where in user code did this op come from"
+displays.
+
+```ts
+import type { Graph } from 'tensorgrad'
+
+// List parameters with shapes.
+const params = compiled.ir.graph.ops
+  .filter(op => op.kind === 'param_input')
+  .map(op => ({ name: op.name, shape: compiled.ir.graph.tensors[op.out].shape }))
+// [{ name: 'l1.W', shape: [1, 64] }, { name: 'l1.b', shape: [64] }, ...]
+```
+
 **Typed param tree.** `downloadParams()` returns a tree that mirrors the
 model class. If `MLP` has `l1: Linear; l2: Linear; l3: Linear` and `Linear`
 has `W: Tensor; b: Tensor`, then the return type is
@@ -548,11 +565,20 @@ expressed as a composition of existing ops (GELU, RMSNorm, etc. are a few
 lines), or — if you need a new primitive — added to the IR with a
 forward + backward + WGSL emit.
 
+## Potential future additions
+
+**Activation patching.** The dual of `capture` — a `patch(name, t)`
+marker that exposes any intermediate for *write* at runtime, the way
+`capture` exposes it for read. Sites are declared in the forward;
+whether they're active and what values they carry are per-`run()` /
+`step()` inputs. Covers mech-interp's core ablation toolkit (zero
+ablation, mean ablation, cross-input transplant) without per-experiment
+recompilation. Free when sites are inactive.
+
 ## When not to use this
 
 - **Inference of pretrained models** → use ONNX Runtime Web or
   transformers.js.
-- **Full JAX surface** (vmap, dynamic shapes, multi-backend) → use jax-js.
 - **Server-side training** → use PyTorch or JAX.
 
 ## License

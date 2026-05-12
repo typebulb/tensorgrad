@@ -175,6 +175,9 @@ export interface CompileForwardMethodOptions<M extends Module, I extends InputDe
  *  every method returns a Promise. Generic over the declared inputs shape
  *  `I` so `step` / `run` accept inputs with the right TypedArray per dtype. */
 export interface CompiledModule<M extends Module, I extends InputDecls = InputDecls> {
+  /** The compiled IR: forward graph, autograd, optimizer ops, buffer plan,
+   *  kernels. Use `compiled.ir.graph` to inspect ops, tensors, and
+   *  captures (see README). Swapped in place by `replaceModel`. */
   readonly ir: CompiledIR
   readonly kernelCount: number
   readonly outputShape: readonly number[]

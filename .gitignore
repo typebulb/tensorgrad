@@ -15,3 +15,6 @@ typebulbs
 .github/
 .claude/
 specs/
+
+# Lab phase — experimental, not for publication. See specs/Explorer.md.
+samples/explorer-lab/
