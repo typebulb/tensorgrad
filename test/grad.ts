@@ -10,7 +10,7 @@
 // (FD harness). Both are reusable for any future op.
 
 import {
-  tensorInput,
+  trace, paramInput, tensorInput,
   mul, add,
   dropout,
   mean,
@@ -21,8 +21,11 @@ import {
   softmaxCausal, whereCausal,
   gelu,
   conv2d, maxPool2d,
+  stopGradient,
 } from '../src/index.js'
-import { section, done } from './_assert.js'
+import { appendGrad } from '../src/grad.js'
+import { evalGraph } from './_eval.js'
+import { section, ok, fail, done } from './_assert.js'
 import { assertGradMatchesFD } from './_fdgrad.js'
 
 section('FD vs autograd — class exemplars')
@@ -118,6 +121,30 @@ assertGradMatchesFD('whereCausal (lower-triangle pass, upper-triangle zero)', [4
 assertGradMatchesFD('maxPool2d (argmax-routing gradient)', [1, 2, 4, 4], p => {
   return mean(maxPool2d(p, 2))   // 2x2 pool, stride 2 (default)
 }, { paramInit: makeRange([1, 2, 4, 4]) })
+
+// 11. stopGradient: structural new pattern — autograd is supposed to *diverge*
+//     from FD here. Forward is identity, but the backward rule deliberately
+//     drops the cotangent. Test: build `mean(stopGradient(p) + p)` where the
+//     numerical derivative w.r.t. each p[i] is 2/N (both paths contribute),
+//     but autograd reports 1/N (only the un-detached path contributes).
+{
+  const N = 6
+  const init = new Float32Array(N).map((_, i) => i * 0.1 - 0.3)
+  const graph = trace(() => {
+    const p = paramInput('w', [N])
+    return mean(add(stopGradient(p), p))
+  })
+  const { paramGrads } = appendGrad(graph)
+  const vals = evalGraph(graph, { w: init })
+  const g = vals.get(paramGrads['w']!.id) as Float32Array
+  const expected = 1 / N
+  for (let i = 0; i < N; i++) {
+    if (Math.abs(g[i]! - expected) > 1e-5) {
+      fail(`stopGradient: autograd g[${i}]=${g[i]} expected ${expected} (gradient should flow only through the un-detached path)`)
+    }
+  }
+  ok(`stopGradient blocks backward — autograd grad is 1/N on the un-detached path only`)
+}
 
 done('test/grad.ts')
 

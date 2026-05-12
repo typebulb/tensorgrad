@@ -245,6 +245,10 @@ function runAdjointRule(
     case 'randn':
       // Samples from a fixed distribution; no differentiable inputs.
       return
+    case 'stop_gradient':
+      // The whole point: detach the input from the backward pass. Cotangent
+      // arrives but doesn't propagate.
+      return
     case 'concat': {
       // Slice the gradient back into each input's piece along the concat axis.
       let cursor = 0

@@ -101,9 +101,10 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2d(x, k, { stride: s, padding: p })` |
 | `F.interpolate(x, scale_factor=k, mode='nearest')` | `nearestUpsample2d(x, k)` |
 | `torch.randn(shape)` | `randn(shape)` — uses the per-step PRNG; zero gradient |
+| `x.detach()` / `torch.no_grad()` (for a single tensor) | `stopGradient(x)` |
 | `x ** 2` / `x.square()` | `square(x)` |
 | `torch.sin(x)` / `torch.cos(x)` | `sin(x)` / `cos(x)` |
-| `torch.take(t, idx)` / 1-D `torch.gather` | `take(table, indices)` — for 1-D tables; use `embedding` for 2-D |
+| `torch.gather(input, dim, index)` / `jnp.take_along_axis(arr, idx, axis)` | `takeAlongAxis(input, indices, axis)` — same-rank, NumPy/JAX naming |
 
 ### Things that aren't 1-to-1
 
@@ -356,12 +357,13 @@ Imported from `'tensorgrad'`:
 - Activations: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`
 - Clamping: `clamp(x, lo, hi)` (scalar bounds)
 - Stochastic: `dropout(x, p)` (inverted dropout, p ∈ [0, 1)), `randn(shape)` (N(0, 1) sampler, zero gradient)
+- Autograd control: `stopGradient(x)` (identity forward, no-op backward — PyTorch's `.detach()`)
 - Comparisons / select: `less`, `greater`, `where`
 - Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax(x, axis?)`, `argmin(x, axis?)`
 - Shape: `reshape`, `permute`, `swapAxes` (`permute` is full-axis reorder, like PyTorch's `permute` / JAX's `jnp.transpose`)
 - Attention layout: `splitHeads(x, nHeads)`, `mergeHeads(x)`
 - Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank)
-- Indexing / casting: `oneHot`, `arange`, `embedding`, `take(table, indices)` (1-D-table gather)
+- Indexing / casting: `oneHot`, `arange`, `embedding`, `takeAlongAxis(input, indices, axis)` (general per-axis gather)
 - Slicing / structural: `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal`
 - 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`, `flatten(x, startAxis?)`

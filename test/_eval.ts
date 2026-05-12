@@ -221,10 +221,12 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       return out
     }
 
-    // ---- Shape -----------------------------------------------------------
-    case 'reshape': {
-      // Same backing data, just a new shape; copy to a fresh buffer to keep
-      // value provenance independent.
+    // ---- Shape / detach --------------------------------------------------
+    case 'reshape':
+    case 'stop_gradient': {
+      // Same backing data, just a new shape (reshape) or a detached view
+      // (stop_gradient); copy to a fresh buffer to keep value provenance
+      // independent.
       const a = v(op.a)
       return a.slice() as Val
     }

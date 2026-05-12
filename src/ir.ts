@@ -111,6 +111,10 @@ export type OpNode =
   // PCG draws + Box-Muller to emit one N(0, 1) value. Output shape is baked
   // into the op (no input tensor — randn synthesizes its values).
   | { kind: 'randn'; out: number; seed: number; salt: number; shape: Shape }
+  // Identity-copy forward, no-op backward. Used to detach a tensor from the
+  // autograd graph so gradient stops flowing through it (PyTorch's `.detach()`,
+  // JAX's `lax.stop_gradient`). Works on any dtype.
+  | { kind: 'stop_gradient'; out: number; a: number }
 
   // ---- Reductions (over last axis only; permute first for other axes) -----
   | { kind: 'mean_last'; out: number; a: number }   // keepdims=true

@@ -132,6 +132,20 @@ export function square(a: Tensor): Tensor {
   return mul(a, a)
 }
 
+/** Detach a tensor from the autograd graph: forward is the identity, but
+ *  the backward pass treats the result as a constant and stops gradient
+ *  from flowing back to `a`. PyTorch's `tensor.detach()`, JAX's
+ *  `lax.stop_gradient`.
+ *
+ *  Use cases: actor-critic value baselines (don't let the policy-gradient
+ *  signal train the value head), schedule constants that flow through the
+ *  graph but shouldn't be differentiated, target networks, residual
+ *  learning where you want to freeze part of the computation. */
+export function stopGradient(a: Tensor): Tensor {
+  const site = captureSite('stopGradient')
+  return addOp(currentGraph(), 'stop_gradient', a.shape, a.dtype, site, { a: a.id })
+}
+
 /** SiLU / Swish: `x * sigmoid(x)`. Composed from primitives. */
 export function silu(a: Tensor): Tensor {
   return mul(a, sigmoid(a))
@@ -470,30 +484,68 @@ export function oneHot(indices: Tensor, depth: number, dtype: Dtype = 'f32'): Te
   return addOp(currentGraph(), 'one_hot', outShape, dtype, site, { indices: indices.id, depth, dtype })
 }
 
-/** Gather from a 1-D table by index. `table` is `[V]` f32; `indices` is any
- *  shape `[...]` of i32; result is `[...]` (same shape as indices). Used for
- *  per-sample lookups into precomputed schedules (DDPM α-schedule, RL value
- *  tables indexed along a single axis, etc.).
+/** Gather along a single axis using a per-position index. `input` and
+ *  `indices` must have the same rank; their shapes must match on every
+ *  axis except `axis`, where `indices` selects which positions to pull
+ *  from `input`. The output has the same shape as `indices`.
  *
- *  Composes from `oneHot` + `matmul` (the same trick `embedding` uses for
- *  `[V, D]` tables) — autograd flows through the matmul adjoint, no new
- *  kernel. For 2-D table lookups (`embedding` semantics) use `embedding`. */
-export function take(table: Tensor, indices: Tensor): Tensor {
-  const site = captureSite('take')
-  if (table.shape.length !== 1) {
-    throw new ShapeError(`take: table must be 1-d [V], got ${showShape(table.shape)}`, site)
-  }
-  if (table.dtype !== 'f32') {
-    throw new ShapeError(`take: table must be f32, got ${table.dtype}`, site)
+ *  Matches `jnp.take_along_axis` / NumPy's `take_along_axis`. PyTorch's
+ *  `torch.gather(input, dim, index)` has equivalent semantics with a
+ *  different argument order — see the porting table.
+ *
+ *  Examples:
+ *  - 1-D table, 1-D index: `takeAlongAxis(schedule [V], t [B], 0)` → `[B]`
+ *  - Per-row pick: `takeAlongAxis(logits [N, C], actions [N, 1], 1)` → `[N, 1]`
+ *  - General: `takeAlongAxis(x [A, B, C], idx [A, K, C], 1)` → `[A, K, C]`
+ *
+ *  Composition under the hood: permute the gather axis to the end,
+ *  reshape to inject a broadcast axis, multiply with `oneHot(indices)`,
+ *  sum over the depth axis. No new kernel — autograd flows back through
+ *  the composed ops correctly. */
+export function takeAlongAxis(input: Tensor, indices: Tensor, axis: number): Tensor {
+  const site = captureSite('takeAlongAxis')
+  if (input.dtype !== 'f32') {
+    throw new ShapeError(`takeAlongAxis: input must be f32, got ${input.dtype}`, site)
   }
   if (indices.dtype !== 'i32') {
-    throw new ShapeError(`take: indices must be i32, got ${indices.dtype}`, site)
+    throw new ShapeError(`takeAlongAxis: indices must be i32, got ${indices.dtype}`, site)
   }
-  const V = table.shape[0]!
-  const oh = oneHot(indices, V, 'f32')       // [...indices.shape, V]
-  const t2d = reshape(table, [V, 1])         // [V, 1]
-  const result = matmul(oh, t2d)             // [...indices.shape, 1]
-  return reshape(result, indices.shape)      // [...indices.shape]
+  const N = input.shape.length
+  if (indices.shape.length !== N) {
+    throw new ShapeError(
+      `takeAlongAxis: input and indices must have the same rank, got ${showShape(input.shape)} and ${showShape(indices.shape)}`,
+      site,
+    )
+  }
+  const k = axis < 0 ? N + axis : axis
+  if (k < 0 || k >= N) {
+    throw new ShapeError(`takeAlongAxis: axis ${axis} out of range for rank-${N} input`, site)
+  }
+  for (let i = 0; i < N; i++) {
+    if (i === k) continue
+    if (input.shape[i]! !== indices.shape[i]!) {
+      throw new ShapeError(
+        `takeAlongAxis: input and indices must match on every axis except ${k}, ` +
+        `got ${showShape(input.shape)} and ${showShape(indices.shape)}`, site,
+      )
+    }
+  }
+  // Move the gather axis to last so the oneHot product sums over it.
+  const perm: number[] = []
+  for (let i = 0; i < N; i++) if (i !== k) perm.push(i)
+  perm.push(k)
+  const permuted = permute(input, perm)
+  // Reinsert a size-1 axis at the original position so the broadcast aligns
+  // with the oneHot. Total elements unchanged → pure reshape.
+  const sA = input.shape[k]!
+  const expandedShape: number[] = []
+  for (let i = 0; i < N; i++) expandedShape.push(i === k ? 1 : input.shape[i]!)
+  expandedShape.push(sA)
+  const expanded = reshape(permuted, expandedShape)
+  // oneHot appends a size-sA depth axis to indices.
+  const oh = oneHot(indices, sA, 'f32')
+  // Broadcast-multiply (size-1 vs k along the gather axis) and sum the depth axis.
+  return sum(mul(expanded, oh), -1)
 }
 
 /** Embedding lookup: pull rows from `table` indexed by `indices`. Decomposes

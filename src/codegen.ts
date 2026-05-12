@@ -350,10 +350,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: outerSize, workgroupSize: WG_SIZE }
     }
 
-    // ---- Shape ---------------------------------------------------------------
-    // reshape could alias buffers; we emit a memcpy-style kernel instead since
-    // aliasing complicates the buffer plan and we have memory headroom.
-    case 'reshape': {
+    // ---- Shape / detach ----------------------------------------------------
+    // Both ops are byte-identical memcpy; reshape relabels the shape, while
+    // stop_gradient detaches from the autograd graph. Aliasing the buffers
+    // would save a copy but complicates the buffer plan; we have headroom.
+    case 'reshape':
+    case 'stop_gradient': {
       const out = tof(op.out)
       const a = tof(op.a)
       const total = shapeSize(out.shape)

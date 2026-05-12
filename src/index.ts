@@ -14,6 +14,8 @@ export {
   square,
   // Stochastic regularization
   dropout, randn,
+  // Autograd control
+  stopGradient,
   // Comparisons + select
   less, greater, where,
   // Reductions
@@ -25,7 +27,7 @@ export {
   // Linear algebra
   matmul,
   // Indexing / casting
-  oneHot, arange, embedding, take,
+  oneHot, arange, embedding, takeAlongAxis,
   // ML primitives
   softmaxCausal, logSoftmax, softmax, whereCausal,
   // 2D conv + pool (NCHW)
