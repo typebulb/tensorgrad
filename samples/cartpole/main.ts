@@ -21,10 +21,10 @@
 // as the other samples.
 
 import {
-  Module, compileModule, isWebGPUAvailable, nn,
+  Module, compile, spec, isWebGPUAvailable, nn,
   mul, sum,
   tanh, oneHot, logSoftmax, softmax,
-  type Tensor, type CompiledModule, type CompiledForwardModule,
+  type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
 // ============================================================================
@@ -127,8 +127,8 @@ function predictFn(m: Policy, { state }: { state: Tensor }): Tensor {
 // State + lifecycle
 // ---------------------------------------------------------------------------
 
-let compiled: CompiledModule<Policy> | null = null
-let predict:  CompiledForwardModule<Policy> | null = null
+let train: CompiledTraining<Policy> | null = null
+let infer: CompiledForward<Policy> | null = null
 let running = false
 let rolloutCount = 0
 let recentEpLens: number[] = []                       // rolling window for status
@@ -152,7 +152,7 @@ async function rollout(): Promise<{
   states: Float32Array; actions: Int32Array; returns: Float32Array; mask: Float32Array
   epLens: number[]
 }> {
-  if (!predict) throw new Error('rollout: no inference graph')
+  if (!infer) throw new Error('rollout: no inference graph')
   const envs: Env[] = Array.from({ length: K }, resetEnv)
   const stateBuf  = new Float32Array(K * STATE_DIM)
   const statesAll = new Float32Array(MAX_T * K * STATE_DIM)
@@ -170,7 +170,9 @@ async function rollout(): Promise<{
       stateBuf[o + 2] = envs[k]!.theta
       stateBuf[o + 3] = envs[k]!.thetaDot
     }
-    const probs = await predict.run({ state: stateBuf })  // [K, A]
+    const probsR = await infer.run({ state: stateBuf })  // [K, A]
+    if (probsR.kind === 'aborted') break
+    const probs = probsR.output
 
     for (let k = 0; k < K; k++) {
       const idx = (t * K + k)
@@ -216,11 +218,13 @@ async function rollout(): Promise<{
 }
 
 async function runTraining(): Promise<void> {
-  while (running && compiled) {
+  while (running && train) {
     const r = await rollout()
-    const loss = await compiled.step({
+    const stepR = await train.step({
       states: r.states, actions: r.actions, returns: r.returns, mask: r.mask,
     })
+    if (stepR.kind === 'aborted') return
+    const loss = stepR.loss
     if (!Number.isFinite(loss)) {
       onStatus(`rollout ${rolloutCount}: loss is ${loss} — NaN, aborting.`)
       running = false
@@ -236,11 +240,12 @@ async function runTraining(): Promise<void> {
   }
 }
 
-async function compile(): Promise<void> {
+async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  compiled = await compileModule({
-    factory: () => new Policy(),
+  const model = new Policy()
+  train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR },
     inputs: {
@@ -249,14 +254,15 @@ async function compile(): Promise<void> {
       returns: [MAX_T * K],
       mask:    [MAX_T * K],
     },
-  })
-  predict = await compiled.compileForward({
+  }))
+  infer = await compile(spec({
+    model,
     forward: predictFn,
     inputs: { state: [K, STATE_DIM] },
-  })
+  }), { shareWith: train })
   rolloutCount = 0
   recentEpLens = []
-  onStatus(`compiled (${compiled.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
+  onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
 }
 
 function startTraining(): void {
@@ -270,14 +276,14 @@ function stopTraining(): void {
 }
 
 async function resetWeights(): Promise<void> {
-  if (!compiled) return
+  if (!train) return
   const wasRunning = running
   running = false
   await new Promise<void>(r => setTimeout(r, 0))
-  await compiled.reset()
+  await train.reset()
   rolloutCount = 0
   recentEpLens = []
-  onStatus(`weights re-initialized (seed ${compiled.seed})`)
+  onStatus(`weights re-initialized (seed ${train.seed})`)
   if (wasRunning) { running = true; void runTraining() }
 }
 
@@ -376,7 +382,7 @@ async function boot(): Promise<void> {
     onStatus('WebGPU not available. Try Chrome 113+ or Safari 17.4+.')
     return
   }
-  await compile()
+  await buildGraphs()
   trainBtn.disabled = false
   resetBtn.disabled = false
 }

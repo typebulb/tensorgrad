@@ -18,10 +18,10 @@
 // as the other samples.
 
 import {
-  Module, compileModule, isWebGPUAvailable, nn,
+  Module, compile, spec, isWebGPUAvailable, nn,
   mul, sub, mean, reshape, relu, sigmoid, concat,
   sin, cos, square,
-  type Tensor, type CompiledModule, type CompiledForwardModule,
+  type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
 // ============================================================================
@@ -101,8 +101,8 @@ function predictFn(m: NeRFTiny, { coords, freqs }: { coords: Tensor; freqs: Tens
 // State + lifecycle
 // ---------------------------------------------------------------------------
 
-let compiled: CompiledModule<NeRFTiny> | null = null
-let infer:    CompiledForwardModule<NeRFTiny> | null = null
+let train: CompiledTraining<NeRFTiny> | null = null
+let infer:    CompiledForward<NeRFTiny> | null = null
 let targetRgb: Float32Array | null = null  // [N_PIXELS * 3], the image we're fitting
 let running = false
 let step = 0
@@ -127,15 +127,17 @@ function nextBatch(): { coords: Float32Array; rgb: Float32Array; freqs: Float32A
 
 async function renderReconstruction(): Promise<void> {
   if (!infer) return
-  const out = await infer.run({ coords: GRID_COORDS, freqs: FREQS })
-  onReconstruction(out)
+  const r = await infer.run({ coords: GRID_COORDS, freqs: FREQS })
+  if (r.kind === 'completed') onReconstruction(r.output)
 }
 
 async function runTraining(): Promise<void> {
   let lastRender = 0
   let lastLoss = 0
-  while (running && compiled) {
-    lastLoss = await compiled.step(nextBatch())
+  while (running && train) {
+    const sr = await train.step(nextBatch())
+    if (sr.kind === 'aborted') return
+    lastLoss = sr.loss
     step += 1
     if (!Number.isFinite(lastLoss)) {
       onStatus(`step ${step}: loss is ${lastLoss} — NaN, aborting.`)
@@ -152,11 +154,12 @@ async function runTraining(): Promise<void> {
   }
 }
 
-async function compile(): Promise<void> {
+async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  compiled = await compileModule({
-    factory: () => new NeRFTiny(),
+  const model = new NeRFTiny()
+  train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: 1e-3 },
     inputs: {
@@ -164,16 +167,17 @@ async function compile(): Promise<void> {
       rgb:    [BATCH_SIZE, 3],
       freqs:  [L_FREQS],
     },
-  })
-  infer = await compiled.compileForward({
+  }))
+  infer = await compile(spec({
+    model,
     forward: predictFn,
     inputs: {
       coords: [N_PIXELS, 2],
       freqs:  [L_FREQS],
     },
-  })
+  }), { shareWith: train })
   step = 0
-  onStatus(`compiled (${compiled.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
+  onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
 }
 
 function startTraining(): void {
@@ -187,14 +191,14 @@ function stopTraining(): void {
 }
 
 async function resetWeights(): Promise<void> {
-  if (!compiled) return
+  if (!train) return
   const wasRunning = running
   running = false
   await new Promise<void>(r => setTimeout(r, 0))
-  await compiled.reset()
+  await train.reset()
   step = 0
   await renderReconstruction()
-  onStatus(`weights re-initialized (seed ${compiled.seed})`)
+  onStatus(`weights re-initialized (seed ${train.seed})`)
   if (wasRunning) { running = true; void runTraining() }
 }
 
@@ -320,8 +324,8 @@ uploadBtn.addEventListener('change', async () => {
   const rgb = await loadUploadedImage(file)
   setTargetImage(rgb)
   rgbToCanvas(rgb, targetCtx)
-  if (compiled) {
-    await compiled.reset()
+  if (train) {
+    await train.reset()
     step = 0
     await renderReconstruction()
   }
@@ -342,7 +346,7 @@ async function boot(): Promise<void> {
   const rgb = makeDefaultImage()
   setTargetImage(rgb)
   rgbToCanvas(rgb, targetCtx)
-  await compile()
+  await buildGraphs()
   await renderReconstruction()
   trainBtn.disabled = false
   resetBtn.disabled = false

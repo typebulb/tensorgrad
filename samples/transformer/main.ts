@@ -6,7 +6,7 @@
 // and computation.
 
 import {
-  Module, compileModule, lr, nn, capture,
+  Module, compile, spec, lr, nn, capture,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
   softmaxCausal, splitHeads, mergeHeads,
@@ -172,8 +172,9 @@ async function run() {
   logEl.innerHTML = ''
   log('Building model + compiling...')
   const t0 = performance.now()
-  const compiled = await compileModule({
-    factory: () => new Transformer(),
+  const model = new Transformer()
+  const train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR, weightDecay: 0.01 },
     inputs: {
@@ -181,17 +182,18 @@ async function run() {
       targets: { shape: [B, T], dtype: 'i32' },
       mask:    [T],
     },
-  })
+  }))
   const compileMs = performance.now() - t0
 
-  log(`  ${compiled.paramNames.length} params, ${compiled.kernels.length} kernels, compile ${compileMs.toFixed(0)} ms`, 'ok')
+  log(`  ${train.paramNames.length} params, ${train.kernels.length} kernels, compile ${compileMs.toFixed(0)} ms`, 'ok')
 
   log('Compiling inference graph (B=1)...')
   const tInfer = performance.now()
-  const predict = await compiled.compileForward({
+  const infer = await compile(spec({
+    model,
     forward: predictFwd,
     inputs: { tokens: { shape: [1, T], dtype: 'i32' } },
-  })
+  }), { shareWith: train })
   log(`  compile ${(performance.now() - tInfer).toFixed(0)} ms`, 'ok')
 
   // One-row test input for the per-100-step shape check.
@@ -215,7 +217,9 @@ async function run() {
       tokensBuf.fill(0)
       for (let i = 0; i < prefix.length; i++) tokensBuf[i] = prefix[i]!
       for (let i = 0; i < generated.length; i++) tokensBuf[prefix.length + i] = generated[i]!
-      const output = await predict.run({ tokens: tokensBuf })
+      const r = await infer.run({ tokens: tokensBuf })
+      if (r.kind === 'aborted') return generated
+      const output = r.output
       const lastStart = (realLen - 1) * VOCAB
       let best = 0
       let bestL = output[lastStart]!
@@ -248,8 +252,8 @@ async function run() {
   // training, then a downloadParamGrads round-trip. Both should be silent;
   // any error here is a worker-protocol bug.
   log('Worker smoke: reset() + downloadParamGrads()...')
-  await compiled.reset()
-  const grads = await compiled.downloadParamGrads()
+  await train.reset()
+  const grads = await train.downloadParamGrads()
   const gradEntries = Object.keys(grads).length
   log(`  ${gradEntries} param grads (expect zeros after reset)`, 'ok')
 
@@ -259,7 +263,9 @@ async function run() {
   while (!stopRequested) {
     step++
     const { tokens, targets } = makeBatch()
-    const lossVal = await compiled.step({ tokens, targets, mask: RESULT_MASK })
+    const sr = await train.step({ tokens, targets, mask: RESULT_MASK })
+    if (sr.kind === 'aborted') break
+    const lossVal = sr.loss
     if (step === 1 || step % 20 === 0) {
       const interval = step === 1 ? 1 : 20
       const dt = (performance.now() - stepStart) / Math.max(1, interval)
@@ -269,10 +275,12 @@ async function run() {
       log(`  step ${step.toString().padStart(4)}  loss ${lossVal.toFixed(4)}  examples ${examples}  (${exPerSec.toLocaleString()} ex/s)`)
     }
     // Periodic inference checks: the cheap one runs every 100 steps to
-    // exercise run() + withCaptures + sharedParams; the held-out accuracy
+    // exercise run() + sharedParams + captures; the held-out accuracy
     // probe runs every 100 steps too, verifying autoregressive prediction.
     if (step === 1 || step % 100 === 0) {
-      const { output, captures } = await predict.run({ tokens: inferTokens }, { withCaptures: true })
+      const rr = await infer.run({ tokens: inferTokens })
+      if (rr.kind === 'aborted') break
+      const { output, captures } = rr
       const expectOutput = 1 * T * VOCAB
       const expectAttn = 1 * N_HEADS * T * T
       const attn0 = captures.get('attn.0')
@@ -290,8 +298,8 @@ async function run() {
     if (step % 5 === 0) await new Promise(r => setTimeout(r, 0))
   }
   log(`Stopped at step ${step}.`, 'ok')
-  predict.destroy()
-  compiled.destroy()
+  infer.destroy()
+  train.destroy()
   runBtn.disabled = false; stopBtn.disabled = true
 }
 

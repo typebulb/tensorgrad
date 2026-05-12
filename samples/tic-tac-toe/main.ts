@@ -21,10 +21,10 @@
 // as the other samples.
 
 import {
-  Module, compileModule, isWebGPUAvailable, nn,
+  Module, compile, spec, isWebGPUAvailable, nn,
   mul, sum,
   tanh, oneHot, logSoftmax, softmax,
-  type Tensor, type CompiledModule, type CompiledForwardModule,
+  type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
 // ============================================================================
@@ -133,8 +133,8 @@ function predictFn(m: Policy, { state }: { state: Tensor }): Tensor {
 // State + lifecycle
 // ---------------------------------------------------------------------------
 
-let compiled: CompiledModule<Policy> | null = null
-let predict:  CompiledForwardModule<Policy> | null = null
+let train: CompiledTraining<Policy> | null = null
+let infer: CompiledForward<Policy> | null = null
 let running = false
 let rolloutCount = 0
 let lastWinRate = 0
@@ -167,7 +167,7 @@ function sampleMaskedAction(probs: Float32Array, offset: number, legal: Int8Arra
 async function rollout(): Promise<{
   states: Float32Array; actions: Int32Array; outcomes: Float32Array; mask: Float32Array
 }> {
-  if (!predict) throw new Error('rollout: no inference graph')
+  if (!infer)throw new Error('rollout: no inference graph')
   const games: Game[] = Array.from({ length: K }, newGame)
   const statesAll  = new Float32Array(N_SLOTS * STATE_DIM)
   const actionsAll = new Int32Array(N_SLOTS)
@@ -182,7 +182,9 @@ async function rollout(): Promise<{
     for (let k = 0; k < K; k++) {
       if (!games[k]!.done) packState(games[k]!, stateBatch, k * STATE_DIM)
     }
-    const probs = await predict.run({ state: stateBatch })  // [K, 9]
+    const probsR = await infer.run({ state: stateBatch })  // [K, 9]
+    if (probsR.kind === 'aborted') break
+    const probs = probsR.output
 
     for (let k = 0; k < K; k++) {
       const g = games[k]!
@@ -227,7 +229,7 @@ async function rollout(): Promise<{
 // Evaluate current policy vs random opponent. Plays NEVAL games as each side
 // and reports overall win+draw rate from the trained model's perspective.
 async function evalVsRandom(): Promise<number> {
-  if (!predict) return 0
+  if (!infer)return 0
   const NEVAL = 30
   let wins = 0, draws = 0
   const stateBatch = new Float32Array(STATE_DIM)
@@ -237,7 +239,9 @@ async function evalVsRandom(): Promise<number> {
     while (!g.done) {
       if (g.turn === modelIsPlayer) {
         packState(g, stateBatch, 0)
-        const probs = await predict.run({ state: stateBatch })
+        const pr = await infer.run({ state: stateBatch })
+        if (pr.kind === 'aborted') return 0
+        const probs = pr.output
         const legal = new Int8Array(9)
         for (let i = 0; i < 9; i++) legal[i] = g.cells[i] === 0 ? 0 : 1
         // Greedy at eval time.
@@ -260,11 +264,13 @@ async function evalVsRandom(): Promise<number> {
 }
 
 async function runTraining(): Promise<void> {
-  while (running && compiled) {
+  while (running && train) {
     const r = await rollout()
-    const loss = await compiled.step({
+    const sr = await train.step({
       states: r.states, actions: r.actions, outcomes: r.outcomes, mask: r.mask,
     })
+    if (sr.kind === 'aborted') return
+    const loss = sr.loss
     if (!Number.isFinite(loss)) {
       onStatus(`rollout ${rolloutCount}: loss is ${loss} — NaN, aborting.`)
       running = false
@@ -282,10 +288,12 @@ async function runTraining(): Promise<void> {
 
 // Pick the model's best legal move from the given game state.
 async function modelMove(g: Game): Promise<number> {
-  if (!predict) throw new Error('modelMove: no inference graph')
+  if (!infer)throw new Error('modelMove: no inference graph')
   const stateBuf = new Float32Array(STATE_DIM)
   packState(g, stateBuf, 0)
-  const probs = await predict.run({ state: stateBuf })
+  const pr = await infer.run({ state: stateBuf })
+  if (pr.kind === 'aborted') return -1
+  const probs = pr.output
   let bestIdx = -1, bestVal = -Infinity
   for (let i = 0; i < 9; i++) {
     if (g.cells[i] !== 0) continue
@@ -294,11 +302,12 @@ async function modelMove(g: Game): Promise<number> {
   return bestIdx
 }
 
-async function compile(): Promise<void> {
+async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  compiled = await compileModule({
-    factory: () => new Policy(),
+  const model = new Policy()
+  train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR },
     inputs: {
@@ -307,15 +316,16 @@ async function compile(): Promise<void> {
       outcomes: [N_SLOTS],
       mask:     [N_SLOTS],
     },
-  })
+  }))
   // Polymorphic batch dim: K=16 during rollouts, B=1 for human-vs-AI moves.
-  predict = await compiled.compileForward({
+  infer = await compile(spec({
+    model,
     forward: predictFn,
     inputs: { state: [null, STATE_DIM] },
-  })
+  }), { shareWith: train })
   rolloutCount = 0
   lastWinRate = 0
-  onStatus(`compiled (${compiled.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
+  onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
 }
 
 function startTraining(): void {
@@ -329,14 +339,14 @@ function stopTraining(): void {
 }
 
 async function resetWeights(): Promise<void> {
-  if (!compiled) return
+  if (!train) return
   const wasRunning = running
   running = false
   await new Promise<void>(r => setTimeout(r, 0))
-  await compiled.reset()
+  await train.reset()
   rolloutCount = 0
   lastWinRate = 0
-  onStatus(`weights re-initialized (seed ${compiled.seed})`)
+  onStatus(`weights re-initialized (seed ${train.seed})`)
   if (wasRunning) { running = true; void runTraining() }
 }
 
@@ -403,7 +413,7 @@ async function startNewGame(): Promise<void> {
   humanPlayer = sideSelect.value === 'O' ? 1 : 0
   renderBoard()
   // If model goes first, get its move now.
-  if (humanGame.turn !== humanPlayer && predict) await modelRespond()
+  if (humanGame.turn !== humanPlayer && infer) await modelRespond()
 }
 
 onStatus = (msg) => { statusEl.textContent = msg }
@@ -436,7 +446,7 @@ async function boot(): Promise<void> {
     onStatus('WebGPU not available. Try Chrome 113+ or Safari 17.4+.')
     return
   }
-  await compile()
+  await buildGraphs()
   trainBtn.disabled = false
   resetBtn.disabled = false
   newGameBtn.disabled = false

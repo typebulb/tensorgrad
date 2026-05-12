@@ -12,7 +12,7 @@
 // with multinomial temperature-1 sampling, stops on '.' or SEQ_LEN.
 
 import {
-  Module, compileModule, isWebGPUAvailable, lr, nn,
+  Module, compile, spec, isWebGPUAvailable, lr, nn,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
   softmaxCausal, splitHeads, mergeHeads,
@@ -223,8 +223,9 @@ async function run() {
 
   log('Building model + compiling...')
   const t0 = performance.now()
-  const compiled = await compileModule({
-    factory: () => new Transformer(),
+  const model = new Transformer()
+  const train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR, weightDecay: 0.01 },
     inputs: {
@@ -232,26 +233,28 @@ async function run() {
       targets: { shape: [B, T], dtype: 'i32' },
       mask:    [B, T],
     },
-  })
-  log(`  ${compiled.paramNames.length} params, ${compiled.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
+  }))
+  log(`  ${train.paramNames.length} params, ${train.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
 
   log('Compiling inference + val-loss graphs...')
   const tInfer = performance.now()
-  const predict = await compiled.compileForward({
+  const infer = await compile(spec({
+    model,
     forward: predictFwd,
     inputs: { tokens: { shape: [1, T], dtype: 'i32' } },
-  })
+  }), { shareWith: train })
   // Forward-only loss graph at full batch shape — feeds the periodic val probe.
-  // Same lossFn, same shapes; reuses model params from compiled (compileForward
-  // shares the param buffers, so val loss reflects the latest training state).
-  const valLossFwd = await compiled.compileForward({
+  // Shares the param buffers via { shareWith }, so val loss reflects the
+  // latest training state.
+  const valLossFwd = await compile(spec({
+    model,
     forward: lossFn,
     inputs: {
       tokens:  { shape: [B, T], dtype: 'i32' },
       targets: { shape: [B, T], dtype: 'i32' },
       mask:    [B, T],
     },
-  })
+  }), { shareWith: train })
   log(`  compile ${(performance.now() - tInfer).toFixed(0)} ms`, 'ok')
 
   const tokensBuf = new Int32Array(T)
@@ -260,9 +263,10 @@ async function run() {
     while (generated.length + 1 < T) {
       tokensBuf.fill(PAD)                       // tokens[0] = '.' (BOS)
       for (let i = 0; i < generated.length; i++) tokensBuf[i + 1] = generated[i]!
-      const output = await predict.run({ tokens: tokensBuf })
+      const r = await infer.run({ tokens: tokensBuf })
+      if (r.kind === 'aborted') return generated.map(decodeChar).join('')
       const readPos = generated.length          // next-token logits at the last written position
-      const probs = softmaxRow(output, readPos * VOCAB, VOCAB)
+      const probs = softmaxRow(r.output, readPos * VOCAB, VOCAB)
       const next = sampleFromProbs(probs)
       if (next === PAD) break
       generated.push(next)
@@ -275,7 +279,9 @@ async function run() {
   let stepStart = performance.now()
   while (!stopRequested) {
     step++
-    const lossVal = await compiled.step(makeBatch(false))
+    const sr = await train.step(makeBatch(false))
+    if (sr.kind === 'aborted') break
+    const lossVal = sr.loss
     if (step === 1 || step % 20 === 0) {
       const interval = step === 1 ? 1 : 20
       const dt = (performance.now() - stepStart) / Math.max(1, interval)
@@ -284,8 +290,9 @@ async function run() {
       log(`  step ${step.toString().padStart(4)}  loss ${lossVal.toFixed(4)}  (${exPerSec.toLocaleString()} ex/s)`)
     }
     if (step === 1 || step % 100 === 0) {
-      const valOut = await valLossFwd.run(makeBatch(true))
-      const valLoss = valOut[0]!
+      const vr = await valLossFwd.run(makeBatch(true))
+      if (vr.kind === 'aborted') break
+      const valLoss = vr.output[0]!
       const samples: string[] = []
       for (let i = 0; i < 8; i++) samples.push(await sampleName())
       const novel = samples.filter(s => !TRAIN_SET.has(s) && s.length > 0).length
@@ -294,7 +301,7 @@ async function run() {
     if (step % 5 === 0) await new Promise(r => setTimeout(r, 0))
   }
   log(`Stopped at step ${step}.`, 'ok')
-  predict.destroy(); valLossFwd.destroy(); compiled.destroy()
+  infer.destroy(); valLossFwd.destroy(); train.destroy()
   runBtn.disabled = false; stopBtn.disabled = true
 }
 

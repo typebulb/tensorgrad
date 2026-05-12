@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>KAN-tiny (tensorgrad)</title>
+  <style>
+    body {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      max-width: 760px;
+      margin: 3rem auto;
+      padding: 0 1rem;
+      color: #222;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .subtitle { color: #666; margin-top: 0; margin-bottom: 1.5rem; }
+    #status {
+      font-family: ui-monospace, monospace;
+      font-size: 0.95rem;
+      background: #f7f7f7;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      min-height: 1.4em;
+      margin-bottom: 1rem;
+    }
+    .controls { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    button {
+      font: inherit;
+      padding: 0.5rem 1rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fafafa;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #f0f0f0; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    canvas {
+      display: block;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      background: #fff;
+      margin-bottom: 1rem;
+    }
+    figcaption {
+      font-size: 0.85rem;
+      color: #666;
+      margin-bottom: 0.5rem;
+    }
+    p.help { color: #555; font-size: 0.9rem; margin-top: 1rem; }
+    p.help code { background: #f3f3f3; padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>KAN-tiny</h1>
+  <p class="subtitle">
+    A 2-layer Kolmogorov-Arnold Network fitting <code>y = sin(πx)</code>.
+    Each edge is a learnable univariate function (a cubic B-spline) rather
+    than the usual scalar-weight-times-fixed-nonlinearity. The bottom grid
+    plots every edge's spline; watch them evolve as the network discovers
+    a decomposition of the target.
+  </p>
+
+  <div id="status">initializing…</div>
+
+  <div class="controls">
+    <button id="train" disabled>Train</button>
+    <button id="stop"  disabled>Stop</button>
+    <button id="reset" disabled>Reset weights</button>
+  </div>
+
+  <figcaption>fit: target sin(πx) (gray) vs model (blue) over x ∈ [-1, 1]</figcaption>
+  <canvas id="fit-canvas" width="720" height="180"></canvas>
+
+  <figcaption>per-edge splines — top row: 1 → 4 layer; bottom row: 4 → 1 layer</figcaption>
+  <canvas id="edge-canvas" width="720" height="260"></canvas>
+
+  <p class="help">
+    Architecture: two KAN layers <code>1 → 4 → 1</code>. Each layer's output
+    is <code>Σ_i φ_{o,i}(x_i) + silu(x) @ W_res</code>, where every
+    <code>φ_{o,i}</code> is a cubic B-spline (8 coefficients, integer-spaced
+    centers covering <code>[-1, 1]</code>). Adam, lr 5e-3, MSE loss, batches
+    of 256. No new ops vs the rest of the library — the B-spline basis is
+    a few <code>where</code> / <code>abs</code> / <code>mul</code> calls.
+  </p>
+
+  <p><a href="/">← back to samples</a></p>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

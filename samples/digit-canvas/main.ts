@@ -30,9 +30,9 @@
 // entirely in the UI section.
 
 import {
-  Module, compileModule, isWebGPUAvailable, nn,
+  Module, compile, spec, isWebGPUAvailable, nn,
   relu, dropout, softmax, singleFlight,
-  type Tensor, type CompiledModule, type CompiledForwardModule,
+  type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
 // ============================================================================
@@ -130,9 +130,9 @@ let trainCursor = 0
 
 // `any` here is the polymorphic-shape input type that includes `null` —
 // the public type signature doesn't yet narrow nicely with wildcards.
-let compiled: CompiledModule<MLP, { x: readonly [number, number]; y: { shape: readonly [number]; dtype: 'i32' } }> | null = null
-let predict: CompiledForwardModule<MLP, { x: readonly [null, number] }> | null = null
-let predictCanvas: ((input: Float32Array) => Promise<Float32Array>) | null = null
+let train: CompiledTraining<MLP, { x: readonly [number, number]; y: { shape: readonly [number]; dtype: 'i32' } }> | null = null
+let infer: CompiledForward<MLP, { x: readonly [null, number] }> | null = null
+let predictCanvas: ((input: Float32Array) => Promise<Float32Array | null>) | null = null
 
 let running = false
 let trainingActive = false
@@ -162,7 +162,7 @@ function nextTrainBatch(): { x: Float32Array; y: Int32Array } {
 }
 
 async function probeAccuracy(): Promise<number> {
-  if (!predict) return 0
+  if (!infer) return 0
   const x = new Float32Array(EVAL_BATCH * INPUT_DIM)
   const truth = new Int32Array(EVAL_BATCH)
   for (let b = 0; b < EVAL_BATCH; b++) {
@@ -172,7 +172,9 @@ async function probeAccuracy(): Promise<number> {
   }
   // First call at B=EVAL_BATCH triggers a sibling compile + cache;
   // subsequent calls hit the cache.
-  const probs = await predict.run({ x })
+  const r = await infer.run({ x })
+  if (r.kind === 'aborted') return 0
+  const probs = r.output
   let correct = 0
   for (let b = 0; b < EVAL_BATCH; b++) {
     let best = 0
@@ -189,9 +191,9 @@ async function runTraining(): Promise<void> {
   let lastEval = 0
   let lastLoss = 0
   try {
-    while (running && compiled) {
+    while (running && train) {
       const batch = nextTrainBatch()
-      const r = await compiled.step(batch, { abortAsValue: true })
+      const r = await train.step(batch)
       if (r.kind === 'aborted') return   // graph was replaced; quietly bail
       lastLoss = r.loss
       step += 1
@@ -220,64 +222,69 @@ async function loadMnist(): Promise<void> {
   shuffleOrder(trainOrder)
 }
 
-async function compile(hidden: number, lr: number): Promise<void> {
+async function buildGraphs(hidden: number, lr: number): Promise<void> {
   const layers = [INPUT_DIM, hidden, N_CLASSES]
   onStatus(`compiling MLP ${layers.join(' → ')}…`)
   const t0 = performance.now()
-  compiled = await compileModule({
-    factory: () => new MLP(layers),
+  const model = new MLP(layers)
+  train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr, weightDecay: 0.01, clipGradNorm: 1.0 },
     inputs: {
       x: [BATCH_SIZE, INPUT_DIM],
       y: { shape: [BATCH_SIZE], dtype: 'i32' },
     },
-  })
-  // One polymorphic inference graph — the same predict serves the canvas
+  }))
+  // One polymorphic inference graph — the same infer serves the canvas
   // (B=1) and the accuracy probe (B=EVAL_BATCH).
-  predict = await compiled.compileForward({
+  infer = await compile(spec({
+    model,
     forward: predictFn,
     inputs: { x: [null, INPUT_DIM] },
-  })
+  }), { shareWith: train })
   // singleFlight: rapid strokes supersede each other; only the latest call
   // resolves. Captured via closure so the wrapper survives replaceModel
   // (which invalidates the per-shape kernel cache, not the proxy object).
-  const inferRef = predict
-  predictCanvas = singleFlight(async (input: Float32Array) => inferRef.run({ x: input }))
+  const inferRef = infer
+  predictCanvas = singleFlight(async (input: Float32Array): Promise<Float32Array | null> => {
+    const r = await inferRef.run({ x: input })
+    return r.kind === 'completed' ? r.output : null
+  })
   step = 0
-  onStatus(`ready (${compiled.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms, seed ${compiled.seed})`)
+  onStatus(`ready (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms, seed ${train.seed})`)
 }
 
 async function changeLayerSize(hidden: number): Promise<void> {
-  if (!compiled) return
+  if (!train) return
   const wasRunning = running
   running = false
   // Wait one tick so any in-flight step finishes and the training loop exits.
   await new Promise<void>(r => setTimeout(r, 0))
   const layers = [INPUT_DIM, hidden, N_CLASSES]
   onStatus(`replacing model with ${layers.join(' → ')}…`)
-  await compiled.replaceModel(() => new MLP(layers))
-  // The forward proxy (predict) stays the same object — its per-shape kernel
+  await train.replaceModel(new MLP(layers))
+  // The forward compile (infer) stays the same object — its per-shape kernel
   // cache was invalidated, so the next run() recompiles against the new
   // topology. predictCanvas (singleFlight wrapper) is still valid.
   step = 0
-  onStatus(`replaced (seed ${compiled.seed})`)
+  onStatus(`replaced (seed ${train.seed})`)
   if (wasRunning) { running = true; void runTraining() }
 }
 
 async function changeLR(lr: number): Promise<void> {
-  if (!compiled) return
-  await compiled.setOptimizerConfig({ lr })
+  if (!train) return
+  await train.setOptimizerConfig({ lr })
 }
 
 async function resetWeights(): Promise<void> {
-  if (!compiled) return
+  if (!train) return
   const wasRunning = running
   running = false
   await new Promise<void>(r => setTimeout(r, 0))
-  await compiled.reset()
+  await train.reset()
   step = 0
-  onStatus(`weights re-initialized (seed ${compiled.seed})`)
+  onStatus(`weights re-initialized (seed ${train.seed})`)
   if (wasRunning) { running = true; void runTraining() }
 }
 
@@ -462,7 +469,7 @@ async function boot(): Promise<void> {
   }
   statusEl.textContent = 'loading MNIST (~11 MB, cached after first load)…'
   await loadMnist()
-  await compile(parseInt(layerSelect.value, 10), parseFloat(lrSelect.value))
+  await buildGraphs(parseInt(layerSelect.value, 10), parseFloat(lrSelect.value))
 }
 
 boot().catch((e: unknown) => {

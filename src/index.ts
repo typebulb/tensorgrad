@@ -42,11 +42,13 @@ export { appendAdam, appendGradClip, lr, resolveLR, type AdamConfig, type AdamRe
 export { appendSGD, type SGDConfig, type SGDResult } from './sgd.js'
 export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
 export { emitKernels, type KernelSpec } from './codegen.js'
-export { Captures, type RunOptions, type StepResult, type RunResult, type Outcome, type UploadParamsOptions } from './runtime.js'
+export { Captures, type UploadParamsOptions } from './runtime.js'
 export {
-  compileToIR, compileModule, isWebGPUAvailable,
-  type CompiledIR, type CompileModuleOptions, type CompileForwardMethodOptions,
-  type CompiledModule, type CompiledForwardModule, type OptimizerConfig,
+  spec, compile, compileIR, isWebGPUAvailable,
+  type CompiledIR, type TrainingSpecOptions, type ForwardSpecOptions,
+  type TrainingSpec, type ForwardSpec, type Spec,
+  type CompiledTraining, type CompiledForward, type OptimizerConfig,
+  type StepResult, type RunResult, type QueueResult,
   type InputDecl, type InputDeclObject, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,
   type DtypeOf, type TypedArrayFor, type TypedInputs, type ParamTree,
 } from './compile.js'

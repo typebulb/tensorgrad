@@ -16,10 +16,8 @@ export interface UploadParamsOptions {
 /**
  * Activation readbacks for one `step()`/`run()` call. Keyed by the names
  * passed to `capture(name, t)` during the trace. `get(name)` throws if the
- * name isn't registered or wasn't read back this call (i.e., the call was
- * made without `{ withCaptures: true }`); use `has(name)` if you need to
- * branch. `shapeOf(name)` returns the static-after-compile shape and works
- * regardless of whether captures were read back.
+ * name wasn't registered during the trace. `shape(name)` returns the
+ * static-after-compile shape — works whether or not captures were populated.
  */
 export class Captures {
   constructor(
@@ -29,17 +27,16 @@ export class Captures {
   get(name: string): Float32Array {
     const d = this.data.get(name)
     if (!d) {
-      const known = [...this.data.keys()].sort().join(', ')
-      const detail = known ? `Known this call: ${known}` : `(call run/step with { withCaptures: true } to populate)`
-      throw new Error(`Captures.get: '${name}' not present. ${detail}`)
+      const known = [...this.data.keys()].sort().join(', ') || '(none registered)'
+      throw new Error(`Captures.get: '${name}' not present. Known: ${known}`)
     }
     return d
   }
-  shapeOf(name: string): readonly number[] {
+  shape(name: string): readonly number[] {
     const s = this.shapes[name]
     if (!s) {
       const known = Object.keys(this.shapes).sort().join(', ') || '(none registered)'
-      throw new Error(`Captures.shapeOf: '${name}' not registered. Known: ${known}`)
+      throw new Error(`Captures.shape: '${name}' not registered. Known: ${known}`)
     }
     return s
   }
@@ -47,49 +44,19 @@ export class Captures {
   names(): string[] { return [...this.data.keys()].sort() }
 }
 
-/** Result of `run(inputs, { withCaptures: true })`: the output tensor as
- *  a flat `Float32Array` plus the activation captures registered via
- *  `capture(...)` during the trace. */
-export interface RunResult {
+/** Result of `run(inputs)`: the output tensor as a flat `Float32Array`
+ *  plus a `Captures` instance. When the traced graph has no `capture(...)`
+ *  sites, `captures` is empty (calling `.get` on any name throws). */
+export interface RunCompletion {
   output: Float32Array
   captures: Captures
 }
 
-/** Result of `step(inputs, { withCaptures: true })`: the scalar loss plus
- *  the activation captures registered via `capture(...)` during the trace. */
-export interface StepResult {
+/** Result of `step(inputs)`: the scalar loss plus a `Captures` instance.
+ *  Empty captures when the graph has no `capture(...)` sites. */
+export interface StepCompletion {
   loss: number
   captures: Captures
-}
-
-/** Discriminated result returned by `step`/`run` when called with
- *  `{ abortAsValue: true }`. Tags successful completion as `'ok'` and
- *  cancellation (e.g. the graph was destroyed mid-flight by `replaceModel`)
- *  as `'aborted'` — no try/catch needed at the call site. */
-export type Outcome<Ok> = ({ kind: 'ok' } & Ok) | { kind: 'aborted' }
-
-export interface RunOptions {
-  /** Read back tensors registered via `capture(name, t)` during the trace.
-   *  Default false. When false, the returned `captures` is empty (calling
-   *  `.get` throws); when true, captures are read back and accessible. */
-  withCaptures?: boolean
-}
-
-export interface StepOptions extends RunOptions {
-  /** If false, the training submit is queued but the JS thread does not
-   *  await `mapAsync` of the loss buffer. Returns `void` immediately.
-   *  Use `runtime.readLoss()` to read the latest loss explicitly when
-   *  you want it (e.g., every Nth step for UI display).
-   *
-   *  Why: each `mapAsync` round-trip is ~1 ms on desktop but 10–30 ms on
-   *  Android Chrome. A training loop that awaits per step pays N × that
-   *  on the main thread, which on mobile starves the OS compositor and
-   *  causes visible UI sluggishness. With `readLoss: false` plus a
-   *  `requestAnimationFrame` yield between steps, the main thread stays
-   *  responsive while training runs at GPU speed.
-   *
-   *  Implies `withCaptures: false`. Default: true. */
-  readLoss?: boolean
 }
 
 /** Common surface for both training and forward-only compiled runtimes. */
@@ -113,14 +80,11 @@ export interface CompiledBase {
   destroy(): void
 }
 
-/** Run a dispatch and read back the full output tensor. Default returns the
- *  output as a `Float32Array`; with `{ withCaptures: true }` returns
- *  `{ output, captures }`. Same shape as `step()`'s overloads. */
-export interface RunFn {
-  (inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  (inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
-  (inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunResult>
-}
+/** Run a dispatch and read back the full output tensor plus any registered
+ *  captures. */
+export type RunFn = (
+  inputs: Record<string, Int32Array | Float32Array>,
+) => Promise<RunCompletion>
 
 export interface CompiledRuntime extends CompiledBase {
   /** Read all parameter gradients back. Mostly for verification / debugging. */
@@ -129,21 +93,23 @@ export interface CompiledRuntime extends CompiledBase {
    * One full forward+backward step.
    *   1. Uploads `inputs` (tokens, targets, masks) to input buffers.
    *   2. Dispatches every kernel in order.
-   *   3. Reads back the loss scalar (and any registered captures, if requested).
-   * Default returns the loss as a JS number; with `{ withCaptures: true }`
-   * returns `{ loss, captures }`.
+   *   3. Reads back the loss scalar plus any captures the graph registered.
+   * Always awaits the loss `mapAsync`. For fire-and-forget training (e.g.
+   * mobile UI responsiveness), use `queueStep` + `readLoss` instead.
    */
-  step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
-  step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
-  step(inputs: Record<string, Int32Array | Float32Array>, opts: { readLoss: false }): Promise<void>
-  step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepResult | void>
-  /** Same dispatch as step() but returns the full output Float32Array — for
-   *  training graphs the output is a scalar loss, so step() is usually more
-   *  convenient. Provided for parity with `compileForward`. */
+  step(inputs: Record<string, Int32Array | Float32Array>): Promise<StepCompletion>
+  /** Submit a training step without awaiting the loss readback. Each
+   *  `mapAsync` round-trip is ~1 ms on desktop but 10–30 ms on Android
+   *  Chrome; for mobile responsiveness, queueStep + periodic `readLoss`
+   *  for UI display beats awaiting every step. */
+  queueStep(inputs: Record<string, Int32Array | Float32Array>): Promise<void>
+  /** Same dispatch as step() but returns the full output array; for
+   *  training graphs the output is a scalar loss, so step() is usually
+   *  more convenient. Provided for parity with `compileForward`. */
   run: RunFn
-  /** Read the latest loss value from the GPU. Pair with `step({ readLoss: false })`
-   *  fire-and-forget training: every Nth iteration, call `readLoss()` for the
-   *  UI, but most iterations don't pay the `mapAsync` cost. */
+  /** Read the latest loss value from the GPU. Pair with `queueStep` for
+   *  fire-and-forget training: queue most iterations, call `readLoss()`
+   *  every Nth for the UI. */
   readLoss(): Promise<number>
   /** Re-zero all optimizer state buffers (Adam's m/v) in place. Pair with
    *  `uploadParams` (or call the proxy's `reset()` which does both) for a
@@ -320,14 +286,10 @@ export async function createRuntime(
     inputs: Record<string, Int32Array | Float32Array>,
     opts: DispatchOpts,
   ): Promise<DispatchResult> {
-    const wantCaptures = opts.wantCaptures
-    if (wantCaptures && plan.capturesByName.size === 0) {
-      throw new Error(
-        `withCaptures=true but no capture(...) calls were registered during ` +
-        `the trace. Add capture('name', tensor) inside your forward pass for ` +
-        `the intermediates you want read back.`,
-      )
-    }
+    // Captures are populated whenever the graph has any capture() sites.
+    // If the user asked for captures but the trace registered none, that's
+    // a no-op (the Captures bag will be empty) — not an error.
+    const wantCaptures = opts.wantCaptures && plan.capturesByName.size > 0
     for (const [name, bufId] of plan.inputsByName) {
       const data = inputs[name]
       if (!data) throw new Error(`tensorgrad: missing input '${name}'`)
@@ -394,21 +356,17 @@ export async function createRuntime(
     return { output, captures }
   }
 
-  function step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
-  function step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
-  function step(inputs: Record<string, Int32Array | Float32Array>, opts: { readLoss: false }): Promise<void>
-  function step(inputs: Record<string, Int32Array | Float32Array>, opts: StepOptions): Promise<number | StepResult | void>
   async function step(
     inputs: Record<string, Int32Array | Float32Array>,
-    opts?: StepOptions,
-  ): Promise<number | StepResult | void> {
-    if (opts?.readLoss === false) {
-      await dispatch(inputs, { wantCaptures: false, readback: false })
-      return
-    }
-    const r = (await dispatch(inputs, { wantCaptures: opts?.withCaptures === true, readback: true }))!
-    if (opts?.withCaptures) return { loss: r.output[0]!, captures: new Captures(captureShapes, r.captures) }
-    return r.output[0]!
+  ): Promise<StepCompletion> {
+    const r = (await dispatch(inputs, { wantCaptures: true, readback: true }))!
+    return { loss: r.output[0]!, captures: new Captures(captureShapes, r.captures) }
+  }
+
+  async function queueStep(
+    inputs: Record<string, Int32Array | Float32Array>,
+  ): Promise<void> {
+    await dispatch(inputs, { wantCaptures: false, readback: false })
   }
 
   // Goes through the same `pending` serialization as step()/run() so two
@@ -424,16 +382,11 @@ export async function createRuntime(
     return turn
   }
 
-  function run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
-  function run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
-  function run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunResult>
   async function run(
     inputs: Record<string, Int32Array | Float32Array>,
-    opts?: RunOptions,
-  ): Promise<Float32Array | RunResult> {
-    const r = (await dispatch(inputs, { wantCaptures: opts?.withCaptures === true, readback: true }))!
-    if (opts?.withCaptures) return { output: r.output, captures: new Captures(captureShapes, r.captures) }
-    return r.output
+  ): Promise<RunCompletion> {
+    const r = (await dispatch(inputs, { wantCaptures: true, readback: true }))!
+    return { output: r.output, captures: new Captures(captureShapes, r.captures) }
   }
 
   // ---- uploadParams ---------------------------------------------------------
@@ -532,6 +485,7 @@ export async function createRuntime(
     downloadParams: () => downloadFromMap(plan.paramsByName),
     downloadParamGrads: () => downloadFromMap(plan.paramGradsByName),
     step,
+    queueStep,
     run,
     readLoss,
     resetOptimizerState,

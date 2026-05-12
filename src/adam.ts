@@ -39,7 +39,7 @@ export type LR =
   | { readonly kind: 'multiStep'; readonly peak: number; readonly milestones: readonly number[]; readonly gamma: number; readonly startStep?: number }
 
 /** Ergonomic constructors for LR schedule shapes. For constant lr, pass a
- *  raw number — every LR field on `compileModule` / `setOptimizerConfig`
+ *  raw number — every LR field on `spec({ optimizer })` / `setOptimizerConfig`
  *  accepts `number | LR`. */
 export const lr = {
   /** Linearly interpolate from `peak` at intrinsic step 1 to `final` at
@@ -128,7 +128,7 @@ export function isLRDynamic(schedule: LR): boolean {
   return typeof schedule !== 'number'
 }
 
-/** Adam / AdamW hyperparameters. Pass via `compileModule({ optimizer:
+/** Adam / AdamW hyperparameters. Pass via `spec({ ..., optimizer:
  *  { kind: 'adam', ... } })`. Only `lr` is required; everything else has
  *  PyTorch-matching defaults. Non-zero `weightDecay` turns Adam into AdamW
  *  (decoupled decay, Loshchilov & Hutter). */

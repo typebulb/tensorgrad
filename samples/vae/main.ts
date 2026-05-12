@@ -17,10 +17,10 @@
 // as the other samples.
 
 import {
-  Module, compileModule, isWebGPUAvailable, nn,
+  Module, compile, spec, isWebGPUAvailable, nn,
   add, sub, mul, sum, exp, sigmoid, relu,
   randn, square,
-  type Tensor, type CompiledModule, type CompiledForwardModule,
+  type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
 // ============================================================================
@@ -117,9 +117,9 @@ function decodeFn(m: VAE, { z }: { z: Tensor }): Tensor {
 // State + lifecycle
 // ---------------------------------------------------------------------------
 
-let compiled: CompiledModule<VAE> | null = null
-let encode:   CompiledForwardModule<VAE> | null = null
-let decode:   CompiledForwardModule<VAE> | null = null
+let train: CompiledTraining<VAE> | null = null
+let encode:   CompiledForward<VAE> | null = null
+let decode:   CompiledForward<VAE> | null = null
 let trainData: MnistSet | null = null
 let testData:  MnistSet | null = null
 let trainOrder: number[] = []
@@ -164,8 +164,8 @@ async function renderSamples(): Promise<void> {
   if (!decode) return
   const z = new Float32Array(N_SAMPLES * LATENT_DIM)
   fillRandn(z)
-  const out = await decode.run({ z })
-  onSamples(out)
+  const r = await decode.run({ z })
+  if (r.kind === 'completed') onSamples(r.output)
 }
 
 // Two endpoint latents for the interpolation demo. Picked from random test
@@ -182,7 +182,9 @@ async function rerollInterpEndpoints(): Promise<void> {
   const idxB = Math.floor(Math.random() * testData.count)
   x.set(testData.images.subarray(idxA * INPUT_DIM, (idxA + 1) * INPUT_DIM), 0)
   x.set(testData.images.subarray(idxB * INPUT_DIM, (idxB + 1) * INPUT_DIM), INPUT_DIM)
-  const mus = await encode.run({ x })   // [2, LATENT_DIM]
+  const mr = await encode.run({ x })   // [2, LATENT_DIM]
+  if (mr.kind === 'aborted') return
+  const mus = mr.output
   interpA = new Float32Array(mus.subarray(0, LATENT_DIM))
   interpB = new Float32Array(mus.subarray(LATENT_DIM, 2 * LATENT_DIM))
   interpAImg = new Float32Array(x.subarray(0, INPUT_DIM))
@@ -193,14 +195,16 @@ async function renderInterp(t: number): Promise<void> {
   if (!decode) return
   const z = new Float32Array(LATENT_DIM)
   for (let i = 0; i < LATENT_DIM; i++) z[i] = (1 - t) * interpA[i]! + t * interpB[i]!
-  const out = await decode.run({ z })
-  onInterp(out)
+  const r = await decode.run({ z })
+  if (r.kind === 'completed') onInterp(r.output)
 }
 
 async function runTraining(): Promise<void> {
   let lastEval = 0
-  while (running && compiled) {
-    const loss = await compiled.step(nextBatch())
+  while (running && train) {
+    const sr = await train.step(nextBatch())
+    if (sr.kind === 'aborted') return
+    const loss = sr.loss
     step += 1
     if (!Number.isFinite(loss)) {
       onStatus(`step ${step}: loss is ${loss} — NaN, aborting.`)
@@ -227,28 +231,31 @@ async function loadMnist(): Promise<void> {
   shuffleOrder(trainOrder)
 }
 
-async function compile(): Promise<void> {
+async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  compiled = await compileModule({
-    factory: () => new VAE(),
+  const model = new VAE()
+  train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: 1e-3, clipGradNorm: 1.0 },
     inputs: { x: [BATCH_SIZE, INPUT_DIM] },
-  })
+  }))
   // Polymorphic batch for both inference proxies: encode is called at B=2
   // (interpolation endpoints), decode at B=1 (interpolation output) and
   // B=N_SAMPLES (random grid).
-  encode = await compiled.compileForward({
+  encode = await compile(spec({
+    model,
     forward: encodeFn,
     inputs: { x: [null, INPUT_DIM] },
-  })
-  decode = await compiled.compileForward({
+  }), { shareWith: train })
+  decode = await compile(spec({
+    model,
     forward: decodeFn,
     inputs: { z: [null, LATENT_DIM] },
-  })
+  }), { shareWith: train })
   step = 0
-  onStatus(`compiled (${compiled.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
+  onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)
 }
 
 function startTraining(): void {
@@ -262,16 +269,16 @@ function stopTraining(): void {
 }
 
 async function resetWeights(): Promise<void> {
-  if (!compiled) return
+  if (!train) return
   const wasRunning = running
   running = false
   await new Promise<void>(r => setTimeout(r, 0))
-  await compiled.reset()
+  await train.reset()
   step = 0
   await rerollInterpEndpoints()
   await renderSamples()
   await renderCurrentInterp()
-  onStatus(`weights re-initialized (seed ${compiled.seed})`)
+  onStatus(`weights re-initialized (seed ${train.seed})`)
   if (wasRunning) { running = true; void runTraining() }
 }
 
@@ -380,7 +387,7 @@ async function boot(): Promise<void> {
   }
   onStatus('loading MNIST…')
   await loadMnist()
-  await compile()
+  await buildGraphs()
   await rerollInterpEndpoints()
   await renderSamples()
   await renderCurrentInterp()

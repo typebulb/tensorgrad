@@ -20,9 +20,9 @@
 // tail it in the terminal instead of copying from the browser console.
 
 import {
-  Module, compileModule, isWebGPUAvailable, nn,
+  Module, compile, spec, isWebGPUAvailable, nn,
   relu, flatten, maxPool2d,
-  type Tensor, type CompiledModule, type CompiledForwardModule,
+  type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
 // ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ const HIDDEN = 64
 let log: (msg: string) => void = () => {}
 
 // ---------------------------------------------------------------------------
-// MNIST loading. Pixels are stored as flat Float32Array; the compileModule
+// MNIST loading. Pixels are stored as flat Float32Array; the spec()
 // declared input shape is [B, 1, 28, 28], so per batch we just slice the
 // flat buffer — WGSL reads contiguously regardless of declared shape.
 // ---------------------------------------------------------------------------
@@ -104,8 +104,8 @@ function predictFn(m: CNN, { x }: { x: Tensor }): Tensor {
 // State
 // ---------------------------------------------------------------------------
 
-let compiled: CompiledModule<CNN> | null = null
-let predict: CompiledForwardModule<CNN> | null = null
+let train: CompiledTraining<CNN> | null = null
+let infer: CompiledForward<CNN> | null = null
 let trainData: MnistSet, testData: MnistSet
 let trainOrder: number[] = []
 let trainCursor = 0
@@ -132,7 +132,7 @@ function nextTrainBatch(): { x: Float32Array; y: Int32Array } {
 }
 
 async function probeAccuracy(): Promise<number> {
-  if (!predict) return 0
+  if (!infer) return 0
   const x = new Float32Array(EVAL_BATCH * 28 * 28)
   const truth = new Int32Array(EVAL_BATCH)
   for (let b = 0; b < EVAL_BATCH; b++) {
@@ -140,7 +140,9 @@ async function probeAccuracy(): Promise<number> {
     for (let j = 0; j < 28 * 28; j++) x[b * 28 * 28 + j] = testData.images[idx * 28 * 28 + j]!
     truth[b] = testData.labels[idx]!
   }
-  const logits = await predict.run({ x })
+  const r = await infer.run({ x })
+  if (r.kind === 'aborted') return 0
+  const logits = r.output
   let correct = 0
   for (let b = 0; b < EVAL_BATCH; b++) {
     let best = 0
@@ -154,9 +156,11 @@ async function probeAccuracy(): Promise<number> {
 async function runTraining(): Promise<void> {
   let lastEval = 0
   let lastLoss = 0
-  while (running && compiled) {
+  while (running && train) {
     const batch = nextTrainBatch()
-    lastLoss = await compiled.step(batch)
+    const sr = await train.step(batch)
+    if (sr.kind === 'aborted') return
+    lastLoss = sr.loss
     step += 1
     if (!Number.isFinite(lastLoss)) {
       log(`step ${step}: loss is ${lastLoss} — training NaN'd. WGSL bug likely.`)
@@ -206,20 +210,22 @@ async function boot(): Promise<void> {
 
   log('compiling CNN…')
   const t0 = performance.now()
-  compiled = await compileModule({
-    factory: () => new CNN(),
+  const model = new CNN()
+  train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: 1e-3, weightDecay: 0.01, clipGradNorm: 1.0 },
     inputs: {
       x: [BATCH_SIZE, 1, 28, 28],
       y: { shape: [BATCH_SIZE], dtype: 'i32' },
     },
-  })
-  predict = await compiled.compileForward({
+  }))
+  infer = await compile(spec({
+    model,
     forward: predictFn,
     inputs: { x: [EVAL_BATCH, 1, 28, 28] },
-  })
-  log(`compiled in ${(performance.now() - t0).toFixed(0)} ms (${compiled.kernels.length} kernels) — training…`)
+  }), { shareWith: train })
+  log(`compiled in ${(performance.now() - t0).toFixed(0)} ms (${train.kernels.length} kernels) — training…`)
 
   void runTraining()
 }

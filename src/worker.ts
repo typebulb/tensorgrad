@@ -207,17 +207,16 @@ function injectPrngSeed(slot: GraphSlot, inputs: Record<string, Int32Array | Flo
 async function handleStep(payload: {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
-  withCaptures: boolean
 }): Promise<{ loss: number; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
   const merged = injectPrngSeed(slot, injectOptimizerScalars(slot, payload.inputs))
+  const hasCaptures = Object.keys(slot.captureShapes).length > 0
   try {
-    if (payload.withCaptures) {
-      const r = await slot.runtime.step(merged, { withCaptures: true })
-      return { loss: r.loss, captures: capturesToRecord(r.captures, slot.captureShapes) }
+    const r = await slot.runtime.step(merged)
+    return {
+      loss: r.loss,
+      captures: hasCaptures ? capturesToRecord(r.captures, slot.captureShapes) : null,
     }
-    const loss = await slot.runtime.step(merged)
-    return { loss, captures: null }
   } catch (e) {
     // If the graph was destroyed mid-flight (replaceModel while awaiting
     // mapAsync), translate WebGPU's "buffer is destroyed" into a clean
@@ -227,20 +226,44 @@ async function handleStep(payload: {
   }
 }
 
+async function handleQueueStep(payload: {
+  graphId: number
+  inputs: Record<string, Int32Array | Float32Array>
+}): Promise<null> {
+  const slot = mustGet(payload.graphId)
+  const merged = injectPrngSeed(slot, injectOptimizerScalars(slot, payload.inputs))
+  try {
+    await slot.runtime.queueStep(merged)
+    return null
+  } catch (e) {
+    if (!graphs.has(payload.graphId)) throw abortErr('queueStep aborted: graph destroyed mid-flight')
+    throw e
+  }
+}
+
+async function handleReadLoss(payload: { graphId: number }): Promise<{ loss: number }> {
+  const slot = mustGet(payload.graphId)
+  try {
+    return { loss: await slot.runtime.readLoss() }
+  } catch (e) {
+    if (!graphs.has(payload.graphId)) throw abortErr('readLoss aborted: graph destroyed mid-flight')
+    throw e
+  }
+}
+
 async function handleRun(payload: {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
-  withCaptures: boolean
 }): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
   const slot = mustGet(payload.graphId)
   const merged = injectPrngSeed(slot, payload.inputs)
+  const hasCaptures = Object.keys(slot.captureShapes).length > 0
   try {
-    if (payload.withCaptures) {
-      const r = await slot.runtime.run(merged, { withCaptures: true })
-      return { output: r.output, captures: capturesToRecord(r.captures, slot.captureShapes) }
+    const r = await slot.runtime.run(merged)
+    return {
+      output: r.output,
+      captures: hasCaptures ? capturesToRecord(r.captures, slot.captureShapes) : null,
     }
-    const output = await slot.runtime.run(merged)
-    return { output, captures: null }
   } catch (e) {
     if (!graphs.has(payload.graphId)) throw abortErr('run aborted: graph destroyed mid-flight')
     throw e
@@ -347,6 +370,8 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case 'createRuntime':     result = await handleCreateRuntime(req.payload); break
       case 'compileForward':    result = await handleCompileForward(req.payload); break
       case 'step':              result = await handleStep(req.payload); transferList = collectTransfers((result as any).captures); break
+      case 'queueStep':         result = await handleQueueStep(req.payload); break
+      case 'readLoss':          result = await handleReadLoss(req.payload); break
       case 'run':               { const r = await handleRun(req.payload); result = r; transferList = [r.output.buffer as ArrayBuffer, ...collectTransfers(r.captures)]; break }
       case 'uploadParams':      handleUploadParams(req.payload); result = null; break
       case 'downloadParams':    { const r = await handleDownloadParams(req.payload); result = r; transferList = collectTransfers(r.params); break }

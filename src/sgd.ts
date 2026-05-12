@@ -16,7 +16,7 @@ import { appendGradClip } from './adam.js'
 import type { LR } from './adam.js'
 import { isLRDynamic, resolveLR } from './adam.js'
 
-/** SGD hyperparameters. Pass via `compileModule({ optimizer:
+/** SGD hyperparameters. Pass via `spec({ ..., optimizer:
  *  { kind: 'sgd', ... } })`. Only `lr` is required. With `momentum: 0`
  *  (default) you get plain SGD; non-zero adds per-param velocity state;
  *  `nesterov: true` (requires `momentum > 0`) switches to Nesterov momentum. */

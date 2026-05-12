@@ -126,17 +126,21 @@ function resolveDecay(opts: ParamOptions | undefined): boolean {
   return kind !== 'zeros' && kind !== 'ones'
 }
 
-// Placeholder produced by `this.param(...)`. Replaced by a real Tensor in
-// `materializeParams`. The `param` return type is cast to `Tensor` so user
-// code can read `this.W` directly; the cast is sound post-materialization,
-// which always happens before any forward call.
-class ParamSentinel {
+// Immutable placeholder produced by `this.param(...)`. Replaced by a real
+// Tensor in `materializeParams`, which always runs on a *clone* of the
+// user's Module tree (never the original instance). The `param` return
+// type is cast to `Tensor` so user code can read `this.W` directly; the
+// cast is sound post-materialization, which always happens before any
+// forward call.
+class Param {
   constructor(
     public readonly shape: Shape,
     public readonly dtype: Dtype,
     public readonly initFn: InitFn,
     public readonly decay: boolean,
-  ) {}
+  ) {
+    Object.freeze(this)
+  }
 }
 
 /**
@@ -174,13 +178,14 @@ export abstract class Module {
    *
    * The parameter's name is auto-derived from its property path in the model
    * tree (e.g. `layers.0.attn.W_q`). Init metadata travels with the param;
-   * `compileModule` applies it during compile, and `compiled.reset()`
+   * `compile()` applies it during compile, and `compiled.reset()`
    * re-applies it later.
    */
   protected param(shape: Shape, opts?: ParamOptions): Tensor {
     const dtype = opts?.dtype ?? 'f32'
-    // Lie to TypeScript: the sentinel becomes a Tensor at materialize time.
-    return new ParamSentinel(shape, dtype, resolveInit(opts?.init), resolveDecay(opts)) as unknown as Tensor
+    // Lie to TypeScript: the Param placeholder becomes a Tensor at
+    // materialize time (on a fresh clone of this module).
+    return new Param(shape, dtype, resolveInit(opts?.init), resolveDecay(opts)) as unknown as Tensor
   }
 }
 
@@ -196,9 +201,11 @@ export interface MaterializedParams {
 }
 
 /**
- * Walk the module tree and replace every ParamSentinel with a real Tensor
- * created via `paramInput(autoName, ...)`. Must be called inside an active
- * trace context (paramInput appends to the current graph).
+ * Walk the module tree and replace every Param placeholder with a real
+ * Tensor created via `paramInput(autoName, ...)`. Must be called inside
+ * an active trace context (paramInput appends to the current graph) AND
+ * on a fresh clone of the user's module (see `cloneModule`) — the
+ * mutation never touches the caller's instance.
  *
  * Returns the param tensors keyed by path, plus init functions the compile
  * pipeline uses to generate initial values.
@@ -208,7 +215,7 @@ export function materializeParams(root: Module): MaterializedParams {
   const initFns: Record<string, InitFn> = {}
   const decayFlags: Record<string, boolean> = {}
   visit(root, '', (path, val, owner, key) => {
-    if (val instanceof ParamSentinel) {
+    if (val instanceof Param) {
       const t = paramInput(path, val.shape, val.dtype)
       ;(owner as any)[key] = t
       tensors[path] = t
@@ -219,8 +226,40 @@ export function materializeParams(root: Module): MaterializedParams {
   return { tensors, initFns, decayFlags }
 }
 
+/**
+ * Deep clone a Module tree, preserving each instance's prototype (so
+ * `cloneModule(new MLP())` is still an MLP) and copying through `Param`
+ * placeholders unchanged. Arrays of Modules are mapped to fresh arrays.
+ * Non-Module fields (numbers, config records, etc.) are shared by
+ * reference — they're not mutated by the trace pipeline.
+ *
+ * The compile pipeline calls this before `materializeParams` so the
+ * user's original Module instance is never mutated. Each polymorphic
+ * sibling cache-miss clones fresh too.
+ */
+export function cloneModule<M extends Module>(m: M): M {
+  return cloneNode(m) as M
+}
+
+function cloneNode(node: unknown): unknown {
+  if (node instanceof Module) {
+    const out = Object.create(Object.getPrototypeOf(node))
+    for (const key of Object.keys(node as object)) {
+      ;(out as any)[key] = cloneNode((node as any)[key])
+    }
+    return out
+  }
+  if (Array.isArray(node)) {
+    return node.map(cloneNode)
+  }
+  // Params, primitives, plain objects: share by reference. Params are
+  // frozen; non-Module objects shouldn't carry mutable state the trace
+  // would touch.
+  return node
+}
+
 // Walks enumerable own properties, recursing into Modules and arrays.
-// `visitor` is called on each leaf (ParamSentinel pre-materialize, Tensor
+// `visitor` is called on each leaf (Param pre-materialize, Tensor
 // post-materialize, or anything else the user stored).
 type Visitor = (path: string, val: unknown, owner: object, key: string | number) => void
 

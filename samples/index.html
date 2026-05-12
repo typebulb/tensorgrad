@@ -32,6 +32,10 @@
       <p>A small DDPM trained from scratch on MNIST. Train for a few thousand steps then watch a digit emerge from noise as the model iteratively denoises. Conv-stack model (no U-Net), learnable timestep embedding, CPU-side noise generation.</p>
     </li>
     <li>
+      <a href="/flow-matching-tiny/">Flow-matching-tiny (MNIST)</a>
+      <p>Same conv stack as <code>diffusion-tiny</code> on the same task, with the training objective swapped for rectified-flow / flow-matching: the model regresses on the data→noise velocity field, and sampling is Euler integration of <code>dx/dt = v_θ(x, t)</code> backward in time — same quality at fewer sampling steps.</p>
+    </li>
+    <li>
       <a href="/nerf-tiny/">NeRF-tiny (image INR)</a>
       <p>A 4-layer MLP fits a single image as an implicit function <code>(x, y) → (r, g, b)</code>. Live reconstruction next to the target as the model trains. Demonstrates sinusoidal positional encoding (<code>sin</code> / <code>cos</code> at multiple frequency bands), without which the network can only fit the low-frequency part of the image. Upload your own image to swap targets.</p>
     </li>
@@ -58,6 +62,10 @@
     <li>
       <a href="/mlp-sin/">MLP fits sin(x)</a>
       <p>Tiny 2-layer MLP regressor. Demonstrates the same library on a much smaller model — lets you see autograd, Adam, and the Module abstraction work in a different shape of problem.</p>
+    </li>
+    <li>
+      <a href="/kan-tiny/">KAN-tiny (per-edge splines)</a>
+      <p>A 2-layer Kolmogorov-Arnold Network fitting <code>y = sin(πx)</code>. Each edge of the network is a learnable cubic B-spline rather than a scalar weight; the per-edge curves are extracted via <code>downloadParams</code> and plotted live so you can watch the network discover a decomposition of the target.</p>
     </li>
   </ul>
 </body>

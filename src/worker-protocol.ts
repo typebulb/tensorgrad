@@ -55,6 +55,8 @@ export type Req =
   | { id: number; kind: 'createRuntime'; payload: CreateRuntimePayload }
   | { id: number; kind: 'compileForward'; payload: CompileForwardPayload }
   | { id: number; kind: 'step'; payload: StepPayload }
+  | { id: number; kind: 'queueStep'; payload: StepPayload }
+  | { id: number; kind: 'readLoss'; payload: { graphId: number } }
   | { id: number; kind: 'run'; payload: RunPayload }
   | { id: number; kind: 'uploadParams'; payload: UploadParamsPayload }
   | { id: number; kind: 'downloadParams'; payload: { graphId: number } }
@@ -83,18 +85,18 @@ export interface CompileForwardPayload {
 }
 
 /** One training step. Inputs are transferred; the caller's typed arrays
- *  become detached after postMessage. */
+ *  become detached after postMessage. Captures are always read back for
+ *  graphs that registered any during the trace (no-op for graphs that
+ *  didn't). */
 export interface StepPayload {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
-  withCaptures: boolean
 }
 
 /** Forward-only run. Same transfer semantics as `step`. */
 export interface RunPayload {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
-  withCaptures: boolean
 }
 
 export interface UploadParamsPayload {
@@ -141,13 +143,18 @@ export interface CompileForwardResult {
 
 export interface StepResultWire {
   loss: number
-  /** Null when `withCaptures` was false. */
+  /** Null when the graph registered no captures. */
   captures: Record<string, Float32Array> | null
 }
 
 export interface RunResultWire {
   output: Float32Array
   captures: Record<string, Float32Array> | null
+}
+
+/** Loss readback. Pair with `queueStep`'s fire-and-forget training pattern. */
+export interface ReadLossResult {
+  loss: number
 }
 
 export interface DownloadParamsResult {

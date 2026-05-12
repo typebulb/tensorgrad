@@ -4,7 +4,7 @@
 // test that the library works for non-transformer shapes of problem.
 
 import {
-  Module, compileModule, nn,
+  Module, compile, spec, nn,
   mul, sub, mean, relu,
   type Tensor,
 } from 'tensorgrad'
@@ -125,21 +125,23 @@ async function run() {
 
   log('Compiling MLP + Adam...')
   const t0 = performance.now()
-  const compiled = await compileModule({
-    factory: () => new MLP(),
+  const model = new MLP()
+  const train = await compile(spec({
+    model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR },
     inputs: { x: [B, 1], y: [B, 1] },
-  })
-  log(`  ${compiled.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
+  }))
+  log(`  ${train.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
 
   // Inference graph for plotting: shares param buffers with the training
   // graph, polymorphic over the batch dim so we can run it at PLOT_N=200
   // without recompiling per-shape.
-  const predict = await compiled.compileForward({
+  const infer = await compile(spec({
+    model,
     forward: predictFn,
     inputs: { x: [null, 1] },
-  })
+  }), { shareWith: train })
 
   // Stretch the plot x's into [PLOT_N, 1] for the [B, 1] input shape.
   const plotInput = new Float32Array(PLOT_N)
@@ -151,25 +153,26 @@ async function run() {
   while (!stopRequested) {
     step++
     const { x, y } = makeBatch()
-    const lossVal = await compiled.step({ x, y })
+    const r = await train.step({ x, y })
+    if (r.kind === 'aborted') break
 
     if (step === 1 || step % 100 === 0) {
-      log(`  step ${step.toString().padStart(4)}  loss ${lossVal.toFixed(6)}`)
+      log(`  step ${step.toString().padStart(4)}  loss ${r.loss.toFixed(6)}`)
     }
 
     // Update plot every ~250 ms.
     const now = performance.now()
     if (now - lastViz > 250 || step === 1) {
       lastViz = now
-      const modelYs = await predict.run({ x: plotInput })
-      drawPlot(plotXs, modelYs)
+      const out = await infer.run({ x: plotInput })
+      if (out.kind === 'completed') drawPlot(plotXs, out.output)
     }
 
     if (step % 5 === 0) await new Promise(r => setTimeout(r, 0))
   }
   log(`Stopped at step ${step}.`, 'ok')
-  predict.destroy()
-  compiled.destroy()
+  infer.destroy()
+  train.destroy()
   runBtn.disabled = false; stopBtn.disabled = true
 }
 

@@ -2,24 +2,32 @@
 // declares its params and exposes `.fwd(x)`; the forward is regular ops so
 // autograd traces through it like any other call.
 
-import { Module, init } from './module.js'
+import { Module, init, type InitSpec } from './module.js'
 import type { Tensor } from './ir.js'
 import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, oneHot, logSoftmax, embedding, conv2d, pairOpt } from './ops.js'
 import type { Conv2dOptions } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
 
+export interface Conv2dLayerOptions extends Conv2dOptions {
+  /** Include a bias term. Default true. */
+  bias?: boolean
+  /** Init for the weight tensor. Defaults to `randn(scale=0.02)`. */
+  init?: InitSpec
+  /** Whether the weight tensor receives AdamW weight decay. Default true. */
+  decay?: boolean
+}
+
 /** 2D convolution layer (NCHW). Shape and option names match PyTorch's
  *  `nn.Conv2d` so 1-shot ports don't need transposes. Wraps the pure
  *  `conv2d` op plus an optional broadcast-add bias. */
 export class Conv2d extends Module {
-  /** Weight, shape `[outC, inC, kH, kW]`. Default init is `randn` with
-   *  scale 0.02 (the tensorgrad default). For Kaiming init, pass
-   *  `{ init: init.kaiming() }` to a custom param() override — or rely on
-   *  the loss landscape's tolerance for the default. */
+  /** Weight, shape `[outC, inC, kH, kW]`. Init follows `opts.init`
+   *  (default `randn` with scale 0.02). Pass `init.kaiming()` for
+   *  Kaiming init. */
   W: Tensor
-  /** Bias, shape `[outC]`, or null if `bias: false`. Broadcasts across the
-   *  H_out, W_out axes via reshape. */
+  /** Bias, shape `[outC]`, or null if `bias: false`. Init `zeros`.
+   *  Broadcasts across the H_out, W_out axes via reshape. */
   b: Tensor | null
   readonly strideH: number; readonly strideW: number
   readonly padH: number;    readonly padW: number
@@ -27,7 +35,7 @@ export class Conv2d extends Module {
     public readonly inC: number,
     public readonly outC: number,
     kernelSize: number | readonly [number, number],
-    opts: Conv2dOptions & { bias?: boolean } = {},
+    opts: Conv2dLayerOptions = {},
   ) {
     super()
     const [kH, kW] = pairOpt(kernelSize, 1)
@@ -35,7 +43,7 @@ export class Conv2d extends Module {
     const [pH, pW] = pairOpt(opts.padding, 0)
     this.strideH = sH; this.strideW = sW
     this.padH = pH; this.padW = pW
-    this.W = this.param([outC, inC, kH, kW])
+    this.W = this.param([outC, inC, kH, kW], paramOptsFrom(opts))
     this.b = opts.bias === false ? null : this.param([outC], { init: init.zeros() })
   }
   /** Apply this conv to `x`: `[B, inC, H, W] → [B, outC, H', W']`. Adds
@@ -48,17 +56,23 @@ export class Conv2d extends Module {
   }
 }
 
+export interface EmbeddingOptions {
+  /** Init for the embedding table. Defaults to `randn(scale=0.02)`. For
+   *  Llama-style scaled init, pass `init: init.randn({ scale: 1/Math.sqrt(dim) })`. */
+  init?: InitSpec
+  /** Whether the embedding table receives AdamW weight decay. Default true. */
+  decay?: boolean
+}
+
 /** Index → row lookup. Matches PyTorch's `nn.Embedding(vocab, dim)`.
  *  Differentiable via the matmul adjoint — no custom scatter-with-atomic-add
  *  backward needed; see `ops.ts`'s `embedding` for the decomposition. */
 export class Embedding extends Module {
-  /** Embedding table, shape `[vocab, dim]`. Default init is `randn` with
-   *  PyTorch's default std (0.02 in tensorgrad). For Llama-style scaled
-   *  init, pass `{ init: init.randn({ scale: 1 / Math.sqrt(dim) }) }`. */
+  /** Embedding table, shape `[vocab, dim]`. */
   W: Tensor
-  constructor(public readonly vocab: number, public readonly dim: number) {
+  constructor(public readonly vocab: number, public readonly dim: number, opts: EmbeddingOptions = {}) {
     super()
-    this.W = this.param([vocab, dim])
+    this.W = this.param([vocab, dim], paramOptsFrom(opts))
   }
   /** Lookup: `idx` is `[...]` of i32, returns `[..., dim]` f32. */
   fwd(idx: Tensor): Tensor {
@@ -69,6 +83,11 @@ export class Embedding extends Module {
 export interface LinearOptions {
   /** Include a bias term (default true). */
   bias?: boolean
+  /** Init for the weight matrix. Defaults to `randn(scale=0.02)`. Pass
+   *  `init.kaiming()` for Kaiming init. */
+  init?: InitSpec
+  /** Whether the weight matrix receives AdamW weight decay. Default true. */
+  decay?: boolean
 }
 
 /** Affine layer `y = x @ W + b`. Matches PyTorch's `nn.Linear` but the
@@ -84,7 +103,7 @@ export class Linear extends Module {
   b: Tensor | null
   constructor(public readonly inDim: number, public readonly outDim: number, opts: LinearOptions = {}) {
     super()
-    this.W = this.param([inDim, outDim])
+    this.W = this.param([inDim, outDim], paramOptsFrom(opts))
     this.b = opts.bias === false ? null : this.param([outDim], { init: init.zeros() })
   }
   /** Apply: `x @ W` (+ `b` when present). Broadcasts bias over leading axes. */
@@ -133,6 +152,15 @@ export class RMSNorm extends Module {
     const rstd = sqrt(add(ms, this.eps))
     return mul(div(x, rstd), this.g)
   }
+}
+
+// Strip undefined-valued init/decay fields so `exactOptionalPropertyTypes`
+// doesn't complain when forwarding optional layer opts to `Module.param`.
+function paramOptsFrom(opts: { init?: InitSpec; decay?: boolean }): { init?: InitSpec; decay?: boolean } {
+  const o: { init?: InitSpec; decay?: boolean } = {}
+  if (opts.init !== undefined) o.init = opts.init
+  if (opts.decay !== undefined) o.decay = opts.decay
+  return o
 }
 
 // ---- Loss helpers --------------------------------------------------------
