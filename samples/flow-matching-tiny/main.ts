@@ -18,7 +18,7 @@
 // with the other samples.
 
 import {
-  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, nn,
   add, mul, sub, mean, reshape, relu,
   randn, takeAlongAxis, square,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -227,7 +227,7 @@ async function buildGraphs(): Promise<void> {
   onStatus('compiling flow-matching model…')
   const t0 = performance.now()
   const model = new TinyFlow()
-  train = await compile(trainingSpec({
+  train = await compile({
     model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: 2e-4, clipGradNorm: 1.0 },
@@ -236,15 +236,14 @@ async function buildGraphs(): Promise<void> {
       t:            { shape: [BATCH_SIZE], dtype: 'i32' },
       tNorm_table:  [T_STEPS + 1],
     },
-  }))
-  infer = await train.attach(forwardSpec({
-    model,
+  })
+  infer = await train.attach({
     forward: predictFn,
     inputs: {
       x_t: [1, 1, IMG_H, IMG_W],
       t:   { shape: [1], dtype: 'i32' },
     },
-  }))
+  })
   step = 0
   onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms, seed ${train.seed})`)
 }

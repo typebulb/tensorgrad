@@ -3,7 +3,7 @@
 // This sample is intended as the broadest demonstration of the tensorgrad
 // API surface in one place. It exercises:
 //
-//   * Forward spec attached via `train.attach(forwardSpec({ forward, ... }))`
+//   * Forward graph attached via `train.attach({ forward, ... })`
 //     with a parametric batch dim (`null` wildcard) — the same predict graph
 //     serves B=1 for the canvas and B=EVAL_BATCH for the periodic accuracy
 //     probe. One forward proxy, two resolved shapes (lazily compiled).
@@ -31,7 +31,7 @@
 // entirely in the UI section.
 
 import {
-  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, nn,
   relu, dropout, softmax, singleFlight,
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
@@ -228,7 +228,7 @@ async function buildGraphs(hidden: number, lr: number): Promise<void> {
   onStatus(`compiling MLP ${layers.join(' → ')}…`)
   const t0 = performance.now()
   const model = new MLP(layers)
-  train = await compile(trainingSpec({
+  train = await compile({
     model,
     loss: lossFn,
     optimizer: { kind: 'adamw', lr, weightDecay: 0.01, clipGradNorm: 1.0 },
@@ -236,14 +236,13 @@ async function buildGraphs(hidden: number, lr: number): Promise<void> {
       x: [BATCH_SIZE, INPUT_DIM],
       y: { shape: [BATCH_SIZE], dtype: 'i32' },
     },
-  }))
+  })
   // One polymorphic inference graph — the same infer serves the canvas
   // (B=1) and the accuracy probe (B=EVAL_BATCH).
-  infer = await train.attach(forwardSpec({
-    model,
+  infer = await train.attach({
     forward: predictFn,
     inputs: { x: [null, INPUT_DIM] },
-  }))
+  })
   // singleFlight: rapid strokes supersede each other; only the latest call
   // resolves. Captured via closure so the wrapper survives replaceModel
   // (which invalidates the per-shape kernel cache, not the proxy object).

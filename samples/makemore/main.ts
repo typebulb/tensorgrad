@@ -12,7 +12,7 @@
 // with multinomial temperature-1 sampling, stops on '.' or SEQ_LEN.
 
 import {
-  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, lr, nn,
+  Module, compile, isWebGPUAvailable, lr, nn,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
   softmaxCausal, splitHeads, mergeHeads,
@@ -224,7 +224,7 @@ async function run() {
   log('Building model + compiling...')
   const t0 = performance.now()
   const model = new Transformer()
-  const train = await compile(trainingSpec({
+  const train = await compile({
     model,
     loss: lossFn,
     optimizer: { kind: 'adamw', lr: LR, weightDecay: 0.01 },
@@ -233,27 +233,25 @@ async function run() {
       targets: { shape: [B, T], dtype: 'i32' },
       mask:    [B, T],
     },
-  }))
+  })
   log(`  ${train.paramNames.length} params, ${train.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
 
   log('Compiling inference + val-loss graphs...')
   const tInfer = performance.now()
-  const infer = await train.attach(forwardSpec({
-    model,
+  const infer = await train.attach({
     forward: predictFwd,
     inputs: { tokens: { shape: [1, T], dtype: 'i32' } },
-  }))
+  })
   // Forward-only loss graph at full batch shape — feeds the periodic val probe.
   // Attached to `train`, so val loss reflects the latest training state.
-  const valLossFwd = await train.attach(forwardSpec({
-    model,
+  const valLossFwd = await train.attach({
     forward: lossFn,
     inputs: {
       tokens:  { shape: [B, T], dtype: 'i32' },
       targets: { shape: [B, T], dtype: 'i32' },
       mask:    [B, T],
     },
-  }))
+  })
   log(`  compile ${(performance.now() - tInfer).toFixed(0)} ms`, 'ok')
 
   const tokensBuf = new Int32Array(T)

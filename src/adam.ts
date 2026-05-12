@@ -34,12 +34,12 @@ export type LR =
   | number
   | { readonly kind: 'linear'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
   | { readonly kind: 'cosineAnnealing'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
-  | { readonly kind: 'warmup'; readonly peak: number; readonly warmupSteps: number; readonly after: LR; readonly startStep?: number }
-  | { readonly kind: 'step'; readonly peak: number; readonly stepSize: number; readonly gamma: number; readonly startStep?: number }
+  | { readonly kind: 'warmup'; readonly peak: number; readonly steps: number; readonly after: LR; readonly startStep?: number }
+  | { readonly kind: 'step'; readonly peak: number; readonly every: number; readonly gamma: number; readonly startStep?: number }
   | { readonly kind: 'multiStep'; readonly peak: number; readonly milestones: readonly number[]; readonly gamma: number; readonly startStep?: number }
 
 /** Ergonomic constructors for LR schedule shapes. For constant lr, pass a
- *  raw number — every LR field on `trainingSpec({ optimizer })` / `setLR`
+ *  raw number — every LR field on `compile({ optimizer })` / `setLR`
  *  accepts `number | LR`. Names mirror PyTorch's `torch.optim.lr_scheduler`. */
 export const lr = {
   /** Linearly interpolate from `peak` at intrinsic step 1 to `final` at
@@ -53,15 +53,15 @@ export const lr = {
    *  timeline. PyTorch: `CosineAnnealingLR`. */
   cosineAnnealing: (opts: { peak: number; final: number; steps: number; startStep?: number }): LR =>
     ({ kind: 'cosineAnnealing', ...opts }),
-  /** Linear ramp from 0 to `peak` over `warmupSteps`, then hand off to
+  /** Linear ramp from 0 to `peak` over `steps`, then hand off to
    *  `after` (offset so step 1 of `after` = first post-warmup step).
    *  Optional `startStep` shifts the timeline. */
-  warmup: (opts: { peak: number; warmupSteps: number; after: LR; startStep?: number }): LR =>
+  warmup: (opts: { peak: number; steps: number; after: LR; startStep?: number }): LR =>
     ({ kind: 'warmup', ...opts }),
-  /** Geometric decay: `peak * gamma^floor(step / stepSize)`. PyTorch's
-   *  `torch.optim.lr_scheduler.StepLR`. With `stepSize: 1`, every step
-   *  multiplies lr by `gamma` (exponential decay). */
-  step: (opts: { peak: number; stepSize: number; gamma: number; startStep?: number }): LR =>
+  /** Geometric decay: `peak * gamma^floor(step / every)`. PyTorch's
+   *  `torch.optim.lr_scheduler.StepLR` (their `step_size`). With `every: 1`,
+   *  every step multiplies lr by `gamma` (exponential decay). */
+  step: (opts: { peak: number; every: number; gamma: number; startStep?: number }): LR =>
     ({ kind: 'step', ...opts }),
   /** Piecewise-constant decay at specific step milestones: `peak * gamma^(count
    *  of milestones <= step)`. PyTorch's
@@ -92,14 +92,14 @@ export function resolveLR(schedule: LR, step: number): number {
     }
     case 'warmup': {
       const s = intrinsicStep(schedule.startStep, step)
-      if (s <= schedule.warmupSteps) return schedule.peak * (s / schedule.warmupSteps)
-      return resolveLR(schedule.after, s - schedule.warmupSteps)
+      if (s <= schedule.steps) return schedule.peak * (s / schedule.steps)
+      return resolveLR(schedule.after, s - schedule.steps)
     }
     case 'step': {
-      // 1-based step indexing; `(s - 1) / stepSize` matches PyTorch StepLR's
-      // boundary semantics (first stepSize values unscaled).
+      // 1-based step indexing; `(s - 1) / every` matches PyTorch StepLR's
+      // boundary semantics (first `every` values unscaled).
       const s = intrinsicStep(schedule.startStep, step)
-      const k = Math.floor((s - 1) / schedule.stepSize)
+      const k = Math.floor((s - 1) / schedule.every)
       return schedule.peak * Math.pow(schedule.gamma, k)
     }
     case 'multiStep': {
@@ -129,7 +129,7 @@ export function isLRDynamic(schedule: LR): boolean {
   return typeof schedule !== 'number'
 }
 
-/** Plain Adam hyperparameters. Pass via `trainingSpec({ ..., optimizer:
+/** Plain Adam hyperparameters. Pass via `compile({ ..., optimizer:
  *  { kind: 'adam', ... } })`. Only `lr` is required; the rest match PyTorch
  *  `torch.optim.Adam`'s defaults. For decoupled weight decay, use the
  *  separate `kind: 'adamw'` variant + `AdamWConfig`. */
@@ -150,7 +150,7 @@ export interface AdamConfig {
 }
 
 /** AdamW hyperparameters (Loshchilov & Hutter — decoupled weight decay).
- *  Pass via `trainingSpec({ ..., optimizer: { kind: 'adamw', ... } })`. `weightDecay`
+ *  Pass via `compile({ ..., optimizer: { kind: 'adamw', ... } })`. `weightDecay`
  *  is required (use plain `{ kind: 'adam' }` if you don't want decay). Every
  *  step shrinks each decayed param by `1 - lr * weightDecay` before the
  *  Adam gradient update. PyTorch parity: `torch.optim.AdamW`. */

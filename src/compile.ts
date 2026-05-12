@@ -1,11 +1,10 @@
 // Top-level compile pipeline:
-//   trainingSpec() / forwardSpec()  — pure value builders, no side effects
-//   compile()                       — takes a TrainingSpec, spawns a worker
-//   train.attach(spec)       — attach a ForwardSpec as a sibling
-//                                     (shares worker + param buffers)
-//   replaceModel                    — in-place topology swap on a training
-//                                     compile; attached forward children
-//                                     invalidate their per-shape caches
+//   compile(opts)                  — spawns a worker; returns CompiledTraining
+//   train.attach(opts)             — attach a sibling forward graph
+//                                    (shares worker + param buffers)
+//   replaceModel                   — in-place topology swap on a training
+//                                    compile; attached forward children
+//                                    invalidate their per-shape caches
 //
 // Compile-time work runs on the main thread; everything past createRuntime
 // runs in a worker (see specs/WorkerArchitecture.md).
@@ -143,8 +142,9 @@ export type OptimizerConfig =
   | ({ readonly kind: 'adamw' } & AdamWConfig)
   | ({ readonly kind: 'sgd'   } & SGDConfig)
 
-/** Options passed to `trainingSpec({ ... })`. */
-export interface TrainingSpecOptions<M extends Module, I extends InputDecls = InputDecls> {
+/** Training spec passed to `compile({ ... })`. Plain data — the compile
+ *  pipeline consumes it once and clones `model` internally. */
+export interface TrainingSpec<M extends Module, I extends InputDecls = InputDecls> {
   /** A model instance — `new Model()`. The compile pipeline clones this
    *  before tracing, so the caller's instance is never mutated and can be
    *  reused across multiple compiles (polymorphic siblings, replaceModel,
@@ -154,7 +154,7 @@ export interface TrainingSpecOptions<M extends Module, I extends InputDecls = In
   loss: ForwardFn<M, I>
   /** Input shape declarations (one per named tensor input). */
   inputs: I
-  /** Optimizer. Discriminated by `kind: 'adam' | 'sgd'`. */
+  /** Optimizer. Discriminated by `kind: 'adam' | 'adamw' | 'sgd'`. */
   optimizer: OptimizerConfig
   /** 32-bit integer seed for the param-init RNG. Same seed + same model
    *  topology → identical initial params, every time. If omitted, a seed
@@ -163,71 +163,26 @@ export interface TrainingSpecOptions<M extends Module, I extends InputDecls = In
   seed?: number
 }
 
-/** Options passed to `forwardSpec({ ... })`. Forward specs compile against
- *  a parent training compile (via `train.attach(forwardSpec)`) and
- *  share its param buffers — every training-step update is immediately
- *  visible. */
-export interface ForwardSpecOptions<M extends Module, I extends InputDecls = InputDecls> {
-  /** A model instance with the same param tree as the parent training
-   *  spec. The forward function reads those params but is otherwise
-   *  independent. Cloned per trace, like the training spec's model. */
-  model: M
-  /** Forward function returning the output tensor (one per shape value). */
+/** Forward spec passed to `train.attach({ ... })`. The forward function
+ *  reads the parent training compile's params — every training-step
+ *  update is immediately visible. */
+export interface ForwardSpec<M extends Module, I extends InputDecls = InputDecls> {
+  /** Forward function returning the output tensor. The first argument is
+   *  the parent compile's model (cloned internally per trace). */
   forward: ForwardFn<M, I>
   /** Input shape declarations. `null` dims become parametric; the
-   *  compile proxy caches a sibling per distinct resolved shape on first
-   *  `run()` at that shape. */
+   *  proxy caches a sibling per distinct resolved shape on first `run()`. */
   inputs: I
-}
-
-/** A training spec value: pure data, no side effects, no worker. Built by
- *  `trainingSpec({ model, loss, inputs, optimizer })`. Consumed by `compile()`. */
-export interface TrainingSpec<M extends Module = Module, I extends InputDecls = InputDecls>
-  extends TrainingSpecOptions<M, I> {
-  readonly kind: 'training'
-}
-
-/** A forward spec value: pure data, no side effects, no worker. Built by
- *  `forwardSpec({ model, forward, inputs })`. Pass to
- *  `train.attach(spec)` to attach a sibling inference graph
- *  to an existing training compile. */
-export interface ForwardSpec<M extends Module = Module, I extends InputDecls = InputDecls>
-  extends ForwardSpecOptions<M, I> {
-  readonly kind: 'forward'
-}
-
-/** Discriminated union of the two spec shapes. */
-export type Spec<M extends Module = Module, I extends InputDecls = InputDecls> =
-  | TrainingSpec<M, I>
-  | ForwardSpec<M, I>
-
-/** Build a training spec — plain data passed to `compile()`.
- *
- *  ```ts
- *  const train = await compile(trainingSpec({ model: new MLP(), loss, inputs, optimizer }))
- *  ``` */
-export function trainingSpec<M extends Module, I extends InputDecls>(
-  opts: TrainingSpecOptions<M, I>,
-): TrainingSpec<M, I> {
-  return { ...opts, kind: 'training' }
-}
-
-/** Build a forward spec — plain data passed to `train.attach()`.
- *
- *  ```ts
- *  const infer = await train.attach(forwardSpec({ model, forward: predictFn, inputs }))
- *  ``` */
-export function forwardSpec<M extends Module, I extends InputDecls>(
-  opts: ForwardSpecOptions<M, I>,
-): ForwardSpec<M, I> {
-  return { ...opts, kind: 'forward' }
+  /** Maximum number of distinct resolved shapes to cache simultaneously.
+   *  Evicts the least-recently-used shape when full. Default: 8. */
+  maxCachedShapes?: number
 }
 
 
-/** Returned by `compile(trainingSpec)`. Proxies all GPU work to an
- *  internal worker; every method returns a Promise. Generic over the
- *  declared inputs shape `I` so `step` / `run` accept inputs with the
- *  right TypedArray per dtype. */
+/** Returned by `compile(opts)`. Proxies all GPU work to an internal
+ *  worker; every method returns a Promise. Generic over the declared
+ *  inputs shape `I` so `step` / `run` accept inputs with the right
+ *  TypedArray per dtype. */
 export interface CompiledTraining<M extends Module, I extends InputDecls = InputDecls> {
   /** The compiled IR graph: ops, tensors, connectivity, captures, outputs.
    *  Walk it to inspect what `compile` produced (see README). Swapped
@@ -243,7 +198,7 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
   readonly paramNames: readonly string[]
   /** The actual seed used for param init (either the one you passed, or a
    *  freshly-generated one if you didn't). Pass this back as
-   *  back via `trainingSpec({ seed })` to reproduce a run. */
+   *  back via `compile({ ..., seed })` to reproduce a run. */
   readonly seed: number
 
   /** One full forward + backward + optimizer step. Always reads back the
@@ -309,7 +264,7 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
    *  the worker, compile a fresh one with the same loss/inputs config and
    *  the new model instance. This handle remains valid (same object, same
    *  `I` generic, same `paramNames`/`graph` after the call). Sibling
-   *  forward compiles attached via `this.attach(forwardSpec)` stay
+   *  forward compiles attached via `this.attach(...)` stay
    *  registered: their per-shape kernel caches are cleared and recompile
    *  lazily on next `run()`.
    *
@@ -330,25 +285,25 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
     opts?: { seed?: number; optimizer?: OptimizerConfig },
   ): Promise<void>
 
-  /** Attach a forward (inference) spec as a sibling — shares this training
+  /** Attach a forward (inference) graph as a sibling — shares this training
    *  compile's worker and param GPUBuffers. Cascading destroy: when this
    *  training compile is destroyed (or `replaceModel`-d), attached forward
    *  proxies are cleaned up / invalidated automatically.
    *
    *  Returned `CompiledForward` proxy is polymorphic over `null`-wildcard
    *  inputs: per-shape kernels are compiled lazily and cached on first
-   *  `run()` at each new resolved shape. */
-  attach<I2 extends InputDecls>(s: ForwardSpec<M, I2>): Promise<CompiledForward<M, I2>>
+   *  `run()` at each new resolved shape. The cache is LRU-bounded
+   *  (default 8 shapes; tune via `maxCachedShapes`). */
+  attach<I2 extends InputDecls>(opts: ForwardSpec<M, I2>): Promise<CompiledForward<M, I2>>
 
   /** Tear down the worker + GPU resources, plus any attached forward
    *  compiles. */
   destroy(): void
 }
 
-/** Returned by `train.attach(forwardSpec)`. Polymorphic by
- *  default: `run()` at a new resolved shape lazily compiles + caches a
- *  sibling. Param reads/writes route to the parent training graph
- *  (shared buffers).
+/** Returned by `train.attach(opts)`. Polymorphic by default: `run()`
+ *  at a new resolved shape lazily compiles + caches a sibling. Param
+ *  reads/writes route to the parent training graph (shared buffers).
  *
  *  No top-level `graph` / `kernels`: forward proxies are polymorphic and
  *  hold one IR per shape. Use `graphFor(inputs)` to fetch (and lazily
@@ -384,39 +339,39 @@ export interface CompiledForward<M extends Module = Module, I extends InputDecls
 }
 
 /**
- * Compile a `TrainingSpec` to a worker-backed runtime — spawns a worker,
+ * Compile a training graph to a worker-backed runtime — spawns a worker,
  * owns the param GPUBuffers, and returns a `CompiledTraining` handle.
  *
  * ```ts
  * const model = new MLP()
- * const train = await compile(trainingSpec({ model, loss, inputs, optimizer }))
+ * const train = await compile({ model, loss, inputs, optimizer })
  * ```
  *
  * For forward (inference) compiles that share the training graph's params
- * and worker, use `train.attach(forwardSpec({ ... }))` — the
- * lifecycle relationship is named at the call site.
+ * and worker, use `train.attach({ forward, inputs })` — the lifecycle
+ * relationship is named at the call site.
  */
 export async function compile<M extends Module, I extends InputDecls>(
-  s: TrainingSpec<M, I>,
-): Promise<CompiledTraining<M, I>> {
-  return compileTrainingSpec(s)
-}
-
-async function compileTrainingSpec<M extends Module, I extends InputDecls>(
-  s: TrainingSpec<M, I>,
+  opts: TrainingSpec<M, I>,
 ): Promise<CompiledTraining<M, I>> {
   const proxy = new WorkerProxy(__WORKER_SOURCE__)
-  const specWithSeed: TrainingSpec<M, I> = { ...s, seed: s.seed ?? randomSeed() }
+  const sealed: TrainingSpecSealed<M, I> = { ...opts, seed: opts.seed ?? randomSeed() }
   try {
-    const built = await buildTrainingGraph(proxy, specWithSeed, 0)
+    const built = await buildTrainingGraph(proxy, sealed, 0)
     return new CompiledTrainingProxy<M, I>(
-      proxy, 0, built.ir, built.meta, specWithSeed, built.initFns, { v: 1 },
+      proxy, 0, built.ir, built.meta, sealed, built.initFns, { v: 1 },
     )
   } catch (e) {
     proxy.terminate()
     throw e
   }
 }
+
+/** Internal: TrainingSpec with `seed` filled in (either user-supplied or
+ *  freshly generated). Kept distinct from the public type so callers can
+ *  omit `seed`, while the runtime always sees a concrete number. */
+type TrainingSpecSealed<M extends Module, I extends InputDecls> =
+  TrainingSpec<M, I> & { seed: number }
 
 /** Fresh 32-bit integer seed for compile runs that didn't pass one. Exposed
  *  on the returned `CompiledTraining.seed` so users can reproduce. */
@@ -438,22 +393,22 @@ interface BuiltTrainingGraph {
 }
 
 // Trace + autograd + optimizer + buffer-plan + codegen + worker createRuntime,
-// using an existing worker proxy. Shared by `compileTrainingSpec` (fresh worker)
+// using an existing worker proxy. Shared by `compile` (fresh worker)
 // and `replaceModel` (existing worker, same graphId).
 async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   proxy: WorkerProxy,
-  s: TrainingSpec<M, I>,
+  opts: TrainingSpecSealed<M, I>,
   graphId: number,
 ): Promise<BuiltTrainingGraph> {
-  const loss = s.loss as unknown as ForwardFn<M, InputDecls>
-  const inputs = s.inputs as InputDecls
-  const { graph, materialized } = traceModule(s.model, loss, inputs)
+  const loss = opts.loss as unknown as ForwardFn<M, InputDecls>
+  const inputs = opts.inputs as InputDecls
+  const { graph, materialized } = traceModule(opts.model, loss, inputs)
   const { paramGrads, loss: lossTensor } = appendGrad(graph)
-  const adamResult = s.optimizer.kind === 'adam' || s.optimizer.kind === 'adamw'
-    ? appendAdam(graph, paramGrads, materialized.tensors, s.optimizer, materialized.decayFlags)
+  const adamResult = opts.optimizer.kind === 'adam' || opts.optimizer.kind === 'adamw'
+    ? appendAdam(graph, paramGrads, materialized.tensors, opts.optimizer, materialized.decayFlags)
     : undefined
-  const sgdResult = s.optimizer.kind === 'sgd'
-    ? appendSGD(graph, paramGrads, materialized.tensors, s.optimizer, materialized.decayFlags)
+  const sgdResult = opts.optimizer.kind === 'sgd'
+    ? appendSGD(graph, paramGrads, materialized.tensors, opts.optimizer, materialized.decayFlags)
     : undefined
 
   const optimizerWritebacks =
@@ -462,7 +417,7 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   const kernels = emitKernels(graph, plan)
   const ir: CompiledIR = { graph, paramGrads, loss: lossTensor, plan, kernels }
 
-  const initialParams = buildInitialParams(plan, materialized.initFns, mulberry32(s.seed!))
+  const initialParams = buildInitialParams(plan, materialized.initFns, mulberry32(opts.seed))
   const wireIR: WireIR = { graph, plan, kernels }
   const wireOptimizer: WireOptimizerConfig | null =
     adamResult ? { kind: 'adam', config: wireAdamConfig(adamResult) }
@@ -496,7 +451,7 @@ interface ParentRef<M extends Module> {
 }
 
 class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements CompiledTraining<M, I> {
-  /** Forward children attached via `this.attach(forwardSpec)`.
+  /** Forward children attached via `this.attach({...})`.
    *  Tracked so `destroy()` can clean them up cascade-style and
    *  `replaceModel()` can invalidate their per-shape kernel caches without
    *  unregistering them. */
@@ -504,10 +459,9 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
 
   // Swapped in place by `replaceModel` so callers' references (and any
   // sibling ForwardProxy holding `this`) stay valid across topology changes.
-  // `spec.seed` is always populated (compileTrainingSpec fills it).
   private _ir: CompiledIR
   private meta: CompileResult
-  private spec: TrainingSpec<M, I>
+  private opts: TrainingSpecSealed<M, I>
   private initFns: Record<string, InitFn>
 
   constructor(
@@ -515,13 +469,13 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     readonly graphId: number,
     ir: CompiledIR,
     meta: CompileResult,
-    spec: TrainingSpec<M, I>,
+    opts: TrainingSpecSealed<M, I>,
     initFns: Record<string, InitFn>,
     private readonly nextGraphId: { v: number },
   ) {
     this._ir = ir
     this.meta = meta
-    this.spec = spec
+    this.opts = opts
     this.initFns = initFns
   }
 
@@ -529,11 +483,11 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
   get kernels(): readonly KernelSpec[] { return this._ir.kernels }
   get outputShape(): readonly number[] { return this.meta.outputShape }
   get paramNames(): readonly string[] { return this.meta.paramNames }
-  get seed(): number { return this.spec.seed! }
+  get seed(): number { return this.opts.seed }
 
   /** Sibling ForwardProxies read this through the proxy ref so they always
    *  re-trace against the latest topology. */
-  currentModel(): M { return this.spec.model }
+  currentModel(): M { return this.opts.model }
 
   async step(inputs: LooseInputs): Promise<StepResult> {
     try {
@@ -604,7 +558,7 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
   }
 
   async reset(): Promise<void> {
-    const initialParams = buildInitialParams(this._ir.plan, this.initFns, mulberry32(this.spec.seed!))
+    const initialParams = buildInitialParams(this._ir.plan, this.initFns, mulberry32(this.opts.seed))
     await Promise.all([this.uploadParams(initialParams), this.resetOptimizerState()])
   }
 
@@ -620,13 +574,14 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     ).then(() => undefined)
   }
 
-  async attach<I2 extends InputDecls>(s: ForwardSpec<M, I2>): Promise<CompiledForward<M, I2>> {
+  async attach<I2 extends InputDecls>(opts: ForwardSpec<M, I2>): Promise<CompiledForward<M, I2>> {
     const child: ForwardProxy<M, I2> = new ForwardProxy<M, I2>(
       this.proxy,
       this,
-      s.forward,
-      normalizeDecls(s.inputs),
+      opts.forward,
+      normalizeDecls(opts.inputs),
       this.nextGraphId,
+      opts.maxCachedShapes ?? DEFAULT_MAX_CACHED_SHAPES,
       () => this.children.delete(child),
     )
     this.children.add(child)
@@ -642,9 +597,9 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     // momentum). The runtime tracks those per-kind and a mid-graph kind
     // switch would silently produce garbage updates. If the user wants to
     // change kind, destroy + recompile fresh.
-    if (replaceOpts?.optimizer && replaceOpts.optimizer.kind !== this.spec.optimizer.kind) {
+    if (replaceOpts?.optimizer && replaceOpts.optimizer.kind !== this.opts.optimizer.kind) {
       throw new Error(
-        `replaceModel: optimizer kind cannot change ('${this.spec.optimizer.kind}' → '${replaceOpts.optimizer.kind}'). ` +
+        `replaceModel: optimizer kind cannot change ('${this.opts.optimizer.kind}' → '${replaceOpts.optimizer.kind}'). ` +
         `State buffers (Adam m/v vs SGD momentum) are kind-specific — destroy the compile and recompile to switch kinds.`,
       )
     }
@@ -653,17 +608,17 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     // valid. Each sibling recompiles lazily on its next run().
     for (const child of this.children) child._invalidateForReplace()
     this.proxy.send({ kind: 'destroy', payload: { graphId: this.graphId } })
-    const newSpec: TrainingSpec<M, I> = {
-      ...this.spec,
+    const newOpts: TrainingSpecSealed<M, I> = {
+      ...this.opts,
       model: newModel,
       seed: replaceOpts?.seed ?? randomSeed(),
       ...(replaceOpts?.optimizer !== undefined ? { optimizer: replaceOpts.optimizer } : {}),
     }
-    const built = await buildTrainingGraph(this.proxy, newSpec, this.graphId)
+    const built = await buildTrainingGraph(this.proxy, newOpts, this.graphId)
     this._ir = built.ir
     this.meta = built.meta
     this.initFns = built.initFns
-    this.spec = newSpec
+    this.opts = newOpts
   }
 
   destroy(): void {
@@ -674,6 +629,12 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
   }
 }
 
+/** Default LRU cap on per-shape sibling cache. Real workloads see 1–3
+ *  distinct shapes (B=1 / B=eval / B=train); 8 leaves headroom without
+ *  permitting unbounded growth on UIs that hit many shapes. Tune via
+ *  `attach({ maxCachedShapes })`. */
+const DEFAULT_MAX_CACHED_SHAPES = 8
+
 /** Single forward proxy class — handles both fully-concrete and polymorphic
  *  shapes (concrete is the cache-size-1 case). Sibling of a training graph;
  *  shares its param GPUBuffers. Holds a reference to the parent proxy so it
@@ -681,6 +642,8 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
 class ForwardProxy<M extends Module, I extends InputDecls>
   implements CompiledForward<M, I>, ChildProxy
 {
+  // LRU cache. Map preserves insertion order, so we evict the first key
+  // when over capacity. On hit we re-insert to bump to most-recent.
   private readonly cache = new Map<string, ForwardSiblingMeta>()
 
   constructor(
@@ -689,6 +652,7 @@ class ForwardProxy<M extends Module, I extends InputDecls>
     private readonly forward: ForwardFn<M, I>,
     private readonly decls: NormalizedDecls,
     private readonly nextGraphId: { v: number },
+    private readonly maxCachedShapes: number,
     private readonly onDestroy: () => void,
   ) {}
 
@@ -698,11 +662,27 @@ class ForwardProxy<M extends Module, I extends InputDecls>
     const resolved = resolveDecls(this.decls, inputs)
     const key = shapeKey(resolved)
     const hit = this.cache.get(key)
-    if (hit) return hit
+    if (hit) {
+      // Bump to most-recently-used.
+      this.cache.delete(key)
+      this.cache.set(key, hit)
+      return hit
+    }
     const sib = await compileSibling<M, I>(
       this.proxy, this.parent.graphId, this.parent.currentModel(), this.forward,
       resolved, this.nextGraphId,
     )
+    // Evict the least-recently-used before inserting (Map preserves insertion
+    // order — first key is oldest). Destroy the evicted graph in the worker
+    // so its kernels free their GPU buffers.
+    if (this.cache.size >= this.maxCachedShapes) {
+      const oldestKey = this.cache.keys().next().value
+      if (oldestKey !== undefined) {
+        const oldest = this.cache.get(oldestKey)!
+        this.proxy.send({ kind: 'destroy', payload: { graphId: oldest.graphId } })
+        this.cache.delete(oldestKey)
+      }
+    }
     this.cache.set(key, sib)
     return sib
   }
@@ -850,7 +830,7 @@ function asConcreteShape(shape: InputShape, inputName: string): Shape {
       throw new Error(
         `compile: input '${inputName}' has an unresolved parametric dim at index ${i}. ` +
         `Polymorphic shapes are only supported via a forward spec attached as a ` +
-        `sibling (\`train.attach(forwardSpec({ forward, inputs: { x: [null, 784] } }))\`); ` +
+        `sibling (\`train.attach({ forward, inputs: { x: [null, 784] } })\`); ` +
         `training specs require fully concrete shapes.`,
       )
     }

@@ -21,7 +21,7 @@
 // as the other samples.
 
 import {
-  Module, compile, trainingSpec, forwardSpec, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, nn,
   mul, sum,
   tanh, oneHot, logSoftmax, softmax,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -244,7 +244,7 @@ async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
   const model = new Policy()
-  train = await compile(trainingSpec({
+  train = await compile({
     model,
     loss: lossFn,
     optimizer: { kind: 'adam', lr: LR },
@@ -254,12 +254,11 @@ async function buildGraphs(): Promise<void> {
       returns: [MAX_T * K],
       mask:    [MAX_T * K],
     },
-  }))
-  infer = await train.attach(forwardSpec({
-    model,
+  })
+  infer = await train.attach({
     forward: predictFn,
     inputs: { state: [K, STATE_DIM] },
-  }))
+  })
   rolloutCount = 0
   recentEpLens = []
   onStatus(`compiled (${train.kernels.length} kernels, ${(performance.now() - t0).toFixed(0)} ms)`)

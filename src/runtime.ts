@@ -41,11 +41,11 @@ export class Captures {
    *  as heads (matching `splitHeads` layout at B=1); a leading singleton batch
    *  is stripped if present so callers can pass capture names directly.
    *  Throws if the capture isn't registered. */
-  mergeHeads(name: string): Float32Array[] {
+  perHead(name: string): Float32Array[] {
     const flat = this.get(name)
     const shape = this.shape(name)
     if (shape.length < 2) {
-      throw new Error(`Captures.mergeHeads: '${name}' shape needs >= 2 dims, got [${shape.join(', ')}]`)
+      throw new Error(`Captures.perHead: '${name}' shape needs >= 2 dims, got [${shape.join(', ')}]`)
     }
     const s = shape[0] === 1 ? shape.slice(1) : shape
     const H = s[0]!
@@ -53,7 +53,7 @@ export class Captures {
     for (let i = 1; i < s.length; i++) stride *= s[i]!
     const expected = H * stride
     if (flat.length !== expected) {
-      throw new Error(`Captures.mergeHeads: '${name}' length ${flat.length} doesn't match shape product ${expected}`)
+      throw new Error(`Captures.perHead: '${name}' length ${flat.length} doesn't match shape product ${expected}`)
     }
     return Array.from({ length: H }, (_, h) => flat.slice(h * stride, (h + 1) * stride))
   }
