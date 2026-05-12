@@ -1,13 +1,6 @@
-// User-facing op surface.
-//
-// Each function here is a thin wrapper:
-//   1. capture the call site (for error attribution)
-//   2. validate input shapes via src/shape.ts (which throws on mismatch)
-//   3. compute the output shape and dtype
-//   4. append the op to the current Graph (held in module state by src/trace.ts)
-//   5. return the produced Tensor handle
-//
-// No actual numeric work happens here. These calls just build the IR.
+// User-facing op surface. Each function captures its call site, validates
+// shapes (via src/shape.ts), and appends an op to the current graph. No
+// numeric work — these calls just build the IR.
 
 import type { Tensor, Shape, Dtype, OpNode, Graph } from './ir.js'
 import { addOp, captureSite } from './ir.js'
@@ -21,15 +14,10 @@ import {
   ShapeError, showShape,
 } from './shape.js'
 
-// ----------------------------------------------------------------------------
-// Element-wise binops (add/sub/mul/div). Trailing-suffix broadcast.
-// ----------------------------------------------------------------------------
+// ---- Element-wise binops --------------------------------------------------
 
-/**
- * Build an element-wise binop op (forward declaration only — appends to the
- * graph). Used by both arithmetic ops (add/sub/mul/div, output dtype = input
- * dtype) and comparisons (less/greater, output dtype = bool).
- */
+// Shared helper for arithmetic ops (outDtype = input dtype) and comparisons
+// (outDtype = bool).
 function binopOp(
   name: string,
   kind: OpNode['kind'],
@@ -42,18 +30,24 @@ function binopOp(
   return addOp(currentGraph(), kind, outShape, outDtype, site, { a: a.id, b: b.id })
 }
 
-// Element-wise binops. Second arg can be a Tensor or a JS number; the latter
-// dispatches to scalar-fused IR ops internally. `mul(x, 2)` and `mul(x, y)`
-// both work — matches every NumPy-shaped library.
+/** Element-wise addition. Trailing-axis broadcast (smaller operand's shape
+ *  is a suffix of the larger's). Scalar form: `add(x, 2)` adds 2 to every
+ *  element via a fused scalar kernel. */
 export function add(a: Tensor, b: Tensor | number): Tensor {
   return typeof b === 'number' ? addScalar(a, b) : binopOp('add', 'add', a, b)
 }
+/** Element-wise subtraction. Same broadcast rules as `add`; scalar form
+ *  subtracts a JS number. */
 export function sub(a: Tensor, b: Tensor | number): Tensor {
   return typeof b === 'number' ? addScalar(a, -b) : binopOp('sub', 'sub', a, b)
 }
+/** Element-wise multiplication. Same broadcast rules as `add`; scalar form
+ *  multiplies by a JS number via a fused scalar kernel. */
 export function mul(a: Tensor, b: Tensor | number): Tensor {
   return typeof b === 'number' ? mulScalar(a, b) : binopOp('mul', 'mul', a, b)
 }
+/** Element-wise division. Same broadcast rules as `add`. Scalar form
+ *  `div(x, k)` is rewritten as `mulScalar(x, 1/k)` (throws on `k === 0`). */
 export function div(a: Tensor, b: Tensor | number): Tensor {
   if (typeof b === 'number') {
     if (b === 0) throw new ShapeError(`div: scalar divisor cannot be zero`, captureSite('div'))
@@ -62,10 +56,14 @@ export function div(a: Tensor, b: Tensor | number): Tensor {
   return binopOp('div', 'div', a, b)
 }
 
+/** Element-wise minimum. Scalar form clamps from above. Backward routes
+ *  the gradient to whichever side won; ties go to `b`. */
 export function min(a: Tensor, b: Tensor | number): Tensor {
   const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
   return binopOp('min', 'min', a, rhs)
 }
+/** Element-wise maximum. Scalar form clamps from below. Backward routes
+ *  the gradient to whichever side won; ties go to `b`. */
 export function max(a: Tensor, b: Tensor | number): Tensor {
   const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
   return binopOp('max', 'max', a, rhs)
@@ -76,11 +74,9 @@ export function clamp(a: Tensor, lo: number, hi: number): Tensor {
   return min(max(a, lo), hi)
 }
 
-// ----------------------------------------------------------------------------
-// Element-wise scalar binops (mul/add by JS number). Used for things like
-// `scores * (1/sqrt(d))` and `logits + 1e-5` where allocating a 0-d tensor
-// for the scalar is wasteful.
-// ----------------------------------------------------------------------------
+// ---- Element-wise scalar binops -------------------------------------------
+// Fused mul/add by a JS number. The Tensor-overload variants of `mul`/`add`
+// dispatch here when the rhs is a number, avoiding a 0-d constant allocation.
 
 export function mulScalar(a: Tensor, scalar: number): Tensor {
   const site = captureSite('mulScalar')
@@ -104,14 +100,25 @@ function unary(name: UnaryKind, a: Tensor): Tensor {
   return addOp(currentGraph(), name, inferUnary(name, a.shape, site), 'f32', site, { a: a.id })
 }
 
+/** Element-wise square root. Requires `f32`. */
 export const sqrt    = (a: Tensor): Tensor => unary('sqrt',    a)
+/** Element-wise reciprocal square root (`1 / sqrt(x)`). Requires `f32`.
+ *  One fused kernel — faster and more numerically stable than `1/sqrt(x)`. */
 export const rsqrt   = (a: Tensor): Tensor => unary('rsqrt',   a)
+/** Element-wise natural log. Requires `f32`. */
 export const log     = (a: Tensor): Tensor => unary('log',     a)
+/** Element-wise exponential (`e^x`). Requires `f32`. */
 export const exp     = (a: Tensor): Tensor => unary('exp',     a)
+/** Element-wise ReLU (`max(0, x)`). Requires `f32`. Backward uses a fused
+ *  `relu_grad` op that passes `dy` through wherever `x > 0`. */
 export const relu    = (a: Tensor): Tensor => unary('relu',    a)
+/** Element-wise negation (`-x`). Requires `f32`. */
 export const neg     = (a: Tensor): Tensor => unary('neg',     a)
+/** Element-wise absolute value. Requires `f32`. Subgradient is 0 at `x = 0`. */
 export const abs     = (a: Tensor): Tensor => unary('abs',     a)
+/** Element-wise hyperbolic tangent. Requires `f32`. */
 export const tanh    = (a: Tensor): Tensor => unary('tanh',    a)
+/** Element-wise logistic sigmoid (`1 / (1 + e^-x)`). Requires `f32`. */
 export const sigmoid = (a: Tensor): Tensor => unary('sigmoid', a)
 
 /** SiLU / Swish: `x * sigmoid(x)`. Composed from primitives. */
@@ -182,20 +189,10 @@ export function gelu(a: Tensor): Tensor {
   return mul(mul(a, 0.5), add(tanh(inner), 1))
 }
 
-// ----------------------------------------------------------------------------
-// Reductions.
-//
-// Public surface: `mean(x, axis?, opts?)` and `sum(x, axis?, opts?)`. Both
-// follow PyTorch's `dim=` convention: negative indices count from the end,
-// `axis` omitted reduces all axes to a 0-d scalar, and `keepDims=false` is
-// the default (the axis is removed from the output shape).
-//
-// The IR-level kernels (`mean_last`, `sum_last`) are last-axis only. Other
-// axes compose as `permute-axis-to-end` + `*_last` + (reshape or
-// permute-back), so there's no new codegen for arbitrary-axis reduction.
-// `meanLastIR` / `sumLastIR` are local helpers — not part of the public
-// API; consumers always go through `mean`/`sum`.
-// ----------------------------------------------------------------------------
+// ---- Reductions ------------------------------------------------------------
+// IR kernels (`mean_last`, `sum_last`, `argmax_last`) are last-axis only.
+// Other axes compose as `permute-axis-to-end` + `*_last` + reshape/back-perm,
+// so there's no new codegen needed for arbitrary-axis reduction.
 
 export interface ReduceOpts {
   /** Preserve the reduced axis as size 1 (PyTorch's `keepdim=True`).
@@ -282,24 +279,22 @@ function reduceAxis(a: Tensor, axisArg: number, keepDims: boolean, kind: 'mean' 
     throw new ShapeError(`${kind}: axis ${axisArg} out of range for shape [${a.shape.join(',')}]`, captureSite(kind))
   }
   const isLast = k === r - 1
-  // Reduce: produce a tensor with the reduced axis at position r-1 (size 1
-  // for mean, dropped for sum). Permute first when k isn't already last.
+  // Move axis k to the trailing position so the last-axis kernel applies.
   const input = isLast ? a : permute(a, [...Array(r).keys()].filter(i => i !== k).concat(k))
   if (kind === 'mean') {
-    const reduced = meanLastIR(input)  // shape: [...others, 1]
+    const reduced = meanLastIR(input)  // [...others, 1]
     if (isLast) return keepDims ? reduced : reshape(reduced, reduced.shape.slice(0, -1))
     if (!keepDims) return reshape(reduced, reduced.shape.slice(0, -1))
     return permute(reduced, backPerm(k, r))
   }
-  // sum
-  const dropped = sumLastIR(input)  // shape: [...others]
+  const dropped = sumLastIR(input)  // [...others]
   if (isLast) return keepDims ? reshape(dropped, [...dropped.shape, 1]) : dropped
   if (!keepDims) return dropped
   return permute(reshape(dropped, [...dropped.shape, 1]), backPerm(k, r))
 }
 
-/** Inverse of `[everyone-but-k, k]`: the perm that moves the trailing axis
- *  back to original position k. Used for `keepDims=true` with non-last axis. */
+/** Inverse of `[everyone-but-k, k]`: moves the trailing axis back to
+ *  position k. Used for `keepDims=true` along a non-last axis. */
 function backPerm(k: number, r: number): number[] {
   const out: number[] = []
   for (let i = 0; i < k; i++) out.push(i)
@@ -312,6 +307,11 @@ function backPerm(k: number, r: number): number[] {
 // Shape ops.
 // ----------------------------------------------------------------------------
 
+/** Reshape a tensor to `newShape`. Total element count must match (a single
+ *  `-1` is allowed and inferred from the others). Equivalent to PyTorch's
+ *  `x.view(...)` / `x.reshape(...)` and NumPy's `np.reshape`. Pure metadata
+ *  in the IR — no kernel is emitted when the underlying memory layout is
+ *  contiguous. */
 export function reshape(a: Tensor, newShape: Shape): Tensor {
   const site = captureSite('reshape')
   const outShape = inferReshape('reshape', a.shape, newShape, site)
@@ -333,7 +333,7 @@ export function flatten(a: Tensor, startAxis: number = 1): Tensor {
   if (s < 0 || s > r) {
     throw new ShapeError(`flatten: startAxis ${startAxis} out of range for rank-${r}`, site)
   }
-  if (s === r) return a  // no axes to collapse
+  if (s === r) return a
   return reshape(a, [...a.shape.slice(0, s), -1])
 }
 
@@ -367,9 +367,7 @@ export function swapAxes(a: Tensor, axis1: number, axis2: number): Tensor {
   return permute(a, perm)
 }
 
-// ----------------------------------------------------------------------------
-// Linear algebra.
-// ----------------------------------------------------------------------------
+// ---- Linear algebra -------------------------------------------------------
 
 /** Matrix multiplication. Dispatches on input rank:
  *  - `a [..., M, K] · b [K, N] → [..., M, N]`   (rhs rank 2: broadcast lhs batch)
@@ -389,12 +387,11 @@ export function matmul(a: Tensor, b: Tensor): Tensor {
   if (b.shape.length < 2) {
     throw new ShapeError(`matmul: rhs must have rank >= 2, got ${showShape(b.shape)}`, site)
   }
-  // rhs rank 2 → unbatched matmul (lhs's leading axes are batch).
+  // rhs rank 2: lhs's leading axes broadcast as batch.
   if (b.shape.length === 2) {
     const outShape = inferMatmul('matmul', a.shape, b.shape, site)
     return addOp(currentGraph(), 'matmul', outShape, 'f32', site, { a: a.id, b: b.id })
   }
-  // Both batched: ranks must match.
   if (a.shape.length !== b.shape.length) {
     throw new ShapeError(
       `matmul: rank mismatch — lhs ${showShape(a.shape)} vs rhs ${showShape(b.shape)}. ` +
@@ -406,10 +403,11 @@ export function matmul(a: Tensor, b: Tensor): Tensor {
   return addOp(currentGraph(), 'matmul_batched', outShape, 'f32', site, { a: a.id, b: b.id })
 }
 
-// ----------------------------------------------------------------------------
-// Indexing / casting.
-// ----------------------------------------------------------------------------
+// ---- Indexing / casting ---------------------------------------------------
 
+/** One-hot encode an `i32` index tensor of shape `[...]` into shape
+ *  `[..., depth]`. Result dtype defaults to `f32`. Used internally by
+ *  `embedding`; pair with `matmul` for end-to-end differentiable lookup. */
 export function oneHot(indices: Tensor, depth: number, dtype: Dtype = 'f32'): Tensor {
   const site = captureSite('oneHot')
   if (indices.dtype !== 'i32') {
@@ -435,7 +433,9 @@ export function embedding(indices: Tensor, table: Tensor): Tensor {
   return matmul(oneHot(indices, table.shape[0]!, 'f32'), table)
 }
 
-// arange(n) → [n] of values [0, 1, ..., n-1]. Used for position embeddings.
+/** `arange(n)` → `[n]` tensor of values `[0, 1, ..., n-1]`. Default dtype
+ *  is `i32` (the index dtype). Used for position embeddings and similar
+ *  index generation. */
 export function arange(n: number, dtype: Dtype = 'i32'): Tensor {
   const site = captureSite('arange')
   if (n <= 0 || !Number.isInteger(n)) {
@@ -444,14 +444,13 @@ export function arange(n: number, dtype: Dtype = 'i32'): Tensor {
   return addOp(currentGraph(), 'arange', [n], dtype, site, { n, dtype })
 }
 
-// ----------------------------------------------------------------------------
-// ML primitives. Fused so autograd's adjoint rule is straightforward and the
-// kernels can be hand-tuned for our specific shapes.
-// ----------------------------------------------------------------------------
+// ---- ML primitives (fused for cleaner autograd + hand-tuned kernels) ------
 
-// Causal-masked softmax along the last axis. Shape preserved. Last two
-// axes must be square (TxT attention scores). Always last-axis by
-// construction — the causal mask is over a sequence-by-sequence matrix.
+/** Causal-masked softmax along the last axis (fused mask + softmax). Shape
+ *  preserved. The last two axes must be square (T×T attention scores).
+ *  Always last-axis by construction — the causal mask is over a
+ *  sequence-by-sequence matrix. Prefer this over composing
+ *  `whereCausal` + `softmax` yourself. */
 export function softmaxCausal(a: Tensor): Tensor {
   const site = captureSite('softmaxCausal')
   if (a.dtype !== 'f32') throw new ShapeError(`softmaxCausal: requires f32, got ${a.dtype}`, site)
@@ -501,10 +500,10 @@ function axisPreserving(
   return permute(applyLast(permute(a, perm)), backPerm(k, r))
 }
 
-// Pre-softmax causal mask. Sets cells where (i < j) on the last two axes to
-// `fillValue` (typically -1e30). Lower-triangle entries pass through.
-// Use this when you want the masked scores explicitly (e.g. for capture);
-// for the common case, prefer softmaxCausal which fuses both.
+/** Pre-softmax causal mask. Sets cells where `i < j` on the last two axes
+ *  to `fillValue` (typically `-1e30`); lower-triangle entries pass through.
+ *  Use when you want the masked scores explicitly (e.g. to `capture` them);
+ *  for the common case, prefer `softmaxCausal` which fuses the mask + softmax. */
 export function whereCausal(a: Tensor, fillValue: number): Tensor {
   const site = captureSite('whereCausal')
   if (a.dtype !== 'f32') throw new ShapeError(`whereCausal: requires f32, got ${a.dtype}`, site)
@@ -512,9 +511,7 @@ export function whereCausal(a: Tensor, fillValue: number): Tensor {
   return addOp(currentGraph(), 'where_causal', a.shape, 'f32', site, { a: a.id, fillValue })
 }
 
-// ----------------------------------------------------------------------------
-// Slicing.
-// ----------------------------------------------------------------------------
+// ---- Slicing --------------------------------------------------------------
 
 /** General-axis slice: take elements `[start, end)` along `axis`. Negative
  *  `axis` indexes from the end (Python convention). */
@@ -580,10 +577,7 @@ export function split(t: Tensor, sizes: readonly number[], axis: number): Tensor
   return out
 }
 
-// ----------------------------------------------------------------------------
-// Broadcast / un-broadcast. Mostly used by autograd, but exposed in case user
-// code needs them (e.g. explicit broadcasting for clarity).
-// ----------------------------------------------------------------------------
+// ---- Broadcast / un-broadcast (mostly used by autograd) -------------------
 
 export function broadcastTo(a: Tensor, targetShape: Shape): Tensor {
   const site = captureSite('broadcastTo')
@@ -597,37 +591,34 @@ export function sumToShape(a: Tensor, targetShape: Shape): Tensor {
   return addOp(currentGraph(), 'sum_to_shape', targetShape, a.dtype, site, { a: a.id, targetShape })
 }
 
-// ----------------------------------------------------------------------------
-// Constants.
-// ----------------------------------------------------------------------------
+// ---- Constants ------------------------------------------------------------
 
-// 0-d tensor with a constant value. Used by autograd to seed the loss cotangent.
+/** 0-d tensor with a constant value. Used by autograd to seed the loss
+ *  cotangent and by comparisons/min/max for their scalar overloads. */
 export function constScalar(value: number, dtype: Dtype = 'f32'): Tensor {
   const site = captureSite('constScalar')
   return addOp(currentGraph(), 'const_scalar', [], dtype, site, { value, dtype })
 }
 
-// ----------------------------------------------------------------------------
-// Autograd-internal helpers (exposed for users writing custom adjoint rules).
-// ----------------------------------------------------------------------------
+// ---- Comparisons and selection --------------------------------------------
 
-// ----------------------------------------------------------------------------
-// Comparisons and selection.
-// ----------------------------------------------------------------------------
-
-// Comparisons reuse the binop helper but return bool. Second arg accepts a
-// Tensor or a JS number — the scalar form composes constScalar with the binop's
-// broadcasting, parallel to add/sub/mul/div's scalar overload.
+/** Element-wise `a < b`. Same broadcast rules as `add`. Returns `bool` —
+ *  pair with `where` to select. Non-differentiable. */
 export function less(a: Tensor, b: Tensor | number): Tensor {
   const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
   return binopOp('less', 'less', a, rhs, 'bool')
 }
+/** Element-wise `a > b`. Same broadcast rules as `add`. Returns `bool` —
+ *  pair with `where` to select. Non-differentiable. */
 export function greater(a: Tensor, b: Tensor | number): Tensor {
   const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
   return binopOp('greater', 'greater', a, rhs, 'bool')
 }
 
-// where(cond, a, b): elementwise select. cond is bool; a and b can be any matching dtype.
+/** Element-wise select: `out[i] = cond[i] ? a[i] : b[i]`. `cond` must be
+ *  `bool` (produced by `less`/`greater`); `a` and `b` must share dtype.
+ *  All three operands broadcast-compatible to the output shape.
+ *  Gradient flows to `a` where `cond` is true, to `b` where false. */
 export function where(cond: Tensor, a: Tensor, b: Tensor): Tensor {
   const site = captureSite('where')
   if (cond.dtype !== 'bool') throw new ShapeError(`where: cond must be bool, got ${cond.dtype}`, site)
@@ -636,8 +627,8 @@ export function where(cond: Tensor, a: Tensor, b: Tensor): Tensor {
   return addOp(currentGraph(), 'where', outShape, a.dtype, site, { cond: cond.id, a: a.id, b: b.id })
 }
 
-// reluGrad(x, dy) = dy where x > 0, else 0. Same shape as x. This is the
-// adjoint rule for relu, exposed as an op so codegen can emit it.
+/** ReLU's adjoint: `dy` where `x > 0`, else 0. Same shape as `x`. Exposed
+ *  so codegen can emit the fused kernel; users go through `relu`. */
 export function reluGrad(x: Tensor, dy: Tensor): Tensor {
   const site = captureSite('reluGrad')
   if (x.dtype !== 'f32' || dy.dtype !== 'f32') {
@@ -685,9 +676,8 @@ export function adamUpdateP(
   if (p.shape.length !== mNew.shape.length || p.shape.some((d, i) => d !== mNew.shape[i])) {
     throw new ShapeError(`adamUpdateP: p/mNew shape mismatch`, site)
   }
-  // decayShrink is either a literal (baked into the kernel) or a 0-d scalar
-  // tensor input the runtime updates per step. The kernel binds at most one,
-  // chosen by whichever the caller provided.
+  // Literal bakes into the kernel; tensor input is updated per step. The
+  // kernel binds at most one, chosen by whichever the caller provided.
   const isTensor = typeof decayShrink === 'object'
   if (isTensor) {
     if (decayShrink.dtype !== 'f32' || decayShrink.shape.length !== 0) {
@@ -705,11 +695,7 @@ export function adamUpdateP(
   })
 }
 
-// ----------------------------------------------------------------------------
-// 2D convolution and pooling (NCHW). Layout matches PyTorch so 1-shot ports
-// don't need a transpose. Bias is added separately (via `add` + broadcast) so
-// the IR op stays pure; see `nn.Conv2d` for the standard wrapper.
-// ----------------------------------------------------------------------------
+// ---- 2D convolution and pooling (NCHW; layout matches PyTorch) ------------
 
 export interface Conv2dOptions {
   /** Strides along H and W. Number = same for both. Default 1. */
@@ -752,9 +738,7 @@ export function conv2dInputGrad(
   const site = captureSite('conv2dInputGrad')
   const [cOut, cIn] = [weight.shape[0]!, weight.shape[1]!]
   const B = dy.shape[0]!
-  // Output shape matches the original conv2d input.
   const targetShape: Shape = [B, cIn, inH, inW]
-  // Validate dy's channel count matches weight's C_out.
   if (dy.shape[1] !== cOut) {
     throw new ShapeError(`conv2dInputGrad: dy's C=${dy.shape[1]} doesn't match weight C_out=${cOut}`, site)
   }
@@ -772,7 +756,6 @@ export function conv2dWeightGrad(
   const site = captureSite('conv2dWeightGrad')
   const cIn = input.shape[1]!
   const cOut = dy.shape[1]!
-  // Output shape matches the original conv2d weight.
   const targetShape: Shape = [cOut, cIn, kH, kW]
   return addOp(currentGraph(), 'conv2d_weight_grad', targetShape, 'f32', site, {
     input: input.id, dy: dy.id, kH, kW, strideH, strideW, padH, padW,
@@ -794,7 +777,6 @@ export function maxPool2d(input: Tensor, kernelSize: number | readonly [number, 
   const site = captureSite('maxPool2d')
   if (input.dtype !== 'f32') throw new ShapeError(`maxPool2d: input must be f32, got ${input.dtype}`, site)
   const [kH, kW] = typeof kernelSize === 'number' ? [kernelSize, kernelSize] : [kernelSize[0], kernelSize[1]]
-  // Default stride = kernel size (non-overlapping pooling, matching PyTorch).
   const [strideH, strideW] = opts.stride === undefined
     ? [kH, kW]
     : typeof opts.stride === 'number' ? [opts.stride, opts.stride]
@@ -813,7 +795,6 @@ export function maxPool2dGrad(
   kH: number, kW: number, strideH: number, strideW: number, padH: number, padW: number,
 ): Tensor {
   const site = captureSite('maxPool2dGrad')
-  // Output shape matches `input`.
   return addOp(currentGraph(), 'max_pool_2d_grad', input.shape, 'f32', site, {
     input: input.id, dy: dy.id, kH, kW, strideH, strideW, padH, padW,
   })

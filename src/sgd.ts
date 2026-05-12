@@ -1,28 +1,12 @@
-// SGD / SGD-with-momentum / Nesterov, in-graph.
-//
-// `appendSGD` extends a graph that already has a forward pass + autograd-
-// emitted backward (i.e., has paramGrads from `appendGrad`) with the SGD
-// update math. The math is simple enough that no fused IR ops are needed:
-// the per-param update composes from existing primitives (add, sub,
-// mulScalar, broadcastTo).
-//
-// Per parameter P with gradient g:
-//   g_eff = g + wd * P                      (when wd > 0 and P is decayed)
-//   v_new = momentum * v + g_eff            (when momentum > 0)
+// SGD / SGD-with-momentum / Nesterov, in-graph. No fused IR ops needed —
+// the per-param update composes from existing primitives:
+//   g_eff = g + wd * P                  (when wd > 0 and P is decayed)
+//   v_new = momentum * v + g_eff        (when momentum > 0)
 //   update = nesterov ? g_eff + momentum * v_new : v_new
 //   P_new = P - lr * update
 //
-// lr is supplied per step from CPU (so LR schedules work the same way they
-// do for Adam — see `LR` in adam.ts).
-//
-// Edge cases the implementation respects:
-//   - momentum = 0: no v state buffer, no v writeback. Plain SGD.
-//   - wd = 0 or param not in decayedNames: no `g + wd*p` injection.
-//   - nesterov requires momentum > 0; validated at appendSGD time.
-//
-// Note: this is PyTorch-style L2 weight decay (injected into the gradient),
-// not decoupled like AdamW. The decoupled form is a less common SGD variant
-// and would surface as a config flag if anyone asks.
+// Weight decay is PyTorch-style (injected into the gradient), not decoupled
+// like AdamW.
 
 import type { Tensor, Graph } from './ir.js'
 import type { WritebackDecl } from './buffers.js'
@@ -32,6 +16,10 @@ import { appendGradClip } from './adam.js'
 import type { LR } from './adam.js'
 import { isLRDynamic, resolveLR } from './adam.js'
 
+/** SGD configuration. Pass via `compileModule({ sgd: ... })`. Only `lr` is
+ *  required. With `momentum: 0` (default) you get plain SGD; non-zero adds
+ *  per-param velocity state; `nesterov: true` (requires `momentum > 0`)
+ *  switches to Nesterov momentum. */
 export interface SGDConfig {
   /** Learning rate schedule. Pass a number for fixed lr, or a shape from
    *  the `lr` helpers (e.g. `lr.cosineDecay({ peak: 0.05, final: 0.001, steps: 10000 })`). */
@@ -69,11 +57,17 @@ export interface SGDResolvedConfig {
   lrIsScheduled: boolean
 }
 
+/** Output of `appendSGD`. Carries the writeback declarations the buffer
+ *  planner needs (param + optional velocity state) and the name of the
+ *  per-step `lr` scalar input the runtime fills each step. */
 export interface SGDResult {
+  /** Writebacks the buffer planner should wire into the runtime. */
   writebacks: WritebackDecl[]
   /** Name of the per-step scalar tensor_input. The runtime fills this each
    *  step with the current lr. */
   lrInputName: string
+  /** Resolved hyperparameters (defaults applied; `lr` left as the schedule
+   *  shape so the runtime can compute per-step values). */
   config: SGDResolvedConfig
 }
 
@@ -94,9 +88,7 @@ export function appendSGD(
   config: SGDConfig,
   decayFlags?: Record<string, boolean>,
 ): SGDResult {
-  // Global L2-norm clipping (if requested) runs before the rest of the
-  // update; gradients are scaled in-graph and we consume the clipped values
-  // as if they were the originals.
+  // Clipping happens in-graph before the rest of the update.
   if (config.clipGradNorm !== undefined && config.clipGradNorm > 0) {
     paramGrads = appendGradClip(graph, paramGrads, config.clipGradNorm)
   }
@@ -135,12 +127,10 @@ export function appendSGD(
       if (!p) throw new Error(`appendSGD: missing param tensor for '${name}'`)
       if (!g) throw new Error(`appendSGD: missing gradient for '${name}'`)
 
-      // g_eff = g + wd * p   (when wd > 0 and p is decayed)
       const gEff = decayedNames.has(name)
         ? add(g, mulScalar(p, fullConfig.weightDecay))
         : g
 
-      // velocity (only when momentum > 0)
       let update: Tensor
       if (momentum > 0) {
         const vState = stateInput(`sgd_v_${name}`, p.shape, 'f32', 0)
@@ -151,7 +141,6 @@ export function appendSGD(
         update = gEff
       }
 
-      // p_new = p - lr * update; broadcast 0-d lr to param shape.
       const pNew = sub(p, mul(broadcastTo(lr, p.shape), update))
       writebacks.push({ source: pNew, destName: name, destKind: 'param' })
     }

@@ -1,30 +1,15 @@
-// Adam / AdamW optimizer, in-graph.
-//
-// `appendAdam` extends a graph that already has a forward pass + autograd-emitted
-// backward (i.e., has paramGrads from `appendGrad`) with the Adam update math.
-//
-// Per parameter P with gradient g:
+// Adam / AdamW optimizer, in-graph. Per parameter P with gradient g:
 //   m_new = b1 * m + (1 - b1) * g
 //   v_new = b2 * v + (1 - b2) * g²
 //   p_new = decayShrink * p - lrt * m_new / (sqrt(v_new) + eps)
 //
-// `decayShrink = 1 - lr * weightDecay` when the param is being decayed
-// (Loshchilov & Hutter, "AdamW") and 1 otherwise — at which point the
-// multiply folds out and you're left with plain Adam. `lrt` is supplied
-// per-step from CPU and includes the bias-correction factor
-// `sqrt(1-b2^t)/(1-b1^t)`; that's why convergence isn't affected by the
-// first-step warmup that bias-correction-free Adam suffers.
+// `decayShrink = 1 - lr * weightDecay` for decayed params (Loshchilov & Hutter
+// "AdamW"), else 1 (so the multiply folds out). `lrt` is supplied per step
+// from CPU and includes Adam's bias correction `sqrt(1-b2^t)/(1-b1^t)`.
 //
-// **Static vs scheduled lr.** When `config.lr` is a number, decayShrink is
-// baked into the kernel as a literal. When it's a function `(step) => lr`,
-// decayShrink for decayed params becomes a per-step scalar input that the
-// runtime updates each call (computed from the current step's lr). lrt is
-// always per-step; the bias-correction factor changes every step regardless.
-//
-// Returns writeback declarations the buffer planner uses to wire up the
-// "after step, copy the new value into the persistent home" path. m and v
-// are state_inputs (zero-initialized, persistent across steps); the param
-// updates are aliased back to the param buffers.
+// Static vs scheduled lr: a number bakes decayShrink as a kernel literal; a
+// schedule routes decayShrink through a per-step scalar input. lrt is always
+// per-step (bias correction changes every step regardless).
 
 import type { Tensor } from './ir.js'
 import type { Graph } from './ir.js'
@@ -32,23 +17,18 @@ import type { WritebackDecl } from './buffers.js'
 import { traceInto, stateInput, tensorInput } from './trace.js'
 import { adamUpdateM, adamUpdateV, adamUpdateP, add, mul, sqrt, sum, div, min, broadcastTo, constScalar } from './ops.js'
 
-/** Per-step learning-rate schedule. Either a fixed number or one of the
- *  serializable shape forms below. Functions/closures are not supported —
- *  the schedule needs to cross thread boundaries and survive serialization
- *  for the worker-internal runtime, and every realistic LR pattern (constant,
- *  linear decay, cosine, warmup-then-decay) maps to a finite set of shapes.
- *  Use the `lr` helper namespace to construct shapes ergonomically. */
 /**
- * Each non-constant schedule variant carries an optional `startStep`
- * (default 0). The schedule's intrinsic step is `current_step - startStep`,
- * clamped to be ≥ 1. This lets a user say "decay starting from where I am
- * now" instead of "decay measured from step 1 of training," without us
- * having to bake closures into the schedule shape.
+ * Per-step learning-rate schedule. Either a fixed number or one of the
+ * serializable shape forms below. Closures aren't supported — the schedule
+ * crosses the worker boundary and every realistic LR pattern (constant,
+ * linear/cosine decay, warmup-then-decay, step, multi-step) maps to one of
+ * these shapes. Use the `lr` helper namespace for ergonomic construction.
  *
- * `setOptimizerConfig({ lr: <schedule> })` auto-fills `startStep = current_t`
- * for any non-constant schedule that doesn't already specify one, so the
- * schedule's "step 1" lines up with the Adam step it took effect. If the
- * caller sets `startStep` explicitly, it's respected as-is.
+ * Each non-constant variant carries an optional `startStep` (default 0).
+ * The intrinsic step is `max(1, currentStep - startStep)`, so users can
+ * say "decay starting from where I am now" without us baking closures into
+ * the shape. `setOptimizerConfig({ lr })` auto-fills `startStep = current_t`
+ * when not set, so the new schedule's step 1 = the next training step.
  */
 export type LR =
   | number
@@ -115,9 +95,8 @@ export function resolveLR(schedule: LR, step: number): number {
       return resolveLR(schedule.after, s - schedule.warmupSteps)
     }
     case 'step': {
-      // PyTorch StepLR uses 0-based epoch indexing; we keep 1-based to match
-      // the rest of the schedules. `(s - 1) / stepSize` mirrors the same
-      // boundary semantics as PyTorch (the first stepSize values are unscaled).
+      // 1-based step indexing; `(s - 1) / stepSize` matches PyTorch StepLR's
+      // boundary semantics (first stepSize values unscaled).
       const s = intrinsicStep(schedule.startStep, step)
       const k = Math.floor((s - 1) / schedule.stepSize)
       return schedule.peak * Math.pow(schedule.gamma, k)
@@ -149,6 +128,10 @@ export function isLRDynamic(schedule: LR): boolean {
   return typeof schedule !== 'number'
 }
 
+/** Adam / AdamW configuration. Pass via `compileModule({ adam: ... })`.
+ *  Only `lr` is required; everything else has PyTorch-matching defaults.
+ *  For pure Adam, leave `weightDecay` at 0; non-zero turns this into AdamW
+ *  (decoupled decay, Loshchilov & Hutter). */
 export interface AdamConfig {
   /** Learning rate schedule. Pass a number for fixed lr, or a shape from
    *  the `lr` helpers (e.g., `lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 })`). */
@@ -188,6 +171,10 @@ export interface AdamResolvedConfig {
   lrIsScheduled: boolean
 }
 
+/** Output of `appendAdam`. Carries the writeback declarations the buffer
+ *  planner needs to wire up persistent state + param updates, plus the
+ *  scalar-input names the runtime fills per step (`lrt`, and `decayShrink`
+ *  when both lr is scheduled and at least one param is being decayed). */
 export interface AdamResult {
   /** Writebacks the buffer planner should wire into the runtime. */
   writebacks: WritebackDecl[]
@@ -259,13 +246,10 @@ export function appendAdam(
   config: AdamConfig,
   /** Per-param decay flags from `materializeParams`. When supplied, overrides
    *  `config.decayFilter` for any name in the map; falls back to `decayFilter`
-   *  for names not present (e.g., for low-level callers using `compile()`
-   *  directly without a Module). */
+   *  for names not present (low-level callers without a Module). */
   decayFlags?: Record<string, boolean>,
 ): AdamResult {
-  // Global L2-norm clipping (if requested) runs before Adam's update path:
-  // gradients are scaled in-graph and the rest of appendAdam consumes the
-  // clipped values as if they were the originals.
+  // Clipping happens in-graph before Adam consumes the gradients.
   if (config.clipGradNorm !== undefined && config.clipGradNorm > 0) {
     paramGrads = appendGradClip(graph, paramGrads, config.clipGradNorm)
   }
@@ -282,17 +266,14 @@ export function appendAdam(
   }
   const writebacks: WritebackDecl[] = []
   const lrtInputName = '_adam_lrt'
-  // Tensor input for runtime-updated decayShrink (only created when lr is a
-  // schedule fn AND at least one param will receive weight decay).
+  // Only allocated when lr is scheduled AND some param receives weight decay.
   let decayShrinkInputName: string | null = null
 
   return traceInto(graph, () => {
     const lrt = tensorInput(lrtInputName, [], 'f32')
 
-    // Up-front: which params receive weight decay? Per-param decayFlags (set
-    // by Module.param's options) wins; falls back to decayFilter for names
-    // not in the map. Empty when weightDecay = 0 so the rest of the function
-    // can just ask "is this name in the set?".
+    // Per-param decayFlags (from Module.param's options) win; decayFilter is
+    // the fallback. Empty set when weightDecay = 0.
     const decayedNames = new Set<string>(
       fullConfig.weightDecay > 0
         ? Object.keys(paramGrads).filter(name =>
@@ -300,9 +281,6 @@ export function appendAdam(
         : [],
     )
 
-    // We only need a runtime decayShrink scalar when lr varies per step AND
-    // at least one param is being decayed. Otherwise the value is constant
-    // and bakes into the kernel as a literal.
     let decayShrinkScalar: Tensor | null = null
     if (lrIsScheduled && decayedNames.size > 0) {
       decayShrinkInputName = '_adam_decay_shrink'
@@ -318,16 +296,15 @@ export function appendAdam(
       const mState = stateInput(`adam_m_${name}`, p.shape, 'f32', 0)
       const vState = stateInput(`adam_v_${name}`, p.shape, 'f32', 0)
 
-      // Choose the decayShrink form per param:
-      //   - non-decayed params: literal 1 (kernel multiply folds out).
-      //   - decayed + scheduled lr: tensor input updated per step.
-      //   - decayed + static lr: literal `1 - lr * wd` baked at compile.
+      // decayShrink form per param:
+      //   non-decayed:           literal 1 (multiply folds out)
+      //   decayed + scheduled:   per-step tensor input
+      //   decayed + static lr:   literal `1 - lr * wd` baked at compile
       const decayShrink: number | Tensor =
         !decayedNames.has(name) ? 1
         : decayShrinkScalar !== null ? decayShrinkScalar
         : 1 - initialLr * fullConfig.weightDecay
 
-      // Three fused kernels per parameter — one for each of m_new / v_new / p_new.
       const newM = adamUpdateM(mState, g, fullConfig.b1)
       const newV = adamUpdateV(vState, g, fullConfig.b2)
       const newP = adamUpdateP(p, newM, newV, lrt, fullConfig.eps, decayShrink)

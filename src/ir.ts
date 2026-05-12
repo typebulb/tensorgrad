@@ -1,54 +1,81 @@
-// Intermediate representation for tensor computations.
-//
-// A `Graph` is a flat array of `OpNode`s in topological (= construction) order.
-// A `Tensor` is an opaque handle: shape + dtype + a pointer back to the OpNode
-// that produced it (or `null` for graph leaves — params and external inputs).
-//
-// This is the data structure everything else operates on:
-//   - tracing builds it (src/trace.ts)
-//   - autograd walks it in reverse to add backward nodes (src/grad.ts, later)
-//   - codegen reads it to emit WGSL kernels and a dispatch plan (src/codegen.ts, later)
-//
-// Design intent: keep this file boring. No tracing logic, no shape inference,
-// no codegen — those live in their own modules and consume `Graph` / `OpNode`.
+// Intermediate representation. Pure data: tracing, shape inference, autograd,
+// and codegen all live in other modules and consume `Graph` / `OpNode`.
 
+/** Element type of a tensor.
+ *  - `f32` — 32-bit float. The only dtype for params, activations, and gradients.
+ *  - `i32` — 32-bit signed int. Indices, token IDs, argmax results.
+ *  - `bool` — 1-bit logical. Produced by comparisons (`less`/`greater`),
+ *    consumed by `where`. Stored as `u32` on the GPU; not user-facing as
+ *    an input dtype. */
 export type Dtype = 'f32' | 'i32' | 'bool'
+
+/** Tensor shape: a tuple of non-negative integer dim sizes. Read-only by
+ *  convention — every shape in the IR is frozen at trace time. Rank 0 means
+ *  a scalar (`[]`). */
 export type Shape = readonly number[]
 
-// A Tensor is just metadata + a unique id. The actual storage doesn't exist
-// until the graph is compiled and run on a device.
+/**
+ * The fundamental handle for everything in the IR. A `Tensor` is *metadata
+ * only* — it carries shape, dtype, and a pointer back to the op that produced
+ * it. The actual GPU storage doesn't exist until the graph is compiled and
+ * run on a device.
+ *
+ * User code receives `Tensor`s from op calls (`add`, `matmul`, etc.) and
+ * threads them through further ops. Tensors are immutable: each op call
+ * returns a freshly-allocated handle pointing at a new node in the graph.
+ *
+ * - `id` — index into `Graph.tensors`. Unique within a single trace.
+ * - `shape` / `dtype` — static at trace time; identical to the producing
+ *   op's output shape/dtype.
+ * - `source` — index into `Graph.ops` of the op that produced this tensor,
+ *   or `null` for graph leaves (params, external inputs, persistent state).
+ * - `site` — call-site captured when the op was invoked, used to attribute
+ *   later shape errors to the user's frame rather than the library's.
+ */
 export interface Tensor {
   readonly id: number
   readonly shape: Shape
   readonly dtype: Dtype
-  // null for leaves (params, external inputs); otherwise the index into Graph.ops.
+  /** Index into `Graph.ops` of the producing op, or `null` for leaves
+   *  (`param_input` / `tensor_input` / `state_input`). */
   readonly source: number | null
-  // Captured at op-call time so shape errors blame the user's frame, not the
-  // library's. Lazy: only formatted on demand.
+  /** Captured at op-call time so shape errors blame the user's frame, not
+   *  the library's. Lazy: only formatted on demand. */
   readonly site: CallSite | null
 }
 
+/** Origin of an op invocation. Captured eagerly at the point each op is
+ *  called so errors raised downstream (during shape inference, autograd,
+ *  or codegen) can point at the user's source line rather than inside
+ *  tensorgrad. Use `formatSite` to render for display. */
 export interface CallSite {
   readonly opName: string
-  // Full Error stack at the point of op invocation. Format on demand.
+  /** Full `Error.stack` at the point of op invocation. Format on demand
+   *  via `formatSite` — parsing/trimming is deferred to error reporting. */
   readonly stack: string
 }
 
-// Discriminated union over every op the IR knows about. Adding an op means:
-//   1. add a variant here,
-//   2. add a shape rule in src/shape.ts,
-//   3. add an adjoint (autograd "transpose") rule in src/grad.ts,
-//   4. add a kernel template in src/codegen.ts.
-// The kinds intentionally match the surface API in src/ops.ts one-to-one.
+/**
+ * Discriminated union over every op the IR knows about. Each variant carries
+ * the inputs (tensor ids), the output tensor id (`out`), and any
+ * op-specific scalar parameters baked at trace time.
+ *
+ * Adding a new op means:
+ *   1. add a variant here,
+ *   2. add a shape rule in `src/shape.ts`,
+ *   3. add an adjoint rule in `src/grad.ts`,
+ *   4. add a kernel template in `src/codegen.ts`.
+ *
+ * The kinds intentionally match the surface API in `src/ops.ts` one-to-one
+ * (with the exception of autograd-internal kinds like `*_grad`, `broadcast_to`,
+ * `sum_to_shape` which are emitted by `appendGrad` but not user-facing).
+ */
 export type OpNode =
   // ---- Leaves ----------------------------------------------------------------
-  // A trainable parameter, supplied by the caller as a Float32Array at runtime.
   | { kind: 'param_input'; out: number; name: string }
-  // A non-trainable input (tokens, targets, constants). Bound at runtime.
   | { kind: 'tensor_input'; out: number; name: string }
-  // Persistent state buffer (e.g. Adam's m/v). Allocated and zero-initialized
-  // at compile time; survives across step() calls. Updated via writebacks
-  // declared in the compile result.
+  // Persistent buffer (e.g. Adam's m/v). Allocated at compile time, filled
+  // with `initValue`, survives across step() calls; updated via writebacks.
   | { kind: 'state_input'; out: number; name: string; initValue: number }
 
   // ---- Element-wise --------------------------------------------------------
@@ -72,33 +99,26 @@ export type OpNode =
   | { kind: 'tanh'; out: number; a: number }
   | { kind: 'sigmoid'; out: number; a: number }
   // Inverted dropout. Same kernel runs forward (a = x) and backward (a = dy):
-  // applies a per-element mask of value 0 or 1/(1-p), reproducibly from
-  // (seed, salt, thread_id). `salt` is a per-dropout-call counter unique
-  // within this graph; backward emits another `dropout` op with the same
-  // salt + seed so the masks match. `seed` is the id of a shared i32 scalar
-  // tensor_input (`__dropoutSeed`) the runtime updates per step.
+  // mask value is 0 or 1/(1-p), reproducible from (seed, salt, thread_id).
+  // `salt` is a per-call counter; backward emits a matching `dropout` op with
+  // the same (seed, salt) so masks line up. `seed` is the id of the shared
+  // i32 scalar tensor_input (`__dropoutSeed`) the runtime updates per step.
   | { kind: 'dropout'; out: number; a: number; seed: number; p: number; salt: number }
 
-  // ---- Reductions (over last axis only; reshape if you need other axes) ----
+  // ---- Reductions (over last axis only; permute first for other axes) -----
   | { kind: 'mean_last'; out: number; a: number }   // keepdims=true
   | { kind: 'sum_last'; out: number; a: number }    // keepdims=false
-  // argmax over the last axis (keepdims=false). Returns i32; non-differentiable.
-  | { kind: 'argmax_last'; out: number; a: number }
+  | { kind: 'argmax_last'; out: number; a: number } // i32, non-differentiable
 
   // ---- Shape ---------------------------------------------------------------
   | { kind: 'reshape'; out: number; a: number; newShape: Shape }
   | { kind: 'permute'; out: number; a: number; perm: readonly number[] }
 
   // ---- Linear algebra -----------------------------------------------------
-  // Public `matmul(a, b)` (src/ops.ts) dispatches between the two kinds below
-  // based on rhs rank — rank-2 rhs uses 'matmul', rank-matched batched rhs
-  // uses 'matmul_batched'. Two kinds for two distinct kernel shapes; one
-  // public name. Kept separate so autograd adjoint rules stay simple.
-  //
-  // matmul: a [..., M, K] · b [K, N] -> [..., M, N]. b is unbatched.
-  | { kind: 'matmul'; out: number; a: number; b: number }
-  // matmul_batched: a [..., M, K] · b [..., K, N] -> [..., M, N]. Used by attention.
-  | { kind: 'matmul_batched'; out: number; a: number; b: number }
+  // Two kinds for two kernel shapes; public `matmul` dispatches on rhs rank.
+  // Kept separate so autograd adjoint rules stay simple.
+  | { kind: 'matmul'; out: number; a: number; b: number }          // [..., M, K] · [K, N]
+  | { kind: 'matmul_batched'; out: number; a: number; b: number }  // [..., M, K] · [..., K, N]
 
   // ---- Indexing / casting --------------------------------------------------
   | { kind: 'one_hot'; out: number; indices: number; depth: number; dtype: Dtype }
@@ -107,34 +127,29 @@ export type OpNode =
   // ---- ML primitives (fused for cleaner autograd) -------------------------
   | { kind: 'softmax_causal_last'; out: number; a: number }
   | { kind: 'log_softmax_last'; out: number; a: number }
-  // Sets cells where (i >= j) on the last two axes; for masking attention scores
-  // *before* softmax. Lower-triangle entries pass through; upper-triangle entries
-  // become `fillValue` (typically -inf or a large negative number).
+  // Pre-softmax causal mask. Upper-triangle (i < j) entries become `fillValue`
+  // (typically a large negative); lower triangle passes through.
   | { kind: 'where_causal'; out: number; a: number; fillValue: number }
 
   // ---- Comparisons + selection -------------------------------------------
-  // Element-wise comparison; result is bool (lowered to u32 in storage).
-  // Supports the same trailing-axis broadcast as element-wise binops.
+  // Bool result (lowered to u32 in storage). Trailing-axis broadcast.
   | { kind: 'less'; out: number; a: number; b: number }
   | { kind: 'greater'; out: number; a: number; b: number }
-  // Element-wise select: out[i] = cond[i] ? a[i] : b[i]. cond must be bool.
-  // a, b, cond all broadcast-compatible to out's shape.
+  // out[i] = cond[i] ? a[i] : b[i]. cond is bool; a/b/cond broadcast to out.
   | { kind: 'where'; out: number; cond: number; a: number; b: number }
 
   // ---- Optimizer-fused ops (Adam) ----------------------------------------
-  // Each is a single kernel doing the full per-element math, baking in the
-  // hyperparameter constant. Used by appendAdam() to avoid decomposing the
-  // update into ~12 element-wise dispatches per param.
+  // Single kernel per param-element. Used by appendAdam to avoid decomposing
+  // the update into ~12 element-wise dispatches per param.
   | { kind: 'adam_update_m'; out: number; m: number; g: number; b1: number }
   | { kind: 'adam_update_v'; out: number; v: number; g: number; b2: number }
-  // adam_update_p: p_new = decayShrink * p - lrt[0] * m_new / (sqrt(v_new) + eps).
-  // `lrt` is a scalar tensor (provided as a tensor_input updated per step) that
-  // already includes Adam's bias-correction factor: lrt = lr * sqrt(1-b2^t) / (1-b1^t).
-  // `decayShrink` is the decoupled-weight-decay factor (Loshchilov & Hutter,
-  // "AdamW"): 1 - lr * weightDecay when the param is being decayed, 1 otherwise.
-  // It can be either a compile-time literal (number) for fixed-lr training, or a
-  // tensor id pointing at a scalar input that the runtime updates per step (used
-  // when the user supplies an lr schedule via `adam: { lr: (step) => ... }`).
+  // p_new = decayShrink * p - lrt[0] * m_new / (sqrt(v_new) + eps).
+  // `lrt` is a 0-d scalar tensor_input updated per step, already including
+  // Adam's bias correction: lrt = lr * sqrt(1-b2^t) / (1-b1^t).
+  // `decayShrink` is AdamW's `1 - lr * weightDecay` (or 1 for non-decayed
+  // params). Static-lr training bakes it as a literal; scheduled lr routes
+  // it through `decayShrinkTensor` (a per-step scalar input), which takes
+  // precedence when non-null.
   | {
       kind: 'adam_update_p'
       out: number
@@ -143,110 +158,108 @@ export type OpNode =
       vNew: number
       lrt: number
       eps: number
-      decayShrink: number               // literal (used when decayShrinkTensor is null)
-      decayShrinkTensor: number | null  // tensor id of a scalar input; takes precedence when set
+      decayShrink: number
+      decayShrinkTensor: number | null
     }
 
   // ---- Slicing / broadcasting / autograd infrastructure -------------------
-  // Slice [start, end) along the last axis. Output shape: input shape with
-  // last axis replaced by (end - start). Used for splitting Q/K/V from a
-  // single fused QKV matmul.
+  // Slice [start, end) along the last axis.
   | { kind: 'slice_last_range'; out: number; a: number; start: number; end: number }
-  // General-axis slice: take elements [start, end) along `axis`. Axis is
-  // non-negative; ops.ts normalizes negative axes before constructing.
+  // General-axis slice. `axis` is non-negative (ops.ts normalizes negatives).
   | { kind: 'slice_range'; out: number; a: number; axis: number; start: number; end: number }
-  // Concatenation along `axis` of two or more inputs. All inputs must have
-  // identical shape except along `axis`; output's size on `axis` is the sum.
-  // Variable-arity input — the only such op in the IR. Capped at 7 inputs
-  // by codegen (WebGPU bind group limit: 8 storage buffers per stage,
-  // minus 1 for the output).
+  // Variable-arity concat along `axis`. Capped at 7 inputs by codegen
+  // (WebGPU bind-group limit: 8 storage buffers per stage minus the output).
   | { kind: 'concat'; out: number; inputs: readonly number[]; axis: number }
-  // Broadcast `a` to `targetShape`. Standard right-aligned NumPy broadcast.
-  // Used by autograd to expand cotangents back over reduced/broadcast axes.
+  // Right-aligned NumPy broadcast. Emitted by autograd to expand cotangents.
   | { kind: 'broadcast_to'; out: number; a: number; targetShape: Shape }
-  // Inverse of broadcast_to: sum-reduce `a` to `targetShape`. Used by autograd
-  // to "un-broadcast" a cotangent back to the smaller operand's shape.
+  // Inverse of broadcast_to: sum-reduce to `targetShape`. Emitted by autograd
+  // to un-broadcast a cotangent back to the smaller operand's shape.
   | { kind: 'sum_to_shape'; out: number; a: number; targetShape: Shape }
-  // 0-d tensor with a constant value. Used to seed loss cotangent (1.0).
+  // 0-d const. Used to seed the loss cotangent (1.0).
   | { kind: 'const_scalar'; out: number; value: number; dtype: Dtype }
-  // ReLU's backward: passes `dy` through where `x > 0`, else 0. Output shape = x's.
+  // ReLU's backward: dy where x > 0, else 0. Fused so autograd doesn't have
+  // to emit a where+const-zero+broadcast chain.
   | { kind: 'relu_grad'; out: number; x: number; dy: number }
 
-  // ---- 2D convolution (NCHW) ----------------------------------------------
-  // conv2d: forward. Input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
-  // -> [B, C_out, H_out, W_out]. Bias is added separately (via `add` + broadcast)
-  // so this op stays pure. Stride and per-side padding are non-negative ints.
+  // ---- 2D convolution (NCHW). Bias is added separately via `add` + reshape
+  // so these ops stay pure. Stride/padding are non-negative ints.
   | {
-      kind: 'conv2d'
+      kind: 'conv2d'                                // [B, C_in, H, W] · [C_out, C_in, K_h, K_w]
       out: number
-      input: number          // [B, C_in, H, W]
-      weight: number         // [C_out, C_in, K_h, K_w]
+      input: number
+      weight: number
       strideH: number; strideW: number
       padH: number; padW: number
     }
-  // conv2d input gradient: dInput = "transposed conv" of dy with weight.
-  // Computed as a gather: each input position sums contributions from every
-  // output position whose receptive field contained it. Shape matches `input`.
+  // dInput as transposed-conv of dy with weight. Implemented as a gather:
+  // each input position sums contributions from every output whose receptive
+  // field covered it.
   | {
       kind: 'conv2d_input_grad'
       out: number
-      weight: number         // [C_out, C_in, K_h, K_w]
-      dy: number             // [B, C_out, H_out, W_out]
-      inH: number; inW: number  // input spatial dims (target shape carries C_in implicitly via weight)
+      weight: number
+      dy: number
+      inH: number; inW: number
       strideH: number; strideW: number
       padH: number; padW: number
     }
-  // conv2d weight gradient: dWeight = correlation between input and dy.
-  // Computed as a gather over (B, H_out, W_out) per (C_out, C_in, K_h, K_w).
-  // Shape matches `weight`.
+  // dWeight as correlation between input and dy. Gather over (B, H_out, W_out)
+  // per (C_out, C_in, K_h, K_w).
   | {
       kind: 'conv2d_weight_grad'
       out: number
-      input: number          // [B, C_in, H, W]
-      dy: number             // [B, C_out, H_out, W_out]
+      input: number
+      dy: number
       kH: number; kW: number
       strideH: number; strideW: number
       padH: number; padW: number
     }
 
-  // ---- 2D max pooling (NCHW) ----------------------------------------------
-  // max_pool_2d: forward. Input [B, C, H, W] -> [B, C, H_out, W_out]. Argmax
-  // indices are not stored; the backward kernel recomputes them on the fly.
-  // Padded regions are treated as -inf (don't contribute to argmax).
+  // ---- 2D max pooling (NCHW). Argmax indices are not stored; backward
+  // recomputes them on the fly. Padded regions are treated as -inf.
   | {
       kind: 'max_pool_2d'
       out: number
-      input: number          // [B, C, H, W]
+      input: number
       kH: number; kW: number
       strideH: number; strideW: number
       padH: number; padW: number
     }
-  // max_pool_2d backward: scatters dy to whichever input position was the
-  // argmax. Implemented as a gather (one thread per input element) to avoid
-  // atomics: each input position checks every output whose receptive field
-  // covers it, and if it's the argmax for that output, accumulates dy.
-  // `input` is the original forward input (needed to recompute argmax).
+  // Scatter dy to whichever input position won the argmax. Implemented as a
+  // gather (one thread per input element) to avoid atomics; needs the
+  // original forward `input` to recompute the argmax.
   | {
       kind: 'max_pool_2d_grad'
       out: number
-      input: number          // [B, C, H, W] — the original forward input
-      dy: number             // [B, C, H_out, W_out]
+      input: number
+      dy: number
       kH: number; kW: number
       strideH: number; strideW: number
       padH: number; padW: number
     }
 
-// A Graph collects ops and tensors during tracing, then becomes the input to
-// autograd and codegen. Once tracing is done it should be treated as immutable.
+/**
+ * A traced computation graph: a flat array of ops in topological (=
+ * construction) order, plus the tensors they produce. Built by `trace(...)`;
+ * consumed by `appendGrad` (autograd), `planBuffers` (memory layout), and
+ * `emitKernels` (codegen).
+ *
+ * Once tracing is done a `Graph` should be treated as immutable — though
+ * `traceInto` may re-enter it to append more ops (used by autograd and the
+ * optimizer passes). `compiled.ir.graph` exposes the final graph for
+ * inspection (op list, tensor metadata, capture registry).
+ */
 export interface Graph {
+  /** Ops in topological / construction order. */
   readonly ops: OpNode[]
+  /** Every tensor produced in this trace, indexed by `Tensor.id`. */
   readonly tensors: Tensor[]
-  // Names of tensors that should be exposed as outputs of the compiled function.
-  // Set by the trace driver; for a loss function, this is `[lossTensor]`.
+  /** Tensor ids exposed as outputs of the compiled function. Set by the
+   *  trace driver — for a loss function, this is `[lossTensor.id]`. */
   readonly outputs: number[]
-  // Tensors registered for activation readback via `capture(name, t)`.
-  // Keyed by user-supplied name; insertion order preserved. Empty when no
-  // captures registered (the common training case — zero overhead).
+  /** Tensors registered for activation readback via `capture(name, t)`.
+   *  Keyed by user-supplied name, insertion order preserved. Empty when
+   *  no captures are registered (the common training case — zero overhead). */
   readonly captures: Map<string, number>
 }
 
@@ -254,7 +267,6 @@ export function makeGraph(): Graph {
   return { ops: [], tensors: [], outputs: [], captures: new Map() }
 }
 
-// Internal: register a fresh tensor in the graph and return its id.
 export function addTensor(g: Graph, shape: Shape, dtype: Dtype, source: number | null, site: CallSite | null): Tensor {
   const id = g.tensors.length
   const t: Tensor = { id, shape, dtype, source, site }
@@ -262,10 +274,8 @@ export function addTensor(g: Graph, shape: Shape, dtype: Dtype, source: number |
   return t
 }
 
-// Internal: append an op and the tensor it produces. Returns the produced tensor.
-// Generic over the specific op kind so callers don't need `as any` casts.
-// `Extract<OpNode, { kind: K }>` narrows the union to the chosen variant, then
-// `Omit` strips the parts addOp itself supplies (the kind tag and out tensor id).
+// Generic over op kind so callers don't need `as any` casts: `Extract<OpNode,
+// { kind: K }>` narrows the union; `Omit` strips the fields addOp supplies.
 export function addOp<K extends OpNode['kind']>(
   g: Graph,
   kind: K,
@@ -281,21 +291,17 @@ export function addOp<K extends OpNode['kind']>(
   return out
 }
 
-// Capture a call site without paying full Error formatting cost up-front.
-// The stack is materialised but parsing/trimming is deferred to error reporting.
+// Cheap: materializes the stack string but defers parsing to format time.
 export function captureSite(opName: string): CallSite {
-  // Skip our own frame plus the op wrapper's frame; user's frame is what's left.
   const stack = (new Error()).stack ?? ''
   return { opName, stack }
 }
 
-// Format a CallSite for inclusion in a thrown error. Strips Tensorgrad frames
-// and library internals so the user sees their code first.
 export function formatSite(site: CallSite): string {
   const lines = site.stack.split('\n')
-  // Stack starts with "Error" line; drop it. Then drop frames from this file
-  // and from src/ops.ts so the first surviving frame is user code.
   const userFrames: string[] = []
+  // Skip the "Error" header and every frame inside the library; first
+  // surviving frame is user code.
   for (const line of lines.slice(1)) {
     if (line.includes('/tensorgrad/src/') || line.includes('\\tensorgrad\\src\\')) continue
     userFrames.push(line.trim())

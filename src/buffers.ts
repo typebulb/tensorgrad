@@ -1,28 +1,29 @@
-// Buffer planning: walk a Graph and decide which GPU buffer each Tensor maps to.
+// Buffer planning. v1 strategy: one GPU buffer per IR Tensor, no pooling.
+// Static shapes make every buffer's size known at compile time and lifetimes
+// don't overlap between steps. Total memory is the sum of every intermediate
+// (~30 MB at transformer B=256 — easily fits).
 //
-// v1 strategy: one GPU buffer per IR Tensor. Static shapes mean every buffer's
-// size is known at compile time and lifetimes don't overlap between steps —
-// so no pooling needed. Total memory is the sum of every intermediate tensor.
-// For our transformer at B=256: ~30 MB of activations + grads. Easily fits.
-//
-// Categorization is what the runtime cares about:
-//   * param        — uploaded by user via uploadParams; persistent across steps
-//   * param_grad   — written each step by the backward pass; readable for inspection
-//   * tensor_input — uploaded each step (tokens, targets, masks)
-//   * intermediate — produced by an op; lifetime = within a single step
-//   * output       — special intermediate that should be made readable (loss)
+// `BufferSpec.kind` is what the runtime branches on for allocation, upload,
+// readback, and lifetime.
 
 import type { Graph, Tensor, Dtype, Shape, OpNode } from './ir.js'
 import { shapeSize } from './shape.js'
 
+/** One entry per GPU buffer. v1: one buffer per IR tensor (no pooling — see
+ *  `planBuffers` header). `kind` discriminates how the runtime should treat it
+ *  (upload vs read-back vs persistent vs ephemeral). */
 export interface BufferSpec {
-  /** Matches tensor.id. */
+  /** Matches `Tensor.id`. */
   id: number
+  /** Allocation size in bytes (padded to ≥ 4 even for 0-d scalars). */
   byteSize: number
   dtype: Dtype
   shape: Shape
+  /** What this buffer is for. Drives runtime allocation, upload, readback,
+   *  and lifetime decisions. */
   kind: 'param' | 'param_grad' | 'tensor_input' | 'state' | 'intermediate' | 'output'
-  /** External name for param/param_grad/tensor_input/state bindings. null otherwise. */
+  /** External name for `param`/`param_grad`/`tensor_input`/`state` bindings.
+   *  `null` for `intermediate` / `output`. */
   name: string | null
   /** For state buffers: the value to fill on initial allocation. 0 by default. */
   initValue?: number
@@ -39,17 +40,26 @@ export interface Writeback {
   bytes: number
 }
 
+/** Compile-time GPU memory layout. Produced by `planBuffers`, consumed by
+ *  the runtime to allocate buffers and by codegen to wire bind groups.
+ *  Lookup maps avoid linear scans of `buffers` at runtime. */
 export interface BufferPlan {
+  /** Every allocation the runtime needs, indexed by `BufferSpec.id` (== tensor id). */
   buffers: BufferSpec[]
   /** Tensor id -> buffer id (currently 1:1 but kept opaque for future pooling). */
   tensorToBuffer: Map<number, number>
-  /** Easy lookup tables for the runtime. */
-  paramsByName: Map<string, number>           // name -> buffer id
-  inputsByName: Map<string, number>           // name -> buffer id
-  paramGradsByName: Map<string, number>       // name -> buffer id
-  statesByName: Map<string, number>           // name -> buffer id (persistent state homes)
-  capturesByName: Map<string, number>         // name -> buffer id (activation captures)
-  outputBufferIds: number[]                   // graph.outputs mapped through
+  /** Param name -> buffer id. Used for uploads/downloads. */
+  paramsByName: Map<string, number>
+  /** Tensor-input name -> buffer id. Filled per step from the inputs record. */
+  inputsByName: Map<string, number>
+  /** Param name -> buffer id of that param's gradient tensor. */
+  paramGradsByName: Map<string, number>
+  /** State name -> buffer id of its persistent home. */
+  statesByName: Map<string, number>
+  /** Capture name -> buffer id of the registered activation. */
+  capturesByName: Map<string, number>
+  /** Graph outputs mapped through `tensorToBuffer`. */
+  outputBufferIds: number[]
   /** End-of-step writebacks (Adam updates for params, m, v, etc.) */
   writebacks: Writeback[]
 }
@@ -87,18 +97,15 @@ export function planBuffers(
   const paramGradsByName = new Map<string, number>()
   const statesByName = new Map<string, number>()
 
-  // Build a quick reverse map: tensorId -> param name (for grads).
   const gradTensorIdToName = new Map<number, string>()
   for (const [name, tensor] of Object.entries(paramGrads)) {
     gradTensorIdToName.set(tensor.id, name)
   }
-  // ...and tensorId -> param/input op (so we can name the buffer correctly).
   const opByOutId = new Map<number, OpNode>()
   for (const op of graph.ops) opByOutId.set(op.out, op)
 
   const outputSet = new Set(graph.outputs)
 
-  // Walk all tensors in id order. Categorize each.
   for (const t of graph.tensors) {
     const op = opByOutId.get(t.id)
     let kind: BufferSpec['kind'] = 'intermediate'
@@ -132,7 +139,7 @@ export function planBuffers(
       ...(initValue !== undefined ? { initValue } : {}),
     }
     buffers.push(spec)
-    tensorToBuffer.set(t.id, t.id)  // 1:1 for v1
+    tensorToBuffer.set(t.id, t.id)
 
     if (kind === 'param') paramsByName.set(name!, t.id)
     if (kind === 'tensor_input') inputsByName.set(name!, t.id)
@@ -142,7 +149,6 @@ export function planBuffers(
 
   const outputBufferIds = graph.outputs.map(id => tensorToBuffer.get(id)!)
 
-  // Resolve writeback declarations to (source, dest) buffer-id pairs.
   const writebacks: Writeback[] = writebackDecls.map(decl => {
     const sourceBufId = tensorToBuffer.get(decl.source.id)
     if (sourceBufId === undefined) {
@@ -165,9 +171,6 @@ export function planBuffers(
     return { source: sourceBufId, dest: destBufId, bytes: sourceSpec.byteSize }
   })
 
-  // Resolve graph.captures (name -> tensor id) to (name -> buffer id).
-  // No pinning needed at the planner level: each tensor already has its own
-  // buffer (see "v1 strategy" comment at top — no pooling yet).
   const capturesByName = new Map<string, number>()
   for (const [name, tensorId] of graph.captures) {
     const bufId = tensorToBuffer.get(tensorId)

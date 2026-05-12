@@ -1,10 +1,5 @@
-// Worker entry point. Holds the GPUDevice + CompiledRuntime for one or more
-// graphs and proxies main-thread requests via postMessage. See
-// specs/WorkerArchitecture.md for the rationale.
-//
-// Keep this file dependency-free of anything DOM-y: it bundles into a Blob
-// URL and runs in a Web Worker context where `window`/`document` don't
-// exist. WebGPU IS available in workers (Chrome 113+, Safari 17.4+).
+// Worker entry point. Runs in a Web Worker context (no `window`/`document`);
+// see specs/WorkerArchitecture.md for the rationale.
 
 import { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
 import { resolveLR, rebaseLR, type LR } from './adam.js'
@@ -12,29 +7,18 @@ import { DROPOUT_SEED_INPUT } from './ops.js'
 import type { Req, Res, WireIR, WireAdamConfig, WireSGDConfig, WireOptimizerConfig, WireError } from './worker-protocol.js'
 import { wireError } from './worker-protocol.js'
 
-// ----------------------------------------------------------------------------
-// Per-graph state
-// ----------------------------------------------------------------------------
-
 interface GraphSlot {
   runtime: CompiledRuntime
   paramNames: readonly string[]
   outputShape: number[]
   kernelCount: number
   captureShapes: Record<string, number[]>
-  /** Optimizer state for this graph, if it's a training graph. The wrapped
-   *  step uses these to populate per-step scalars (Adam's lrt + decayShrink,
-   *  or SGD's lr). Exactly one branch is populated when training; `null`
-   *  for forward-only graphs (compileForward siblings). */
+  /** Null for forward-only graphs (compileForward siblings). */
   optimizer: OptimizerState | null
-  /** Parent graph id for sibling forward graphs (those that share params via
-   *  `sharedParams`). Set during `compileForward`; `null` for the training
-   *  graph itself. Used by `handleDestroy` to cascade-destroy children when
-   *  the parent goes away. */
+  /** Set for sibling forward graphs (those sharing params via `sharedParams`);
+   *  null for the training graph itself. Used to cascade-destroy children. */
   parentGraphId: number | null
-  /** Per-step dropout seed state, when the graph contains any `dropout` op.
-   *  `null` otherwise. The injected seed input is named DROPOUT_SEED_INPUT
-   *  ('__dropoutSeed') and updated before every step()/run(). */
+  /** Set when the graph contains any `dropout` op. */
   dropout: DropoutState | null
 }
 
@@ -56,19 +40,16 @@ interface SGDState {
 }
 
 interface DropoutState {
-  /** Per-graph step counter; mixes into the kernel's PCG hash. Starts at 1;
-   *  every step()/run() increments before dispatch so each call has a fresh
-   *  seed and reset() back to 1 reproduces an earlier run from the same
-   *  starting point. */
+  /** Per-graph step counter that mixes into the kernel's PCG hash. Bumped
+   *  before each dispatch so successive calls draw different masks while
+   *  staying reproducible from a known starting counter. */
   counter: number
-  /** Reused i32 single-element buffer for the per-step seed. */
   seedBuf: Int32Array
 }
 
 const graphs = new Map<number, GraphSlot>()
 
-// Worker holds one device shared across all graphs (sibling forward graphs
-// must share param GPUBuffers, which means sharing a device).
+// One device shared across all graphs (siblings must share param buffers).
 let device: GPUDevice | null = null
 
 async function ensureDevice(): Promise<GPUDevice> {
@@ -82,9 +63,7 @@ async function ensureDevice(): Promise<GPUDevice> {
   return device
 }
 
-// ----------------------------------------------------------------------------
-// Request handlers
-// ----------------------------------------------------------------------------
+// ---- Request handlers ---------------------------------------------------
 
 async function handleCreateRuntime(payload: {
   graphId: number
@@ -104,7 +83,6 @@ async function handleCreateRuntime(payload: {
     runtime.uploadParams(payload.initialParams)
   }
 
-  // Capture shape metadata for return.
   const captureShapes: Record<string, number[]> = {}
   for (const [name, bufId] of plan.capturesByName) {
     captureShapes[name] = [...plan.buffers[bufId]!.shape]
@@ -136,8 +114,6 @@ function createOptimizerState(cfg: WireOptimizerConfig | null): OptimizerState |
   return { kind: 'sgd', state: createSGDState(cfg.config) }
 }
 
-/** True iff the graph contains any `dropout` op. Drives whether the slot
- *  carries a `DropoutState` and whether step/run inject the seed input. */
 function graphUsesDropout(graph: WireIR['graph']): boolean {
   for (const op of graph.ops) if (op.kind === 'dropout') return true
   return false
@@ -157,7 +133,6 @@ async function handleCompileForward(payload: {
   const outputBufferId = plan.tensorToBuffer.get(outputTensorId)!
   const opts: RuntimeOpts = { device: dev, sharedParams: parent.runtime.params }
   const runtime = await createRuntime(plan, kernels, outputBufferId, opts)
-  // No initial-param upload — sharedParams covers everything.
 
   const captureShapes: Record<string, number[]> = {}
   for (const [name, bufId] of plan.capturesByName) {
@@ -197,9 +172,8 @@ function createSGDState(cfg: WireSGDConfig): SGDState {
   return { config: cfg, t: 0, lrBuf: new Float32Array(1) }
 }
 
-/** Inject the optimizer's per-step scalars into the inputs map. For Adam:
- *  the bias-corrected effective LR (`lrt`) and optionally `decayShrink`.
- *  For SGD: the per-step LR. Buffers are reused across steps. */
+/** Inject the optimizer's per-step scalars: Adam's `lrt` (bias-corrected
+ *  effective LR) and optional `decayShrink`, or SGD's `lr`. */
 function injectOptimizerScalars(slot: GraphSlot, inputs: Record<string, Int32Array | Float32Array>): Record<string, Int32Array | Float32Array> {
   const o = slot.optimizer
   if (!o) return inputs
@@ -215,16 +189,12 @@ function injectOptimizerScalars(slot: GraphSlot, inputs: Record<string, Int32Arr
     }
     return merged
   }
-  // SGD
   const s = o.state
   s.t++
   s.lrBuf[0] = resolveLR(s.config.lr, s.t)
   return { ...inputs, [s.config.lrInputName]: s.lrBuf }
 }
 
-/** Inject the per-step dropout seed into `inputs` when this graph uses
- *  dropout. Counter advances before every step()/run() so each call
- *  produces a different mask, while same-counter dispatches reproduce. */
 function injectDropoutSeed(slot: GraphSlot, inputs: Record<string, Int32Array | Float32Array>): Record<string, Int32Array | Float32Array> {
   const d = slot.dropout
   if (!d) return inputs
@@ -248,10 +218,9 @@ async function handleStep(payload: {
     const loss = await slot.runtime.step(merged)
     return { loss, captures: null }
   } catch (e) {
-    // If the graph was destroyed mid-flight (e.g. replaceModel ran while we
-    // were awaiting mapAsync), surface a clean AbortError instead of the raw
-    // WebGPU "buffer is destroyed" or similar — callers can branch on it
-    // (or pass { abortAsValue: true } to get a discriminated result).
+    // If the graph was destroyed mid-flight (replaceModel while awaiting
+    // mapAsync), translate WebGPU's "buffer is destroyed" into a clean
+    // AbortError so callers can branch on it.
     if (!graphs.has(payload.graphId)) throw abortErr('step aborted: graph destroyed mid-flight')
     throw e
   }
@@ -283,12 +252,10 @@ function abortErr(msg: string): Error {
   return e
 }
 
-/** Captures (a class instance with a private Map) → a plain Record so the
- *  worker can transfer Float32Arrays back without serializing the class. */
+/** Captures class instance → plain Record so we can transfer Float32Arrays
+ *  back without serializing the class. */
 function capturesToRecord(
   captures: { get(name: string): Float32Array; has(name: string): boolean; names(): string[] },
-  // captureShapes available but not used directly — capture names from
-  // shapes in case captures.names() is filtered (it isn't, but be safe).
   shapes: Record<string, number[]>,
 ): Record<string, Float32Array> {
   const out: Record<string, Float32Array> = {}
@@ -335,7 +302,7 @@ function handleSetOptimizerConfig(payload: {
     throw new Error(`setOptimizerConfig: graph ${payload.graphId} has no optimizer (compileForward graphs don't take optimizer state)`)
   }
   if (payload.update.lr === undefined) return
-  // The next step will increment t from its current value, so the schedule
+  // injectOptimizerScalars increments t before each step, so the new schedule
   // takes effect at t+1 — that's the step we rebase against.
   const state = slot.optimizer.state
   const nextStep = state.t + 1
@@ -348,9 +315,8 @@ function handleSetOptimizerConfig(payload: {
 }
 
 function handleDestroy(payload: { graphId: number }): void {
-  // Cascade: any graph that listed this one as parent (a sibling forward
-  // sharing params) loses its backing buffers when we destroy the parent.
-  // Destroy children first so their bind groups release before parent buffers.
+  // Cascade: destroy children first so their bind groups release before the
+  // parent's param buffers (which they were sharing) go away.
   for (const [id, slot] of graphs) {
     if (slot.parentGraphId === payload.graphId) {
       slot.runtime.destroy()
@@ -369,9 +335,7 @@ function mustGet(graphId: number): GraphSlot {
   return slot
 }
 
-// ----------------------------------------------------------------------------
-// Message dispatch
-// ----------------------------------------------------------------------------
+// ---- Message dispatch ---------------------------------------------------
 
 self.onmessage = async (ev: MessageEvent<Req>) => {
   const req = ev.data

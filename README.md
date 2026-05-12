@@ -250,7 +250,7 @@ compiled.downloadParamsFlat()                   // → Record<'layers.0.W' | …
 compiled.downloadParamGrads()                   // → ParamTree<M> (same tree shape)
 compiled.reset()                                // re-init params + zero Adam state
 compiled.resetOptimizerState()
-compiled.setOptimizerConfig({ lr?, weightDecay?, b1?, b2? })  // mutate without recompile
+compiled.setOptimizerConfig({ lr })             // mutate LR without recompile
 compiled.compileForward({ forward, inputs })    // sibling forward graph
 compiled.replaceModel(newFactory)               // swap topology, same worker
 compiled.destroy()                              // tear down worker + GPU
@@ -423,23 +423,19 @@ boundary). Use a `number` for constant LR, or one of the constructors above.
 
 ### `setOptimizerConfig` (mid-training)
 
-Mutate hyperparameters live, without recompiling. For Adam graphs:
-`{ lr?, weightDecay?, b1?, b2? }`. For SGD graphs: `{ lr? }` only
-(passing `b1` / `b2` to an SGD graph throws). Pass any subset; absent
-fields stay put. The step counter is preserved.
+Update the learning rate live, without recompiling. Works for both Adam
+and SGD graphs. The step counter is preserved.
 
 ```ts
 await compiled.setOptimizerConfig({ lr: 0.001 })
-await compiled.setOptimizerConfig({ lr: 0.0005, b2: 0.99 })
 await compiled.setOptimizerConfig({
   lr: lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }),
 })  // non-constant schedules auto-rebase so step 1 = next training step
 ```
 
 Which params receive weight decay is baked at compile time (per-param
-`{ decay: true | false }` metadata). `setOptimizerConfig` changes the
-shrink magnitude on already-decayed params; it doesn't add decay to
-params that didn't have it.
+`{ decay: true | false }` metadata). To change `weightDecay`, `b1`, `b2`,
+or any other non-LR hyperparameter, recompile via `replaceModel`.
 
 ### Gradient clipping
 

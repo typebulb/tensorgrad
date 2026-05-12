@@ -1,14 +1,9 @@
-// WebGPU runtime. Reads a BufferPlan + KernelSpec[] (produced by codegen),
-// allocates real GPU buffers and pipelines, and provides a `step()` method
-// that uploads inputs, dispatches all kernels, and reads back outputs.
-//
-// Browser-only: this module needs `navigator.gpu` at runtime.
+// WebGPU runtime. Browser-only — needs `navigator.gpu` at runtime.
 
 import type { BufferPlan } from './buffers.js'
 import type { KernelSpec } from './codegen.js'
 
-// TS lib.dom defines WebGPU types but not the GPUMapMode runtime constant.
-// Provided by the browser per WebGPU spec; declare just what we use.
+// lib.dom declares the WebGPU types but not this runtime constant.
 declare const GPUMapMode: { readonly READ: number; readonly WRITE: number }
 
 export interface UploadParamsOptions {
@@ -52,11 +47,16 @@ export class Captures {
   names(): string[] { return [...this.data.keys()].sort() }
 }
 
+/** Result of `run(inputs, { withCaptures: true })`: the output tensor as
+ *  a flat `Float32Array` plus the activation captures registered via
+ *  `capture(...)` during the trace. */
 export interface RunResult {
   output: Float32Array
   captures: Captures
 }
 
+/** Result of `step(inputs, { withCaptures: true })`: the scalar loss plus
+ *  the activation captures registered via `capture(...)` during the trace. */
 export interface StepResult {
   loss: number
   captures: Captures
@@ -146,7 +146,8 @@ export interface CompiledRuntime extends CompiledBase {
    *  UI, but most iterations don't pay the `mapAsync` cost. */
   readLoss(): Promise<number>
   /** Re-zero all optimizer state buffers (Adam's m/v) in place. Pair with
-   *  `uploadInitialParams()` for a full training reset without recompile. */
+   *  `uploadParams` (or call the proxy's `reset()` which does both) for a
+   *  full training reset without recompile. */
   resetOptimizerState(): void
 }
 
@@ -167,9 +168,9 @@ export interface RuntimeOpts {
   sharedParams?: Map<string, GPUBuffer>
 }
 
-// Inlined numeric values (per WebGPU spec) so this module is importable in Node
-// for codegen-only usage. The browser provides GPUBufferUsage as a global, but
-// referencing it at module scope would crash before any browser code runs.
+// Spec-inlined so this module is importable in Node for codegen-only use.
+// `GPUBufferUsage` is a browser global; referencing it at module scope would
+// crash on import in Node.
 const STORAGE_RW = 0x80 /*STORAGE*/ | 0x8 /*COPY_DST*/ | 0x4 /*COPY_SRC*/
 const READBACK = 0x1 /*MAP_READ*/ | 0x8 /*COPY_DST*/
 
@@ -182,13 +183,10 @@ export async function createRuntime(
   const device = opts.device ?? await acquireDevice()
   const queue = device.queue
 
-  // ---- Allocate one GPUBuffer per BufferSpec --------------------------------
-  // State buffers also get filled with their initValue at allocation time.
-  // Param buffers may be supplied externally via opts.sharedParams; in that
-  // case we reuse the provided GPUBuffer instead of allocating, and the
-  // sibling compile that owns it is responsible for upload + lifetime.
-  // ownedBufferIds tracks which buffers we allocated ourselves (and so must
-  // destroy on .destroy()) vs which were handed in by a sibling compile.
+  // Allocate one GPUBuffer per BufferSpec. State buffers are filled with
+  // their initValue here. Param buffers in `sharedParams` are reused as-is
+  // (the sibling that owns them is responsible for upload + lifetime);
+  // `ownedBufferIds` tracks which buffers `.destroy()` must release.
   const buffers = new Map<number, GPUBuffer>()
   const ownedBufferIds = new Set<number>()
   const sharedParams = opts.sharedParams
@@ -214,10 +212,9 @@ export async function createRuntime(
     if (spec.kind === 'state') fillStateBuffer(spec, buf)
   }
 
-  // ---- Compile pipelines per kernel; cache by WGSL source -------------------
-  // Push an error scope around each shader+pipeline creation so we can surface
-  // the actual compile error rather than the cryptic "previous error" that
-  // comes from using an invalid pipeline at dispatch time.
+  // Per-kernel pipelines, cached by WGSL source. Error scope around each
+  // creation surfaces the real shader compile error instead of the cryptic
+  // "previous error" you'd otherwise get at dispatch time.
   const moduleCache = new Map<string, GPUShaderModule>()
   const pipelines: (GPUComputePipeline | null)[] = []
   type ErrorProbe = Promise<{ k: KernelSpec; module: GPUShaderModule; err: GPUError } | null>
@@ -258,7 +255,7 @@ export async function createRuntime(
     throw new Error(`tensorgrad: ${failures.length} shader(s) failed to compile (see console).`)
   }
 
-  // ---- Pre-build bind groups (static — buffer ids don't change per step) ---
+  // Static bind groups — buffer ids don't change per step.
   const bindGroups: (GPUBindGroup | null)[] = kernels.map((k, i) => {
     const pipeline = pipelines[i]
     if (!pipeline) return null
@@ -271,20 +268,14 @@ export async function createRuntime(
     })
   })
 
-  // ---- Output readback staging buffer ---------------------------------------
-  // `outputBufferId` is the graph's main output (loss for training, the user's
-  // returned tensor for forward-only). step() reads back its first element;
-  // run() reads back the full Float32Array.
+  // step() reads buf[0] for the scalar loss; run() returns the full array.
   const outputSpec = plan.buffers[lossBufferId]!
   const outputReadback = device.createBuffer({ size: outputSpec.byteSize, usage: READBACK })
 
-  // ---- Capture readback staging buffer (lazy, single concatenated) ---------
-  // One buffer for ALL captures, with each capture occupying a slice. Matters
-  // on mobile: each `mapAsync` round-trip on Android Chrome adds significant
-  // GPU-fence latency (~10–30 ms vs ~1 ms on desktop). With N captures, the
-  // per-call mobile cost is N × that latency on the main thread. Concatenating
-  // and reading back via one `mapAsync` collapses N stalls into one. Allocated
-  // on first `step({ withCaptures: true })` call.
+  // One concatenated staging buffer for ALL captures. mapAsync round-trips
+  // on Android Chrome cost 10–30 ms each (vs ~1 ms on desktop) — N captures
+  // means N stalls without batching. Allocated lazily on first
+  // step({ withCaptures: true }) call.
   type CaptureLayout = {
     buffer: GPUBuffer
     slices: { name: string; bufId: number; offset: number; byteSize: number }[]
@@ -296,9 +287,8 @@ export async function createRuntime(
     const slices: CaptureLayout['slices'] = []
     for (const [name, bufId] of plan.capturesByName) {
       const spec = plan.buffers[bufId]!
-      // copyBufferToBuffer offsets must be 4-aligned. Capture byteSizes are
-      // always shape-product × 4 (f32/i32/bool all 4 bytes), so cumulative
-      // offsets stay aligned.
+      // copyBufferToBuffer offsets must be 4-aligned. byteSizes are always
+      // shape-product × 4 (every dtype is 4 bytes), so offsets stay aligned.
       slices.push({ name, bufId, offset: totalBytes, byteSize: spec.byteSize })
       totalBytes += spec.byteSize
     }
@@ -307,18 +297,14 @@ export async function createRuntime(
     return captureStaging
   }
 
-  // ---- dispatch() — shared core for step() and run() -----------------------
-  // Uploads inputs, dispatches all kernels (in order), queues writebacks, copies
-  // the output buffer into its staging, optionally copies captures into theirs,
-  // submits, and reads back. Returns the full output Float32Array; step() takes
-  // [0] for scalar loss, run() returns it whole.
+  // Shared core for step() and run(): upload inputs, dispatch every kernel
+  // in order, queue writebacks, copy output (and captures, if requested) into
+  // staging, submit, read back.
   //
-  // **Concurrent calls auto-serialize.** Two `step()`/`run()` calls on the same
-  // runtime would otherwise both try to `mapAsync` the shared output staging
-  // buffer at the same time and trip "Buffer already has an outstanding map
-  // pending." We chain each new dispatch onto the prior one's promise so they
-  // run sequentially even when fired from independent async paths (e.g., a
-  // training loop's auxiliary `refreshPrediction()` + `writeDiagnostic()`).
+  // Concurrent calls auto-serialize. Two step/run calls would otherwise both
+  // mapAsync the shared output staging buffer and trip "Buffer already has
+  // an outstanding map pending." Chaining via `pending` makes independent
+  // async paths (e.g. training loop + aux `refreshPrediction`) run in turn.
   let pending: Promise<unknown> = Promise.resolve()
   type DispatchOpts = { wantCaptures: boolean; readback: boolean }
   type DispatchResult = { output: Float32Array; captures: Map<string, Float32Array> } | null
@@ -363,10 +349,9 @@ export async function createRuntime(
       const pass = encoder.beginComputePass({ label: k.opKind })
       pass.setPipeline(pipeline)
       pass.setBindGroup(0, bindGroup)
-      // WebGPU caps each dispatch dimension at 65535 workgroups. Split into 2D
-      // when a kernel needs more than that on the X axis. Kernels compute their
-      // global index as `gid.x + gid.y * (65535 * workgroup_size)`, matching the
-      // stride we set here. For dispatches that fit in one row, gid.y is 0.
+      // WebGPU caps each dispatch dim at 65535 workgroups; split into 2D when
+      // the X axis overflows. Kernels compute the global index as
+      // `gid.x + gid.y * (65535 * workgroup_size)` to match this stride.
       const wgCount = Math.max(1, Math.ceil(k.threads / k.workgroupSize))
       const MAX_X = 65535
       const wgX = Math.min(wgCount, MAX_X)
@@ -374,14 +359,11 @@ export async function createRuntime(
       pass.dispatchWorkgroups(wgX, wgY, 1)
       pass.end()
     }
-    // After all dispatches: writebacks (Adam state, updated params). Empty for
-    // forward-only compiles.
+    // Writebacks for Adam state + updated params. Empty for forward-only.
     for (const wb of plan.writebacks) {
       encoder.copyBufferToBuffer(buffers.get(wb.source)!, 0, buffers.get(wb.dest)!, 0, wb.bytes)
     }
     encoder.copyBufferToBuffer(buffers.get(lossBufferId)!, 0, outputReadback, 0, outputSpec.byteSize)
-    // Capture readbacks (only when opted in). All captures concatenate into
-    // a single staging buffer so we mapAsync once instead of N times.
     let layout: CaptureLayout | null = null
     if (wantCaptures) {
       layout = ensureCaptureStaging()
@@ -391,10 +373,8 @@ export async function createRuntime(
     }
     queue.submit([encoder.finish()])
 
-    // readback=false: training fire-and-forget. The encoder still copied
-    // loss → outputReadback (and captures → staging), but we don't await
-    // mapAsync. The caller can read the latest loss later via readLoss()
-    // when it actually wants to display it.
+    // Fire-and-forget: the encoder already copied loss → outputReadback,
+    // but we skip mapAsync. The caller can read it later via readLoss().
     if (!opts.readback) return null
 
     await outputReadback.mapAsync(GPUMapMode.READ)
@@ -406,8 +386,7 @@ export async function createRuntime(
       await layout.buffer.mapAsync(GPUMapMode.READ)
       const range = layout.buffer.getMappedRange()
       for (const s of layout.slices) {
-        // Copy out (slice) before unmap — the underlying ArrayBuffer is
-        // detached when the buffer unmaps.
+        // .slice() copies before unmap — the ArrayBuffer detaches on unmap.
         captures.set(s.name, new Float32Array(range, s.offset, s.byteSize / 4).slice())
       }
       layout.buffer.unmap()
@@ -415,7 +394,6 @@ export async function createRuntime(
     return { output, captures }
   }
 
-  // ---- step() — training-mode wrapper, returns scalar [0] of output ---------
   function step(inputs: Record<string, Int32Array | Float32Array>): Promise<number>
   function step(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<StepResult>
   function step(inputs: Record<string, Int32Array | Float32Array>, opts: { readLoss: false }): Promise<void>
@@ -433,11 +411,8 @@ export async function createRuntime(
     return r.output[0]!
   }
 
-  // ---- readLoss() — explicit late readback for fire-and-forget training -----
-  // Maps the output buffer (which step() always copies the latest loss into,
-  // even when readLoss:false) and returns the value. Goes through the same
-  // serialization chain as step()/run() so two readLoss() calls don't both
-  // try to mapAsync the same buffer.
+  // Goes through the same `pending` serialization as step()/run() so two
+  // readLoss() calls don't both try to mapAsync the same buffer.
   async function readLoss(): Promise<number> {
     const turn = pending.catch(() => {}).then(async () => {
       await outputReadback.mapAsync(GPUMapMode.READ)
@@ -449,9 +424,6 @@ export async function createRuntime(
     return turn
   }
 
-  // ---- run() — forward-mode wrapper, returns Float32Array by default -------
-  // Same overloaded shape as step(): scalar-shaped result (here Float32Array,
-  // there a JS number) is the default; { ..., captures } is the opt-in form.
   function run(inputs: Record<string, Int32Array | Float32Array>): Promise<Float32Array>
   function run(inputs: Record<string, Int32Array | Float32Array>, opts: { withCaptures: true }): Promise<RunResult>
   function run(inputs: Record<string, Int32Array | Float32Array>, opts: RunOptions): Promise<Float32Array | RunResult>
@@ -496,7 +468,6 @@ export async function createRuntime(
     }
   }
 
-  // ---- download helpers -----------------------------------------------------
   async function downloadFromMap(map: Map<string, number>): Promise<Record<string, Float32Array>> {
     const stagings: { name: string; buf: GPUBuffer; bytes: number }[] = []
     const encoder = device.createCommandEncoder({ label: 'tensorgrad-download' })
@@ -517,9 +488,8 @@ export async function createRuntime(
     return out
   }
 
-  // Fill a state buffer with its declared initValue (typically 0). Float and
-  // int both serialize to 4 bytes per element. Used at allocation time and on
-  // resetOptimizerState() — same logic, two callers.
+  // Fill a state buffer with its declared initValue. Used at allocation and
+  // on resetOptimizerState().
   function fillStateBuffer(spec: { byteSize: number; dtype: 'f32' | 'i32' | 'bool'; initValue?: number }, target: GPUBuffer): void {
     const elements = spec.byteSize / 4
     const init = spec.dtype === 'f32'
@@ -534,14 +504,12 @@ export async function createRuntime(
     }
   }
 
-  // Build the params map AFTER buffer allocation so it points at the actual
-  // GPUBuffers (shared or freshly allocated).
+  // Built after allocation so it points at the actual (possibly shared) buffers.
   const params = new Map<string, GPUBuffer>()
   for (const [name, bufId] of plan.paramsByName) {
     params.set(name, buffers.get(bufId)!)
   }
-  // Static-after-compile shape metadata so users don't have to recompute
-  // strides to interpret a flat capture readback.
+  // Static shape per capture, surfaced so callers don't recompute strides.
   const captureShapes: Record<string, number[]> = {}
   for (const [name, bufId] of plan.capturesByName) {
     captureShapes[name] = [...plan.buffers[bufId]!.shape]

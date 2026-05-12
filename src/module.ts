@@ -1,36 +1,10 @@
-// Module abstraction — a Domeleon-style component layer for parameter trees.
-//
-// User code defines a model as nested classes:
-//
-//   class Linear extends Module {
-//     W: Tensor; b: Tensor
-//     constructor(inDim: number, outDim: number) {
-//       super()
-//       this.W = this.param([inDim, outDim])               // randn, scale 0.02
-//       this.b = this.param([outDim], { init: 'zeros' })
-//     }
-//   }
-//   class Block extends Module {
-//     attn = new Attention(D)
-//     mlp  = new MLP(D, 4 * D)
-//   }
-//   class Model extends Module {
-//     embed = new Linear(VOCAB, D)
-//     layers = range(N).map(() => new Block())
-//   }
-//
-// The param tree is discovered automatically at compile time by walking
-// enumerable instance properties. Each parameter gets a name auto-derived
-// from its path (`layers.0.attn.W_q`); names are used for upload/download
-// and writeback wiring. Forward functions are pure and stateless — they
-// take the materialized model and inputs, return a Tensor.
+// Module abstraction — Domeleon-style component layer for parameter trees.
+// Param tree is auto-discovered at compile time by walking enumerable instance
+// properties. Forward functions are pure and stateless (take the materialized
+// model + inputs, return a Tensor) — see `Module` JSDoc for the pattern.
 
 import type { Tensor, Shape, Dtype } from './ir.js'
 import { paramInput } from './trace.js'
-
-// ============================================================================
-// Init metadata
-// ============================================================================
 
 /** How a parameter's initial values are produced. Serializable shape — no
  *  closures, since the initial values cross the worker boundary at compile
@@ -64,7 +38,11 @@ export const init = {
   literal: (data: Float32Array): InitSpec => ({ kind: 'literal', data }),
 }
 
+/** Per-parameter options accepted by `Module.param(shape, opts)`. All
+ *  fields are optional; sensible defaults apply (`f32` dtype, `'randn'`
+ *  init, decay-true for weight-shaped inits). */
 export interface ParamOptions {
+  /** Element type. Default `'f32'`. */
   dtype?: Dtype
   /** Init shape. Default: `'randn'` (std 0.02). */
   init?: InitSpec
@@ -93,6 +71,9 @@ export function mulberry32(seed: number): Rng {
   }
 }
 
+/** A resolved initializer: given a flat element count, the original shape,
+ *  and an `Rng`, produce the param's initial `Float32Array`. Built by
+ *  `resolveInit` from an `InitSpec`. */
 export type InitFn = (size: number, shape: readonly number[], rng: Rng) => Float32Array
 
 function boxMuller(rng: Rng): number {
@@ -147,15 +128,10 @@ function resolveDecay(opts: ParamOptions | undefined): boolean {
   return spec !== 'zeros' && spec !== 'ones'
 }
 
-// ============================================================================
-// Internals: param sentinel
-// ============================================================================
-//
-// `this.param(shape)` returns a placeholder that's replaced by a real Tensor
-// during `materializeParams`. We type-cheat by declaring the return type as
-// `Tensor` so user code can write `this.W` and have TS happy; the cheat is
-// only valid post-materialization (which is always before forward runs).
-
+// Placeholder produced by `this.param(...)`. Replaced by a real Tensor in
+// `materializeParams`. The `param` return type is cast to `Tensor` so user
+// code can read `this.W` directly; the cast is sound post-materialization,
+// which always happens before any forward call.
 class ParamSentinel {
   constructor(
     public readonly shape: Shape,
@@ -165,10 +141,33 @@ class ParamSentinel {
   ) {}
 }
 
-// ============================================================================
-// Module base class
-// ============================================================================
-
+/**
+ * Base class for model components. Subclass to declare a tree of parameters
+ * and child modules:
+ *
+ * ```ts
+ * class Linear extends Module {
+ *   W: Tensor; b: Tensor
+ *   constructor(inDim: number, outDim: number) {
+ *     super()
+ *     this.W = this.param([inDim, outDim])
+ *     this.b = this.param([outDim], { init: 'zeros' })
+ *   }
+ * }
+ * ```
+ *
+ * Parameters are declared via `this.param(shape, opts?)` from inside the
+ * constructor. Nested modules are plain instance fields (`this.l1 = new
+ * Linear(...)`); arrays of modules (`this.layers = [...]`) are walked too.
+ * Parameter names are auto-derived from the property path
+ * (`layers.0.attn.W_q`).
+ *
+ * Forward functions are *free functions*, not methods — they take the
+ * materialized module plus inputs and return a `Tensor`. The built-in
+ * leaf modules (`nn.Linear`, `nn.LayerNorm`, etc.) expose `.fwd(x)` as a
+ * convenience for chaining, but composite modules you write should follow
+ * the free-function pattern.
+ */
 export abstract class Module {
   /**
    * Declare a learnable parameter at this module. Must be called from inside
@@ -177,7 +176,8 @@ export abstract class Module {
    *
    * The parameter's name is auto-derived from its property path in the model
    * tree (e.g. `layers.0.attn.W_q`). Init metadata travels with the param;
-   * call `compiled.uploadInitialParams()` to apply it after compile.
+   * `compileModule` applies it during compile, and `compiled.reset()`
+   * re-applies it later.
    */
   protected param(shape: Shape, opts?: ParamOptions): Tensor {
     const dtype = opts?.dtype ?? 'f32'
@@ -186,14 +186,11 @@ export abstract class Module {
   }
 }
 
-// ============================================================================
-// Tree walking
-// ============================================================================
-
 export interface MaterializedParams {
   /** Map from auto-derived path (e.g. `layers.0.attn.W_q`) to its Tensor. */
   tensors: Record<string, Tensor>
-  /** Init function per param path. Used by `uploadInitialParams`. */
+  /** Init function per param path. Used by the compile pipeline to generate
+   *  the initial Float32Array transferred to the worker. */
   initFns: Record<string, InitFn>
   /** Whether this param should receive AdamW weight decay. Resolved at
    *  `param()` time from `ParamOptions.decay` (with init-based default). */
@@ -205,8 +202,8 @@ export interface MaterializedParams {
  * created via `paramInput(autoName, ...)`. Must be called inside an active
  * trace context (paramInput appends to the current graph).
  *
- * Returns the param tensors keyed by path, plus init functions for use by
- * `uploadInitialParams`.
+ * Returns the param tensors keyed by path, plus init functions the compile
+ * pipeline uses to generate initial values.
  */
 export function materializeParams(root: Module): MaterializedParams {
   const tensors: Record<string, Tensor> = {}
@@ -224,15 +221,9 @@ export function materializeParams(root: Module): MaterializedParams {
   return { tensors, initFns, decayFlags }
 }
 
-// ----------------------------------------------------------------------------
-// Visitor
-// ----------------------------------------------------------------------------
-//
-// Walks enumerable own properties recursively, building a path string. Recurses
-// into nested Modules and arrays of Modules (or arrays of arrays, etc.).
-// Calls `visitor` on every leaf — including ParamSentinels (pre-materialize)
-// and real Tensor leaves (post-materialize).
-
+// Walks enumerable own properties, recursing into Modules and arrays.
+// `visitor` is called on each leaf (ParamSentinel pre-materialize, Tensor
+// post-materialize, or anything else the user stored).
 type Visitor = (path: string, val: unknown, owner: object, key: string | number) => void
 
 function visit(node: unknown, path: string, visitor: Visitor): void {
@@ -254,8 +245,6 @@ function visit(node: unknown, path: string, visitor: Visitor): void {
     })
     return
   }
-  // Plain leaf object (sentinel / tensor / something else): visitor decides.
-  // No deeper recursion.
 }
 
 function visitChild(child: unknown, path: string, owner: object, key: string | number, visitor: Visitor): void {

@@ -1,19 +1,9 @@
-// Reverse-mode autograd over a traced Graph.
-//
-// Given a graph that ends in a scalar loss tensor, this module walks the ops
-// in reverse and appends backward ops to the same graph, computing dL/dT for
-// every Tensor T that descends from a `param_input`. The final cotangents on
-// the param_input tensors are the parameter gradients.
-//
-// Cotangent accumulation: a tensor with multiple consumers ends up with
-// contributions from each. We add them as we encounter them, so by the time
-// reverse iteration reaches a tensor's producer op, its cotangent is complete.
-//
-// Why this works as "more graph nodes": the adjoint rule for an op like
-// mul(a, b)→c is `da += dc * b; db += dc * a`. The right-hand sides are
-// expressible in terms of existing forward ops (mul) plus accumulation (add).
-// We just call those op functions, which append nodes to the current graph
-// because we run inside an active trace context.
+// Reverse-mode autograd. Walks a traced Graph in reverse and appends backward
+// ops in-place via traceInto. Each adjoint rule expresses its contribution as
+// regular forward-op calls (e.g. mul(a, b)→c gives da += dc*b, db += dc*a),
+// which append to the current graph since we run inside a trace context.
+// Cotangents are accumulated as they arrive, so by the time we reach a
+// tensor's producer the cotangent sum is complete.
 
 import type { Graph, OpNode, Tensor, Shape } from './ir.js'
 import {
@@ -30,26 +20,27 @@ import {
 import { traceInto } from './trace.js'
 import { shapesEqual } from './shape.js'
 
-// ============================================================================
-// Public API
-// ============================================================================
-
+/** Output of `appendGrad`: the graph (now extended with backward ops),
+ *  the gradient Tensor for every parameter (keyed by name), and the
+ *  scalar loss tensor (echoed from the input graph for convenience). */
 export interface GradResult {
-  // The graph, augmented with backward ops.
+  /** The same graph instance passed in, with backward ops appended. */
   readonly graph: Graph
-  // Cotangents (gradients) for each param_input, keyed by param name.
+  /** Cotangents (gradients) for each `param_input`, keyed by param name. */
   readonly paramGrads: Record<string, Tensor>
-  // The loss output (unchanged from input).
+  /** The loss output (unchanged from input). */
   readonly loss: Tensor
 }
 
-// `appendGrad(graph)` augments `graph` (which must have already been built by
-// `trace(...)` and must have a single scalar output = the loss) with backward
-// ops. Returns gradients for every param_input.
-//
-// Internally re-enters the graph as the active trace context, so backward ops
-// emitted by adjoint rules append to it. The caller doesn't need to manage
-// trace state.
+/**
+ * Reverse-mode autograd over a traced `Graph`. Walks the ops in reverse,
+ * appending backward ops in-place. The input graph must have a single
+ * scalar output (the loss). Returns the same graph (mutated) plus a map
+ * from each `param_input` name to its gradient Tensor.
+ *
+ * Re-enters the graph as the active trace context internally via
+ * `traceInto`; callers don't need to manage trace state.
+ */
 export function appendGrad(graph: Graph): GradResult {
   if (graph.outputs.length !== 1) {
     throw new Error(`autograd: expected graph with exactly 1 output (the loss); got ${graph.outputs.length}`)
@@ -63,19 +54,17 @@ export function appendGrad(graph: Graph): GradResult {
     )
   }
 
-  // Snapshot the forward portion of the graph before we start emitting backward
-  // ops, so the reverse walk only iterates over forward ops.
+  // Snapshot forward ops before emitting backwards so the reverse walk only
+  // iterates the original forward subgraph.
   const forwardOpCount = graph.ops.length
   const forwardOps = graph.ops.slice(0, forwardOpCount)
 
-  // cotangents: tensorId -> the Tensor representing dL/dTensor in the graph.
+  // tensorId -> the Tensor representing dL/dTensor in the graph.
   const cotangents = new Map<number, Tensor>()
 
   return traceInto(graph, () => {
-    // Seed: dL/dLoss = 1.0
     cotangents.set(lossId, constScalar(1.0, 'f32'))
 
-    // Reverse walk.
     for (let i = forwardOpCount - 1; i >= 0; i--) {
       const op = forwardOps[i]!
       const outCotan = cotangents.get(op.out)
@@ -83,11 +72,9 @@ export function appendGrad(graph: Graph): GradResult {
       runAdjointRule(op, outCotan, graph, cotangents)
     }
 
-    // Collect param gradients by name. Skip non-param leaves.
     const paramGrads: Record<string, Tensor> = {}
     for (const op of forwardOps) {
       if (op.kind !== 'param_input') continue
-      // (state_input and tensor_input don't produce gradients we hand back.)
       const cotan = cotangents.get(op.out)
       if (!cotan) {
         // No path from this param to the loss — emit explicit zeros so the
@@ -103,12 +90,7 @@ export function appendGrad(graph: Graph): GradResult {
   })
 }
 
-// ============================================================================
-// Cotangent accumulation
-// ============================================================================
-
-// Add `contribution` to the cotangent of tensor `inputId`. If a cotangent
-// already exists, sum them (multiple consumers); otherwise initialize.
+// Sum into the cotangent of `inputId` (multiple consumers accumulate).
 function accumulate(cotangents: Map<number, Tensor>, inputId: number, contribution: Tensor): void {
   const existing = cotangents.get(inputId)
   if (existing) {
@@ -118,23 +100,15 @@ function accumulate(cotangents: Map<number, Tensor>, inputId: number, contributi
   }
 }
 
-// Reduce a cotangent to match the input's shape, undoing any broadcast that
-// occurred during forward. If `fromShape == toShape`, no-op.
+// Reduce a cotangent back to the input's shape, undoing any forward broadcast.
 function unbroadcast(cotan: Tensor, toShape: Shape): Tensor {
   if (shapesEqual(cotan.shape, toShape)) return cotan
   return sumToShape(cotan, toShape)
 }
 
-
-// ============================================================================
-// Adjoint rules (a.k.a. autograd "transpose" rules — adjoint of the linear
-// operator linearized at this op's inputs)
-// ============================================================================
-//
-// One per OpNode kind. Each rule:
-//   * receives the forward op + its output cotangent
-//   * builds the backward expression(s) in graph terms (calling ops.ts functions)
-//   * accumulates cotangent contributions onto each input tensor
+// One rule per OpNode kind. Each rule builds backward expressions via the
+// ops.ts public functions (which append to the active trace) and accumulates
+// cotangent contributions onto each input tensor.
 
 function runAdjointRule(
   op: OpNode,
@@ -154,7 +128,6 @@ function runAdjointRule(
       return
 
     // ---- Element-wise binops (with broadcast) ------------------------------
-    // c = a op b; reduce cotan back to each operand's shape.
     case 'add': {
       const a = tensorOf(op.a), b = tensorOf(op.b)
       accumulate(cotangents, op.a, unbroadcast(outCotan, a.shape))
@@ -168,106 +141,97 @@ function runAdjointRule(
       return
     }
     case 'mul': {
+      // dc/da = b, dc/db = a. Reading the forward tensors via tensorOf is
+      // safe — we emit fresh mul() ops, never mutate the originals.
       const a = tensorOf(op.a), b = tensorOf(op.b)
-      // dC/dA = b ; dC/dB = a. Both are forward tensors still alive in the graph.
-      // We must NOT consume the forward tensors — they're referenced by id.
-      // The mul() helper allocates fresh tensors, so referencing a/b multiple
-      // times in different mul() calls is fine: we just emit fresh ops.
       accumulate(cotangents, op.a, unbroadcast(mul(outCotan, b), a.shape))
       accumulate(cotangents, op.b, unbroadcast(mul(outCotan, a), b.shape))
       return
     }
     case 'div': {
-      // c = a/b. dc/da = 1/b. dc/db = -a/b^2.
+      // dc/da = 1/b. dc/db = -a/b².
       const a = tensorOf(op.a), b = tensorOf(op.b)
       accumulate(cotangents, op.a, unbroadcast(div(outCotan, b), a.shape))
-      // -outCotan * a / (b*b)
       const numer = mul(outCotan, a)
       const bSq = mul(b, b)
       accumulate(cotangents, op.b, unbroadcast(mulScalar(div(numer, bSq), -1), b.shape))
       return
     }
 
-    // ---- Element-wise scalar binops (scalar is a JS number, not a tensor) -
+    // ---- Element-wise scalar binops ---------------------------------------
     case 'mul_scalar': {
-      // c = a * s. dc/da = s.
       accumulate(cotangents, op.a, mulScalar(outCotan, op.scalar))
       return
     }
     case 'add_scalar': {
-      // c = a + s. dc/da = 1.
       accumulate(cotangents, op.a, outCotan)
       return
     }
 
     // ---- Unary -------------------------------------------------------------
     case 'sqrt': {
-      // c = sqrt(a). dc/da = 1/(2*sqrt(a)) = 1/(2*c).
+      // dc/da = 1/(2*sqrt(a)) = 1/(2*c).
       const c = tensorOf(op.out)
       accumulate(cotangents, op.a, mulScalar(div(outCotan, c), 0.5))
       return
     }
     case 'rsqrt': {
-      // c = a^(-0.5). dc/da = -0.5 * a^(-1.5) = -0.5 * c^3.
+      // c = a^(-0.5). dc/da = -0.5 * c³.
       const c = tensorOf(op.out)
       const c3 = mul(mul(c, c), c)
       accumulate(cotangents, op.a, mulScalar(mul(outCotan, c3), -0.5))
       return
     }
     case 'log': {
-      // c = log(a). dc/da = 1/a.
       const a = tensorOf(op.a)
       accumulate(cotangents, op.a, div(outCotan, a))
       return
     }
     case 'exp': {
-      // c = exp(a). dc/da = exp(a) = c.
+      // dc/da = exp(a) = c.
       const c = tensorOf(op.out)
       accumulate(cotangents, op.a, mul(outCotan, c))
       return
     }
     case 'relu': {
-      // c = relu(a). dc/da = (a > 0 ? 1 : 0). Use the fused relu_grad op.
       const a = tensorOf(op.a)
       accumulate(cotangents, op.a, reluGrad(a, outCotan))
       return
     }
     case 'neg': {
-      // c = -a. dc/da = -1.
       accumulate(cotangents, op.a, mulScalar(outCotan, -1))
       return
     }
     case 'abs': {
-      // c = |a|. dc/da = sign(a) (subgradient 0 at a=0, fine in practice).
+      // dc/da = sign(a). Subgradient is 0 at a=0 (the where below routes 0
+      // there via the outCotan branch — fine in practice).
       const a = tensorOf(op.a)
       const dySigned = where(less(a, constScalar(0, 'f32')), mulScalar(outCotan, -1), outCotan)
       accumulate(cotangents, op.a, dySigned)
       return
     }
     case 'tanh': {
-      // c = tanh(a). dc/da = 1 - c² = (1 - c) * (1 + c).
+      // dc/da = 1 - c².
       const c = tensorOf(op.out)
       const oneMinusCSq = sub(constScalar(1, 'f32'), mul(c, c))
       accumulate(cotangents, op.a, mul(outCotan, oneMinusCSq))
       return
     }
     case 'sigmoid': {
-      // c = sigmoid(a). dc/da = c * (1 - c) = c - c².
+      // dc/da = c * (1 - c) = c - c².
       const c = tensorOf(op.out)
       const cMinusCSq = sub(c, mul(c, c))
       accumulate(cotangents, op.a, mul(outCotan, cMinusCSq))
       return
     }
     case 'dropout': {
-      // Same kernel applied to dy with the same (seed, salt, p) — the PCG
-      // hash reproduces the forward mask. The 1/(1-p) scale is already
-      // baked into the dropout kernel.
+      // Same kernel, same (seed, salt, p) — the PCG hash reproduces the
+      // forward mask. 1/(1-p) scaling is baked into the kernel.
       accumulate(cotangents, op.a, dropoutWithSalt(outCotan, op.p, op.salt, op.seed))
       return
     }
     case 'concat': {
-      // Backward of concat is slicing the gradient back into each input's
-      // shape along the concat axis.
+      // Slice the gradient back into each input's piece along the concat axis.
       let cursor = 0
       for (const inputId of op.inputs) {
         const inputTensor = tensorOf(inputId)
@@ -278,28 +242,27 @@ function runAdjointRule(
       return
     }
     case 'slice_range':
-      // Backward would be scatter-into-zero (pad along axis). Same status
-      // as slice_last_range — deferred until a user needs to differentiate
-      // through one. For now: throws if reached.
+      // Scatter-into-zero. Deferred until a user needs to differentiate
+      // through one (concat's gradient uses sliceRange but doesn't differentiate
+      // *through* it).
       throw new Error(
-        `autograd: slice_range backward not implemented yet ` +
-        `(used as backward of concat — concat's gradient already uses sliceRange ` +
-        `but does not need to differentiate *through* it). If you hit this, please file an issue.`,
+        `autograd: slice_range backward not implemented yet. ` +
+        `If you hit this, please file an issue.`,
       )
     case 'min': {
-      // c = min(a, b). Pass dy through to whichever side won (a if a <= b).
+      // Pass dy through to whichever side won. Ties go to b (subgradient choice).
       const a = tensorOf(op.a), b = tensorOf(op.b)
       const zero = constScalar(0, 'f32')
-      const aWins = less(a, b)  // ties go to b; subgradient choice
+      const aWins = less(a, b)
       accumulate(cotangents, op.a, unbroadcast(where(aWins, outCotan, broadcastTo(zero, outCotan.shape)), a.shape))
       accumulate(cotangents, op.b, unbroadcast(where(aWins, broadcastTo(zero, outCotan.shape), outCotan), b.shape))
       return
     }
     case 'max': {
-      // c = max(a, b). Pass dy through to whichever side won (a if a >= b).
+      // Pass dy through to whichever side won. Ties go to b (subgradient choice).
       const a = tensorOf(op.a), b = tensorOf(op.b)
       const zero = constScalar(0, 'f32')
-      const aWins = greater(a, b)  // ties go to b; subgradient choice
+      const aWins = greater(a, b)
       accumulate(cotangents, op.a, unbroadcast(where(aWins, outCotan, broadcastTo(zero, outCotan.shape)), a.shape))
       accumulate(cotangents, op.b, unbroadcast(where(aWins, broadcastTo(zero, outCotan.shape), outCotan), b.shape))
       return
@@ -307,7 +270,6 @@ function runAdjointRule(
 
     // ---- Reductions over last axis ---------------------------------------
     case 'mean_last': {
-      // c[..., 1] = mean over last axis of a[..., D]. da[..., d] = dc[..., 0] / D.
       // outCotan has shape [..., 1]; broadcast to a's shape and divide by D.
       const a = tensorOf(op.a)
       const D = a.shape[a.shape.length - 1]!
@@ -316,11 +278,9 @@ function runAdjointRule(
       return
     }
     case 'sum_last': {
-      // c[...] = sum over last axis (keepdims=false). da[..., d] = dc[...].
-      // outCotan has rank one less than a; broadcast to a's shape (which inserts
-      // back the last axis with a's last-axis size).
+      // sum_last drops the last axis (keepdims=false); add it back as size 1
+      // then broadcast to a's shape.
       const a = tensorOf(op.a)
-      // First reshape outCotan to add a trailing 1, then broadcast to a's shape.
       const withKeep = reshape(outCotan, [...outCotan.shape, 1])
       accumulate(cotangents, op.a, broadcastTo(withKeep, a.shape))
       return
@@ -328,13 +288,11 @@ function runAdjointRule(
 
     // ---- Shape ------------------------------------------------------------
     case 'reshape': {
-      // c = reshape(a, ...). Backward: reshape outCotan back to a's shape.
       const a = tensorOf(op.a)
       accumulate(cotangents, op.a, reshape(outCotan, a.shape))
       return
     }
     case 'permute': {
-      // c = permute(a, perm). Backward: permute outCotan with inverse perm.
       const inv = invertPerm(op.perm)
       accumulate(cotangents, op.a, permute(outCotan, inv))
       return
@@ -342,26 +300,18 @@ function runAdjointRule(
 
     // ---- Linear algebra ---------------------------------------------------
     case 'matmul': {
-      // c = a @ b, where a: [..., M, K], b: [K, N], c: [..., M, N].
-      // dA = dC @ B^T  (matmul, since b is unbatched)
-      // dB = sum_over_batch( A^T @ dC )
-      //
-      // dB needs A^T which has shape [..., K, M], then a matmul with dC
-      // ([..., M, N]) gives [..., K, N], which we sum over leading batch dims
-      // to get [K, N]. The public `matmul` dispatches to the batched kernel
-      // when both operands have rank > 2, and the plain kernel otherwise.
+      // a: [..., M, K], b: [K, N]. dA = dC @ B^T, dB = sum_batch(A^T @ dC).
+      // The public `matmul` dispatches to the batched kernel for batched
+      // operands; sumToShape collapses dB's leading batch dims to [K, N].
       const a = tensorOf(op.a), b = tensorOf(op.b)
       accumulate(cotangents, op.a, matmul(outCotan, swapAxes(b, -1, -2)))
-      const aT = swapAxes(a, -1, -2)  // [..., K, M]
-      const perBatchDb = matmul(aT, outCotan)  // [..., K, N] or [K, N]
-      // Sum over leading batch dims to collapse to b's shape [K, N].
+      const aT = swapAxes(a, -1, -2)
+      const perBatchDb = matmul(aT, outCotan)
       accumulate(cotangents, op.b, sumToShape(perBatchDb, b.shape))
       return
     }
     case 'matmul_batched': {
-      // c = a @ b, both [..., M, K] · [..., K, N] -> [..., M, N].
-      // dA = dC @ B^T   (per-batch, all batch dims preserved)
-      // dB = A^T @ dC   (per-batch)
+      // Per-batch: dA = dC @ B^T, dB = A^T @ dC.
       const a = tensorOf(op.a), b = tensorOf(op.b)
       accumulate(cotangents, op.a, matmul(outCotan, swapAxes(b, -1, -2)))
       accumulate(cotangents, op.b, matmul(swapAxes(a, -1, -2), outCotan))
@@ -370,41 +320,26 @@ function runAdjointRule(
 
     // ---- Indexing / casting (no gradient through integer indices) --------
     case 'one_hot':
-      // The output is float, but the input (indices) is integer-valued — no
-      // continuous gradient flows through it. Stop here.
       return
 
     // ---- Slicing ---------------------------------------------------------
     case 'slice_last_range': {
-      // c = a[..., start:end]. Backward: pad outCotan with zeros to a's shape.
-      // We construct this as: zeros at left, outCotan in middle, zeros at right,
-      // concatenated along the last axis. We don't have concat or generic pad
-      // ops; the simplest expression here is a sparse expansion via broadcasting
-      // and addition of zero tensors. For Phase 2 we punt: slice's autograd is
-      // implemented by emitting a single fused op that scatters the cotangent.
-      // For now: signal that slice's backward needs a dedicated op kind.
+      // Same status as `slice_range` above — scatter-into-zero, deferred.
       const a = tensorOf(op.a)
-      // Build a zeros tensor of a's shape, then add via... no, we can't do
-      // additive scatter without an index_put. Easiest path: add a dedicated
-      // backward op kind. For this pass, throw until we extend the IR.
       throw new Error(
         `autograd: slice_last_range backward not implemented yet ` +
-        `(would need a scatter-style op or a Concat op). ` +
-        `Workaround for now: avoid taking gradients through slices by using ` +
-        `separate matmuls for Q/K/V instead of a fused W_qkv. ` +
+        `(would need a scatter-style op). If you hit this, please file an issue. ` +
         `Tensor: ${a.shape} -> ${tensorOf(op.out).shape}`,
       )
     }
 
     // ---- Broadcast / un-broadcast (autograd infrastructure) ---------------
     case 'broadcast_to': {
-      // c = broadcast(a, target). da = sum_to_shape(dc, a.shape).
       const a = tensorOf(op.a)
       accumulate(cotangents, op.a, sumToShape(outCotan, a.shape))
       return
     }
     case 'sum_to_shape': {
-      // c = sum_to_shape(a, target). da = broadcast_to(dc, a.shape).
       const a = tensorOf(op.a)
       accumulate(cotangents, op.a, broadcastTo(outCotan, a.shape))
       return
@@ -412,10 +347,9 @@ function runAdjointRule(
 
     // ---- ML primitives ---------------------------------------------------
     case 'log_softmax_last': {
-      // c = log_softmax(a, axis=-1). softmax(a) = exp(c).
-      // dL/dA = dL/dC - softmax(a) * sum_last_keepdims(dL/dC)
+      // dL/dA = dL/dC - softmax(a) * sum_last_keepdims(dL/dC).
       const c = tensorOf(op.out)
-      const sm = exp(c)  // softmax(a)
+      const sm = exp(c)
       const sumDcKeep = sum(outCotan, -1, { keepDims: true })
       const term = mul(sm, broadcastTo(sumDcKeep, c.shape))
       accumulate(cotangents, op.a, sub(outCotan, term))
@@ -446,11 +380,9 @@ function runAdjointRule(
     case 'where': {
       // c = where(cond, a, b).
       // dC flows to a where cond is true, to b where cond is false.
-      // Need broadcast-aware unreduction back to a's and b's original shapes.
       const cond = tensorOf(op.cond)
       const a = tensorOf(op.a)
       const b = tensorOf(op.b)
-      // Build zero tensors via broadcasting a 0-d const scalar.
       const zeroA = broadcastTo(constScalar(0, a.dtype), outCotan.shape)
       const zeroB = broadcastTo(constScalar(0, b.dtype), outCotan.shape)
       accumulate(cotangents, op.a, unbroadcast(where(cond, outCotan, zeroA), a.shape))
@@ -458,15 +390,13 @@ function runAdjointRule(
       return
     }
 
-    case 'where_causal': {
-      // c = where(causal_mask, a, fillValue). Upper triangle becomes constant
-      // (no gradient); lower triangle passes a through. So da_lower = dc_lower,
-      // da_upper = 0. We can't easily express this with current ops; punt.
+    case 'where_causal':
+      // Lower triangle should pass through, upper should drop. Hard to
+      // express with current ops; punt.
       throw new Error(
         `autograd: where_causal backward not yet implemented. ` +
         `Use softmax_causal_last (which fuses the mask + softmax) instead.`,
       )
-    }
 
     // ---- Adam ops are post-autograd; no backward through them. ----------
     case 'adam_update_m':
@@ -476,9 +406,8 @@ function runAdjointRule(
 
     // ---- Conv2d + MaxPool2d ----------------------------------------------
     case 'conv2d': {
-      // c = conv2d(input, weight) with stride+padding.
-      // dInput = transposed-conv(weight, dy). dWeight = correlation(input, dy).
-      // Both implemented as gather kernels with the same stride/padding params.
+      // dInput = transposed-conv(weight, dy); dWeight = correlation(input, dy).
+      // Both are gather kernels reusing the forward's stride/padding params.
       const input = tensorOf(op.input)
       const weight = tensorOf(op.weight)
       const inH = input.shape[2]!
@@ -503,32 +432,21 @@ function runAdjointRule(
     case 'conv2d_input_grad':
     case 'conv2d_weight_grad':
     case 'max_pool_2d_grad':
-      // These are themselves backward ops emitted by conv2d / max_pool_2d.
-      // No second-order autograd through them.
       throw new Error(`autograd: cannot differentiate through ${op.kind} (it's a backward op)`)
 
-    // ---- relu_grad has no further backward (autograd-internal) ----------
-    case 'relu_grad': {
-      // We don't double-differentiate. If someone tries, this will blow up —
-      // intentional. Phase 2 doesn't need 2nd-order gradients.
+    case 'relu_grad':
       throw new Error(
-        `autograd: cannot take second-order gradient through relu_grad. ` +
-        `Phase 2 does not support higher-order autodiff.`,
+        `autograd: cannot take second-order gradient through relu_grad — ` +
+        `tensorgrad does not support higher-order autodiff.`,
       )
-    }
 
     default: {
-      // Exhaustiveness check at type level.
       const _exhaustive: never = op
       void _exhaustive
       throw new Error(`autograd: unhandled op kind ${(op as OpNode).kind}`)
     }
   }
 }
-
-// ============================================================================
-// Helpers
-// ============================================================================
 
 function invertPerm(perm: readonly number[]): number[] {
   const inv: number[] = new Array(perm.length)

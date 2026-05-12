@@ -1,28 +1,15 @@
-// Shape inference and validation for each op kind.
-//
-// Every op in src/ops.ts validates its inputs and computes its output shape
-// through helpers here. Errors throw with the captured call-site so the
-// stack trace points at the user's line, not into the library.
-//
-// Broadcasting rules (deliberately limited):
-//   * For element-wise binops (add/sub/mul/div), we support trailing-axis
-//     broadcasting: the smaller operand's shape must be a suffix of the
-//     larger's, with axes of size 1 broadcasting to any size. Examples
-//     ALLOWED:  [B, T, D] op [D]  →  [B, T, D]
-//               [B, T, D] op [1, D]  → [B, T, D]
-//               [B, T, D] op [B, T, D]  → [B, T, D]
-//     Examples REJECTED:  [B, T, D] op [B]   (suffix mismatch)
-//                         [B, T, D] op [T, D] when T != B (legal numpy, banned here)
-//   The restriction makes codegen and autograd much simpler and covers every
-//   broadcast pattern in our transformer (biases, layernorm gain/bias, masks).
+// Shape inference and validation. Broadcasting is deliberately limited to
+// trailing-axis (suffix) broadcasts with size-1 axes — `[B,T,D] op [D]` is
+// allowed, `[B,T,D] op [B]` and middle-axis broadcasts are not. This covers
+// every pattern in transformer/CNN code we care about and keeps codegen and
+// autograd straightforward.
 
 import type { Shape, CallSite } from './ir.js'
 import { formatSite } from './ir.js'
 
-// ============================================================================
-// Errors
-// ============================================================================
-
+/** Thrown when an op's shape constraints are violated (rank mismatch,
+ *  non-broadcastable dims, axis out of range, etc.). The message includes
+ *  the captured `CallSite` so the user's frame appears first in the stack. */
 export class ShapeError extends Error {
   constructor(message: string, site: CallSite | null) {
     const formatted = site ? `${message}\n  at ${formatSite(site)}` : message
@@ -35,9 +22,6 @@ function fail(message: string, site: CallSite | null): never {
   throw new ShapeError(message, site)
 }
 
-// ============================================================================
-// Shape utilities
-// ============================================================================
 
 export function shapesEqual(a: Shape, b: Shape): boolean {
   if (a.length !== b.length) return false
@@ -55,9 +39,8 @@ export function showShape(shape: Shape): string {
   return `[${shape.join(', ')}]`
 }
 
-// Standard right-aligned NumPy-style broadcasting. Pad the shorter shape with
-// leading 1s, then per-axis: equal dims unify, size-1 dims broadcast on either
-// side, otherwise incompatible. Returns the resulting shape or null.
+// Right-aligned NumPy broadcasting. Equal dims unify, size-1 dims broadcast,
+// otherwise incompatible. Returns null on incompatibility.
 export function broadcastTrailing(a: Shape, b: Shape): Shape | null {
   const rank = Math.max(a.length, b.length)
   const out: number[] = new Array(rank)
@@ -74,12 +57,7 @@ export function broadcastTrailing(a: Shape, b: Shape): Shape | null {
   return out
 }
 
-// ============================================================================
-// Per-op shape rules
-// ============================================================================
-//
-// Each rule takes the input shapes and returns the output shape, or throws.
-// All rules accept a `site` for error attribution.
+// Per-op shape rules. Each returns the output shape or throws via `fail`.
 
 export function inferElementwiseBinop(
   opName: string, aShape: Shape, bShape: Shape, site: CallSite | null,
@@ -100,15 +78,14 @@ export function inferUnary(_opName: string, aShape: Shape, _site: CallSite | nul
   return aShape
 }
 
+// mean_last keeps dims (last axis → 1); sum_last drops the last axis.
 export function inferMeanLast(opName: string, aShape: Shape, site: CallSite | null): Shape {
   if (aShape.length === 0) fail(`${opName}: cannot reduce a 0-d tensor`, site)
-  // keepdims=true: replace last axis with 1.
   return [...aShape.slice(0, -1), 1]
 }
 
 export function inferSumLast(opName: string, aShape: Shape, site: CallSite | null): Shape {
   if (aShape.length === 0) fail(`${opName}: cannot reduce a 0-d tensor`, site)
-  // keepdims=false: drop the last axis.
   return aShape.slice(0, -1)
 }
 
@@ -119,7 +96,6 @@ export function inferArgmaxLast(opName: string, aShape: Shape, site: CallSite | 
 }
 
 export function inferReshape(opName: string, aShape: Shape, newShape: Shape, site: CallSite | null): Shape {
-  // Validate -1 placeholder (at most one allowed) and total size match.
   let inferIdx = -1
   let knownSize = 1
   for (let i = 0; i < newShape.length; i++) {
@@ -159,7 +135,6 @@ export function inferPermute(opName: string, aShape: Shape, perm: readonly numbe
   return perm.map(p => aShape[p]!)
 }
 
-// matmul (rank-2 rhs): a [..., M, K] · b [K, N]  →  [..., M, N].
 export function inferMatmul(opName: string, aShape: Shape, bShape: Shape, site: CallSite | null): Shape {
   if (aShape.length < 2) fail(`${opName}: lhs must have rank >= 2, got ${showShape(aShape)}`, site)
   if (bShape.length !== 2) fail(`${opName}: internal: inferMatmul expects rank-2 rhs, got ${showShape(bShape)}`, site)
@@ -171,7 +146,6 @@ export function inferMatmul(opName: string, aShape: Shape, bShape: Shape, site: 
   return [...aShape.slice(0, -2), M, N]
 }
 
-// matmul_batched: a [..., M, K] · b [..., K, N]  →  [..., M, N].  Both have leading batch dims.
 export function inferMatmulBatched(opName: string, aShape: Shape, bShape: Shape, site: CallSite | null): Shape {
   if (aShape.length < 2 || bShape.length < 2) {
     fail(`${opName}: both inputs must have rank >= 2, got ${showShape(aShape)} and ${showShape(bShape)}`, site)
@@ -199,7 +173,7 @@ export function inferOneHot(opName: string, indicesShape: Shape, depth: number, 
   return [...indicesShape, depth]
 }
 
-// where_causal preserves shape but requires the last two axes to be square.
+// Requires the last two axes to be square; shape preserved.
 export function inferWhereCausal(opName: string, aShape: Shape, site: CallSite | null): Shape {
   if (aShape.length < 2) fail(`${opName}: requires rank >= 2, got ${showShape(aShape)}`, site)
   const m = aShape[aShape.length - 2]!
@@ -260,8 +234,6 @@ export function inferConcat(opName: string, shapes: readonly Shape[], axis: numb
   return out
 }
 
-// broadcast_to: validate that `aShape` can broadcast to `targetShape` under
-// right-aligned NumPy rules. Returns targetShape on success.
 export function inferBroadcastTo(opName: string, aShape: Shape, targetShape: Shape, site: CallSite | null): Shape {
   if (aShape.length > targetShape.length) {
     fail(`${opName}: source rank ${aShape.length} > target rank ${targetShape.length}`, site)
@@ -277,8 +249,8 @@ export function inferBroadcastTo(opName: string, aShape: Shape, targetShape: Sha
   return targetShape
 }
 
-// sum_to_shape: validate that `targetShape` is a valid right-aligned reduction
-// of `aShape` (i.e., aShape can have been produced by broadcasting targetShape).
+// Inverse of broadcast_to: targetShape must be a valid right-aligned reduction
+// of aShape (i.e. aShape could have been produced by broadcasting targetShape).
 export function inferSumToShape(opName: string, aShape: Shape, targetShape: Shape, site: CallSite | null): Shape {
   if (targetShape.length > aShape.length) {
     fail(`${opName}: target rank ${targetShape.length} > source rank ${aShape.length}`, site)
@@ -294,8 +266,7 @@ export function inferSumToShape(opName: string, aShape: Shape, targetShape: Shap
   return targetShape
 }
 
-// Three-way broadcast for `where(cond, a, b)`. All three shapes must broadcast
-// to a common shape under standard NumPy rules.
+// Three-way broadcast for where(cond, a, b).
 export function inferWhere(opName: string, condShape: Shape, aShape: Shape, bShape: Shape, site: CallSite | null): Shape {
   const ab = broadcastTrailing(aShape, bShape)
   if (!ab) fail(`${opName}: a/b incompatible: ${showShape(aShape)} vs ${showShape(bShape)}`, site)

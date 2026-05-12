@@ -23,15 +23,14 @@ export class WorkerProxy {
     const blob = new Blob([workerSource], { type: 'application/javascript' })
     const url = URL.createObjectURL(blob)
     this.worker = new Worker(url, { type: 'module' })
-    // The Blob URL keeps memory alive as long as it's referenced; revoke
-    // once the worker has loaded its source. Browsers tolerate revoke
-    // immediately after construction in practice.
+    // Safe to revoke immediately — the Worker constructor already kicked off
+    // the fetch and holds its own reference.
     URL.revokeObjectURL(url)
 
     this.worker.onmessage = (ev: MessageEvent<Res>) => {
       const reply = ev.data
       const handlers = this.pending.get(reply.id)
-      if (!handlers) return  // stale reply; ignore
+      if (!handlers) return
       this.pending.delete(reply.id)
       if (reply.ok) handlers.resolve(reply.result)
       else handlers.reject(reconstituteError(reply.error))
@@ -40,7 +39,6 @@ export class WorkerProxy {
     this.worker.onerror = (ev: ErrorEvent) => {
       const err = new Error(`tensorgrad worker error: ${ev.message || 'unknown'}`)
       const wire: WireError = { name: 'WorkerError', message: err.message, stack: err.stack ?? '' }
-      // Reject everything in flight; subsequent calls will fail too.
       for (const handlers of this.pending.values()) handlers.reject(reconstituteError(wire))
       this.pending.clear()
     }
@@ -57,8 +55,7 @@ export class WorkerProxy {
     })
   }
 
-  /** Fire-and-forget variant for cases where the caller doesn't need a reply
-   *  (currently unused; keep for symmetry / future use). */
+  /** Fire-and-forget variant for cases where the caller doesn't need a reply. */
   send(req: Omit<Req, 'id'>, transfer: ArrayBuffer[] = []): void {
     if (this.terminated) return
     const id = this.nextId++

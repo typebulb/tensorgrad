@@ -5,28 +5,26 @@
 // (so `add([B, T, D], [D])` and `add([B, T, D], [B, T, D])` get different
 // kernels), which is fine for our static-shape model and gives the WGSL
 // compiler full freedom to specialize.
-//
-// Most kernels are direct ports of `transformer-gpu.bulb.md`'s WGSL — those
-// are already debugged and tuned. The autograd ops (broadcast_to, sum_to_shape,
-// relu_grad, etc.) are new.
 
 import type { Graph, OpNode, Tensor, Shape } from './ir.js'
 import type { BufferPlan } from './buffers.js'
 import { shapeSize } from './shape.js'
 
-// Workgroup size of 256 means even our biggest kernel (~8M threads in
-// matmul_bwd_dW) needs only ~32K workgroups, well under WebGPU's 65535-per-dim
-// dispatch cap. Smaller WG_SIZE forced 2D dispatch with significant over-dispatch.
+// 256 lets our biggest kernel (~8M threads in matmul_bwd_dW) fit in ~32K
+// workgroups, well under WebGPU's 65535-per-dim cap. Smaller sizes forced
+// 2D dispatch with significant over-dispatch.
 const WG_SIZE = 256
 
-// Global thread index, packed across the 2D dispatch grid that lets us route
-// past WebGPU's 65535-per-dim cap. Every kernel uses this exact line — keep
-// the formula consistent with the dispatch-stride math in runtime.ts (MAX_X
-// = 65535, so per-row stride = 65535 * WG_SIZE = 16776960). Inlined into
-// each WGSL string via interpolation rather than a function so the WGSL
-// compiler still sees a literal constant.
+// Global thread index packed across the 2D dispatch grid (see runtime.ts).
+// `MAX_X * WG_SIZE = 65535 * 256 = 16776960`. Inlined as a string so the WGSL
+// compiler sees the value as a literal constant.
 const GID_LINE = 'let i = gid.x + gid.y * 16776960u;'
 
+/** One emitted compute kernel. The runtime turns each `KernelSpec` with
+ *  non-empty `wgsl` into a `GPUComputePipeline` + bind group; logical ops
+ *  (param/tensor/state inputs, reshape no-ops) carry empty `wgsl` and
+ *  produce no dispatch. Order matches `graph.ops` — `emitKernels` returns
+ *  them in dispatch order. */
 export interface KernelSpec {
   /** Index into graph.ops. */
   opIndex: number
@@ -45,10 +43,6 @@ export interface KernelSpec {
   /** Workgroup size; usually WG_SIZE. */
   workgroupSize: number
 }
-
-// ============================================================================
-// Public entry point
-// ============================================================================
 
 /** Generate a KernelSpec per compute op in graph.ops (in dispatch order). */
 export function emitKernels(graph: Graph, plan: BufferPlan): KernelSpec[] {
@@ -169,8 +163,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         op.kind === 'neg'     ? '-x' :
         op.kind === 'abs'     ? 'abs(x)' :
         op.kind === 'tanh'    ? 'tanh(x)' :
-        // sigmoid via tanh identity for numerical stability:
-        // sigmoid(x) = 0.5 + 0.5 * tanh(0.5 * x)
+        // tanh identity for numerical stability: sigmoid(x) = 0.5 + 0.5 * tanh(0.5x)
         /* sigmoid */           '0.5 + 0.5 * tanh(0.5 * x)'
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<${wgslDtype(a.dtype)}>;
@@ -192,11 +185,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const total = shapeSize(out.shape)
       const p = op.p
       const scale = 1 / (1 - p)
-      // Per-dropout-call salt mixes into the PCG hash so two dropout ops in
-      // the same graph (and the same forward/backward pair across an op
-      // boundary) produce different masks but stay reproducible per
-      // (seed, salt, thread). Forward and backward share salt → same mask.
-      // Salt is baked into the kernel; the only per-step input is the seed.
+      // Per-call salt mixes into the PCG hash so independent dropout sites
+      // get independent masks. Forward and backward share salt → same mask.
       const saltConst = ((op.salt * 0x9E3779B1) >>> 0).toString(10) + 'u'
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<f32>;
@@ -328,9 +318,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
 
     // ---- Shape ---------------------------------------------------------------
-    // reshape: no kernel needed if buffers can alias (shape change only). For
-    // v1 simplicity we emit a memcpy-style kernel rather than aliasing buffers,
-    // because aliasing complicates the buffer plan and we have memory headroom.
+    // reshape could alias buffers; we emit a memcpy-style kernel instead since
+    // aliasing complicates the buffer plan and we have memory headroom.
     case 'reshape': {
       const out = tof(op.out)
       const a = tof(op.a)
@@ -351,9 +340,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const out = tof(op.out)
       const a = tof(op.a)
       const total = shapeSize(out.shape)
-      // Emit per-axis index computation. For each output flat index i, decompose
-      // into per-axis output indices, then use op.perm to find the source axis order.
-      // Source flat index = sum(outIdx[perm.invert()[k]] * a_stride[k] for k).
+      // For each output flat index, decompose into per-axis indices then
+      // recombine via input strides: srcIdx = Σ outIdx[perm⁻¹(k)] * aStride[k].
       const aStrides = computeStrides(a.shape)
       const outDimDecls = decomposeFlatIndexBlock('i', out.shape, 'oIdx')
       const srcExpr: string[] = []
@@ -376,7 +364,6 @@ ${outDimDecls}
     }
 
     // ---- Linear algebra ----------------------------------------------------
-    // matmul: a [..., M, K] · b [K, N] -> [..., M, N]. b is unbatched.
     case 'matmul': {
       const out = tof(op.out)
       const a = tof(op.a)
@@ -394,7 +381,7 @@ ${outDimDecls}
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
-  let bi = i / ${M * N}u;          // batch index
+  let bi = i / ${M * N}u;
   let mn = i % ${M * N}u;
   let m = mn / ${N}u;
   let n = mn % ${N}u;
@@ -495,8 +482,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
     case 'softmax_causal_last': {
       const a = tof(op.a)
-      const T = a.shape[a.shape.length - 1]!  // == second-to-last (square)
-      // Outer size = (everything except last 2 axes) * (second-to-last axis)
+      const T = a.shape[a.shape.length - 1]!  // last 2 axes are square TxT
       const outerSize = shapeSize(a.shape) / T
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<f32>;
@@ -574,9 +560,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
 
     case 'slice_range': {
-      // General-axis slice. Output element at flat index `i` decomposes into
-      // (outerIdx, axisIdx, innerIdx); input element is at the same outer/inner
-      // but axisIdx shifted by `start` and axis stride D_in instead of D_out.
+      // Decompose i into (outer, axisIdx, inner); shift axisIdx by `start`
+      // and use the input's axis stride.
       const out = tof(op.out)
       const a = tof(op.a)
       const axis = op.axis
@@ -601,9 +586,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
 
     case 'concat': {
-      // Variadic. For each output element, locate which input it came from
-      // by walking the axis-offset chain; index into that input. Inputs are
-      // bound 0..N-1; output is the last binding.
+      // Variadic. For each output element, walk the axis-offset chain to
+      // find the source input. Inputs are bound 0..N-1; output is binding N.
       const out = tof(op.out)
       const axis = op.axis
       const inner = out.shape.slice(axis + 1).reduce((p, d) => p * d, 1)
@@ -611,8 +595,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const total = shapeSize(out.shape)
       const inputDtypes = op.inputs.map(id => tof(id).dtype)
       const inputAxisSizes = op.inputs.map(id => tof(id).shape[axis]!)
-      // Chain of `if (axisIdx < offset+size) { read from input k }` selecting
-      // the source input by output's axis index.
       let cursor = 0
       const branches: string[] = []
       for (let k = 0; k < op.inputs.length; k++) {
@@ -670,8 +652,8 @@ ${broadcastIndexBlock('i', out.shape, a.shape, 'srcIdx')}
     }
 
     // ---- Adam (fused per-element) -----------------------------------------
+    // m_new = b1 * m + (1 - b1) * g
     case 'adam_update_m': {
-      // m_new = b1 * m + (1 - b1) * g
       const out = tof(op.out)
       const total = shapeSize(out.shape)
       const b1 = op.b1
@@ -688,8 +670,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 }`.trim()
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.m), buf(op.g), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
+    // v_new = b2 * v + (1 - b2) * g²
     case 'adam_update_v': {
-      // v_new = b2 * v + (1 - b2) * g²
       const out = tof(op.out)
       const total = shapeSize(out.shape)
       const b2 = op.b2
@@ -707,13 +689,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 }`.trim()
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.v), buf(op.g), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
+    // p_new = decayShrink * p - lrt[0] * m_new / (sqrt(v_new) + eps).
+    // decayShrink is baked as a literal under fixed lr, bound as a per-step
+    // scalar input under a schedule. When literal=1 the multiply folds away.
     case 'adam_update_p': {
-      // p_new = decayShrink * p - lrt[0] * m_new / (sqrt(v_new) + eps).
-      // lrt is supplied per-step from CPU (already includes bias correction).
-      // decayShrink is either baked as a literal (no schedule, fixed lr) or
-      // bound as a per-step scalar input (when the user supplies an lr
-      // schedule via `adam: { lr: (step) => ... }`). When literal=1 the WGSL
-      // compiler folds the multiply away.
       const out = tof(op.out)
       const total = shapeSize(out.shape)
       const dynamicShrink = op.decayShrinkTensor !== null
@@ -741,8 +720,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
 
     case 'sum_to_shape': {
-      // Sum-reduce src down to target by summing over each axis where target=1
-      // or where target is missing (offset-prefix axes that get fully summed).
+      // Sum over each axis where target is 1 or missing (prefix axes).
       const out = tof(op.out)
       const a = tof(op.a)
       const wgsl = emitSumToShape(a.shape, out.shape, a.dtype)
@@ -791,10 +769,8 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_o
     }
 
     case 'conv2d_input_grad': {
-      // dInput[b, c_in, h_in, w_in] = sum over (c_out, kh, kw) of
-      //   weight[c_out, c_in, kh, kw] * dy[b, c_out, h_out, w_out]
-      // where h_in = h_out * strideH + kh - padH, w_in similarly. Invert:
-      // h_out = (h_in + padH - kh) / strideH (must divide evenly).
+      // Invert the forward index relation:
+      //   h_out = (h_in + padH - kh) / strideH (must divide evenly).
       const weight = tof(op.weight)
       const dy = tof(op.dy)
       const out = tof(op.out)
@@ -838,9 +814,8 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_i
     }
 
     case 'conv2d_weight_grad': {
-      // dWeight[c_out, c_in, kh, kw] = sum over (b, h_out, w_out) of
-      //   input[b, c_in, h_in, w_in] * dy[b, c_out, h_out, w_out]
-      // where h_in = h_out * strideH + kh - padH.
+      // dWeight[c_out,c_in,kh,kw] = Σ_{b,h_out,w_out} input[b,c_in,h_in,w_in]
+      // * dy[b,c_out,h_out,w_out], with h_in = h_out * strideH + kh - padH.
       const input = tof(op.input)
       const dy = tof(op.dy)
       const out = tof(op.out)
@@ -883,9 +858,8 @@ ${decompose4d(out.shape as [number, number, number, number], ['c_out_', 'c_in_',
       const [, C, H, W] = input.shape
       const [B, , hOut, wOut] = out.shape
       const total = shapeSize(out.shape)
-      // Initialize max to a large negative so out-of-bounds (padding) never
-      // wins. Forward picks the strictly-greater value, so ties favor the
-      // earliest position in scan order — backward replicates this scan.
+      // Padding never wins; ties favor earliest in scan order (strictly-greater
+      // comparison). Backward must replicate this exact scan to match.
       const NEG = '-3.4e38'
       const wgsl = `
 @group(0) @binding(0) var<storage, read> input : array<f32>;
@@ -913,9 +887,8 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_out',
     }
 
     case 'max_pool_2d_grad': {
-      // For each input position, walk every output whose receptive field
-      // covers it. Recompute the argmax (scan order, strictly-greater) and
-      // if our position was first-tied-max, accumulate dy.
+      // Gather: for each input position, walk every output whose receptive
+      // field covers it; recompute its argmax and accumulate dy when we won.
       const input = tof(op.input)
       const dy = tof(op.dy)
       const out = tof(op.out)
@@ -948,8 +921,6 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 
       if ((numW % ${op.strideW}) != 0) { continue; }
       let w_out = numW / ${op.strideW};
       if (w_out >= ${wOut!}) { continue; }
-      // Recompute argmax for (b, c, h_out, w_out). Use the same scan order
-      // as forward so tie-breaking matches.
       var m : f32 = ${NEG};
       var argH : i32 = -1;
       var argW : i32 = -1;
@@ -975,13 +946,10 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 
   }
 }
 
-// ============================================================================
-// WGSL helpers
-// ============================================================================
+// ---- WGSL helpers --------------------------------------------------------
 
-/** Emit WGSL that decomposes a flat thread index `i` into 4 named axes per
- *  the row-major flat layout of `shape`. Returns a multi-line WGSL string
- *  ready to interpolate inside a kernel body. Each axis is a `u32` local. */
+/** Decompose a flat thread index `i` into 4 row-major named axes — emits
+ *  six `let` lines ready to interpolate inside a kernel body. */
 function decompose4d(shape: readonly [number, number, number, number], names: readonly [string, string, string, string]): string {
   const [, d1, d2, d3] = shape
   const [n0, n1, n2, n3] = names
@@ -999,9 +967,8 @@ function decompose4d(shape: readonly [number, number, number, number], names: re
 
 function wgslDtype(d: 'f32' | 'i32' | 'bool'): string {
   // bool can't be in storage buffers in WGSL; we lower bool-typed tensors to
-  // u32 (0/1). For Phase 3a there are no bool-typed storage buffers in the
-  // forward+backward graph (causal mask is built inline in softmax kernels),
-  // so this only matters if the user explicitly creates a bool tensor.
+  // u32 (0/1). In practice bool tensors only appear via explicit `less` /
+  // `greater` / `where` — the causal mask is built inline in softmax kernels.
   if (d === 'bool') return 'u32'
   return d
 }
@@ -1009,7 +976,7 @@ function wgslDtype(d: 'f32' | 'i32' | 'bool'): string {
 function wgslLiteral(value: number, dtype: 'f32' | 'i32' | 'bool'): string {
   if (dtype === 'f32') {
     if (Number.isFinite(value)) {
-      // WGSL requires `.` in float literals; force decimal form.
+      // WGSL float literals need a `.` or exponent — force one in.
       return value.toString().includes('.') || value.toString().includes('e')
         ? `${value}f`
         : `${value}.0f`
@@ -1039,7 +1006,7 @@ function computeStrides(shape: Shape): number[] {
  * `outVar_0, outVar_1, ...` according to `shape`.
  */
 function decomposeFlatIndexBlock(flatVar: string, shape: Shape, outVar: string): string {
-  if (shape.length === 0) return `  let ${outVar}_0 : u32 = 0u;`  // not used but parser-safe
+  if (shape.length === 0) return `  let ${outVar}_0 : u32 = 0u;`
   const strides = computeStrides(shape)
   const lines: string[] = []
   let remaining = flatVar
@@ -1057,20 +1024,15 @@ function decomposeFlatIndexBlock(flatVar: string, shape: Shape, outVar: string):
 }
 
 /**
- * Generate WGSL that computes the source flat index in `srcVar` for an output
- * flat index `flatVar`, given output shape `outShape` and source shape `srcShape`
- * under right-aligned NumPy-style broadcasting (size-1 axes broadcast).
- *
- * Strategy:
- *   1. Decompose flat output index into per-axis output indices.
- *   2. For each output axis that maps onto a source axis (right-aligned), use
- *      the output index there if src.dim != 1, else 0 (broadcast).
- *   3. Drop output-only axes (those with no corresponding source axis).
- *   4. Combine source indices with source strides.
+ * Compute the source flat index for an output flat index under right-aligned
+ * NumPy broadcasting (size-1 source axes broadcast; output-only leading axes
+ * drop). Decomposes the output index per-axis, picks 0 or the matching axis
+ * index per source axis (broadcast vs pass-through), recombines via source
+ * strides.
  */
 function broadcastIndexBlock(flatVar: string, outShape: Shape, srcShape: Shape, srcVar: string): string {
-  // Name the per-axis decomposition vars after `srcVar` so multiple
-  // broadcastIndexBlock calls in the same WGSL function don't collide.
+  // Per-axis var names are prefixed with srcVar so multiple calls in the same
+  // kernel don't collide.
   const prefix = `${srcVar}_ax`
   const decompose = decomposeFlatIndexBlock(flatVar, outShape, prefix)
   const offset = outShape.length - srcShape.length
@@ -1089,27 +1051,17 @@ function broadcastIndexBlock(flatVar: string, outShape: Shape, srcShape: Shape, 
 }
 
 /**
- * sum_to_shape: each output cell sums over the source axes that are reduced.
- * For source shape S and target shape T (right-aligned):
- *   - Axes in S not in T (leading prefix): fully reduced (sum over whole axis).
- *   - Axes where T=1 but S>1: reduced (sum over that axis).
- *   - Axes where T=S: passed through.
- *
- * Implementation: each thread = one output cell. It iterates over the reduced
- * axes via nested-loop unrolling (we generate explicit nested for-loops).
+ * One thread per output cell. Reduced source axes — leading-prefix axes
+ * (in src, missing from tgt) and any tgt=1/src>1 axis — get explicit nested
+ * for-loops; pass-through axes are indexed directly via tgt_k.
  */
 function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' | 'bool'): string {
   const srcStrides = computeStrides(srcShape)
   const tgtStrides = computeStrides(tgtShape)
   const offset = srcShape.length - tgtShape.length
 
-  // Decompose flat output index into per-axis target indices.
   const decompose = decomposeFlatIndexBlock('i', tgtShape, 'tgt')
 
-  // Identify reduced axes of the SOURCE: axis k in src is reduced if either
-  // it's in the leading prefix (k < offset) or its corresponding target axis
-  // has size 1. For non-reduced axes (k >= offset and tgt=src), the source
-  // index is the target index along that axis.
   const reducedAxes: number[] = []
   for (let k = 0; k < srcShape.length; k++) {
     if (k < offset) { reducedAxes.push(k); continue }
@@ -1118,16 +1070,14 @@ function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' |
     if (tDim === 1 && sDim > 1) reducedAxes.push(k)
   }
 
-  // Build the source flat index expression. Initialize from the non-reduced axes.
   const baseTerms: string[] = []
   for (let k = 0; k < srcShape.length; k++) {
-    if (reducedAxes.includes(k)) continue  // contributed by loop var instead
+    if (reducedAxes.includes(k)) continue
     const tAxis = k - offset
     baseTerms.push(`tgt_${tAxis} * ${srcStrides[k]}u`)
   }
   const baseExpr = baseTerms.length > 0 ? baseTerms.join(' + ') : '0u'
 
-  // Emit nested for loops over the reduced axes.
   const indent = (depth: number) => '  '.repeat(depth + 1)
   const loops: string[] = []
   for (let depth = 0; depth < reducedAxes.length; depth++) {
@@ -1135,7 +1085,6 @@ function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' |
     const dim = srcShape[k]!
     loops.push(`${indent(depth)}for (var r${k} : u32 = 0u; r${k} < ${dim}u; r${k} = r${k} + 1u) {`)
   }
-  // Inside innermost loop, compute source index.
   const reducedTerms = reducedAxes.map(k => `r${k} * ${srcStrides[k]}u`)
   const fullExpr = reducedTerms.length > 0
     ? `${baseExpr} + ${reducedTerms.join(' + ')}`

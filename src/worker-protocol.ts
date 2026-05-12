@@ -1,28 +1,15 @@
-// Wire format for the main-thread ↔ worker postMessage channel.
-//
-// All requests carry a numeric `id` assigned by the main thread; responses
-// echo it back so the proxy can match concurrent in-flight calls. Every
-// response is either `{ ok: true, result }` or `{ ok: false, error }`.
-// Errors carry serialized name/message/stack so the proxy can reconstitute
-// an Error with a working `instanceof` check on the receiving side.
-//
-// Inputs (typed arrays) and outputs (typed arrays, captures) are transferred
-// rather than copied — see the per-request notes for which fields go on the
-// transfer list. A single worker may host multiple compiled graphs (a train
-// graph plus sibling forward graphs); each has a `graphId` issued by the
-// main thread at compile time.
+// Wire format for the main-thread ↔ worker postMessage channel. Requests
+// carry a numeric `id`; responses echo it back. Inputs and outputs (typed
+// arrays, captures) are transferred zero-copy. A single worker may host
+// multiple graphs (training + sibling forwards) keyed by `graphId`.
 
 import type { Graph } from './ir.js'
 import type { BufferPlan } from './buffers.js'
 import type { KernelSpec } from './codegen.js'
 import type { LR } from './adam.js'
 
-// ============================================================================
-// Serializable config (subset of AdamResolvedConfig that crosses the wire).
-// `decayFilter` (a function, used only at compile time) is NOT part of this —
-// the per-param decay decision is already baked into the IR by appendAdam
-// before the IR ships to the worker.
-// ============================================================================
+// Per-param decay flags are baked into the IR by appendAdam/appendSGD before
+// it ships to the worker, so `decayFilter` isn't part of the wire types.
 
 export interface WireAdamConfig {
   lr: LR
@@ -38,8 +25,6 @@ export interface WireAdamConfig {
   decayShrinkInputName: string | null
 }
 
-/** Serializable subset of SGDResolvedConfig for the wire. `decayFilter` is
- *  baked into the IR at appendSGD time, so it doesn't cross. */
 export interface WireSGDConfig {
   lr: LR
   momentum: number
@@ -57,17 +42,14 @@ export type WireOptimizerConfig =
   | { kind: 'adam'; config: WireAdamConfig }
   | { kind: 'sgd'; config: WireSGDConfig }
 
-/** Compile output that crosses to the worker. Same fields as CompiledIR
- *  minus the `loss` tensor (carried by graph.outputs[0]). */
+/** CompiledIR minus the `loss` tensor (carried by graph.outputs[0]). */
 export interface WireIR {
   graph: Graph
   plan: BufferPlan
   kernels: KernelSpec[]
 }
 
-// ============================================================================
-// Requests (main → worker)
-// ============================================================================
+// ---- Requests (main → worker) -------------------------------------------
 
 export type Req =
   | { id: number; kind: 'createRuntime'; payload: CreateRuntimePayload }
@@ -121,17 +103,9 @@ export interface UploadParamsPayload {
   partial: boolean
 }
 
-/** Update one or more Adam hyperparameters on a training graph at runtime,
- *  without recompiling. The step counter is preserved. Only the fields
- *  present are updated; absent fields stay unchanged. Note that the set
- *  of decayed params is baked into the IR at compile time — adjusting
- *  weightDecay here changes the shrink magnitude on already-decayed
- *  params, not which params receive decay.
- *
- *  When `update.lr` is a non-constant schedule with no explicit `startStep`,
- *  the worker auto-rebases it so step 1 aligns with the next training step
- *  ("decay from now"). Numbers, `constant`, and schedules with an explicit
- *  `startStep` pass through unchanged. */
+/** Update the lr on a training graph at runtime, without recompiling. The
+ *  step counter is preserved. Non-constant schedules without an explicit
+ *  `startStep` auto-rebase so step 1 = the next training step. */
 export interface SetOptimizerConfigPayload {
   graphId: number
   update: {
@@ -139,9 +113,7 @@ export interface SetOptimizerConfigPayload {
   }
 }
 
-// ============================================================================
-// Responses (worker → main)
-// ============================================================================
+// ---- Responses (worker → main) ------------------------------------------
 
 export type Res<R = unknown> =
   | { id: number; ok: true; result: R }
@@ -152,8 +124,6 @@ export interface WireError {
   message: string
   stack: string
 }
-
-// Per-request result shapes:
 
 export interface CreateRuntimeResult {
   paramNames: string[]
@@ -169,31 +139,23 @@ export interface CompileForwardResult {
   captureShapes: Record<string, number[]>
 }
 
-/** Step without `withCaptures` returns just `loss`. With captures, also
- *  populates `captures` (per-name Float32Array, all transferred back). */
 export interface StepResultWire {
   loss: number
+  /** Null when `withCaptures` was false. */
   captures: Record<string, Float32Array> | null
 }
 
-/** Run without `withCaptures` returns `{ output, captures: null }`.
- *  With captures, also populates `captures`. */
 export interface RunResultWire {
   output: Float32Array
   captures: Record<string, Float32Array> | null
 }
 
 export interface DownloadParamsResult {
-  params: Record<string, Float32Array>  // transferred
+  params: Record<string, Float32Array>
 }
 
-// ============================================================================
-// Transfer-list helpers
-// ============================================================================
-
-/** Collect the underlying ArrayBuffers from a Record of typed arrays so we
- *  can pass them on `postMessage`'s transfer list. The values themselves
- *  stay in the Record; only their backing buffers move. */
+/** Collect the ArrayBuffers from a Record of typed arrays for postMessage's
+ *  transfer list. The values stay in the Record; their buffers move. */
 export function transferablesOfRecord(
   rec: Record<string, Int32Array | Float32Array>,
 ): ArrayBuffer[] {
@@ -202,9 +164,8 @@ export function transferablesOfRecord(
   return out
 }
 
-/** Serialize an Error to a wire-friendly shape, preserving stack + name so
- *  the receiving side can reconstitute an Error that an `instanceof`-aware
- *  caller (e.g., for `ShapeError`) can still pattern-match by name. */
+/** Serialize an Error, preserving `name` so callers can still match on it
+ *  after reconstitution (e.g., for `ShapeError`). */
 export function wireError(e: unknown): WireError {
   if (e instanceof Error) {
     return { name: e.name, message: e.message, stack: e.stack ?? '' }
@@ -212,7 +173,6 @@ export function wireError(e: unknown): WireError {
   return { name: 'Error', message: String(e), stack: '' }
 }
 
-/** Reconstitute an Error from the wire shape on the receiving (main) side. */
 export function reconstituteError(w: WireError): Error {
   const err = new Error(w.message)
   err.name = w.name

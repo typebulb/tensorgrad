@@ -1,15 +1,6 @@
-// Standard "batteries-included" Module subclasses for the most common layers.
-//
-// Each class declares its params and a `.fwd(x)` method that runs the forward
-// computation. Forward methods are pure tensorgrad ops — autograd traces
-// through them just like any other call.
-//
-//   import { nn } from 'tensorgrad'
-//   class Block extends Module {
-//     ln  = new nn.LayerNorm(D)
-//     ffn = new nn.Linear(D, 4 * D)
-//   }
-//   const y = p.ffn.fwd(p.ln.fwd(x))
+// Batteries-included `Module` subclasses for the most common layers. Each
+// declares its params and exposes `.fwd(x)`; the forward is regular ops so
+// autograd traces through it like any other call.
 
 import { Module } from './module.js'
 import type { Tensor } from './ir.js'
@@ -19,10 +10,9 @@ import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
 import type { Captures } from './runtime.js'
 
-// ----------------------------------------------------------------------------
-// Conv2d: NCHW 2D convolution. Matches PyTorch's `nn.Conv2d` shape.
-// ----------------------------------------------------------------------------
-
+/** 2D convolution layer (NCHW). Shape and option names match PyTorch's
+ *  `nn.Conv2d` so 1-shot ports don't need transposes. Wraps the pure
+ *  `conv2d` op plus an optional broadcast-add bias. */
 export class Conv2d extends Module {
   /** Weight, shape `[outC, inC, kH, kW]`. Default init is `randn` with
    *  scale 0.02 (the tensorgrad default). For Kaiming init, pass
@@ -49,19 +39,19 @@ export class Conv2d extends Module {
     this.W = this.param([outC, inC, kH, kW])
     this.b = opts.bias === false ? null : this.param([outC], { init: 'zeros' })
   }
+  /** Apply this conv to `x`: `[B, inC, H, W] → [B, outC, H', W']`. Adds
+   *  bias (broadcast over the spatial axes) when present. */
   fwd(x: Tensor): Tensor {
     const y = conv2d(x, this.W, { stride: [this.strideH, this.strideW], padding: [this.padH, this.padW] })
     if (!this.b) return y
-    // Reshape bias [outC] → [1, outC, 1, 1] so it broadcasts over (B, H, W).
     const bShaped = reshape(this.b, [1, this.outC, 1, 1])
     return add(y, bShaped)
   }
 }
 
-// ----------------------------------------------------------------------------
-// Embedding: integer indices → row lookup. Like `nn.Embedding` in PyTorch.
-// ----------------------------------------------------------------------------
-
+/** Index → row lookup. Matches PyTorch's `nn.Embedding(vocab, dim)`.
+ *  Differentiable via the matmul adjoint — no custom scatter-with-atomic-add
+ *  backward needed; see `ops.ts`'s `embedding` for the decomposition. */
 export class Embedding extends Module {
   /** Embedding table, shape `[vocab, dim]`. Default init is `randn` with
    *  PyTorch's default std (0.02 in tensorgrad). For Llama-style scaled
@@ -77,15 +67,15 @@ export class Embedding extends Module {
   }
 }
 
-// ----------------------------------------------------------------------------
-// Linear: y = x @ W (+ b)
-// ----------------------------------------------------------------------------
-
 export interface LinearOptions {
   /** Include a bias term (default true). */
   bias?: boolean
 }
 
+/** Affine layer `y = x @ W + b`. Matches PyTorch's `nn.Linear` but the
+ *  weight orientation is `[inDim, outDim]` (so `matmul(x, W)` is direct,
+ *  no transpose at call site — PyTorch stores `[outDim, inDim]` and uses
+ *  `x @ W^T` internally). Bias is optional. */
 export class Linear extends Module {
   /** Weight matrix, shape `[inDim, outDim]`. Applied as `x @ W` so input
    *  features are along the input axis and rows are not transposed. */
@@ -98,16 +88,16 @@ export class Linear extends Module {
     this.W = this.param([inDim, outDim])
     this.b = opts.bias === false ? null : this.param([outDim], { init: 'zeros' })
   }
+  /** Apply: `x @ W` (+ `b` when present). Broadcasts bias over leading axes. */
   fwd(x: Tensor): Tensor {
     const out = matmul(x, this.W)
     return this.b ? add(out, this.b) : out
   }
 }
 
-// ----------------------------------------------------------------------------
-// LayerNorm — normalizes over the last axis. eps defaults to 1e-5.
-// ----------------------------------------------------------------------------
-
+/** Layer normalization over the last axis. Matches PyTorch's
+ *  `nn.LayerNorm(d, eps=1e-5)`. Subtract mean, divide by stddev (with `eps`
+ *  for stability), then affine-scale by `g` and shift by `b`. */
 export class LayerNorm extends Module {
   /** Gain (gamma), shape `[d]`, init `ones`. Scales the normalized output. */
   g: Tensor
@@ -118,6 +108,7 @@ export class LayerNorm extends Module {
     this.g = this.param([d], { init: 'ones' })
     this.b = this.param([d], { init: 'zeros' })
   }
+  /** Normalize over the last axis; affine-scale and shift. Shape preserved. */
   fwd(x: Tensor): Tensor {
     const m = mean(x, -1, { keepDims: true })
     const c = sub(x, m)
@@ -127,12 +118,9 @@ export class LayerNorm extends Module {
   }
 }
 
-// ----------------------------------------------------------------------------
-// RMSNorm — Llama-style normalization. Scale-only (no mean-subtraction, no
-// bias), so cheaper than LayerNorm and stable enough for modern transformers.
-// `y = x / sqrt(mean(x², dim=-1) + eps) * g`
-// ----------------------------------------------------------------------------
-
+/** Llama-style RMS normalization over the last axis. Scale-only (no
+ *  mean-subtraction, no bias): `y = x / sqrt(mean(x², -1) + eps) * g`.
+ *  Cheaper than `LayerNorm`; stable enough for modern transformers. */
 export class RMSNorm extends Module {
   /** Gain (gamma), shape `[d]`, init `ones`. Scales the RMS-normalized output. */
   g: Tensor
@@ -140,17 +128,15 @@ export class RMSNorm extends Module {
     super()
     this.g = this.param([d], { init: 'ones' })
   }
+  /** RMS-normalize over the last axis; affine-scale by `g`. Shape preserved. */
   fwd(x: Tensor): Tensor {
-    const ms = mean(mul(x, x), -1, { keepDims: true })  // mean of squares; [..., 1]
-    const rstd = sqrt(add(ms, this.eps))                // [..., 1]
+    const ms = mean(mul(x, x), -1, { keepDims: true })
+    const rstd = sqrt(add(ms, this.eps))
     return mul(div(x, rstd), this.g)
   }
 }
 
-// ----------------------------------------------------------------------------
-// Multi-head attention shape helpers — split the last (model) axis into
-// [nHeads, headDim] and bring heads ahead of the sequence axis.
-// ----------------------------------------------------------------------------
+// ---- Multi-head attention shape helpers ----------------------------------
 
 /** [..., T, D] → [..., H, T, D/H]. Folds the standard
  *  `permute(reshape(x, [..., T, H, d]), [..., H, T, d])` pattern into one
@@ -166,7 +152,6 @@ export function splitHeads(x: Tensor, nHeads: number): Tensor {
   }
   const lead = x.shape.slice(0, r - 2)
   const reshaped = reshape(x, [...lead, T, nHeads, D / nHeads])
-  // Swap T (axis lead.length) with H (axis lead.length + 1).
   return swapAxes(reshaped, lead.length, lead.length + 1)
 }
 
@@ -179,7 +164,6 @@ export function mergeHeads(x: Tensor): Tensor {
   const T = x.shape[r - 2]!
   const d = x.shape[r - 1]!
   const lead = x.shape.slice(0, r - 3)
-  // Swap H (axis r-3) and T (axis r-2): [..., H, T, d] → [..., T, H, d]
   const swapped = swapAxes(x, r - 3, r - 2)
   return reshape(swapped, [...lead, T, H * d])
 }
@@ -195,8 +179,7 @@ export function unsplitHeads(captures: Captures, name: string): Float32Array[] {
   if (shape.length < 2) {
     throw new Error(`unsplitHeads: '${name}' shape needs >= 2 dims, got [${shape.join(', ')}]`)
   }
-  // For inference graphs at B=1, captures have shape [1, H, ..., ...]. Strip
-  // the leading 1 if present so the next axis is heads.
+  // Inference at B=1 captures as [1, H, ...]; strip the leading singleton.
   const s = shape[0] === 1 ? shape.slice(1) : shape
   const H = s[0]!
   let stride = 1
@@ -208,9 +191,7 @@ export function unsplitHeads(captures: Captures, name: string): Float32Array[] {
   return Array.from({ length: H }, (_, h) => flat.slice(h * stride, (h + 1) * stride))
 }
 
-// ----------------------------------------------------------------------------
-// Loss helpers
-// ----------------------------------------------------------------------------
+// ---- Loss helpers --------------------------------------------------------
 
 /** Per-position negative log-likelihood along the last (vocab) axis: returns
  *  `-logProbs[target]` at each position. `logProbs` is `[..., V]` (already
@@ -229,7 +210,7 @@ export function nllLoss(logProbs: Tensor, targets: Tensor): Tensor {
     throw new ShapeError(`nllLoss: targets must be i32, got ${targets.dtype}`, site)
   }
   const vocab = logProbs.shape[logProbs.shape.length - 1]!
-  const targetLp = sum(mul(logProbs, oneHot(targets, vocab, 'f32')), -1)   // [...]
+  const targetLp = sum(mul(logProbs, oneHot(targets, vocab, 'f32')), -1)
   return mul(targetLp, -1)
 }
 

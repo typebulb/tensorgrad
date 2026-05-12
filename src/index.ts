@@ -1,59 +1,43 @@
-// Public surface. Bulb code imports from here.
-//
-// Phase 1 exports: IR types, op surface, trace driver. Autograd (Phase 2) and
-// codegen / compile() (Phase 3+) come later.
+// Public surface — everything tensorgrad exposes lives behind this barrel.
+// IR types, op surface, trace driver, autograd, codegen, runtime, compile
+// entry points, Module abstraction, and the `nn` namespace.
 
 export type { Tensor, Shape, Dtype, OpNode, Graph, CallSite } from './ir.js'
 export { ShapeError } from './shape.js'
 export { trace, traceInto, paramInput, tensorInput, stateInput } from './trace.js'
 export { capture } from './capture.js'
 export {
-  // Element-wise arithmetic. Binops accept Tensor or JS-number for the second arg.
+  // Element-wise arithmetic (binops accept Tensor or JS number)
   add, sub, mul, div, min, max, clamp,
-  // Element-wise unary
-  sqrt, rsqrt, log, exp, relu,
-  neg, abs, tanh, sigmoid, gelu, silu,
-  // Stochastic regularization (training-forward only; no mode flag)
+  // Unary
+  sqrt, rsqrt, log, exp, relu, neg, abs, tanh, sigmoid, gelu, silu,
+  // Stochastic regularization
   dropout,
   // Comparisons + select
   less, greater, where,
-  // Reductions: `mean(x, axis?, { keepDims? })` / `sum(x, axis?, { keepDims? })`.
-  // Negative axis counts from the end; omit `axis` to reduce all → 0-d scalar.
+  // Reductions
   mean, sum, argmax,
   type ReduceOpts,
-  // Shape ops
-  reshape, permute, swapAxes,
-  // PyTorch-style flatten — collapse trailing axes into one. Sugar for reshape(-1).
-  flatten,
-  // Linear algebra — single `matmul` dispatches between unbatched + batched
-  // kernels on rhs rank.
+  // Shape
+  reshape, permute, swapAxes, flatten,
+  // Linear algebra
   matmul,
   // Indexing / casting
   oneHot, arange, embedding,
-  // ML primitives. `softmax` / `logSoftmax` take an optional axis (default
-  // -1); `softmaxCausal` is always last-axis (mask is over a seq-seq matrix).
+  // ML primitives
   softmaxCausal, logSoftmax, softmax, whereCausal,
-  // 2D convolution + pooling (NCHW, PyTorch-shape). conv2d/maxPool2d are the
-  // user surface; the *Grad helpers are emitted by autograd.
+  // 2D conv + pool (NCHW)
   conv2d, maxPool2d,
   type Conv2dOptions, type MaxPool2dOptions,
   // Slicing / structural
   sliceRange, concat, stack, split,
 } from './ops.js'
 
-// Note: addScalar/mulScalar/broadcastTo/sumToShape/constScalar/reluGrad/adam_update_*
-// are autograd/optimizer building blocks. They live in ops.ts (so grad.ts and
-// adam.ts can import them) but aren't part of the public API — `add`/`mul`
-// overload on JS numbers, `where` subsumes the rest.
 export { appendGrad, type GradResult } from './grad.js'
 export { appendAdam, appendGradClip, lr, resolveLR, type AdamConfig, type AdamResult, type LR } from './adam.js'
 export { appendSGD, type SGDConfig, type SGDResult } from './sgd.js'
 export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
 export { emitKernels, type KernelSpec } from './codegen.js'
-// Runtime types: only the user-facing pieces. CompiledRuntime/CompiledForward
-// (worker-internal) and createRuntime/createForwardRuntime aren't part of the
-// public API — users get CompiledModule/CompiledForwardModule (proxies) from
-// compileModule/compileForward instead.
 export { Captures, type RunOptions, type StepResult, type RunResult, type Outcome, type UploadParamsOptions } from './runtime.js'
 export {
   compileToIR, compileModule, isWebGPUAvailable,
