@@ -279,6 +279,27 @@ const params = compiled.ir.graph.ops
 // [{ name: 'l1.W', shape: [1, 64] }, { name: 'l1.b', shape: [64] }, ...]
 ```
 
+**Standalone IR (no worker, no GPU).** `compileToIR` is the same pipeline
+without the worker spawn — trace + autograd + buffer plan + codegen,
+returning a `CompiledIR` synchronously. Useful for unit tests that walk
+the graph, op-count regressions in CI, or environments without WebGPU.
+
+```ts
+import { compileToIR, paramInput, tensorInput, matmul, mean, mul } from 'tensorgrad'
+
+const ir = compileToIR(() => {
+  const W = paramInput('W', [4, 8])
+  const x = tensorInput('x', [16, 4])
+  const y = matmul(x, W)
+  return mean(mul(y, y))            // scalar loss; appendGrad runs internally
+})
+
+ir.graph.ops.length             // count of fwd + bwd ops
+ir.kernels.length               // emitted WGSL kernels
+Object.keys(ir.paramGrads)      // [ 'W' ] — gradient tensors keyed by param name
+ir.paramGrads.W.shape           // [4, 8] — matches the param
+```
+
 **Typed param tree.** `downloadParams()` returns a tree that mirrors the
 model class. If `MLP` has `l1: Linear; l2: Linear; l3: Linear` and `Linear`
 has `W: Tensor; b: Tensor`, then the return type is

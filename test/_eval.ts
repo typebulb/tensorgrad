@@ -432,6 +432,25 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       }
       return out
     }
+    case 'scatter_axis': {
+      const a = v(op.a) as Float32Array
+      const ax = op.axis
+      const inner = shape.slice(ax + 1).reduce((p, d) => p * d, 1)
+      const D_out = shape[ax]!
+      const D_in = op.end - op.start
+      const outer = shapeSize(shape) / (D_out * inner)
+      const out = new Float32Array(shapeSize(shape))
+      for (let i = 0; i < outer; i++) {
+        for (let j = 0; j < D_out; j++) {
+          if (j < op.start || j >= op.end) continue
+          const ja = j - op.start
+          for (let k = 0; k < inner; k++) {
+            out[i * D_out * inner + j * inner + k] = a[i * D_in * inner + ja * inner + k]!
+          }
+        }
+      }
+      return out
+    }
     case 'concat': {
       const axis = op.axis
       const inner = shape.slice(axis + 1).reduce((p, d) => p * d, 1)

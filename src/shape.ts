@@ -207,6 +207,33 @@ export function inferSliceRange(opName: string, aShape: Shape, axis: number, sta
   return out
 }
 
+/** Scatter-into-zero: place `a` into `[start, end)` along `axis` of an
+ *  otherwise-zero tensor of `outShape`. Validates that `a` matches `outShape`
+ *  everywhere except along `axis`, where its size equals `end - start`. */
+export function inferScatterAxis(
+  opName: string, aShape: Shape, outShape: Shape,
+  axis: number, start: number, end: number, site: CallSite | null,
+): Shape {
+  if (outShape.length === 0) fail(`${opName}: cannot scatter into 0-d tensor`, site)
+  if (axis < 0 || axis >= outShape.length) {
+    fail(`${opName}: axis ${axis} out of range for output shape ${showShape(outShape)}`, site)
+  }
+  const dim = outShape[axis]!
+  if (start < 0 || end > dim || start >= end) {
+    fail(`${opName}: invalid range [${start}, ${end}) for axis ${axis} of size ${dim}`, site)
+  }
+  if (aShape.length !== outShape.length) {
+    fail(`${opName}: input rank ${aShape.length} must equal output rank ${outShape.length}`, site)
+  }
+  for (let i = 0; i < outShape.length; i++) {
+    const expected = i === axis ? end - start : outShape[i]!
+    if (aShape[i]! !== expected) {
+      fail(`${opName}: input ${showShape(aShape)} doesn't match output ${showShape(outShape)} at axis ${i} (expected ${expected})`, site)
+    }
+  }
+  return outShape
+}
+
 /** Concat along `axis`. All inputs must have identical shape except along
  *  `axis`; output's size on `axis` is the sum. `axis` is non-negative. */
 export function inferConcat(opName: string, shapes: readonly Shape[], axis: number, site: CallSite | null): Shape {

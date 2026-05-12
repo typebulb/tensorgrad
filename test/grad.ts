@@ -11,13 +11,14 @@
 
 import {
   tensorInput,
-  mul,
+  mul, add,
   dropout,
   mean,
   matmul,
   embedding,
   concat,
-  softmaxCausal,
+  sliceRange, split,
+  softmaxCausal, whereCausal,
   gelu,
   conv2d, maxPool2d,
 } from '../src/index.js'
@@ -87,6 +88,29 @@ assertGradMatchesFD('conv2d (weight gradient, stride 2, padding 1)', [3, 2, 2, 2
   const x = tensorInput('x', [1, 2, 4, 4])
   return mean(conv2d(x, p, { stride: 2, padding: 1 }))
 }, { extraInputs: { x: makeRange([1, 2, 4, 4]) } })
+
+// 9c. Slice + scatter-into-zero backward. `sliceRange` on a non-last axis is the
+//     general path; its adjoint emits the scatter_axis op (slice's reverse). A
+//     stable test takes a slice and reduces — gradient is 1/N inside the slice,
+//     0 outside.
+assertGradMatchesFD('sliceRange (non-last axis, scatter backward)', [4, 6], p => {
+  return mean(sliceRange(p, 1, 1, 4))   // [4, 6] -> [4, 3]; backward scatters
+})
+
+// 9d. Split: composes from sliceRange. Each piece flows back through its own
+//     scatter; sums recombine cleanly in the input cotangent. Catches a
+//     missing accumulate() in slice's adjoint.
+assertGradMatchesFD('split (two pieces, both contribute to loss)', [4, 6], p => {
+  const [a, b] = split(p, [2, 4], 1)
+  return add(mean(mul(a!, a!)), mean(mul(b!, b!)))
+})
+
+// 9e. whereCausal: lower triangle passes through, upper is replaced by
+//     fillValue. Backward zeroes the upper triangle. Pair with mean so the
+//     scalar loss has gradient 1/N on the lower triangle, 0 elsewhere.
+assertGradMatchesFD('whereCausal (lower-triangle pass, upper-triangle zero)', [4, 4], p => {
+  return mean(whereCausal(p, 0))
+})
 
 // 10. MaxPool2D: gradient routes only to the argmax position in each window.
 //     Use deterministic, well-separated values so ties don't muddy the FD

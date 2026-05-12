@@ -167,6 +167,9 @@ export type OpNode =
   | { kind: 'slice_last_range'; out: number; a: number; start: number; end: number }
   // General-axis slice. `axis` is non-negative (ops.ts normalizes negatives).
   | { kind: 'slice_range'; out: number; a: number; axis: number; start: number; end: number }
+  // Adjoint of slice_range: scatter `a` into `[start, end)` along `axis` of
+  // an otherwise-zero tensor of shape `outShape`. `axis` is non-negative.
+  | { kind: 'scatter_axis'; out: number; a: number; outShape: Shape; axis: number; start: number; end: number }
   // Variable-arity concat along `axis`. Capped at 7 inputs by codegen
   // (WebGPU bind-group limit: 8 storage buffers per stage minus the output).
   | { kind: 'concat'; out: number; inputs: readonly number[]; axis: number }

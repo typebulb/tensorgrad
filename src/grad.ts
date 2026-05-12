@@ -14,7 +14,7 @@ import {
   constScalar, reluGrad,
   sum, where, less, greater,
   dropoutWithSalt,
-  sliceRange,
+  sliceRange, scatterAxis, whereCausal,
   conv2dInputGrad, conv2dWeightGrad, maxPool2dGrad,
 } from './ops.js'
 import { traceInto } from './trace.js'
@@ -241,14 +241,11 @@ function runAdjointRule(
       }
       return
     }
-    case 'slice_range':
-      // Scatter-into-zero. Deferred until a user needs to differentiate
-      // through one (concat's gradient uses sliceRange but doesn't differentiate
-      // *through* it).
-      throw new Error(
-        `autograd: slice_range backward not implemented yet. ` +
-        `If you hit this, please file an issue.`,
-      )
+    case 'slice_range': {
+      const a = tensorOf(op.a)
+      accumulate(cotangents, op.a, scatterAxis(outCotan, a.shape, op.axis, op.start, op.end))
+      return
+    }
     case 'min': {
       // Pass dy through to whichever side won. Ties go to b (subgradient choice).
       const a = tensorOf(op.a), b = tensorOf(op.b)
@@ -324,13 +321,10 @@ function runAdjointRule(
 
     // ---- Slicing ---------------------------------------------------------
     case 'slice_last_range': {
-      // Same status as `slice_range` above — scatter-into-zero, deferred.
       const a = tensorOf(op.a)
-      throw new Error(
-        `autograd: slice_last_range backward not implemented yet ` +
-        `(would need a scatter-style op). If you hit this, please file an issue. ` +
-        `Tensor: ${a.shape} -> ${tensorOf(op.out).shape}`,
-      )
+      const axis = a.shape.length - 1
+      accumulate(cotangents, op.a, scatterAxis(outCotan, a.shape, axis, op.start, op.end))
+      return
     }
 
     // ---- Broadcast / un-broadcast (autograd infrastructure) ---------------
@@ -391,12 +385,10 @@ function runAdjointRule(
     }
 
     case 'where_causal':
-      // Lower triangle should pass through, upper should drop. Hard to
-      // express with current ops; punt.
-      throw new Error(
-        `autograd: where_causal backward not yet implemented. ` +
-        `Use softmax_causal_last (which fuses the mask + softmax) instead.`,
-      )
+      // Lower triangle passes through, upper is zeroed — that's whereCausal
+      // applied to the cotangent with fillValue=0.
+      accumulate(cotangents, op.a, whereCausal(outCotan, 0))
+      return
 
     // ---- Adam ops are post-autograd; no backward through them. ----------
     case 'adam_update_m':
@@ -438,6 +430,11 @@ function runAdjointRule(
       throw new Error(
         `autograd: cannot take second-order gradient through relu_grad — ` +
         `tensorgrad does not support higher-order autodiff.`,
+      )
+
+    case 'scatter_axis':
+      throw new Error(
+        `autograd: cannot differentiate through scatter_axis (it's a backward op)`,
       )
 
     default: {

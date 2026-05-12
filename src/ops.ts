@@ -8,7 +8,7 @@ import { currentGraph, tensorInput } from './trace.js'
 import {
   inferElementwiseBinop, inferUnary, inferMeanLast, inferSumLast, inferArgmaxLast,
   inferReshape, inferPermute, inferMatmul, inferMatmulBatched,
-  inferOneHot, inferWhereCausal, inferSliceRange, inferConcat,
+  inferOneHot, inferWhereCausal, inferSliceRange, inferScatterAxis, inferConcat,
   inferBroadcastTo, inferSumToShape, inferReluGrad, inferWhere,
   inferConv2d, inferMaxPool2d,
   ShapeError, showShape,
@@ -520,6 +520,15 @@ export function sliceRange(a: Tensor, axis: number, start: number, end: number):
   const ax = axis < 0 ? a.shape.length + axis : axis
   const outShape = inferSliceRange('sliceRange', a.shape, ax, start, end, site)
   return addOp(currentGraph(), 'slice_range', outShape, a.dtype, site, { a: a.id, axis: ax, start, end })
+}
+
+/** `sliceRange`'s adjoint: scatter `a` into `[start, end)` along `axis` of
+ *  an otherwise-zero tensor of `outShape`. Emitted by autograd; users go
+ *  through `sliceRange`. `axis` must be non-negative. */
+export function scatterAxis(a: Tensor, outShape: Shape, axis: number, start: number, end: number): Tensor {
+  const site = captureSite('scatterAxis')
+  const out = inferScatterAxis('scatterAxis', a.shape, outShape, axis, start, end, site)
+  return addOp(currentGraph(), 'scatter_axis', out, a.dtype, site, { a: a.id, outShape, axis, start, end })
 }
 
 /** Concatenate two or more tensors along `axis`. All inputs must share

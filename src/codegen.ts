@@ -585,6 +585,38 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
 
+    case 'scatter_axis': {
+      // Inverse of slice_range: copy `a` into [start, end) along `axis` of an
+      // otherwise-zero output; one thread per output cell branches on whether
+      // the cell sits inside the slice region.
+      const out = tof(op.out)
+      const a = tof(op.a)
+      const axis = op.axis
+      const inner = out.shape.slice(axis + 1).reduce((p, d) => p * d, 1)
+      const D_out = out.shape[axis]!
+      const D_in = op.end - op.start
+      const total = shapeSize(out.shape)
+      const zeroLit = wgslLiteral(0, out.dtype)
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> a : array<${wgslDtype(a.dtype)}>;
+@group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  let outer = i / ${D_out * inner}u;
+  let rest = i % ${D_out * inner}u;
+  let axisIdx = rest / ${inner}u;
+  let innerIdx = rest % ${inner}u;
+  if (axisIdx < ${op.start}u || axisIdx >= ${op.end}u) {
+    out[i] = ${zeroLit};
+  } else {
+    out[i] = a[outer * ${D_in * inner}u + (axisIdx - ${op.start}u) * ${inner}u + innerIdx];
+  }
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
+
     case 'concat': {
       // Variadic. For each output element, walk the axis-offset chain to
       // find the source input. Inputs are bound 0..N-1; output is binding N.
