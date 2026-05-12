@@ -14,7 +14,7 @@ import {
   constScalar, reluGrad,
   sum, where, less, greater,
   dropoutWithSalt,
-  sliceRange, scatterAxis, whereCausal,
+  narrow, scatterAxis, whereCausal,
   conv2dInputGrad, conv2dWeightGrad, maxPool2dGrad,
 } from './ops.js'
 import { traceInto } from './trace.js'
@@ -255,7 +255,7 @@ function runAdjointRule(
       for (const inputId of op.inputs) {
         const inputTensor = tensorOf(inputId)
         const sliceSize = inputTensor.shape[op.axis]!
-        accumulate(cotangents, inputId, sliceRange(outCotan, op.axis, cursor, cursor + sliceSize))
+        accumulate(cotangents, inputId, narrow(outCotan, op.axis, cursor, sliceSize))
         cursor += sliceSize
       }
       return

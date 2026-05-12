@@ -28,7 +28,7 @@ const D_HEAD = D / N_HEADS
 const SEQ_LEN = 17                            // longest name is 15 chars: '.' + 15 + '.'
 const T = SEQ_LEN - 1                         // 16 input positions; targets shifted by 1
 const B = 32
-const LR = lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 })
+const LR = lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 })
 const SCALE_QK = 1 / Math.sqrt(D_HEAD)
 
 const PAD = 0                                 // '.' = 0; 'a'..'z' = 1..26
@@ -227,7 +227,7 @@ async function run() {
   const train = await compile(spec({
     model,
     loss: lossFn,
-    optimizer: { kind: 'adam', lr: LR, weightDecay: 0.01 },
+    optimizer: { kind: 'adamw', lr: LR, weightDecay: 0.01 },
     inputs: {
       tokens:  { shape: [B, T], dtype: 'i32' },
       targets: { shape: [B, T], dtype: 'i32' },

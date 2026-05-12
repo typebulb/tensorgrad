@@ -22,7 +22,7 @@ import { isLRDynamic, resolveLR } from './adam.js'
  *  `nesterov: true` (requires `momentum > 0`) switches to Nesterov momentum. */
 export interface SGDConfig {
   /** Learning rate schedule. Pass a number for fixed lr, or a shape from
-   *  the `lr` helpers (e.g. `lr.cosineDecay({ peak: 0.05, final: 0.001, steps: 10000 })`). */
+   *  the `lr` helpers (e.g. `lr.cosineAnnealing({ peak: 0.05, final: 0.001, steps: 10000 })`). */
   lr: LR
   /** Momentum coefficient. Default 0 (plain SGD). When non-zero, a per-param
    *  velocity buffer accumulates `momentum * v + g_eff` each step. */

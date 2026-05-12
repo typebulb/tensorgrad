@@ -29,7 +29,7 @@ const B = 128
 // Linear LR decay: peak at step 1, finalLr by `decaySteps`, flat after.
 // Letting bigger-batch take a bigger initial step then anneal — the recipe
 // the JS bulb uses to recover small-batch generalization at higher throughput.
-const LR = lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 })
+const LR = lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 })
 const SCALE_QK = 1 / Math.sqrt(D_HEAD)
 
 // ---------- Modules: structure of the param tree ---------------------------
@@ -176,7 +176,7 @@ async function run() {
   const train = await compile(spec({
     model,
     loss: lossFn,
-    optimizer: { kind: 'adam', lr: LR, weightDecay: 0.01 },
+    optimizer: { kind: 'adamw', lr: LR, weightDecay: 0.01 },
     inputs: {
       tokens:  { shape: [B, T], dtype: 'i32' },
       targets: { shape: [B, T], dtype: 'i32' },

@@ -14,16 +14,19 @@
 // Run with:  pnpm test  (which runs `tsx test/smoke.ts`)
 
 import {
-  trace, traceInto, paramInput, tensorInput, capture,
+  capture,
   add, sub, mul, div,
   sqrt, relu, mean, sum, reshape, permute,
   matmul,
   oneHot, arange,
   logSoftmax,
-  appendGrad,
-  planBuffers, emitKernels,
   type Tensor, type Graph,
 } from '../src/index.js'
+import {
+  trace, traceInto, paramInput, tensorInput,
+  appendGrad,
+  planBuffers, emitKernels,
+} from '../src/internal.js'
 
 // Minimal Node typing — keeps `@types/node` off the dev-dep tree.
 declare const process: { exit(code: number): never }
@@ -322,7 +325,7 @@ console.log('  ✓ capture() inside traceInto is a no-op')
 
 console.log('\nVerifying appendSGD...')
 
-import { appendSGD } from '../src/index.js'
+import { appendSGD } from '../src/internal.js'
 
 // Build a trivial training graph: one param p, loss = sum(p * p).
 function buildTrivialTrainingGraph(): { graph: Graph; paramGrads: Record<string, Tensor>; paramTensors: Record<string, Tensor> } {
@@ -399,7 +402,8 @@ try {
 
 console.log('\nVerifying lr.step / lr.multiStep schedules...')
 
-const { lr, resolveLR } = await import('../src/index.js')
+const { lr } = await import('../src/index.js')
+const { resolveLR } = await import('../src/internal.js')
 
 function approxEq(a: number, b: number, eps = 1e-9): boolean {
   return Math.abs(a - b) < eps

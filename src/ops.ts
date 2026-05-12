@@ -2,7 +2,7 @@
 // shapes (via src/shape.ts), and appends an op to the current graph. No
 // numeric work — these calls just build the IR.
 
-import type { Tensor, Shape, Dtype, OpNode, Graph } from './ir.js'
+import type { Tensor, Shape, Dtype, OpNode, Graph, CallSite } from './ir.js'
 import { addOp, captureSite } from './ir.js'
 import { currentGraph, tensorInput } from './trace.js'
 import {
@@ -647,18 +647,19 @@ export function whereCausal(a: Tensor, fillValue: number): Tensor {
 
 // ---- Slicing --------------------------------------------------------------
 
-/** General-axis slice: take elements `[start, end)` along `axis`. Negative
- *  `axis` indexes from the end (Python convention). */
-export function sliceRange(a: Tensor, axis: number, start: number, end: number): Tensor {
-  const site = captureSite('sliceRange')
+/** Take `length` elements starting at `start` along `axis`. Negative `axis`
+ *  indexes from the end (Python convention). PyTorch: `torch.narrow`. */
+export function narrow(a: Tensor, axis: number, start: number, length: number): Tensor {
+  const site = captureSite('narrow')
   const ax = axis < 0 ? a.shape.length + axis : axis
-  const outShape = inferSliceRange('sliceRange', a.shape, ax, start, end, site)
+  const end = start + length
+  const outShape = inferSliceRange('narrow', a.shape, ax, start, end, site)
   return addOp(currentGraph(), 'slice_range', outShape, a.dtype, site, { a: a.id, axis: ax, start, end })
 }
 
-/** `sliceRange`'s adjoint: scatter `a` into `[start, end)` along `axis` of
+/** `narrow`'s adjoint: scatter `a` into `[start, end)` along `axis` of
  *  an otherwise-zero tensor of `outShape`. Emitted by autograd; users go
- *  through `sliceRange`. `axis` must be non-negative. */
+ *  through `narrow`. `axis` must be non-negative. */
 export function scatterAxis(a: Tensor, outShape: Shape, axis: number, start: number, end: number): Tensor {
   const site = captureSite('scatterAxis')
   const out = inferScatterAxis('scatterAxis', a.shape, outShape, axis, start, end, site)
@@ -667,24 +668,35 @@ export function scatterAxis(a: Tensor, outShape: Shape, axis: number, start: num
 
 /** Concatenate two or more tensors along `axis`. All inputs must share
  *  shape except along `axis`; output's size on `axis` is the sum. Negative
- *  `axis` indexes from the end. Capped at 7 inputs (WebGPU bind-group
- *  limit) — chain calls for more. */
+ *  `axis` indexes from the end. Inputs past the WebGPU 7-binding cap are
+ *  auto-chained into successive `concat` ops — call signature is the same
+ *  whether you pass 2 or 200. */
 const CONCAT_INPUT_CAP = 7
 export function concat(tensors: readonly Tensor[], axis: number): Tensor {
   const site = captureSite('concat')
   if (tensors.length === 0) throw new ShapeError(`concat: needs at least one input`, site)
   if (tensors.length === 1) return tensors[0]!
-  if (tensors.length > CONCAT_INPUT_CAP) {
-    throw new ShapeError(
-      `concat: ${tensors.length} inputs exceeds the bind-group cap of ${CONCAT_INPUT_CAP}. ` +
-      `Chain two concats, or restructure the call site.`, site,
-    )
-  }
   const dtype = tensors[0]!.dtype
   for (const t of tensors) {
     if (t.dtype !== dtype) throw new ShapeError(`concat: dtype mismatch (${dtype} vs ${t.dtype})`, site)
   }
   const ax = axis < 0 ? tensors[0]!.shape.length + axis : axis
+  // Chain into groups of CONCAT_INPUT_CAP — each group becomes one concat op.
+  // The final layer reduces in CAP-sized chunks until a single tensor remains.
+  let layer: Tensor[] = tensors.slice()
+  while (layer.length > CONCAT_INPUT_CAP) {
+    const next: Tensor[] = []
+    for (let i = 0; i < layer.length; i += CONCAT_INPUT_CAP) {
+      const chunk = layer.slice(i, i + CONCAT_INPUT_CAP)
+      next.push(chunk.length === 1 ? chunk[0]! : concatOne(chunk, ax, site))
+    }
+    layer = next
+  }
+  return concatOne(layer, ax, site)
+}
+
+function concatOne(tensors: Tensor[], ax: number, site: CallSite): Tensor {
+  const dtype = tensors[0]!.dtype
   const outShape = inferConcat('concat', tensors.map(t => t.shape), ax, site)
   return addOp(currentGraph(), 'concat', outShape, dtype, site, { inputs: tensors.map(t => t.id), axis: ax })
 }
@@ -731,8 +743,8 @@ export function mergeHeads(x: Tensor): Tensor {
 }
 
 /** Inverse of `concat`: split into pieces along `axis` with the given
- *  per-piece sizes (must sum to the axis's size). Composes from
- *  `sliceRange` — no new IR. */
+ *  per-piece sizes (must sum to the axis's size). Composes from `narrow` —
+ *  no new IR. */
 export function split(t: Tensor, sizes: readonly number[], axis: number): Tensor[] {
   const site = captureSite('split')
   const ax = axis < 0 ? t.shape.length + axis : axis
@@ -744,7 +756,7 @@ export function split(t: Tensor, sizes: readonly number[], axis: number): Tensor
   const out: Tensor[] = []
   let cursor = 0
   for (const s of sizes) {
-    out.push(sliceRange(t, ax, cursor, cursor + s))
+    out.push(narrow(t, ax, cursor, s))
     cursor += s
   }
   return out

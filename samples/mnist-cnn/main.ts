@@ -214,7 +214,7 @@ async function boot(): Promise<void> {
   train = await compile(spec({
     model,
     loss: lossFn,
-    optimizer: { kind: 'adam', lr: 1e-3, weightDecay: 0.01, clipGradNorm: 1.0 },
+    optimizer: { kind: 'adamw', lr: 1e-3, weightDecay: 0.01, clipGradNorm: 1.0 },
     inputs: {
       x: [BATCH_SIZE, 1, 28, 28],
       y: { shape: [BATCH_SIZE], dtype: 'i32' },

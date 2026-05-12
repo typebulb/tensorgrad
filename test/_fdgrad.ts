@@ -11,11 +11,8 @@
 // shape-only tests miss. A typo in tanh's backward (`(1 + c²)` instead
 // of `(1 - c²)`) fails the FD comparison; the shape-only check passes.
 
-import {
-  trace, paramInput,
-  type Tensor, type Graph,
-} from '../src/index.js'
-import { appendGrad } from '../src/grad.js'
+import type { Tensor, Graph } from '../src/index.js'
+import { trace, paramInput, appendGrad } from '../src/internal.js'
 import { evalGraph, evalOutput } from './_eval.js'
 import { fail, ok } from './_assert.js'
 

@@ -8,7 +8,8 @@
 // transformer trace), and by the FD harness in test/grad.ts. Tests for
 // stable shape rules and obvious literal guards were pruned as padding.
 
-import { trace, tensorInput, dropout } from '../src/index.js'
+import { dropout } from '../src/index.js'
+import { trace, tensorInput } from '../src/internal.js'
 import { section, ok, fail, done } from './_assert.js'
 
 section('dropout — auto-managed per-op salt + shared seed input')

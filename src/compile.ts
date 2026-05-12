@@ -18,7 +18,7 @@ import { trace, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
 import {
   appendAdam, resolveLR,
-  type AdamConfig, type AdamResult, type AdamResolvedConfig, type LR,
+  type AdamConfig, type AdamWConfig, type AdamResult, type AdamResolvedConfig, type LR,
 } from './adam.js'
 import { appendSGD, type SGDConfig, type SGDResult, type SGDResolvedConfig } from './sgd.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
@@ -29,7 +29,7 @@ import { WorkerProxy } from './worker-proxy.js'
 import {
   transferablesOfRecord,
   type Req, type WireIR, type WireAdamConfig, type WireSGDConfig, type WireOptimizerConfig,
-  type CreateRuntimeResult, type CompileForwardResult,
+  type CompileResult,
   type StepResultWire, type RunResultWire, type DownloadParamsResult, type ReadLossResult,
 } from './worker-protocol.js'
 
@@ -138,10 +138,14 @@ export interface CompiledIR {
   kernels: KernelSpec[]
 }
 
-/** Optimizer config — discriminated by `kind`. Adam/AdamW or SGD/Nesterov. */
+/** Optimizer config — discriminated by `kind`. `'adam'` is plain Adam (no
+ *  weight decay); `'adamw'` is decoupled-decay AdamW (requires `weightDecay`).
+ *  `'sgd'` is SGD / momentum / Nesterov. Splits mirror PyTorch's
+ *  `torch.optim.Adam` vs `torch.optim.AdamW`. */
 export type OptimizerConfig =
-  | ({ readonly kind: 'adam' } & AdamConfig)
-  | ({ readonly kind: 'sgd'  } & SGDConfig)
+  | ({ readonly kind: 'adam'  } & AdamConfig)
+  | ({ readonly kind: 'adamw' } & AdamWConfig)
+  | ({ readonly kind: 'sgd'   } & SGDConfig)
 
 /** Options passed to `spec({ ... })` to build a training spec. */
 export interface TrainingSpecOptions<M extends Module, I extends InputDecls = InputDecls> {
@@ -286,29 +290,40 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
    *  more convenient. */
   run(inputs: TypedInputs<I>): Promise<RunResult>
 
+  /** Upload params from a flat record (the shape `downloadParamsFlat` returns).
+   *  Pass `{ partial: true }` to update a subset and leave the rest at their
+   *  current GPU values; the default rejects missing keys. */
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
   /** Read params back as a typed tree mirroring the model class structure.
-   *  `params.layers[0].W` etc. — typed, autocompletable. */
+   *  `params.layers[0].W` etc. — typed, autocompletable. Mirror of
+   *  `downloadParamsFlat` and `downloadParamGrads` — same underlying data,
+   *  three views; pick whichever matches your call site. */
   downloadParams(): Promise<ParamTree<M>>
   /** Escape hatch: read params back as a flat `{ 'layers.0.W': Float32Array, ... }`
-   *  record. Useful for serialization, iteration over all params, or partial
-   *  re-uploads via `uploadParams`. */
+   *  record. The natural feed for `uploadParams` (round-trip works without
+   *  any reshaping); also handy for serialization or iterating all params. */
   downloadParamsFlat(): Promise<Record<string, Float32Array>>
-  /** Gradients in the same tree shape as `downloadParams`. */
+  /** Gradients in the same tree shape as `downloadParams`. Mirror of the
+   *  params-side download; same per-tensor sizes. */
   downloadParamGrads(): Promise<ParamTree<M>>
 
-  /** Re-initialize all params + zero optimizer state. */
+  /** Re-initialize all params (from `seed`) and zero optimizer state in one
+   *  call. The "start over with the same compile" button. For just zeroing
+   *  optimizer state while keeping params, use `resetOptimizerState`. */
   reset(): Promise<void>
+  /** Zero Adam's m/v buffers (or SGD's momentum buffer). Params untouched.
+   *  Reach for this when you want to discard accumulated optimizer state
+   *  without re-initializing params (e.g. after a hyperparameter change). */
   resetOptimizerState(): Promise<void>
 
   /** Update the learning rate at runtime, without recompiling. Works for
    *  both Adam and SGD graphs.
    *
-   *  When `update.lr` is a non-constant schedule with no explicit
-   *  `startStep`, the schedule is rebased so its step 1 aligns with the
-   *  next training step ("decay from now"). Numbers and schedules with an
-   *  explicit `startStep` pass through unchanged. */
-  setOptimizerConfig(update: { lr?: LR }): Promise<void>
+   *  When `lr` is a non-constant schedule with no explicit `startStep`, the
+   *  schedule is rebased so its step 1 aligns with the next training step
+   *  ("decay from now"). Numbers and schedules with an explicit `startStep`
+   *  pass through unchanged. */
+  setLR(lr: LR): Promise<void>
 
   /** Swap the model topology in place: destroy the current training graph in
    *  the worker, compile a fresh one with the same loss/inputs config and
@@ -325,8 +340,7 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
    *
    *  Pass `{ optimizer }` to update optimizer config atomically with the
    *  topology swap. Without it, the existing optimizer config carries over.
-   *  For mid-training LR changes without a topology swap, use
-   *  `setOptimizerConfig`.
+   *  For mid-training LR changes without a topology swap, use `setLR`.
    *
    *  Use when the user changes layer count, hidden width, or any other
    *  shape-affecting model parameter — you don't need to re-create the
@@ -346,8 +360,9 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
  *  sibling. Param reads/writes route to the parent training graph
  *  (shared buffers).
  *
- *  No sync inspection surface for kernel count / output shape / IR — those
- *  would lie on a polymorphic proxy that caches multiple shape variants. */
+ *  No top-level `graph` / `kernels`: forward proxies are polymorphic and
+ *  hold one IR per shape. Use `graphFor(inputs)` to fetch (and lazily
+ *  compile) the IR for a specific shape. */
 export interface CompiledForward<M extends Module = Module, I extends InputDecls = InputDecls> {
   /** Same as the parent training graph's param names. */
   readonly paramNames: readonly string[]
@@ -357,11 +372,23 @@ export interface CompiledForward<M extends Module = Module, I extends InputDecls
    *  if the parent training graph was destroyed mid-flight. */
   run(inputs: TypedInputs<I>): Promise<RunResult>
 
+  /** The compiled IR for the resolved shape of `inputs`. Compiles + caches
+   *  a sibling on first call for that shape (same lazy-compile behavior as
+   *  `run()`). Use for inspecting the kernel count / IR ops at the actual
+   *  shape you're running. */
+  graphFor(inputs: TypedInputs<I>): Promise<CompiledIR>
+
+  /** Upload params. Pass `{ partial: true }` to update a subset and leave
+   *  the rest at their current GPU values. Reads/writes go to the parent
+   *  training compile's buffers (shared, so updates are immediately visible
+   *  there too). */
   uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void>
-  /** Typed tree view of the shared param state — same shape as the parent
-   *  training graph's `downloadParams()` (params are physically shared). */
+  /** Typed tree view of the shared param state — identical to the parent
+   *  training graph's `downloadParams()` since params are physically
+   *  shared. Mirror of `downloadParamsFlat`. */
   downloadParams(): Promise<ParamTree<M>>
-  /** Escape hatch: flat `{ 'layers.0.W': Float32Array, ... }` record. */
+  /** Flat `{ 'layers.0.W': Float32Array, ... }` record — the natural feed
+   *  for `uploadParams`. */
   downloadParamsFlat(): Promise<Record<string, Float32Array>>
 
   destroy(): void
@@ -434,7 +461,7 @@ export function isWebGPUAvailable(): boolean {
 
 interface BuiltTrainingGraph {
   ir: CompiledIR
-  meta: CreateRuntimeResult
+  meta: CompileResult
   initFns: Record<string, InitFn>
 }
 
@@ -450,7 +477,7 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
   const inputs = s.inputs as InputDecls
   const { graph, materialized } = traceModule(s.model, loss, inputs)
   const { paramGrads, loss: lossTensor } = appendGrad(graph)
-  const adamResult = s.optimizer.kind === 'adam'
+  const adamResult = s.optimizer.kind === 'adam' || s.optimizer.kind === 'adamw'
     ? appendAdam(graph, paramGrads, materialized.tensors, s.optimizer, materialized.decayFlags)
     : undefined
   const sgdResult = s.optimizer.kind === 'sgd'
@@ -471,7 +498,7 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
     : null
   const transfers = transferablesOfRecord(initialParams)
 
-  const meta = await proxy.request<CreateRuntimeResult>(
+  const meta = await proxy.request<CompileResult>(
     { kind: 'createRuntime', payload: { graphId, ir: wireIR, initialParams, optimizer: wireOptimizer } },
     transfers,
   )
@@ -507,7 +534,7 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
   // sibling ForwardProxy holding `this`) stay valid across topology changes.
   // `spec.seed` is always populated (compileTrainingSpec fills it).
   private _ir: CompiledIR
-  private meta: CreateRuntimeResult
+  private meta: CompileResult
   private spec: TrainingSpec<M, I>
   private initFns: Record<string, InitFn>
 
@@ -515,7 +542,7 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     private readonly proxy: WorkerProxy,
     readonly graphId: number,
     ir: CompiledIR,
-    meta: CreateRuntimeResult,
+    meta: CompileResult,
     spec: TrainingSpec<M, I>,
     initFns: Record<string, InitFn>,
     private readonly nextGraphId: { v: number },
@@ -613,9 +640,9 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     ).then(() => undefined)
   }
 
-  setOptimizerConfig(update: { lr?: LR }): Promise<void> {
+  setLR(lr: LR): Promise<void> {
     return this.proxy.request<null>(
-      { kind: 'setOptimizerConfig', payload: { graphId: this.graphId, update } },
+      { kind: 'setLR', payload: { graphId: this.graphId, lr } },
     ).then(() => undefined)
   }
 
@@ -639,6 +666,17 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     newModel: M,
     replaceOpts?: { seed?: number; optimizer?: OptimizerConfig },
   ): Promise<void> {
+    // Optimizer kind must match — swapping kinds (e.g. Adam → SGD) requires
+    // re-creating state buffers (Adam has m/v slots; SGD has just v with
+    // momentum). The runtime tracks those per-kind and a mid-graph kind
+    // switch would silently produce garbage updates. If the user wants to
+    // change kind, destroy + recompile fresh.
+    if (replaceOpts?.optimizer && replaceOpts.optimizer.kind !== this.spec.optimizer.kind) {
+      throw new Error(
+        `replaceModel: optimizer kind cannot change ('${this.spec.optimizer.kind}' → '${replaceOpts.optimizer.kind}'). ` +
+        `State buffers (Adam m/v vs SGD momentum) are kind-specific — destroy the compile and recompile to switch kinds.`,
+      )
+    }
     // Invalidate (don't destroy) siblings — their kernels are model-specific
     // but the proxy objects must outlive the swap so callers' references stay
     // valid. Each sibling recompiles lazily on its next run().
@@ -711,6 +749,10 @@ class ForwardProxy<M extends Module, I extends InputDecls>
     }
   }
 
+  async graphFor(inputs: LooseInputs): Promise<CompiledIR> {
+    return (await this.siblingFor(inputs)).ir
+  }
+
   async uploadParams(params: Record<string, Float32Array>, opts?: UploadParamsOptions): Promise<void> {
     // Params live on the parent (shared with all siblings).
     await this.proxy.request<null>(
@@ -758,7 +800,7 @@ class ForwardProxy<M extends Module, I extends InputDecls>
 interface ForwardSiblingMeta {
   graphId: number
   ir: CompiledIR
-  meta: CompileForwardResult
+  meta: CompileResult
 }
 
 /** Compile a per-shape sibling forward graph against the parent training
@@ -779,7 +821,7 @@ async function compileSibling<M extends Module, I extends InputDecls>(
 
   const childGraphId = nextGraphId.v++
   const wireIR: WireIR = { graph, plan, kernels }
-  const meta = await proxy.request<CompileForwardResult>(
+  const meta = await proxy.request<CompileResult>(
     { kind: 'compileForward', payload: { graphId: childGraphId, parentGraphId, ir: wireIR } },
   )
   return { graphId: childGraphId, ir, meta }

@@ -27,31 +27,32 @@ import { adamUpdateM, adamUpdateV, adamUpdateP, add, mul, sqrt, sum, div, min, b
  * Each non-constant variant carries an optional `startStep` (default 0).
  * The intrinsic step is `max(1, currentStep - startStep)`, so users can
  * say "decay starting from where I am now" without us baking closures into
- * the shape. `setOptimizerConfig({ lr })` auto-fills `startStep = current_t`
- * when not set, so the new schedule's step 1 = the next training step.
+ * the shape. `setLR(...)` auto-fills `startStep = current_t` when not set,
+ * so the new schedule's step 1 = the next training step.
  */
 export type LR =
   | number
-  | { readonly kind: 'linearDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
-  | { readonly kind: 'cosineDecay'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
+  | { readonly kind: 'linear'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
+  | { readonly kind: 'cosineAnnealing'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
   | { readonly kind: 'warmup'; readonly peak: number; readonly warmupSteps: number; readonly after: LR; readonly startStep?: number }
   | { readonly kind: 'step'; readonly peak: number; readonly stepSize: number; readonly gamma: number; readonly startStep?: number }
   | { readonly kind: 'multiStep'; readonly peak: number; readonly milestones: readonly number[]; readonly gamma: number; readonly startStep?: number }
 
 /** Ergonomic constructors for LR schedule shapes. For constant lr, pass a
- *  raw number — every LR field on `spec({ optimizer })` / `setOptimizerConfig`
- *  accepts `number | LR`. */
+ *  raw number — every LR field on `spec({ optimizer })` / `setLR`
+ *  accepts `number | LR`. Names mirror PyTorch's `torch.optim.lr_scheduler`. */
 export const lr = {
   /** Linearly interpolate from `peak` at intrinsic step 1 to `final` at
-   *  intrinsic step `steps`, then hold at `final`. Optional `startStep` shifts
-   *  the timeline (intrinsic = current - startStep + 1). */
-  linearDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LR =>
-    ({ kind: 'linearDecay', ...opts }),
+   *  intrinsic step `steps`, then hold at `final`. Optional `startStep`
+   *  shifts the timeline (intrinsic = current - startStep + 1).
+   *  PyTorch: `LinearLR`. */
+  linear: (opts: { peak: number; final: number; steps: number; startStep?: number }): LR =>
+    ({ kind: 'linear', ...opts }),
   /** Half-cosine from `peak` at intrinsic step 1 down to `final` at intrinsic
    *  step `steps`, then hold at `final`. Optional `startStep` shifts the
-   *  timeline. */
-  cosineDecay: (opts: { peak: number; final: number; steps: number; startStep?: number }): LR =>
-    ({ kind: 'cosineDecay', ...opts }),
+   *  timeline. PyTorch: `CosineAnnealingLR`. */
+  cosineAnnealing: (opts: { peak: number; final: number; steps: number; startStep?: number }): LR =>
+    ({ kind: 'cosineAnnealing', ...opts }),
   /** Linear ramp from 0 to `peak` over `warmupSteps`, then hand off to
    *  `after` (offset so step 1 of `after` = first post-warmup step).
    *  Optional `startStep` shifts the timeline. */
@@ -79,12 +80,12 @@ function intrinsicStep(startStep: number | undefined, currentStep: number): numb
 export function resolveLR(schedule: LR, step: number): number {
   if (typeof schedule === 'number') return schedule
   switch (schedule.kind) {
-    case 'linearDecay': {
+    case 'linear': {
       const s = intrinsicStep(schedule.startStep, step)
       const f = Math.min(s / schedule.steps, 1)
       return schedule.peak + (schedule.final - schedule.peak) * f
     }
-    case 'cosineDecay': {
+    case 'cosineAnnealing': {
       const s = intrinsicStep(schedule.startStep, step)
       const f = Math.min(s / schedule.steps, 1)
       return schedule.final + 0.5 * (schedule.peak - schedule.final) * (1 + Math.cos(Math.PI * f))
@@ -128,26 +129,17 @@ export function isLRDynamic(schedule: LR): boolean {
   return typeof schedule !== 'number'
 }
 
-/** Adam / AdamW hyperparameters. Pass via `spec({ ..., optimizer:
- *  { kind: 'adam', ... } })`. Only `lr` is required; everything else has
- *  PyTorch-matching defaults. Non-zero `weightDecay` turns Adam into AdamW
- *  (decoupled decay, Loshchilov & Hutter). */
+/** Plain Adam hyperparameters. Pass via `spec({ ..., optimizer:
+ *  { kind: 'adam', ... } })`. Only `lr` is required; the rest match PyTorch
+ *  `torch.optim.Adam`'s defaults. For decoupled weight decay, use the
+ *  separate `kind: 'adamw'` variant + `AdamWConfig`. */
 export interface AdamConfig {
   /** Learning rate schedule. Pass a number for fixed lr, or a shape from
-   *  the `lr` helpers (e.g., `lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 })`). */
+   *  the `lr` helpers (e.g., `lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 })`). */
   lr: LR
   b1?: number   // default 0.9
   b2?: number   // default 0.999
   eps?: number  // default 1e-8
-  /** AdamW: decoupled weight decay coefficient. Default 0 (plain Adam).
-   *  When non-zero, every step shrinks each decayed param by a factor of
-   *  `1 - lr * weightDecay` before the gradient update. */
-  weightDecay?: number
-  /** Filter deciding which params get weight decay. Only consulted when
-   *  weightDecay > 0. Default: decay every param. Override for the standard
-   *  transformer convention (decay weights/embeddings, skip biases + LN gains).
-   *  Example: `(name) => name.includes('.W') || name.endsWith('_emb')`. */
-  decayFilter?: (paramName: string) => boolean
   /** Global L2-norm gradient clipping. When set, every gradient is scaled
    *  by `min(1, maxNorm / (totalNorm + 1e-6))` before the Adam update,
    *  where `totalNorm = sqrt(sum_p sum(grad_p ** 2))`. Standard
@@ -155,6 +147,35 @@ export interface AdamConfig {
    *  optax's `clip_by_global_norm`. Use `appendGradClip` directly if you
    *  need to compose clipping with a custom optimizer. */
   clipGradNorm?: number
+}
+
+/** AdamW hyperparameters (Loshchilov & Hutter — decoupled weight decay).
+ *  Pass via `spec({ ..., optimizer: { kind: 'adamw', ... } })`. `weightDecay`
+ *  is required (use plain `{ kind: 'adam' }` if you don't want decay). Every
+ *  step shrinks each decayed param by `1 - lr * weightDecay` before the
+ *  Adam gradient update. PyTorch parity: `torch.optim.AdamW`. */
+export interface AdamWConfig extends AdamConfig {
+  /** Decoupled weight decay coefficient. Must be > 0 — if you don't want
+   *  decay, use `{ kind: 'adam' }`. */
+  weightDecay: number
+  /** Filter deciding which params get weight decay. Default: decay every
+   *  param. Override for the standard transformer convention (decay
+   *  weights/embeddings, skip biases + LN gains). Per-param `{ decay }` set
+   *  via `this.param(shape, { decay })` overrides this filter when present.
+   *  Example: `(name) => name.includes('.W') || name.endsWith('_emb')`. */
+  decayFilter?: (paramName: string) => boolean
+}
+
+/** Union accepted by `appendAdam`. The compile pipeline narrows to one of
+ *  these based on `OptimizerConfig.kind`. */
+export type AdamOrAdamW = AdamConfig | AdamWConfig
+
+function adamWeightDecay(c: AdamOrAdamW): number {
+  return 'weightDecay' in c && c.weightDecay > 0 ? c.weightDecay : 0
+}
+
+function adamDecayFilter(c: AdamOrAdamW): (name: string) => boolean {
+  return 'decayFilter' in c && c.decayFilter ? c.decayFilter : () => true
 }
 
 /** Resolved hyperparameters with all fields populated. `lr` stays as the
@@ -166,8 +187,8 @@ export interface AdamResolvedConfig {
   eps: number
   weightDecay: number
   decayFilter: (name: string) => boolean
-  /** True iff the lr shape varies with step (linearDecay, cosineDecay,
-   *  warmup). When false, decayShrink is baked at compile time. */
+  /** True iff the lr shape varies with step (linear, cosineAnnealing,
+   *  warmup, step, multiStep). When false, decayShrink is baked at compile time. */
   lrIsScheduled: boolean
 }
 
@@ -243,10 +264,10 @@ export function appendAdam(
   graph: Graph,
   paramGrads: Record<string, Tensor>,
   paramTensors: Record<string, Tensor>,
-  config: AdamConfig,
+  config: AdamOrAdamW,
   /** Per-param decay flags from `materializeParams`. When supplied, overrides
-   *  `config.decayFilter` for any name in the map; falls back to `decayFilter`
-   *  for names not present (low-level callers without a Module). */
+   *  the config's `decayFilter` for any name in the map; falls back to
+   *  `decayFilter` for names not present (low-level callers without a Module). */
   decayFlags?: Record<string, boolean>,
 ): AdamResult {
   // Clipping happens in-graph before Adam consumes the gradients.
@@ -260,8 +281,8 @@ export function appendAdam(
     b1: config.b1 ?? 0.9,
     b2: config.b2 ?? 0.999,
     eps: config.eps ?? 1e-8,
-    weightDecay: config.weightDecay ?? 0,
-    decayFilter: config.decayFilter ?? (() => true),
+    weightDecay: adamWeightDecay(config),
+    decayFilter: adamDecayFilter(config),
     lrIsScheduled,
   }
   const writebacks: WritebackDecl[] = []

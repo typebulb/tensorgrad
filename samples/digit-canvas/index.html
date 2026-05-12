@@ -113,11 +113,11 @@
   </div>
 
   <p class="help">
-    Demonstrates: <code>compileForward</code> with a parametric batch dim
+    Demonstrates: forward-spec siblings with a parametric batch dim
     (same predict graph serves B=1 for the canvas and B=256 for the
     accuracy probe), <code>dropout</code> in training only (omitted from
     the inference forward — no <code>.train()/.eval()</code> mode flag),
-    <code>setOptimizerConfig</code> for live LR changes,
+    <code>setLR</code> for live LR changes,
     <code>replaceModel</code> for swapping hidden size without losing the
     worker, <code>clipGradNorm</code> for training stability,
     <code>singleFlight</code> so rapid-stroke predictions don't queue up,

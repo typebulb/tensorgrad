@@ -1,11 +1,11 @@
-// Public surface — everything tensorgrad exposes lives behind this barrel.
-// IR types, op surface, trace driver, autograd, codegen, runtime, compile
-// entry points, Module abstraction, and the `nn` namespace.
+// Public surface — `tensorgrad`. Documented end-user API: ops, modules,
+// the `nn` namespace, `spec`/`compile`/`compileIR`, runtime helpers.
+// Extension hooks (custom optimizers, IR walks, codegen visualization)
+// live in the sibling `tensorgrad/internal` barrel.
 
 export type { Tensor, Shape, Dtype, OpNode, Graph, CallSite } from './ir.js'
 export { ShapeError } from './shape.js'
-export { trace, traceInto, paramInput, tensorInput, stateInput } from './trace.js'
-export { capture, unsplitHeads } from './capture.js'
+export { capture } from './capture.js'
 export {
   // Element-wise arithmetic (binops accept Tensor or JS number)
   add, sub, mul, div, min, max, clamp,
@@ -34,14 +34,11 @@ export {
   conv2d, maxPool2d, nearestUpsample2d,
   type Conv2dOptions, type MaxPool2dOptions,
   // Slicing / structural
-  sliceRange, concat, stack, split,
+  narrow, concat, stack, split,
 } from './ops.js'
 
-export { appendGrad, type GradResult } from './grad.js'
-export { appendAdam, appendGradClip, lr, resolveLR, type AdamConfig, type AdamResult, type LR } from './adam.js'
-export { appendSGD, type SGDConfig, type SGDResult } from './sgd.js'
-export { planBuffers, type BufferPlan, type BufferSpec, type Writeback, type WritebackDecl } from './buffers.js'
-export { emitKernels, type KernelSpec } from './codegen.js'
+export { lr, type AdamConfig, type AdamWConfig, type LR } from './adam.js'
+export { type SGDConfig } from './sgd.js'
 export { Captures, type UploadParamsOptions } from './runtime.js'
 export {
   spec, compile, compileIR, isWebGPUAvailable,
@@ -49,12 +46,8 @@ export {
   type TrainingSpec, type ForwardSpec, type Spec,
   type CompiledTraining, type CompiledForward, type OptimizerConfig,
   type StepResult, type RunResult, type QueueResult,
-  type InputDecl, type InputDeclObject, type InputDecls, type InputShape, type InputsTensors, type ForwardFn,
-  type DtypeOf, type TypedArrayFor, type TypedInputs, type ParamTree,
+  type InputDecl, type InputDecls, type TypedInputs, type ParamTree,
 } from './compile.js'
-export {
-  Module, materializeParams, init, mulberry32,
-  type InitSpec, type ParamOptions, type MaterializedParams, type InitFn, type Rng,
-} from './module.js'
+export { Module, init, type InitSpec, type ParamOptions } from './module.js'
 export { singleFlight } from './single-flight.js'
 export * as nn from './nn.js'

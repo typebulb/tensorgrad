@@ -10,20 +10,19 @@
 // (FD harness). Both are reusable for any future op.
 
 import {
-  trace, paramInput, tensorInput,
   mul, add,
   dropout,
   mean,
   matmul,
   embedding,
   concat,
-  sliceRange, split,
+  narrow, split,
   softmaxCausal, whereCausal,
   gelu,
   conv2d, maxPool2d,
   stopGradient,
 } from '../src/index.js'
-import { appendGrad } from '../src/grad.js'
+import { trace, paramInput, tensorInput, appendGrad } from '../src/internal.js'
 import { evalGraph } from './_eval.js'
 import { section, ok, fail, done } from './_assert.js'
 import { assertGradMatchesFD } from './_fdgrad.js'
@@ -66,7 +65,7 @@ assertGradMatchesFD('dropout (forward/backward mask match)', [4, 8],
 
 // 7. Structural / variadic: concat's gradient slices the cotangent back
 //    into each input's shape along the concat axis.
-assertGradMatchesFD('concat (variadic, gradient via sliceRange)', [3, 4], p => {
+assertGradMatchesFD('concat (variadic, gradient via narrow)', [3, 4], p => {
   const q = tensorInput('q', [3, 5])
   return mean(concat([p, q], 1))
 }, { extraInputs: { q: makeRange([3, 5]) } })
@@ -92,15 +91,15 @@ assertGradMatchesFD('conv2d (weight gradient, stride 2, padding 1)', [3, 2, 2, 2
   return mean(conv2d(x, p, { stride: 2, padding: 1 }))
 }, { extraInputs: { x: makeRange([1, 2, 4, 4]) } })
 
-// 9c. Slice + scatter-into-zero backward. `sliceRange` on a non-last axis is the
-//     general path; its adjoint emits the scatter_axis op (slice's reverse). A
+// 9c. Slice + scatter-into-zero backward. `narrow` on a non-last axis is the
+//     general path; its adjoint emits the scatter_axis op (narrow's reverse). A
 //     stable test takes a slice and reduces — gradient is 1/N inside the slice,
 //     0 outside.
-assertGradMatchesFD('sliceRange (non-last axis, scatter backward)', [4, 6], p => {
-  return mean(sliceRange(p, 1, 1, 4))   // [4, 6] -> [4, 3]; backward scatters
+assertGradMatchesFD('narrow (non-last axis, scatter backward)', [4, 6], p => {
+  return mean(narrow(p, 1, 1, 3))   // [4, 6] -> [4, 3]; backward scatters
 })
 
-// 9d. Split: composes from sliceRange. Each piece flows back through its own
+// 9d. Split: composes from narrow. Each piece flows back through its own
 //     scatter; sums recombine cleanly in the input cotangent. Catches a
 //     missing accumulate() in slice's adjoint.
 assertGradMatchesFD('split (two pieces, both contribute to loss)', [4, 6], p => {

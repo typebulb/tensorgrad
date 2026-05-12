@@ -3,9 +3,10 @@
 // This sample is intended as the broadest demonstration of the tensorgrad
 // API surface in one place. It exercises:
 //
-//   * compileForward with a parametric batch dim (`null` wildcard) — the
-//     same predict graph serves B=1 for the canvas and B=EVAL_BATCH for
-//     the periodic accuracy probe. One compileForward, two resolved shapes.
+//   * Forward spec attached via `compile(spec({ forward, ... }), { shareWith })`
+//     with a parametric batch dim (`null` wildcard) — the same predict graph
+//     serves B=1 for the canvas and B=EVAL_BATCH for the periodic accuracy
+//     probe. One forward proxy, two resolved shapes (lazily compiled).
 //   * dropout in the training forward only, omitted from the inference
 //     forward. No `.train()/.eval()` mode flag — the two are separate
 //     forward functions, each compiled into its own graph. Dropout is
@@ -13,7 +14,7 @@
 //   * replaceModel for changing the hidden layer size without spawning a
 //     new worker. The sibling forward proxy stays valid; its per-shape
 //     kernel cache recompiles lazily on the next run.
-//   * setOptimizerConfig for changing the learning rate mid-training.
+//   * setLR for changing the learning rate mid-training.
 //   * clipGradNorm for training stability, baked into AdamConfig.
 //   * singleFlight wrapping the canvas predict so rapid-stroke predictions
 //     don't queue up — only the latest call resolves; older callers reject
@@ -114,7 +115,7 @@ function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
 
 function predictFn(m: MLP, { x }: { x: Tensor }): Tensor {
   // Inference: no dropout. Returns softmax probabilities so the canvas can
-  // show a confidence breakdown without a second compileForward call.
+  // show a confidence breakdown without compiling a second forward sibling.
   return softmax(netFwd(m, x, false))
 }
 
@@ -230,7 +231,7 @@ async function buildGraphs(hidden: number, lr: number): Promise<void> {
   train = await compile(spec({
     model,
     loss: lossFn,
-    optimizer: { kind: 'adam', lr, weightDecay: 0.01, clipGradNorm: 1.0 },
+    optimizer: { kind: 'adamw', lr, weightDecay: 0.01, clipGradNorm: 1.0 },
     inputs: {
       x: [BATCH_SIZE, INPUT_DIM],
       y: { shape: [BATCH_SIZE], dtype: 'i32' },
@@ -274,7 +275,7 @@ async function changeLayerSize(hidden: number): Promise<void> {
 
 async function changeLR(lr: number): Promise<void> {
   if (!train) return
-  await train.setOptimizerConfig({ lr })
+  await train.setLR(lr)
 }
 
 async function resetWeights(): Promise<void> {

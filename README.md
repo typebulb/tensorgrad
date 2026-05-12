@@ -81,10 +81,13 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `model.parameters()` | `train.paramNames`, `train.downloadParams()` |
 | `optimizer.zero_grad(); out = model(x); loss = ...; loss.backward(); optimizer.step()` | `await train.step(inputs)` — forward + backward + Adam update are fused |
 | `optim.Adam(params, lr=...)` | `optimizer: { kind: 'adam', lr }` in `spec({ ... })` |
+| `optim.AdamW(params, lr=..., weight_decay=w)` | `optimizer: { kind: 'adamw', lr, weightDecay: w }` |
 | `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `optimizer: { kind: 'sgd', lr, momentum?, nesterov? }` in `spec({ ... })` |
 | `StepLR(opt, step_size=N, gamma=g)` | `lr.step({ peak, stepSize: N, gamma: g })` |
 | `MultiStepLR(opt, milestones=[..], gamma=g)` | `lr.multiStep({ peak, milestones: [..], gamma: g })` |
-| `CosineAnnealingLR(opt, T_max=N, eta_min=m)` | `lr.cosineDecay({ peak, final: m, steps: N })` |
+| `CosineAnnealingLR(opt, T_max=N, eta_min=m)` | `lr.cosineAnnealing({ peak, final: m, steps: N })` |
+| `LinearLR(opt, …, total_iters=N)` | `lr.linear({ peak, final, steps: N })` |
+| `torch.narrow(t, axis, start, length)` | `narrow(t, axis, start, length)` |
 | `nn.Dropout(p)` as a child module | `dropout(x, p)` as a free-function call inside the training forward |
 | `x.mean(dim=k)` / `x.sum(dim=k)` | `mean(x, k)` / `sum(x, k)` — negative `k` counts from the end |
 | `x.mean()` / `x.sum()` | `mean(x)` / `sum(x)` — 0-d scalar |
@@ -244,7 +247,7 @@ await train.replaceModel(
 ```
 
 For mid-training optimizer changes *without* a topology swap (LR
-schedule update on the existing weights), use `setOptimizerConfig`.
+schedule update on the existing weights), use `setLR`.
 
 ### `singleFlight` (live-preview helper)
 
@@ -280,7 +283,7 @@ train.downloadParamsFlat()                   // → Record<'layers.0.W' | …, F
 train.downloadParamGrads()                   // → ParamTree<M> (same tree shape)
 train.reset()                                // re-init params + zero optimizer state
 train.resetOptimizerState()
-train.setOptimizerConfig({ lr })             // mutate LR without recompile
+train.setLR(lr)                              // mutate LR without recompile
 train.replaceModel(newModel)                 // swap topology, same worker
 train.destroy()                              // tear down worker + GPU (cascades to attached forwards)
 ```
@@ -303,11 +306,19 @@ for (let i = 0; i < N; i++) {
 }
 ```
 
+**Concurrent `step` / `run` auto-serialize.** A `run()` (or `readLoss()`)
+issued while a `step()` is in flight is queued automatically — same
+worker, same single output staging buffer; the runtime chains the second
+call so the two `mapAsync`s don't collide. Useful for the "training in
+the background, refresh preview on every input change" pattern: just
+fire both — no manual lock needed.
+
 `train.graph`, `train.kernels`, `train.outputShape`, `train.paramNames`,
 and `train.seed` are sync properties for inspection. Forward compiles
 expose only `paramNames` (the same names as the parent training graph)
-— output shape isn't stable on a proxy that
-caches multiple shape variants.
+— output shape isn't stable on a proxy that caches multiple shape
+variants. Use `await infer.graphFor(inputs)` to fetch the IR at a
+specific resolved shape (compiles + caches lazily, like `run`).
 
 **Inspecting the compiled IR.** `train.graph` exposes ops, tensors,
 connectivity, captures, and outputs. `Graph`, `OpNode`, `Tensor`,
@@ -366,6 +377,18 @@ input (or a tuple shape, which defaults to f32) expects a `Float32Array`;
 a dtype-`'i32'` input expects an `Int32Array`. Passing the wrong array
 type is a compile-time error.
 
+**Shape declaration forms.** Two canonical shapes:
+
+```ts
+inputs: {
+  x:       [B, 784],                              // tuple → f32 (the common case)
+  tokens:  { shape: [B, T], dtype: 'i32' },       // object → required for non-f32
+}
+```
+
+The tuple shorthand is `f32`-only — i32 / bool indices use the object
+form. Mixing `null` wildcards for parametric dims works in either form.
+
 **Wildcard consistency.** Every `null` wildcard across all inputs in a
 single `run()` must resolve to the same value (matches Keras `None` /
 ONNX dynamic-axis convention). Mismatched inferred dims throw at the
@@ -421,8 +444,8 @@ Imported from `'tensorgrad'`:
 - Attention layout: `splitHeads(x, nHeads)`, `mergeHeads(x)`
 - Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank)
 - Indexing / casting: `oneHot`, `arange`, `embedding`, `takeAlongAxis(input, indices, axis)` (general per-axis gather)
-- Slicing / structural: `sliceRange(t, axis, start, end)`, `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
-- Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal`
+- Slicing / structural: `narrow(t, axis, start, length)` (PyTorch `torch.narrow`), `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
+- Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal(x, fillValue)` (mask below the diagonal; pairs with `softmaxCausal` when you need a non-softmax causal mask)
 - 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`, `flatten(x, startAxis?)`
 
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
@@ -434,10 +457,9 @@ default).
 **Structural ops.** `concat([a, b], axis)` joins along an existing axis;
 `stack([a, b], axis)` joins along a new axis (sugar for
 `reshape` + `concat`). Negative axes index from the end (Python
-convention). Concat is capped at 7 inputs (WebGPU bind-group limit:
-8 storage buffers per shader stage minus the output) — chain a second
-concat if you need more. `split(t, sizes, axis)` is the inverse, built
-from `sliceRange`.
+convention). Concat over the WebGPU 7-binding cap is auto-chained
+internally — call signature is the same whether you pass 2 or 200
+tensors. `split(t, sizes, axis)` is the inverse, built from `narrow`.
 
 ### `nn` namespace
 
@@ -463,23 +485,29 @@ PyTorch's `F.cross_entropy(..., reduction='mean')`). Pass `{ reduction:
 'none' }` for a per-position tensor when you need to mask or weight
 positions yourself before reducing; `'sum'` for an unscaled sum.
 
-Multi-head shape helpers (`splitHeads(x, nHeads)`, `mergeHeads(x)`) and
-the captures-side `unsplitHeads(captures, name)` live at the top level
-(not under `nn`) — they're pure tensor / readback ops, not modules.
+Multi-head shape helpers (`splitHeads(x, nHeads)`, `mergeHeads(x)`) live
+at the top level (not under `nn`) — pure tensor ops, not modules. The
+captures-side counterpart is `captures.mergeHeads(name)` — a method on
+the `Captures` instance returned by `step()` / `run()`, splits a flat
+capture into one `Float32Array` per head.
 
 ### Optimizers
 
-`spec()` takes an `optimizer` discriminated by `kind: 'adam' | 'sgd'`.
-Both kinds accept the same LR schedule shapes from the `lr` namespace.
+`spec()` takes an `optimizer` discriminated by
+`kind: 'adam' | 'adamw' | 'sgd'`. Splits mirror PyTorch:
+`torch.optim.Adam` (no decay) vs `torch.optim.AdamW` (decoupled decay).
+All kinds accept the same LR schedule shapes from the `lr` namespace.
 
 ```ts
 import { lr } from 'tensorgrad'
 
-// Adam / AdamW
+// Plain Adam
 optimizer: { kind: 'adam', lr: 0.005 }
-optimizer: { kind: 'adam', lr: 0.005, weightDecay: 0.01 }
-optimizer: { kind: 'adam', lr: 0.005, weightDecay: 0.01, decayFilter: n => n.endsWith('.W') }
 optimizer: { kind: 'adam', lr: 0.005, clipGradNorm: 1.0 }
+
+// AdamW — decoupled weight decay (Loshchilov & Hutter)
+optimizer: { kind: 'adamw', lr: 0.005, weightDecay: 0.01 }
+optimizer: { kind: 'adamw', lr: 0.005, weightDecay: 0.01, decayFilter: n => n.endsWith('.W') }
 
 // SGD / SGD-with-momentum / Nesterov. Plain SGD when momentum is 0 (default).
 optimizer: { kind: 'sgd', lr: 0.05 }
@@ -491,27 +519,27 @@ optimizer: { kind: 'sgd', lr: 0.05, weightDecay: 5e-4 }   // PyTorch-style L2 (i
 ### LR schedules (`lr` namespace)
 
 ```ts
-optimizer: { kind: 'adam', lr: lr.linearDecay({ peak: 0.005, final: 0.0005, steps: 1500 }) }
-optimizer: { kind: 'adam', lr: lr.cosineDecay({ peak: 0.005, final: 0.0001, steps: 5000 }) }
-optimizer: { kind: 'sgd',  lr: lr.cosineDecay({ peak: 0.1, final: 0.001, steps: 10000 }), momentum: 0.9 }
-optimizer: { kind: 'adam', lr: lr.warmup({ peak: 0.001, warmupSteps: 200, after: 0.001 }) }
-optimizer: { kind: 'adam', lr: lr.step({ peak: 1.0, stepSize: 1, gamma: 0.7 }) }            // PyTorch StepLR
+optimizer: { kind: 'adamw', lr: lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 }) }
+optimizer: { kind: 'adam',  lr: lr.cosineAnnealing({ peak: 0.005, final: 0.0001, steps: 5000 }) }
+optimizer: { kind: 'sgd',   lr: lr.cosineAnnealing({ peak: 0.1, final: 0.001, steps: 10000 }), momentum: 0.9 }
+optimizer: { kind: 'adam',  lr: lr.warmup({ peak: 0.001, warmupSteps: 200, after: 0.001 }) }
+optimizer: { kind: 'adam',  lr: lr.step({ peak: 1.0, stepSize: 1, gamma: 0.7 }) }            // PyTorch StepLR
 optimizer: { kind: 'adam', lr: lr.multiStep({ peak: 0.1, milestones: [30000, 60000], gamma: 0.1 }) }  // MultiStepLR
 ```
 
 LR schedules are serializable shapes, not closures (they cross the worker
 boundary). Use a `number` for constant LR, or one of the constructors above.
 
-### `setOptimizerConfig` (mid-training)
+### `setLR` (mid-training)
 
 Update the learning rate live, without recompiling. Works for both Adam
 and SGD graphs. The step counter is preserved.
 
 ```ts
-await train.setOptimizerConfig({ lr: 0.001 })
-await train.setOptimizerConfig({
-  lr: lr.cosineDecay({ peak: 0.001, final: 1e-5, steps: 5000 }),
-})  // non-constant schedules auto-rebase so step 1 = next training step
+await train.setLR(0.001)
+await train.setLR(
+  lr.cosineAnnealing({ peak: 0.001, final: 1e-5, steps: 5000 }),
+)  // non-constant schedules auto-rebase so step 1 = next training step
 ```
 
 Which params receive weight decay is baked at compile time (per-param

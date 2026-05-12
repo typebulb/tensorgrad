@@ -62,7 +62,7 @@ export type Req =
   | { id: number; kind: 'downloadParams'; payload: { graphId: number } }
   | { id: number; kind: 'downloadParamGrads'; payload: { graphId: number } }
   | { id: number; kind: 'resetOptimizer'; payload: { graphId: number } }
-  | { id: number; kind: 'setOptimizerConfig'; payload: SetOptimizerConfigPayload }
+  | { id: number; kind: 'setLR'; payload: SetLRPayload }
   | { id: number; kind: 'destroy'; payload: { graphId: number } }
 
 /** Build the training runtime. Always graphId=0 for a fresh worker. */
@@ -108,11 +108,9 @@ export interface UploadParamsPayload {
 /** Update the lr on a training graph at runtime, without recompiling. The
  *  step counter is preserved. Non-constant schedules without an explicit
  *  `startStep` auto-rebase so step 1 = the next training step. */
-export interface SetOptimizerConfigPayload {
+export interface SetLRPayload {
   graphId: number
-  update: {
-    lr?: LR
-  }
+  lr: LR
 }
 
 // ---- Responses (worker → main) ------------------------------------------
@@ -127,14 +125,10 @@ export interface WireError {
   stack: string
 }
 
-export interface CreateRuntimeResult {
-  paramNames: string[]
-  outputShape: number[]
-  kernelCount: number
-  captureShapes: Record<string, number[]>
-}
-
-export interface CompileForwardResult {
+/** Reply for both `createRuntime` and `compileForward`: the shape metadata
+ *  the main thread needs to expose on the runtime handle (param order,
+ *  output shape, kernel count for status, capture shape index). */
+export interface CompileResult {
   paramNames: string[]
   outputShape: number[]
   kernelCount: number

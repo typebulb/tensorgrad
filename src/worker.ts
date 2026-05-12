@@ -317,20 +317,16 @@ function handleResetOptimizer(payload: { graphId: number }): void {
   }
 }
 
-function handleSetOptimizerConfig(payload: {
-  graphId: number
-  update: { lr?: LR }
-}): void {
+function handleSetLR(payload: { graphId: number; lr: LR }): void {
   const slot = mustGet(payload.graphId)
   if (!slot.optimizer) {
-    throw new Error(`setOptimizerConfig: graph ${payload.graphId} has no optimizer (compileForward graphs don't take optimizer state)`)
+    throw new Error(`setLR: graph ${payload.graphId} has no optimizer (compileForward graphs don't take optimizer state)`)
   }
-  if (payload.update.lr === undefined) return
   // injectOptimizerScalars increments t before each step, so the new schedule
   // takes effect at t+1 — that's the step we rebase against.
   const state = slot.optimizer.state
   const nextStep = state.t + 1
-  const newLR = rebaseLR(payload.update.lr, nextStep)
+  const newLR = rebaseLR(payload.lr, nextStep)
   if (slot.optimizer.kind === 'adam') {
     state.config = { ...(state.config as WireAdamConfig), lr: newLR }
   } else {
@@ -377,7 +373,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case 'downloadParams':    { const r = await handleDownloadParams(req.payload); result = r; transferList = collectTransfers(r.params); break }
       case 'downloadParamGrads':{ const r = await handleDownloadParamGrads(req.payload); result = r; transferList = collectTransfers(r.params); break }
       case 'resetOptimizer':    handleResetOptimizer(req.payload); result = null; break
-      case 'setOptimizerConfig':handleSetOptimizerConfig(req.payload); result = null; break
+      case 'setLR':             handleSetLR(req.payload); result = null; break
       case 'destroy':           handleDestroy(req.payload); result = null; break
       default: throw new Error(`unknown request kind: ${(req as { kind: string }).kind}`)
     }
