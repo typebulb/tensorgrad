@@ -243,12 +243,17 @@ schedule update on the existing weights), use `setLR`.
 
 ### `singleFlight` (live-preview helper)
 
+A generic concurrency primitive, in the public surface because the async
+worker boundary turns naive UI event handlers into bad behavior (queued
+strokes, stale predictions racing fresh ones). The same `'completed'` /
+`'aborted'` vocabulary used by `step` and `run` composes through it.
+
 For live-preview patterns where stale calls (earlier mouse positions,
 partial drawings) should be dropped in favor of the newest, wrap a
 promise-returning function with `singleFlight`. Matches RxJS `switchMap` /
 p-debounce semantics: at most one in-flight, at most one queued; only
 the most recent call resolves with `'completed'`, displaced callers
-resolve with `'aborted'` — same discriminated vocabulary as `step` / `run`.
+resolve with `'aborted'`.
 
 ```ts
 import { singleFlight } from 'tensorgrad'
@@ -599,6 +604,9 @@ The library is small because of what it doesn't do. Plan accordingly:
 - **`f32` only.** No mixed precision. Inputs may be `i32` for indices.
 - **One transformation: `grad`.** No `vmap`, `pmap`, `jvp`, `custom_vjp`.
   Batch your data explicitly.
+- **Only `lr` is hot-mutable.** `weightDecay`, `b1`, `b2`, `clipGradNorm`,
+  and which params receive decay are baked at compile time. Use `setLR` for
+  live LR changes; everything else needs `replaceModel({ optimizer })`.
 - **Loss must be a scalar.** A training spec's `loss` returns a rank-0 tensor.
 - **Closures don't cross the worker boundary.** LR schedules and inits are
   serializable shapes, not functions. Anything per-step you write into a
