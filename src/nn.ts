@@ -116,6 +116,9 @@ export class Linear extends Module {
 export interface LayerNormOptions {
   /** Numerical-stability constant. Default 1e-5 (matches PyTorch). */
   eps?: number
+  /** Include a learnable bias (beta). Default true. Set `false` for
+   *  gain-only LayerNorm (the GPT-3 / nanoGPT preset). */
+  bias?: boolean
   /** Whether gain + bias receive AdamW weight decay. Default `false` —
    *  the conventional transformer pattern excludes norm params from decay. */
   decay?: boolean
@@ -127,15 +130,15 @@ export interface LayerNormOptions {
 export class LayerNorm extends Module {
   /** Gain (gamma), shape `[d]`, init `ones`. Scales the normalized output. */
   g: Tensor
-  /** Bias (beta), shape `[d]`, init `zeros`. Shifts the normalized output. */
-  b: Tensor
+  /** Bias (beta), shape `[d]`, init `zeros`, or `null` when `bias: false`. */
+  b: Tensor | null
   readonly eps: number
   constructor(public readonly d: number, opts: LayerNormOptions = {}) {
     super()
     this.eps = opts.eps ?? 1e-5
     const decay = opts.decay ?? false
     this.g = this.param([d], { init: init.ones(), decay })
-    this.b = this.param([d], { init: init.zeros(), decay })
+    this.b = opts.bias === false ? null : this.param([d], { init: init.zeros(), decay })
   }
   /** Normalize over the last axis; affine-scale and shift. Shape preserved. */
   fwd(x: Tensor): Tensor {
@@ -143,7 +146,8 @@ export class LayerNorm extends Module {
     const c = sub(x, m)
     const v = mean(mul(c, c), -1, { keepDims: true })
     const stdev = sqrt(add(v, this.eps))
-    return add(mul(div(c, stdev), this.g), this.b)
+    const scaled = mul(div(c, stdev), this.g)
+    return this.b ? add(scaled, this.b) : scaled
   }
 }
 
