@@ -139,6 +139,10 @@ const train = await compile({ model, loss: lossFn, inputs, optimizer })
 const infer = await train.attach({ forward: predictFn, inputs: inferInputs })
 ```
 
+Keep the two bodies separate rather than factoring shared helpers
+between them: side-effecting ops (`dropout`, `capture`) in a shared
+helper leak into both graphs.
+
 **No eager mode.** The forward is traced once and compiled. To read an
 intermediate, mark it with `capture(name, t)` inside the forward; the
 activation surfaces on the result's `captures` field every call. Graphs
@@ -592,7 +596,9 @@ if (r.kind === 'completed') {
 Captures are zero-overhead when the graph has no `capture()` sites.
 When it does, they're read back via a single batched `mapAsync`
 alongside the loss/output — no opt-in flag, the activation is just
-there on the result.
+there on the result. A capture site in a *training* forward therefore
+costs a readback on every `train.step()` (megabytes for transformer
+activations); keep them in inference-only forwards.
 
 ## Constraints
 
