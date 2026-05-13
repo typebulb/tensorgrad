@@ -18,9 +18,7 @@ import {
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
-// ============================================================================
-//                          MODEL / TRAINING
-// ============================================================================
+// ========== MODEL / TRAINING ==========
 
 const VOCAB = 12
 const D = 64
@@ -301,9 +299,7 @@ async function runTraining(): Promise<void> {
   onStatus(`Stopped at step ${step}.`, 'ok')
 }
 
-// ============================================================================
-//                                   UI
-// ============================================================================
+// ========== UI ==========
 
 const logEl = document.getElementById('log')!
 const runBtn = document.getElementById('run') as HTMLButtonElement

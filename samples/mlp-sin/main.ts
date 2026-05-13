@@ -14,9 +14,7 @@ import {
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
-// ============================================================================
-//                          MODEL / TRAINING
-// ============================================================================
+// ========== MODEL / TRAINING ==========
 
 const HIDDEN = 64
 const B = 256                 // batch size
@@ -128,9 +126,7 @@ async function runTraining(): Promise<void> {
   onStatus(`Stopped at step ${step}.`, 'ok')
 }
 
-// ============================================================================
-//                                   UI
-// ============================================================================
+// ========== UI ==========
 
 const canvas = document.getElementById('plot') as HTMLCanvasElement
 const cctx = canvas.getContext('2d')!

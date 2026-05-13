@@ -22,9 +22,7 @@ import {
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
-// ============================================================================
-//                          MODEL / TRAINING
-// ============================================================================
+// ========== MODEL / TRAINING ==========
 
 const G = 5
 const DEG = 3
@@ -212,9 +210,7 @@ async function resetWeights(): Promise<void> {
   if (wasRunning) { running = true; void trainLoop() }
 }
 
-// ============================================================================
-//                                   UI
-// ============================================================================
+// ========== UI ==========
 
 const statusEl   = document.getElementById('status')      as HTMLDivElement
 const trainBtn   = document.getElementById('train')       as HTMLButtonElement

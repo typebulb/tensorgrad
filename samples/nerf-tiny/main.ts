@@ -24,9 +24,7 @@ import {
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
-// ============================================================================
-//                          MODEL / TRAINING
-// ============================================================================
+// ========== MODEL / TRAINING ==========
 
 const IMG_W = 64
 const IMG_H = 64
@@ -208,9 +206,7 @@ function setTargetImage(rgb: Float32Array): void {
   targetRgb = rgb
 }
 
-// ============================================================================
-//                                   UI
-// ============================================================================
+// ========== UI ==========
 
 const statusEl   = document.getElementById('status')         as HTMLDivElement
 const trainBtn   = document.getElementById('train')          as HTMLButtonElement

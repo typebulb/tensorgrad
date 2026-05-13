@@ -40,9 +40,7 @@ import {
   type Tensor, type CompiledTraining, type CompiledForward, type SingleFlightResult,
 } from 'tensorgrad'
 
-// ============================================================================
-//                          MODEL / TRAINING
-// ============================================================================
+// ========== MODEL / TRAINING ==========
 
 const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
 const INPUT_DIM = 784       // 28 * 28 grayscale pixels
@@ -372,9 +370,7 @@ async function predictDrawing(input: Float32Array): Promise<Float32Array | null>
   return r.kind === 'completed' ? r.value : null
 }
 
-// ============================================================================
-//                                   UI
-// ============================================================================
+// ========== UI ==========
 
 const canvas = document.getElementById('draw') as HTMLCanvasElement
 const ctx = canvas.getContext('2d')!
@@ -522,9 +518,7 @@ resetBtn.addEventListener('click', () => { void resetWeights() })
 saveBtn.addEventListener('click', () => { void saveWeights() })
 loadBtn.addEventListener('click', () => { void loadWeights() })
 
-// ============================================================================
-//                                  BOOT
-// ============================================================================
+// ========== BOOT ==========
 
 async function boot(): Promise<void> {
   if (!isWebGPUAvailable()) {

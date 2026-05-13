@@ -27,9 +27,7 @@ import {
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
-// ============================================================================
-//                          MODEL / TRAINING
-// ============================================================================
+// ========== MODEL / TRAINING ==========
 
 const K = 16                      // parallel games per rollout
 const MAX_MOVES = 9               // longest possible tic-tac-toe game
@@ -349,9 +347,7 @@ async function resetWeights(): Promise<void> {
   if (wasRunning) { running = true; void runTraining() }
 }
 
-// ============================================================================
-//                                   UI
-// ============================================================================
+// ========== UI ==========
 
 const statusEl     = document.getElementById('status')   as HTMLDivElement
 const trainBtn     = document.getElementById('train')    as HTMLButtonElement

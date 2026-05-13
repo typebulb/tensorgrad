@@ -24,9 +24,7 @@ import {
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
-// ============================================================================
-//                          MODEL / TRAINING
-// ============================================================================
+// ========== MODEL / TRAINING ==========
 
 const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
 const IMG_H = 28
@@ -258,9 +256,7 @@ function stopTraining(): void {
   running = false
 }
 
-// ============================================================================
-//                                   UI
-// ============================================================================
+// ========== UI ==========
 
 const statusEl  = document.getElementById('status')   as HTMLDivElement
 const trainBtn  = document.getElementById('train')    as HTMLButtonElement
