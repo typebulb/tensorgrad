@@ -145,7 +145,7 @@ activation surfaces on the result's `captures` field every call. Graphs
 with no `capture()` sites pay nothing.
 
 **Tensorgrad runs in a worker.** Every method on a compiled module is
-async. `step` and `run` return a discriminated result:
+async. `step` and `infer.run` return a discriminated result:
 
 ```ts
 const r = await train.step({ x, y })
@@ -156,9 +156,9 @@ switch (r.kind) {
 ```
 
 No try/catch on `AbortError` needed — the cancellation surfaces as the
-`'aborted'` discriminator across `step`, `run`, `readLoss`, and even
-the `singleFlight` helper (below) for displaced live-preview callers.
-One vocabulary for the whole library.
+`'aborted'` discriminator across `step`, `run`, and the `singleFlight`
+helper (below) for displaced live-preview callers. One vocabulary for
+the whole library.
 
 ## Public API
 
@@ -267,16 +267,11 @@ Generic — works around `run`, `step`, or any single-argument promise function.
 
 ```ts
 train.step(inputs)                           // → { kind: 'completed', loss, captures } | { kind: 'aborted' }
-train.queueStep(inputs)                      // → void; fire-and-forget
-train.readLoss()                             // → number; pair with queueStep
-train.run(inputs)                            // → { kind: 'completed', output, captures } | { kind: 'aborted' }
 train.uploadParams(record)                   // partial by default; missing keys keep current values
 train.downloadParams()                       // → ParamTree<M> (typed tree, mirrors class)
 train.downloadParamsFlat()                   // → Record<'layers.0.W' | …, Float32Array>
-train.downloadParamGrads()                   // → ParamTree<M> (same tree shape)
 train.attach(forwardSpec)                    // → CompiledForward; sibling that shares params + worker
-train.reset()                                // re-init params + zero optimizer state
-train.resetOptimizerState()
+train.reset({ params?, optimizer? })         // defaults to both; pass false to skip either
 train.setLR(lr)                              // mutate LR without recompile
 train.replaceModel(newModel)                 // swap topology, same worker
 train.destroy()                              // tear down worker + GPU (cascades to attached forwards)
@@ -287,25 +282,12 @@ surface: `run`, `uploadParams`, `downloadParams` / `downloadParamsFlat`,
 `destroy`, and `paramNames`. Params are shared with the parent training
 compile, so reads/writes are visible there too.
 
-**Fire-and-forget training.** Each `mapAsync` loss readback costs ~1 ms
-on desktop but 10–30 ms on Android Chrome. For mobile UI responsiveness,
-use `queueStep` to submit each step without awaiting the loss, and call
-`readLoss()` periodically when you actually want a number to display:
-
-```ts
-for (let i = 0; i < N; i++) {
-  await train.queueStep({ x, y })
-  if (i % 100 === 0) updateUI(await train.readLoss())
-  await nextFrame()
-}
-```
-
-**Concurrent `step` / `run` auto-serialize.** A `run()` (or `readLoss()`)
-issued while a `step()` is in flight is queued automatically — same
-worker, same single output staging buffer; the runtime chains the second
-call so the two `mapAsync`s don't collide. Useful for the "training in
-the background, refresh preview on every input change" pattern: just
-fire both — no manual lock needed.
+**Concurrent `step` / `run` auto-serialize.** A `run()` issued while a
+`step()` is in flight is queued automatically — same worker, same single
+output staging buffer; the runtime chains the second call so the two
+`mapAsync`s don't collide. Useful for the "training in the background,
+refresh preview on every input change" pattern: just fire both — no
+manual lock needed.
 
 `train.graph`, `train.kernels`, `train.outputShape`, `train.paramNames`,
 and `train.seed` are sync properties for inspection. Forward compiles
@@ -337,10 +319,10 @@ has `W: Tensor; b: Tensor`, then the return type is
 typed access (`params.l1.W`), no string indexing. Arrays of Modules
 (e.g. `layers: Linear[]`) become arrays of subtrees
 (`params.layers[0].W`). Non-param fields on the model class (numbers,
-config, etc.) are pruned. `downloadParamsFlat()` is the escape hatch
-returning the legacy `Record<string, Float32Array>` — useful for
-serialization, full-tree iteration, or partial re-upload via
-`uploadParams`.
+config, etc.) are pruned. `downloadParamsFlat()` returns the same data as
+a flat `Record<string, Float32Array>` — the natural form for serialization,
+full-tree iteration, and the direct round-trip back through `uploadParams`
+(e.g. save weights to IndexedDB, load on next visit).
 
 **Typed inputs.** `step` / `run` are typed against the declared `inputs`
 shape, so each named input expects the right TypedArray: a dtype-`'f32'`
@@ -634,6 +616,10 @@ the same pattern as `appendAdam`:
 ```ts
 import { appendAdam, appendGrad } from 'tensorgrad/internal'
 ```
+
+Anything under `tensorgrad/internal` is an extension hook that tracks the
+IR — expect breakage on 0.0.x bumps. The `tensorgrad` (public) surface is
+stable within 0.0.x; `internal` is not.
 
 A custom optimizer is a function that takes the autograd output (graph +
 `paramGrads`) and the materialized param tensors, appends its update ops

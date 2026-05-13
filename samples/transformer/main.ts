@@ -247,14 +247,14 @@ async function run() {
   }
 
   // Worker-architecture smoke: exercise reset() (re-init main-thread →
-  // uploadParams → resetOptimizer round-trips through the worker) before any
-  // training, then a downloadParamGrads round-trip. Both should be silent;
-  // any error here is a worker-protocol bug.
-  log('Worker smoke: reset() + downloadParamGrads()...')
+  // uploadParams → resetOptimizer round-trips through the worker) plus a
+  // params download. Both should be silent; any error here is a worker-
+  // protocol bug.
+  log('Worker smoke: reset() + downloadParams()...')
   await train.reset()
-  const grads = await train.downloadParamGrads()
-  const gradEntries = Object.keys(grads).length
-  log(`  ${gradEntries} param grads (expect zeros after reset)`, 'ok')
+  const params = await train.downloadParamsFlat()
+  const paramEntries = Object.keys(params).length
+  log(`  ${paramEntries} params re-initialized`, 'ok')
 
   log('Training...')
   let step = 0

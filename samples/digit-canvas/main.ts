@@ -21,6 +21,10 @@
 //     a `{ kind: 'aborted' }` result.
 //   * crossEntropy(logits, targets) as the canonical classification loss
 //     tail (reduces to scalar mean by default).
+//   * downloadParamsFlat + uploadParams round-trip through IndexedDB —
+//     save trained weights to local storage, reload them on the next visit
+//     (or after a reset). One persistence slot per hidden-size topology so
+//     a 64-unit save doesn't clash with a 128-unit save.
 //
 // MNIST data is served from solenya-media S3 — same URLs the in-repo bulbs
 // use. ~11 MB on first load; cached after that.
@@ -33,7 +37,7 @@
 import {
   Module, compile, isWebGPUAvailable, nn,
   relu, dropout, softmax, singleFlight,
-  type Tensor, type CompiledTraining, type CompiledForward,
+  type Tensor, type CompiledTraining, type CompiledForward, type SingleFlightResult,
 } from 'tensorgrad'
 
 // ============================================================================
@@ -133,7 +137,7 @@ let trainCursor = 0
 // the public type signature doesn't yet narrow nicely with wildcards.
 let train: CompiledTraining<MLP, { x: readonly [number, number]; y: { shape: readonly [number]; dtype: 'i32' } }> | null = null
 let infer: CompiledForward<MLP, { x: readonly [null, number] }> | null = null
-let predictCanvas: ((input: Float32Array) => Promise<Float32Array | null>) | null = null
+let predictCanvas: ((input: Float32Array) => Promise<SingleFlightResult<Float32Array | null>>) | null = null
 
 let running = false
 let trainingActive = false
@@ -288,6 +292,68 @@ async function resetWeights(): Promise<void> {
   if (wasRunning) { running = true; void runTraining() }
 }
 
+// IndexedDB persistence — Float32Arrays survive a structured clone, so we can
+// store the flat param record as-is. One row per hidden size so a saved 64-unit
+// model doesn't clash with a 128-unit one.
+const DB_NAME = 'digit-canvas-weights'
+const STORE = 'params'
+
+function openDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1)
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE)
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+function dbPut(key: string, value: Record<string, Float32Array>): Promise<void> {
+  return openDb().then(db => new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite')
+    tx.objectStore(STORE).put(value, key)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  }))
+}
+
+function dbGet(key: string): Promise<Record<string, Float32Array> | undefined> {
+  return openDb().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly')
+    const req = tx.objectStore(STORE).get(key)
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  }))
+}
+
+function weightsKey(hidden: number): string {
+  return `mlp-${INPUT_DIM}-${hidden}-${N_CLASSES}`
+}
+
+async function saveWeights(): Promise<void> {
+  if (!train) return
+  const hidden = parseInt(layerSelect.value, 10)
+  const params = await train.downloadParamsFlat()
+  await dbPut(weightsKey(hidden), params)
+  onStatus(`saved ${Object.keys(params).length} param tensors at step ${step}`)
+}
+
+async function loadWeights(): Promise<void> {
+  if (!train) return
+  const hidden = parseInt(layerSelect.value, 10)
+  const params = await dbGet(weightsKey(hidden))
+  if (!params) { onStatus(`no saved weights for hidden=${hidden}`); return }
+  const wasRunning = running
+  running = false
+  await new Promise<void>(r => setTimeout(r, 0))
+  await train.uploadParams(params)
+  // Restored params come with no optimizer state — wipe it so Adam's
+  // accumulated m/v from before the load don't pollute the next steps.
+  await train.reset({ params: false })
+  step = 0
+  onStatus(`loaded weights (${Object.keys(params).length} tensors); optimizer state cleared`)
+  if (wasRunning) { running = true; void runTraining() }
+}
+
 function startTraining(): void {
   if (running) return
   running = true
@@ -316,6 +382,8 @@ const trainBtn = document.getElementById('train') as HTMLButtonElement
 const stopBtn = document.getElementById('stop') as HTMLButtonElement
 const clearBtn = document.getElementById('clear') as HTMLButtonElement
 const resetBtn = document.getElementById('reset-weights') as HTMLButtonElement
+const saveBtn = document.getElementById('save-weights') as HTMLButtonElement
+const loadBtn = document.getElementById('load-weights') as HTMLButtonElement
 const layerSelect = document.getElementById('layer-size') as HTMLSelectElement
 const lrSelect = document.getElementById('lr') as HTMLSelectElement
 const statusEl = document.getElementById('status') as HTMLDivElement
@@ -451,6 +519,8 @@ lrSelect.addEventListener('change', () => {
   void changeLR(parseFloat(lrSelect.value))
 })
 resetBtn.addEventListener('click', () => { void resetWeights() })
+saveBtn.addEventListener('click', () => { void saveWeights() })
+loadBtn.addEventListener('click', () => { void loadWeights() })
 
 // ============================================================================
 //                                  BOOT

@@ -85,6 +85,10 @@
           <button id="reset-weights">Reset weights</button>
         </div>
         <div class="line">
+          <button id="save-weights">Save weights</button>
+          <button id="load-weights">Load weights</button>
+        </div>
+        <div class="line">
           <label>hidden size
             <select id="layer-size">
               <option value="32">32</option>
@@ -121,8 +125,10 @@
     <code>replaceModel</code> for swapping hidden size without losing the
     worker, <code>clipGradNorm</code> for training stability,
     <code>singleFlight</code> so rapid-stroke predictions don't queue up,
-    and <code>mean(nn.crossEntropy(...))</code> as the canonical
-    classification loss tail.
+    <code>mean(nn.crossEntropy(...))</code> as the canonical classification
+    loss tail, and <code>downloadParamsFlat</code> +
+    <code>uploadParams</code> round-trip through IndexedDB for
+    save/load.
   </p>
 
   <p><a href="/">← back to samples</a></p>

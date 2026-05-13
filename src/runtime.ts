@@ -102,33 +102,18 @@ export type RunFn = (
 ) => Promise<RunCompletion>
 
 export interface CompiledRuntime extends CompiledBase {
-  /** Read all parameter gradients back. Mostly for verification / debugging. */
-  downloadParamGrads(): Promise<Record<string, Float32Array>>
   /**
    * One full forward+backward step.
    *   1. Uploads `inputs` (tokens, targets, masks) to input buffers.
    *   2. Dispatches every kernel in order.
    *   3. Reads back the loss scalar plus any captures the graph registered.
-   * Always awaits the loss `mapAsync`. For fire-and-forget training (e.g.
-   * mobile UI responsiveness), use `queueStep` + `readLoss` instead.
    */
   step(inputs: Record<string, Int32Array | Float32Array>): Promise<StepCompletion>
-  /** Submit a training step without awaiting the loss readback. Each
-   *  `mapAsync` round-trip is ~1 ms on desktop but 10–30 ms on Android
-   *  Chrome; for mobile responsiveness, queueStep + periodic `readLoss`
-   *  for UI display beats awaiting every step. */
-  queueStep(inputs: Record<string, Int32Array | Float32Array>): Promise<void>
-  /** Same dispatch as step() but returns the full output array; for
-   *  training graphs the output is a scalar loss, so step() is usually
-   *  more convenient. Provided for parity with `compileForward`. */
+  /** Forward-only dispatch. Used by the worker for `compileForward` sibling
+   *  graphs (training graphs never invoke this — `step` covers them). */
   run: RunFn
-  /** Read the latest loss value from the GPU. Pair with `queueStep` for
-   *  fire-and-forget training: queue most iterations, call `readLoss()`
-   *  every Nth for the UI. */
-  readLoss(): Promise<number>
   /** Re-zero all optimizer state buffers (Adam's m/v) in place. Pair with
-   *  `uploadParams` (or call the proxy's `reset()` which does both) for a
-   *  full training reset without recompile. */
+   *  `uploadParams` for a full training reset without recompile. */
   resetOptimizerState(): void
 }
 
@@ -287,8 +272,8 @@ export async function createRuntime(
   // an outstanding map pending." Chaining via `pending` makes independent
   // async paths (e.g. training loop + aux `refreshPrediction`) run in turn.
   let pending: Promise<unknown> = Promise.resolve()
-  type DispatchOpts = { wantCaptures: boolean; readback: boolean }
-  type DispatchResult = { output: Float32Array; captures: Map<string, Float32Array> } | null
+  type DispatchOpts = { wantCaptures: boolean }
+  type DispatchResult = { output: Float32Array; captures: Map<string, Float32Array> }
   async function dispatch(
     inputs: Record<string, Int32Array | Float32Array>,
     opts: DispatchOpts,
@@ -350,10 +335,6 @@ export async function createRuntime(
     }
     queue.submit([encoder.finish()])
 
-    // Fire-and-forget: the encoder already copied loss → outputReadback,
-    // but we skip mapAsync. The caller can read it later via readLoss().
-    if (!opts.readback) return null
-
     await outputReadback.mapAsync(GPUMapMode.READ)
     const output = new Float32Array(outputReadback.getMappedRange().slice(0))
     outputReadback.unmap()
@@ -374,33 +355,14 @@ export async function createRuntime(
   async function step(
     inputs: Record<string, Int32Array | Float32Array>,
   ): Promise<StepCompletion> {
-    const r = (await dispatch(inputs, { wantCaptures: true, readback: true }))!
+    const r = await dispatch(inputs, { wantCaptures: true })
     return { loss: r.output[0]!, captures: new Captures(captureShapes, r.captures) }
-  }
-
-  async function queueStep(
-    inputs: Record<string, Int32Array | Float32Array>,
-  ): Promise<void> {
-    await dispatch(inputs, { wantCaptures: false, readback: false })
-  }
-
-  // Goes through the same `pending` serialization as step()/run() so two
-  // readLoss() calls don't both try to mapAsync the same buffer.
-  async function readLoss(): Promise<number> {
-    const turn = pending.catch(() => {}).then(async () => {
-      await outputReadback.mapAsync(GPUMapMode.READ)
-      const v = new Float32Array(outputReadback.getMappedRange())[0]!
-      outputReadback.unmap()
-      return v
-    })
-    pending = turn
-    return turn
   }
 
   async function run(
     inputs: Record<string, Int32Array | Float32Array>,
   ): Promise<RunCompletion> {
-    const r = (await dispatch(inputs, { wantCaptures: true, readback: true }))!
+    const r = await dispatch(inputs, { wantCaptures: true })
     return { output: r.output, captures: new Captures(captureShapes, r.captures) }
   }
 
@@ -487,11 +449,8 @@ export async function createRuntime(
     outputShape,
     uploadParams,
     downloadParams: () => downloadFromMap(plan.paramsByName),
-    downloadParamGrads: () => downloadFromMap(plan.paramGradsByName),
     step,
-    queueStep,
     run,
-    readLoss,
     resetOptimizerState,
     destroy,
   }

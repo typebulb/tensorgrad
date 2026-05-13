@@ -55,12 +55,9 @@ export type Req =
   | { id: number; kind: 'createRuntime'; payload: CreateRuntimePayload }
   | { id: number; kind: 'compileForward'; payload: CompileForwardPayload }
   | { id: number; kind: 'step'; payload: StepPayload }
-  | { id: number; kind: 'queueStep'; payload: StepPayload }
-  | { id: number; kind: 'readLoss'; payload: { graphId: number } }
   | { id: number; kind: 'run'; payload: RunPayload }
   | { id: number; kind: 'uploadParams'; payload: UploadParamsPayload }
   | { id: number; kind: 'downloadParams'; payload: { graphId: number } }
-  | { id: number; kind: 'downloadParamGrads'; payload: { graphId: number } }
   | { id: number; kind: 'resetOptimizer'; payload: { graphId: number } }
   | { id: number; kind: 'setLR'; payload: SetLRPayload }
   | { id: number; kind: 'destroy'; payload: { graphId: number } }
@@ -143,11 +140,6 @@ export interface StepResultWire {
 export interface RunResultWire {
   output: Float32Array
   captures: Record<string, Float32Array> | null
-}
-
-/** Loss readback. Pair with `queueStep`'s fire-and-forget training pattern. */
-export interface ReadLossResult {
-  loss: number
 }
 
 export interface DownloadParamsResult {

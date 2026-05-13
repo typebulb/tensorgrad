@@ -30,7 +30,7 @@ import {
   transferablesOfRecord,
   type Req, type WireIR, type WireAdamConfig, type WireSGDConfig, type WireOptimizerConfig,
   type CompileResult,
-  type StepResultWire, type RunResultWire, type DownloadParamsResult, type ReadLossResult,
+  type StepResultWire, type RunResultWire, type DownloadParamsResult,
 } from './worker-protocol.js'
 
 declare const __WORKER_SOURCE__: string
@@ -207,49 +207,26 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
    *  destroyed, typically by `replaceModel`). */
   step(inputs: TypedInputs<I>): Promise<StepResult>
 
-  /** Submit a training step without awaiting the loss readback. Each
-   *  loss `mapAsync` costs ~1 ms on desktop but 10–30 ms on Android
-   *  Chrome; on mobile, `queueStep` + occasional `readLoss()` keeps the
-   *  main thread responsive while training runs at GPU speed.
-   *
-   *  Fire-and-forget by design: returns `Promise<void>`. If the graph is
-   *  destroyed mid-flight (`replaceModel` / `destroy`), the call resolves
-   *  silently — the loop that submitted it has already exited. */
-  queueStep(inputs: TypedInputs<I>): Promise<void>
-
-  /** Read the most recent step's loss. Pair with `queueStep`. */
-  readLoss(): Promise<number>
-
-  /** Same dispatch as `step` but returns the full output tensor. For
-   *  training graphs the output is a scalar loss, so `step` is usually
-   *  more convenient. */
-  run(inputs: TypedInputs<I>): Promise<RunResult>
-
   /** Upload params from a flat record (the shape `downloadParamsFlat` returns).
    *  Partial by default — missing keys leave existing GPU values unchanged.
    *  Unknown keys throw (typo guard). */
   uploadParams(params: Record<string, Float32Array>): Promise<void>
   /** Read params back as a typed tree mirroring the model class structure.
    *  `params.layers[0].W` etc. — typed, autocompletable. Mirror of
-   *  `downloadParamsFlat` and `downloadParamGrads` — same underlying data,
-   *  three views; pick whichever matches your call site. */
+   *  `downloadParamsFlat` — same underlying data, two views; pick whichever
+   *  matches your call site. */
   downloadParams(): Promise<ParamTree<M>>
-  /** Escape hatch: read params back as a flat `{ 'layers.0.W': Float32Array, ... }`
+  /** Read params back as a flat `{ 'layers.0.W': Float32Array, ... }`
    *  record. The natural feed for `uploadParams` (round-trip works without
    *  any reshaping); also handy for serialization or iterating all params. */
   downloadParamsFlat(): Promise<Record<string, Float32Array>>
-  /** Gradients in the same tree shape as `downloadParams`. Mirror of the
-   *  params-side download; same per-tensor sizes. */
-  downloadParamGrads(): Promise<ParamTree<M>>
 
-  /** Re-initialize all params (from `seed`) and zero optimizer state in one
-   *  call. The "start over with the same compile" button. For just zeroing
-   *  optimizer state while keeping params, use `resetOptimizerState`. */
-  reset(): Promise<void>
-  /** Zero Adam's m/v buffers (or SGD's momentum buffer). Params untouched.
-   *  Reach for this when you want to discard accumulated optimizer state
-   *  without re-initializing params (e.g. after a hyperparameter change). */
-  resetOptimizerState(): Promise<void>
+  /** Re-initialize params (from `seed`) and/or zero optimizer state. Defaults
+   *  to both — the "start over with the same compile" button. Pass
+   *  `{ params: false }` to wipe only optimizer state (e.g. after a
+   *  hyperparameter change), or `{ optimizer: false }` to re-init params
+   *  while keeping accumulated momentum. */
+  reset(opts?: { params?: boolean; optimizer?: boolean }): Promise<void>
 
   /** Update the learning rate at runtime, without recompiling. Works for
    *  both Adam and SGD graphs.
@@ -501,37 +478,6 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     }
   }
 
-  async queueStep(inputs: LooseInputs): Promise<void> {
-    try {
-      await this.proxy.request<null>({ kind: 'queueStep', payload: { graphId: this.graphId, inputs } })
-    } catch (e) {
-      // Fire-and-forget: swallow mid-flight abort (graph destroyed). The
-      // submitter's loop has already exited; surfacing the abort would
-      // just force a try/catch at every call site for no payload.
-      if ((e as { name?: string })?.name === 'AbortError') return
-      throw e
-    }
-  }
-
-  async readLoss(): Promise<number> {
-    const r = await this.proxy.request<ReadLossResult>(
-      { kind: 'readLoss', payload: { graphId: this.graphId } },
-    )
-    return r.loss
-  }
-
-  async run(inputs: LooseInputs): Promise<RunResult> {
-    try {
-      const r = await this.proxy.request<RunResultWire>(
-        { kind: 'run', payload: { graphId: this.graphId, inputs } },
-      )
-      return { kind: 'completed', output: r.output, captures: makeCaptures(r.captures, this.meta.captureShapes) }
-    } catch (e) {
-      if ((e as { name?: string })?.name === 'AbortError') return { kind: 'aborted' }
-      throw e
-    }
-  }
-
   uploadParams(params: Record<string, Float32Array>): Promise<void> {
     return this.proxy.request<null>(
       { kind: 'uploadParams', payload: { graphId: this.graphId, params } },
@@ -539,33 +485,36 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
   }
 
   async downloadParams(): Promise<ParamTree<M>> {
-    return buildParamTree(await this.fetchParams('downloadParams')) as ParamTree<M>
+    return buildParamTree(await this.fetchParams()) as ParamTree<M>
   }
 
   downloadParamsFlat(): Promise<Record<string, Float32Array>> {
-    return this.fetchParams('downloadParams')
+    return this.fetchParams()
   }
 
-  async downloadParamGrads(): Promise<ParamTree<M>> {
-    return buildParamTree(await this.fetchParams('downloadParamGrads')) as ParamTree<M>
-  }
-
-  private async fetchParams(kind: 'downloadParams' | 'downloadParamGrads'): Promise<Record<string, Float32Array>> {
+  private async fetchParams(): Promise<Record<string, Float32Array>> {
     const r = await this.proxy.request<DownloadParamsResult>(
-      { kind, payload: { graphId: this.graphId } },
+      { kind: 'downloadParams', payload: { graphId: this.graphId } },
     )
     return r.params
   }
 
-  async reset(): Promise<void> {
-    const initialParams = buildInitialParams(this._ir.plan, this.initFns, mulberry32(this.opts.seed))
-    await Promise.all([this.uploadParams(initialParams), this.resetOptimizerState()])
-  }
-
-  resetOptimizerState(): Promise<void> {
-    return this.proxy.request<null>(
-      { kind: 'resetOptimizer', payload: { graphId: this.graphId } },
-    ).then(() => undefined)
+  async reset(opts: { params?: boolean; optimizer?: boolean } = {}): Promise<void> {
+    const doParams = opts.params !== false
+    const doOptimizer = opts.optimizer !== false
+    const tasks: Promise<void>[] = []
+    if (doParams) {
+      const initialParams = buildInitialParams(this._ir.plan, this.initFns, mulberry32(this.opts.seed))
+      tasks.push(this.uploadParams(initialParams))
+    }
+    if (doOptimizer) {
+      tasks.push(
+        this.proxy.request<null>(
+          { kind: 'resetOptimizer', payload: { graphId: this.graphId } },
+        ).then(() => undefined),
+      )
+    }
+    await Promise.all(tasks)
   }
 
   setLR(lr: LR): Promise<void> {

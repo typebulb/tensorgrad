@@ -226,31 +226,6 @@ async function handleStep(payload: {
   }
 }
 
-async function handleQueueStep(payload: {
-  graphId: number
-  inputs: Record<string, Int32Array | Float32Array>
-}): Promise<null> {
-  const slot = mustGet(payload.graphId)
-  const merged = injectPrngSeed(slot, injectOptimizerScalars(slot, payload.inputs))
-  try {
-    await slot.runtime.queueStep(merged)
-    return null
-  } catch (e) {
-    if (!graphs.has(payload.graphId)) throw abortErr('queueStep aborted: graph destroyed mid-flight')
-    throw e
-  }
-}
-
-async function handleReadLoss(payload: { graphId: number }): Promise<{ loss: number }> {
-  const slot = mustGet(payload.graphId)
-  try {
-    return { loss: await slot.runtime.readLoss() }
-  } catch (e) {
-    if (!graphs.has(payload.graphId)) throw abortErr('readLoss aborted: graph destroyed mid-flight')
-    throw e
-  }
-}
-
 async function handleRun(payload: {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
@@ -300,11 +275,6 @@ function handleUploadParams(payload: {
 async function handleDownloadParams(payload: { graphId: number }): Promise<{ params: Record<string, Float32Array> }> {
   const slot = mustGet(payload.graphId)
   return { params: await slot.runtime.downloadParams() }
-}
-
-async function handleDownloadParamGrads(payload: { graphId: number }): Promise<{ params: Record<string, Float32Array> }> {
-  const slot = mustGet(payload.graphId)
-  return { params: await slot.runtime.downloadParamGrads() }
 }
 
 function handleResetOptimizer(payload: { graphId: number }): void {
@@ -365,12 +335,9 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case 'createRuntime':     result = await handleCreateRuntime(req.payload); break
       case 'compileForward':    result = await handleCompileForward(req.payload); break
       case 'step':              result = await handleStep(req.payload); transferList = collectTransfers((result as any).captures); break
-      case 'queueStep':         result = await handleQueueStep(req.payload); break
-      case 'readLoss':          result = await handleReadLoss(req.payload); break
       case 'run':               { const r = await handleRun(req.payload); result = r; transferList = [r.output.buffer as ArrayBuffer, ...collectTransfers(r.captures)]; break }
       case 'uploadParams':      handleUploadParams(req.payload); result = null; break
       case 'downloadParams':    { const r = await handleDownloadParams(req.payload); result = r; transferList = collectTransfers(r.params); break }
-      case 'downloadParamGrads':{ const r = await handleDownloadParamGrads(req.payload); result = r; transferList = collectTransfers(r.params); break }
       case 'resetOptimizer':    handleResetOptimizer(req.payload); result = null; break
       case 'setLR':             handleSetLR(req.payload); result = null; break
       case 'destroy':           handleDestroy(req.payload); result = null; break
