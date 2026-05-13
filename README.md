@@ -429,8 +429,8 @@ import {
 } from 'tensorgrad'
 
 new Linear(inDim, outDim, { bias?, init?, decay? })   // .fwd(x); W: [inDim, outDim], b: [outDim]
-new LayerNorm(dim, eps?)              // .fwd(x); g (gain) and b (bias) both [dim]
-new RMSNorm(dim, eps?)                // .fwd(x); g (gain) only — Llama-style
+new LayerNorm(dim, { eps?, decay? })  // .fwd(x); g (gain) and b (bias) both [dim]
+new RMSNorm(dim, { eps?, decay? })    // .fwd(x); g (gain) only — Llama-style
 new Embedding(vocab, dim, { init?, decay? })          // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
 new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW
                                       // x: [B, inC, H, W] -> [B, outC, H', W']

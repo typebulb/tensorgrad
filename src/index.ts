@@ -53,5 +53,6 @@ export {
   Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
   crossEntropy, nllLoss,
   type LinearOptions, type EmbeddingOptions, type Conv2dOptions,
+  type LayerNormOptions, type RMSNormOptions,
   type LossOptions,
 } from './nn.js'

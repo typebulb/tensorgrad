@@ -1,6 +1,6 @@
 {
   "name": "tensorgrad",
-  "version": "0.0.47",
+  "version": "0.0.48",
   "description": "Tiny TypeScript-native tensor library with autograd, compiling to WebGPU. Train small models in the browser without hand-writing kernels.",
   "license": "MIT",
   "author": "Ben Albahari",

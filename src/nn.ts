@@ -113,6 +113,14 @@ export class Linear extends Module {
   }
 }
 
+export interface LayerNormOptions {
+  /** Numerical-stability constant. Default 1e-5 (matches PyTorch). */
+  eps?: number
+  /** Whether gain + bias receive AdamW weight decay. Default `false` —
+   *  the conventional transformer pattern excludes norm params from decay. */
+  decay?: boolean
+}
+
 /** Layer normalization over the last axis. Matches PyTorch's
  *  `torch.nn.LayerNorm(d, eps=1e-5)`. Subtract mean, divide by stddev (with `eps`
  *  for stability), then affine-scale by `g` and shift by `b`. */
@@ -121,10 +129,13 @@ export class LayerNorm extends Module {
   g: Tensor
   /** Bias (beta), shape `[d]`, init `zeros`. Shifts the normalized output. */
   b: Tensor
-  constructor(public readonly d: number, public readonly eps: number = 1e-5) {
+  readonly eps: number
+  constructor(public readonly d: number, opts: LayerNormOptions = {}) {
     super()
-    this.g = this.param([d], { init: init.ones() })
-    this.b = this.param([d], { init: init.zeros() })
+    this.eps = opts.eps ?? 1e-5
+    const decay = opts.decay ?? false
+    this.g = this.param([d], { init: init.ones(), decay })
+    this.b = this.param([d], { init: init.zeros(), decay })
   }
   /** Normalize over the last axis; affine-scale and shift. Shape preserved. */
   fwd(x: Tensor): Tensor {
@@ -136,15 +147,25 @@ export class LayerNorm extends Module {
   }
 }
 
+export interface RMSNormOptions {
+  /** Numerical-stability constant. Default 1e-6. */
+  eps?: number
+  /** Whether the gain receives AdamW weight decay. Default `false` —
+   *  the conventional transformer pattern excludes norm params from decay. */
+  decay?: boolean
+}
+
 /** Llama-style RMS normalization over the last axis. Scale-only (no
  *  mean-subtraction, no bias): `y = x / sqrt(mean(x², -1) + eps) * g`.
  *  Cheaper than `LayerNorm`; stable enough for modern transformers. */
 export class RMSNorm extends Module {
   /** Gain (gamma), shape `[d]`, init `ones`. Scales the RMS-normalized output. */
   g: Tensor
-  constructor(public readonly d: number, public readonly eps: number = 1e-6) {
+  readonly eps: number
+  constructor(public readonly d: number, opts: RMSNormOptions = {}) {
     super()
-    this.g = this.param([d], { init: init.ones() })
+    this.eps = opts.eps ?? 1e-6
+    this.g = this.param([d], { init: init.ones(), decay: opts.decay ?? false })
   }
   /** RMS-normalize over the last axis; affine-scale by `g`. Shape preserved. */
   fwd(x: Tensor): Tensor {
@@ -162,6 +183,7 @@ function paramOptsFrom(opts: { init?: InitSpec; decay?: boolean }): { init?: Ini
   if (opts.decay !== undefined) o.decay = opts.decay
   return o
 }
+
 
 // ---- Loss helpers --------------------------------------------------------
 
