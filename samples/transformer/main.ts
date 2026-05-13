@@ -243,7 +243,7 @@ async function startTraining(): Promise<void> {
     // protocol bug.
     onStatus('Worker smoke: reset() + downloadParams()...')
     await train.reset()
-    const params = await train.downloadParamsFlat()
+    const params = await train.downloadParams()
     onStatus(`  ${Object.keys(params).length} params re-initialized`, 'ok')
 
     await runTraining()

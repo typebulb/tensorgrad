@@ -21,7 +21,7 @@
 //     a `{ kind: 'aborted' }` result.
 //   * crossEntropy(logits, targets) as the canonical classification loss
 //     tail (reduces to scalar mean by default).
-//   * downloadParamsFlat + uploadParams round-trip through IndexedDB —
+//   * downloadParams + uploadParams round-trip through IndexedDB —
 //     save trained weights to local storage, reload them on the next visit
 //     (or after a reset). One persistence slot per hidden-size topology so
 //     a 64-unit save doesn't clash with a 128-unit save.
@@ -330,7 +330,7 @@ function weightsKey(hidden: number): string {
 async function saveWeights(): Promise<void> {
   if (!train) return
   const hidden = parseInt(layerSelect.value, 10)
-  const params = await train.downloadParamsFlat()
+  const params = await train.downloadParams()
   await dbPut(weightsKey(hidden), params)
   onStatus(`saved ${Object.keys(params).length} param tensors at step ${step}`)
 }

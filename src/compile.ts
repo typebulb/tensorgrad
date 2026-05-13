@@ -80,28 +80,6 @@ export type TypedArrayFor<D extends Dtype> =
  *  at marshal time. */
 export type TypedInputs<I extends InputDecls> = { [K in keyof I]: TypedArrayFor<DtypeOf<I[K]>> }
 
-/** A typed view of a Module's params, mirroring the class structure with
- *  every Tensor leaf replaced by its backing `Float32Array`. Returned by
- *  `compiled.downloadParams()` so user code can write
- *  `params.layers[0].W` instead of `params['layers.0.W']` — typed,
- *  autocompletable, no string indexing.
- *
- *  Filters keep only fields that contribute params: `Tensor`, nested
- *  `Module`, and arrays of `Module`. Other instance fields (`inDim`,
- *  config metadata, etc.) are pruned. */
-export type ParamTree<M> = {
-  [K in keyof M as
-      M[K] extends Tensor ? K
-    : M[K] extends Module ? K
-    : M[K] extends readonly Module[] ? K
-    : never
-  ]:
-      M[K] extends Tensor ? Float32Array
-    : M[K] extends readonly (infer U extends Module)[] ? ParamTree<U>[]
-    : M[K] extends Module ? ParamTree<M[K]>
-    : never
-}
-
 /** Forward function shape. */
 export type ForwardFn<M extends Module, I extends InputDecls = InputDecls> =
   (m: M, inputs: InputsTensors<I>) => Tensor
@@ -207,19 +185,13 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
    *  destroyed, typically by `replaceModel`). */
   step(inputs: TypedInputs<I>): Promise<StepResult>
 
-  /** Upload params from a flat record (the shape `downloadParamsFlat` returns).
+  /** Upload params from a flat record (the shape `downloadParams` returns).
    *  Partial by default — missing keys leave existing GPU values unchanged.
    *  Unknown keys throw (typo guard). */
   uploadParams(params: Record<string, Float32Array>): Promise<void>
-  /** Read params back as a typed tree mirroring the model class structure.
-   *  `params.layers[0].W` etc. — typed, autocompletable. Mirror of
-   *  `downloadParamsFlat` — same underlying data, two views; pick whichever
-   *  matches your call site. */
-  downloadParams(): Promise<ParamTree<M>>
   /** Read params back as a flat `{ 'layers.0.W': Float32Array, ... }`
-   *  record. The natural feed for `uploadParams` (round-trip works without
-   *  any reshaping); also handy for serialization or iterating all params. */
-  downloadParamsFlat(): Promise<Record<string, Float32Array>>
+   *  record. Round-trips directly through `uploadParams`. */
+  downloadParams(): Promise<Record<string, Float32Array>>
 
   /** Re-initialize params (from `seed`) and/or zero optimizer state. Defaults
    *  to both — the "start over with the same compile" button. Pass
@@ -304,13 +276,10 @@ export interface CompiledForward<M extends Module = Module, I extends InputDecls
    *  unchanged. Reads/writes go to the parent training compile's buffers
    *  (shared, so updates are immediately visible there too). */
   uploadParams(params: Record<string, Float32Array>): Promise<void>
-  /** Typed tree view of the shared param state — identical to the parent
-   *  training graph's `downloadParams()` since params are physically
-   *  shared. Mirror of `downloadParamsFlat`. */
-  downloadParams(): Promise<ParamTree<M>>
-  /** Flat `{ 'layers.0.W': Float32Array, ... }` record — the natural feed
-   *  for `uploadParams`. */
-  downloadParamsFlat(): Promise<Record<string, Float32Array>>
+  /** Flat `{ 'layers.0.W': Float32Array, ... }` record of the shared param
+   *  state — identical to the parent training graph's `downloadParams()`
+   *  since params are physically shared. */
+  downloadParams(): Promise<Record<string, Float32Array>>
 
   destroy(): void
 }
@@ -484,15 +453,7 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     ).then(() => undefined)
   }
 
-  async downloadParams(): Promise<ParamTree<M>> {
-    return buildParamTree(await this.fetchParams()) as ParamTree<M>
-  }
-
-  downloadParamsFlat(): Promise<Record<string, Float32Array>> {
-    return this.fetchParams()
-  }
-
-  private async fetchParams(): Promise<Record<string, Float32Array>> {
+  async downloadParams(): Promise<Record<string, Float32Array>> {
     const r = await this.proxy.request<DownloadParamsResult>(
       { kind: 'downloadParams', payload: { graphId: this.graphId } },
     )
@@ -660,15 +621,7 @@ class ForwardProxy<M extends Module, I extends InputDecls>
     )
   }
 
-  async downloadParams(): Promise<ParamTree<M>> {
-    return buildParamTree(await this.fetchParams()) as ParamTree<M>
-  }
-
-  downloadParamsFlat(): Promise<Record<string, Float32Array>> {
-    return this.fetchParams()
-  }
-
-  private async fetchParams(): Promise<Record<string, Float32Array>> {
+  async downloadParams(): Promise<Record<string, Float32Array>> {
     const r = await this.proxy.request<DownloadParamsResult>(
       { kind: 'downloadParams', payload: { graphId: this.parent.graphId } },
     )
@@ -913,26 +866,3 @@ function makeCaptures(
   return new Captures(captureShapes, data)
 }
 
-/** Inflate a flat `{ 'layers.0.W': ..., ... }` record into a tree mirroring
- *  the Module class structure. Numeric path segments become array indices. */
-function buildParamTree(flat: Record<string, Float32Array>): Record<string, unknown> {
-  const tree: Record<string, unknown> = {}
-  for (const [name, value] of Object.entries(flat)) {
-    setDeep(tree, name.split('.'), value)
-  }
-  return tree
-}
-
-function setDeep(root: Record<string, unknown>, parts: string[], value: Float32Array): void {
-  let cur: any = root
-  for (let i = 0; i < parts.length; i++) {
-    const seg = parts[i]!
-    const segIsIdx = /^\d+$/.test(seg)
-    const key: string | number = segIsIdx ? parseInt(seg, 10) : seg
-    if (i === parts.length - 1) { cur[key] = value; return }
-    const next = parts[i + 1]!
-    const nextIsIdx = /^\d+$/.test(next)
-    if (cur[key] === undefined) cur[key] = nextIsIdx ? [] : {}
-    cur = cur[key]
-  }
-}

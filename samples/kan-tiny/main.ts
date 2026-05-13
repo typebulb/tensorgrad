@@ -150,7 +150,7 @@ async function renderAll(): Promise<void> {
   const r = await infer.run({ x: PLOT_XS })
   if (r.kind === 'aborted') return
   const params = await train.downloadParams()
-  onRender(r.output, { l1C: params.l1.C, l2C: params.l2.C })
+  onRender(r.output, { l1C: params['l1.C']!, l2C: params['l2.C']! })
 }
 
 async function buildGraphs(): Promise<void> {

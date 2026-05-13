@@ -79,7 +79,7 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `class Net(nn.Module): def forward(self, x): ...` | `class Net extends Module { ... }` + a free `forward(m, x)` function |
 | `model(x)` | `forward(m, x)` |
 | `linear(x)` on `nn.Linear` / `nn.LayerNorm` | `linear.fwd(x)` (`.fwd` is the convention for built-in leaf modules) |
-| `model.parameters()` | `train.paramNames`, `train.downloadParams()` |
+| `model.parameters()` / `model.state_dict()` | `train.paramNames`, `train.downloadParams()` (flat `Record<string, Float32Array>`) |
 | `optimizer.zero_grad(); out = model(x); loss = ...; loss.backward(); optimizer.step()` | `await train.step(inputs)` — forward + backward + Adam update are fused |
 | `optim.Adam(params, lr=...)` | `optimizer: { kind: 'adam', lr }` in `compile({ ... })` |
 | `optim.AdamW(params, lr=..., weight_decay=w)` | `optimizer: { kind: 'adamw', lr, weightDecay: w }` |
@@ -277,8 +277,7 @@ Generic — works around `run`, `step`, or any single-argument promise function.
 ```ts
 train.step(inputs)                           // → { kind: 'completed', loss, captures } | { kind: 'aborted' }
 train.uploadParams(record)                   // partial by default; missing keys keep current values
-train.downloadParams()                       // → ParamTree<M> (typed tree, mirrors class)
-train.downloadParamsFlat()                   // → Record<'layers.0.W' | …, Float32Array>
+train.downloadParams()                       // → Record<'layers.0.W' | …, Float32Array> (round-trips through uploadParams)
 train.attach(forwardSpec)                    // → CompiledForward; sibling that shares params + worker
 train.reset({ params?, optimizer? })         // defaults to both; pass false to skip either
 train.setLR(lr)                              // mutate LR without recompile
@@ -287,9 +286,13 @@ train.destroy()                              // tear down worker + GPU (cascades
 ```
 
 `CompiledForward` (from `train.attach(forwardSpec)`) exposes a narrower
-surface: `run`, `uploadParams`, `downloadParams` / `downloadParamsFlat`,
-`destroy`, and `paramNames`. Params are shared with the parent training
-compile, so reads/writes are visible there too.
+surface: `run`, `uploadParams`, `downloadParams`, `destroy`, and
+`paramNames`. Params are shared with the parent training compile, so
+reads/writes are visible there too.
+
+```ts
+infer.run(inputs)                            // → { kind: 'completed', output, captures } | { kind: 'aborted' }
+```
 
 **Concurrent `step` / `run` auto-serialize.** A `run()` issued while a
 `step()` is in flight is queued automatically — same worker, same single
@@ -321,17 +324,12 @@ const params = train.graph.ops
 // [{ name: 'l1.W', shape: [1, 64] }, { name: 'l1.b', shape: [64] }, ...]
 ```
 
-**Typed param tree.** `downloadParams()` returns a tree that mirrors the
-model class. If `MLP` has `l1: Linear; l2: Linear; l3: Linear` and `Linear`
-has `W: Tensor; b: Tensor`, then the return type is
-`{ l1: { W, b }; l2: { W, b }; l3: { W, b } }` with `Float32Array` leaves —
-typed access (`params.l1.W`), no string indexing. Arrays of Modules
-(e.g. `layers: Linear[]`) become arrays of subtrees
-(`params.layers[0].W`). Non-param fields on the model class (numbers,
-config, etc.) are pruned. `downloadParamsFlat()` returns the same data as
-a flat `Record<string, Float32Array>` — the natural form for serialization,
-full-tree iteration, and the direct round-trip back through `uploadParams`
-(e.g. save weights to IndexedDB, load on next visit).
+**Flat param record.** `downloadParams()` returns a flat
+`Record<'l1.W' | 'l1.b' | ..., Float32Array>` — dotted keys mirror the
+Module class path. Round-trips directly back through `uploadParams`
+(e.g. save weights to IndexedDB, load on next visit). The string-literal
+union autocompletes in TS, so `params['l1.W']` is typed access without a
+separate tree variant.
 
 **Typed inputs.** `step` / `run` are typed against the declared `inputs`
 shape, so each named input expects the right TypedArray: a dtype-`'f32'`

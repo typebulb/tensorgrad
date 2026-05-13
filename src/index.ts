@@ -45,7 +45,7 @@ export {
   type TrainingSpec, type ForwardSpec, type CompiledIR,
   type CompiledTraining, type CompiledForward, type OptimizerConfig,
   type StepResult, type RunResult,
-  type InputDecl, type InputDecls, type TypedInputs, type ParamTree,
+  type InputDecl, type InputDecls, type TypedInputs,
 } from './compile.js'
 export { Module, init, type InitSpec, type ParamOptions } from './module.js'
 export { singleFlight, type SingleFlightResult } from './single-flight.js'
