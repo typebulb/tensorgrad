@@ -19,8 +19,8 @@ export interface Conv2dLayerOptions extends Conv2dOptions {
 }
 
 /** 2D convolution layer (NCHW). Shape and option names match PyTorch's
- *  `nn.Conv2d` so 1-shot ports don't need transposes. Wraps the pure
- *  `conv2d` op plus an optional broadcast-add bias. */
+ *  `torch.nn.Conv2d` so 1-shot ports don't need transposes. Wraps the
+ *  pure `conv2d` op plus an optional broadcast-add bias. */
 export class Conv2d extends Module {
   /** Weight, shape `[outC, inC, kH, kW]`. Init follows `opts.init`
    *  (default `randn` with scale 0.02). Pass `init.kaiming()` for
@@ -64,7 +64,7 @@ export interface EmbeddingOptions {
   decay?: boolean
 }
 
-/** Index → row lookup. Matches PyTorch's `nn.Embedding(vocab, dim)`.
+/** Index → row lookup. Matches PyTorch's `torch.nn.Embedding(vocab, dim)`.
  *  Differentiable via the matmul adjoint — no custom scatter-with-atomic-add
  *  backward needed; see `ops.ts`'s `embedding` for the decomposition. */
 export class Embedding extends Module {
@@ -90,7 +90,7 @@ export interface LinearOptions {
   decay?: boolean
 }
 
-/** Affine layer `y = x @ W + b`. Matches PyTorch's `nn.Linear` but the
+/** Affine layer `y = x @ W + b`. Matches PyTorch's `torch.nn.Linear` but the
  *  weight orientation is `[inDim, outDim]` (so `matmul(x, W)` is direct,
  *  no transpose at call site — PyTorch stores `[outDim, inDim]` and uses
  *  `x @ W^T` internally). Bias is optional. */
@@ -114,7 +114,7 @@ export class Linear extends Module {
 }
 
 /** Layer normalization over the last axis. Matches PyTorch's
- *  `nn.LayerNorm(d, eps=1e-5)`. Subtract mean, divide by stddev (with `eps`
+ *  `torch.nn.LayerNorm(d, eps=1e-5)`. Subtract mean, divide by stddev (with `eps`
  *  for stability), then affine-scale by `g` and shift by `b`. */
 export class LayerNorm extends Module {
   /** Gain (gamma), shape `[d]`, init `ones`. Scales the normalized output. */

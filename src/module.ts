@@ -28,11 +28,22 @@ export type InitSpec =
 
 /** Ergonomic constructors for InitSpec. */
 export const init = {
+  /** Gaussian draw with std `scale` (default 0.02). The library's default
+   *  param init; PyTorch ports that don't specify init match this. */
   randn: (opts: { scale?: number } = {}): InitSpec => ({ kind: 'randn', scale: opts.scale ?? 0.02 }),
+  /** Fill with 0. Standard for biases and LayerNorm β. AdamW weight decay
+   *  defaults to off for zeros-init params. */
   zeros: (): InitSpec => ({ kind: 'zeros' }),
+  /** Fill with 1. Standard for LayerNorm / RMSNorm gain. AdamW weight decay
+   *  defaults to off for ones-init params. */
   ones: (): InitSpec => ({ kind: 'ones' }),
+  /** Kaiming-normal: `std = gain / sqrt(fan_in)` where `fan_in = shape[0]`.
+   *  Default `gain = sqrt(2)` (the He init for ReLU). PyTorch:
+   *  `nn.init.kaiming_normal_(..., mode='fan_in')`. */
   kaiming: (opts: { gain?: number } = {}): InitSpec =>
     opts.gain !== undefined ? { kind: 'kaiming', gain: opts.gain } : { kind: 'kaiming' },
+  /** Explicit data. `data.length` must match the parameter's total element
+   *  count. Use for loading pretrained weights or seeding test fixtures. */
   literal: (data: Float32Array): InitSpec => ({ kind: 'literal', data }),
 }
 
@@ -166,7 +177,7 @@ class Param {
  *
  * Forward functions are *free functions*, not methods — they take the
  * materialized module plus inputs and return a `Tensor`. The built-in
- * leaf modules (`nn.Linear`, `nn.LayerNorm`, etc.) expose `.fwd(x)` as a
+ * leaf modules (`Linear`, `LayerNorm`, etc.) expose `.fwd(x)` as a
  * convenience for chaining, but composite modules you write should follow
  * the free-function pattern.
  */

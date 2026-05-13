@@ -17,7 +17,7 @@ A 2-layer MLP fitting `y = sin(x)`:
 
 ```ts
 import {
-  Module, compile, nn,
+  Module, compile, Linear,
   sub, mean, square, relu,
   type Tensor,
 } from 'tensorgrad'
@@ -25,9 +25,9 @@ import {
 const B = 256
 
 class MLP extends Module {
-  l1 = new nn.Linear(1, 64)
-  l2 = new nn.Linear(64, 64)
-  l3 = new nn.Linear(64, 1)
+  l1 = new Linear(1, 64)
+  l2 = new Linear(64, 64)
+  l3 = new Linear(64, 1)
 }
 
 function modelFwd(m: MLP, x: Tensor): Tensor {
@@ -101,9 +101,9 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `x.view(B, T, H, -1)` / `x.reshape(B, -1)` | `reshape(x, [B, T, H, -1])` — exactly one `-1` allowed, inferred from total size |
 | `torch.matmul(a, b)` / `a @ b` | `matmul(a, b)` — dispatches between unbatched and batched on rhs rank |
 | `torch.split(x, sizes, dim)` | `split(x, sizes, dim)` |
-| `nn.Embedding(V, D)` | `new nn.Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
+| `nn.Embedding(V, D)` | `new Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
 | `torch.flatten(x, start_dim=1)` | `flatten(x, 1)` (or `reshape(x, [B, -1])`) |
-| `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new nn.Conv2d(in, out, k, { stride: s, padding: p })` |
+| `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new Conv2d(in, out, k, { stride: s, padding: p })` |
 | `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2d(x, k, { stride: s, padding: p })` |
 | `F.interpolate(x, scale_factor=k, mode='nearest')` | `nearestUpsample2d(x, k)` |
 | `torch.randn(shape)` | `randn(shape)` — uses the per-step PRNG; zero gradient |
@@ -116,14 +116,14 @@ If you're translating a PyTorch model or training loop. Assumes the
 
 **Pass raw logits to the loss, not log-probs.** PyTorch tutorials often
 write `F.log_softmax(logits, dim=-1)` in `forward` and `F.nll_loss(...)`
-in the loss. Tensorgrad's `nn.crossEntropy(logits, targets)` fuses
+in the loss. Tensorgrad's `crossEntropy(logits, targets)` fuses
 log-softmax + NLL into one call. Pass raw logits — don't apply
 log-softmax yourself. Applying it twice silently
 double-log-softmaxes; the model trains but converges to garbage. This
 is the worst class of bug: it runs.
 
 If you specifically want the log-probability intermediate visible (e.g.
-to `capture` it for inspection), use `nn.nllLoss(logSoftmax(logits),
+to `capture` it for inspection), use `nllLoss(logSoftmax(logits),
 targets)` instead — same numerics, just unfused.
 
 **No `.train()` / `.eval()` mode flag.** Write two forwards: a training
@@ -412,7 +412,7 @@ Imported from `'tensorgrad'`:
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
 `(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmax`
 and `argmin` return `i32` and are non-differentiable. The standard loss
-tail is `nn.crossEntropy(logits, targets)` (reduces to scalar mean by
+tail is `crossEntropy(logits, targets)` (reduces to scalar mean by
 default).
 
 **Structural ops.** `concat([a, b], axis)` joins along an existing axis;
@@ -422,19 +422,22 @@ convention). Concat over the WebGPU 7-binding cap is auto-chained
 internally — call signature is the same whether you pass 2 or 200
 tensors. `split(t, sizes, axis)` is the inverse, built from `narrow`.
 
-### `nn` namespace
+### Layer modules and loss helpers
 
 ```ts
-import { nn } from 'tensorgrad'
+import {
+  Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
+  crossEntropy, nllLoss,
+} from 'tensorgrad'
 
-nn.Linear(inDim, outDim, { bias?, init?, decay? })   // .fwd(x); W: [inDim, outDim], b: [outDim]
-nn.LayerNorm(dim, eps?)              // .fwd(x); g (gain) and b (bias) both [dim]
-nn.RMSNorm(dim, eps?)                // .fwd(x); g (gain) only — Llama-style
-nn.Embedding(vocab, dim, { init?, decay? })          // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
-nn.Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW
-                                     // x: [B, inC, H, W] -> [B, outC, H', W']
-nn.crossEntropy(logits, targets, { reduction? })  // fused log-softmax + NLL; default mean
-nn.nllLoss(logProbs, targets, { reduction? })     // NLL only; pair with logSoftmax for the log-prob intermediate
+new Linear(inDim, outDim, { bias?, init?, decay? })   // .fwd(x); W: [inDim, outDim], b: [outDim]
+new LayerNorm(dim, eps?)              // .fwd(x); g (gain) and b (bias) both [dim]
+new RMSNorm(dim, eps?)                // .fwd(x); g (gain) only — Llama-style
+new Embedding(vocab, dim, { init?, decay? })          // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
+new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW
+                                      // x: [B, inC, H, W] -> [B, outC, H', W']
+crossEntropy(logits, targets, { reduction? })  // fused log-softmax + NLL; default mean
+nllLoss(logProbs, targets, { reduction? })     // NLL only; pair with logSoftmax for the log-prob intermediate
 ```
 
 Convention: leaf modules (`Linear`, `LayerNorm`) expose `.fwd(x)` for ergonomic
@@ -446,11 +449,11 @@ PyTorch's `F.cross_entropy(..., reduction='mean')`). Pass `{ reduction:
 'none' }` for a per-position tensor when you need to mask or weight
 positions yourself before reducing; `'sum'` for an unscaled sum.
 
-Multi-head shape helpers (`splitHeads(x, nHeads)`, `mergeHeads(x)`) live
-at the top level (not under `nn`) — pure tensor ops, not modules. The
-captures-side counterpart is `captures.perHead(name)` — a method on
-the `Captures` instance returned by `step()` / `run()`, splits a flat
-capture into one `Float32Array` per head.
+Multi-head shape helpers (`splitHeads(x, nHeads)`, `mergeHeads(x)`) are
+pure tensor ops, not modules. The captures-side counterpart is
+`captures.perHead(name)` — a method on the `Captures` instance returned
+by `step()` / `run()`, splits a flat capture into one `Float32Array` per
+head.
 
 ### Optimizers
 
@@ -563,7 +566,7 @@ separate graphs — dropout is literally absent from the inference path.
 ```ts
 function lossFn(m: Model, { x, y }: { x: Tensor; y: Tensor }) {
   const h = relu(dropout(m.l1.fwd(x), 0.1))    // dropout in training
-  return nn.crossEntropy(m.l2.fwd(h), y)
+  return crossEntropy(m.l2.fwd(h), y)
 }
 
 function predictFn(m: Model, { x }: { x: Tensor }) {

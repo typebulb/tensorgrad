@@ -11,7 +11,7 @@
 // UI section.
 
 import {
-  Module, compile, lr, nn, capture,
+  Module, compile, lr, Linear, LayerNorm, crossEntropy, capture,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
   softmaxCausal, splitHeads, mergeHeads,
@@ -41,35 +41,35 @@ const SCALE_QK = 1 / Math.sqrt(D_HEAD)
 // ---------- Modules: structure of the param tree ---------------------------
 
 class Attention extends Module {
-  q = new nn.Linear(D, D, { bias: false })
-  k = new nn.Linear(D, D, { bias: false })
-  v = new nn.Linear(D, D, { bias: false })
-  o = new nn.Linear(D, D, { bias: false })
+  q = new Linear(D, D, { bias: false })
+  k = new Linear(D, D, { bias: false })
+  v = new Linear(D, D, { bias: false })
+  o = new Linear(D, D, { bias: false })
 }
 
 class MLP extends Module {
-  up   = new nn.Linear(D, 4 * D)
-  down = new nn.Linear(4 * D, D)
+  up   = new Linear(D, 4 * D)
+  down = new Linear(4 * D, D)
 }
 
 class Block extends Module {
-  ln1  = new nn.LayerNorm(D)
+  ln1  = new LayerNorm(D)
   attn = new Attention()
-  ln2  = new nn.LayerNorm(D)
+  ln2  = new LayerNorm(D)
   mlp  = new MLP()
 }
 
 class Transformer extends Module {
   tok_emb: Tensor; pos_emb: Tensor
   layers: Block[]
-  lnf: nn.LayerNorm
+  lnf: LayerNorm
   constructor() {
     super()
     this.tok_emb = this.param([VOCAB, D])
     this.pos_emb = this.param([SEQ_LEN, D])
     this.layers = []
     for (let i = 0; i < N_LAYERS; i++) this.layers.push(new Block())
-    this.lnf = new nn.LayerNorm(D)
+    this.lnf = new LayerNorm(D)
   }
 }
 
@@ -109,7 +109,7 @@ function modelFwd(p: Transformer, tokens: Tensor): Tensor {
 }
 
 function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tensor; targets: Tensor; mask: Tensor }): Tensor {
-  const ce = nn.crossEntropy(modelFwd(p, tokens), targets, { reduction: 'none' })   // [B, T] of -log p(target)
+  const ce = crossEntropy(modelFwd(p, tokens), targets, { reduction: 'none' })   // [B, T] of -log p(target)
   return mul(sum(mul(ce, mask)), 1 / (B * N_RESULT_DIGITS))
 }
 

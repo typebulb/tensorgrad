@@ -1,5 +1,5 @@
 // MNIST CNN — primary purpose is GPU verification of the conv2d /
-// maxPool2d / nn.Conv2d / flatten path. If anything in the WGSL is broken,
+// maxPool2d / Conv2d / flatten path. If anything in the WGSL is broken,
 // training either crashes at compile, NaNs, or fails to converge.
 //
 // Architecture: two conv+pool blocks → flatten → MLP head. Standard
@@ -20,7 +20,7 @@
 // tail it in the terminal instead of copying from the browser console.
 
 import {
-  Module, compile, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, Linear, Conv2d, crossEntropy,
   relu, flatten, maxPool2d,
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
@@ -75,11 +75,11 @@ async function loadSet(imgFile: string, lblFile: string): Promise<MnistSet> {
 // ---------------------------------------------------------------------------
 
 class CNN extends Module {
-  conv1 = new nn.Conv2d(1, CONV1_OUT, 3, { padding: 1 })
-  conv2 = new nn.Conv2d(CONV1_OUT, CONV2_OUT, 3, { padding: 1 })
+  conv1 = new Conv2d(1, CONV1_OUT, 3, { padding: 1 })
+  conv2 = new Conv2d(CONV1_OUT, CONV2_OUT, 3, { padding: 1 })
   // After two 2x2 pools: 28 → 14 → 7. Conv2 output is [B, 32, 7, 7] → 1568.
-  fc1 = new nn.Linear(CONV2_OUT * 7 * 7, HIDDEN)
-  fc2 = new nn.Linear(HIDDEN, N_CLASSES)
+  fc1 = new Linear(CONV2_OUT * 7 * 7, HIDDEN)
+  fc2 = new Linear(HIDDEN, N_CLASSES)
 }
 
 function forwardLogits(m: CNN, x: Tensor): Tensor {
@@ -93,7 +93,7 @@ function forwardLogits(m: CNN, x: Tensor): Tensor {
 }
 
 function lossFn(m: CNN, { x, y }: { x: Tensor; y: Tensor }): Tensor {
-  return nn.crossEntropy(forwardLogits(m, x), y)
+  return crossEntropy(forwardLogits(m, x), y)
 }
 
 function predictFn(m: CNN, { x }: { x: Tensor }): Tensor {

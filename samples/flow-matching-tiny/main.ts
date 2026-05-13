@@ -18,7 +18,7 @@
 // with the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, Linear, Embedding, Conv2d,
   add, mul, sub, mean, reshape, relu,
   randn, takeAlongAxis, square,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -90,12 +90,12 @@ async function loadImages(file: string): Promise<MnistSet> {
 // ---------------------------------------------------------------------------
 
 class TinyFlow extends Module {
-  tEmb  = new nn.Embedding(T_STEPS + 1, EMB_DIM)
-  tProj = new nn.Linear(EMB_DIM, CONV_CH)
-  conv1 = new nn.Conv2d(1,       CONV_CH, 3, { padding: 1 })
-  conv2 = new nn.Conv2d(CONV_CH, CONV_CH, 3, { padding: 1 })
-  conv3 = new nn.Conv2d(CONV_CH, CONV_CH, 3, { padding: 1 })
-  conv4 = new nn.Conv2d(CONV_CH, 1,       3, { padding: 1 })
+  tEmb  = new Embedding(T_STEPS + 1, EMB_DIM)
+  tProj = new Linear(EMB_DIM, CONV_CH)
+  conv1 = new Conv2d(1,       CONV_CH, 3, { padding: 1 })
+  conv2 = new Conv2d(CONV_CH, CONV_CH, 3, { padding: 1 })
+  conv3 = new Conv2d(CONV_CH, CONV_CH, 3, { padding: 1 })
+  conv4 = new Conv2d(CONV_CH, 1,       3, { padding: 1 })
 }
 
 function modelFwd(m: TinyFlow, x_t: Tensor, t: Tensor): Tensor {

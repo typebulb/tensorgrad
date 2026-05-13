@@ -17,7 +17,8 @@
 // UI section.
 
 import {
-  Module, compile, isWebGPUAvailable, lr, nn,
+  Module, compile, isWebGPUAvailable, lr,
+  Linear, LayerNorm, crossEntropy,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
   softmaxCausal, splitHeads, mergeHeads,
@@ -46,35 +47,35 @@ const decodeChar = (idx: number) => idx === PAD ? '.' : String.fromCharCode(idx 
 // ---------- Modules: structure of the param tree ---------------------------
 
 class Attention extends Module {
-  q = new nn.Linear(D, D, { bias: false })
-  k = new nn.Linear(D, D, { bias: false })
-  v = new nn.Linear(D, D, { bias: false })
-  o = new nn.Linear(D, D, { bias: false })
+  q = new Linear(D, D, { bias: false })
+  k = new Linear(D, D, { bias: false })
+  v = new Linear(D, D, { bias: false })
+  o = new Linear(D, D, { bias: false })
 }
 
 class MLP extends Module {
-  up   = new nn.Linear(D, 4 * D)
-  down = new nn.Linear(4 * D, D)
+  up   = new Linear(D, 4 * D)
+  down = new Linear(4 * D, D)
 }
 
 class Block extends Module {
-  ln1  = new nn.LayerNorm(D)
+  ln1  = new LayerNorm(D)
   attn = new Attention()
-  ln2  = new nn.LayerNorm(D)
+  ln2  = new LayerNorm(D)
   mlp  = new MLP()
 }
 
 class Transformer extends Module {
   tok_emb: Tensor; pos_emb: Tensor
   layers: Block[]
-  lnf: nn.LayerNorm
+  lnf: LayerNorm
   constructor() {
     super()
     this.tok_emb = this.param([VOCAB, D])
     this.pos_emb = this.param([SEQ_LEN, D])
     this.layers = []
     for (let i = 0; i < N_LAYERS; i++) this.layers.push(new Block())
-    this.lnf = new nn.LayerNorm(D)
+    this.lnf = new LayerNorm(D)
   }
 }
 
@@ -113,7 +114,7 @@ function modelFwd(p: Transformer, tokens: Tensor): Tensor {
 // references (~2.0 at convergence) instead of being diluted ~2x by trivial
 // '.'-from-'.' pad positions.
 function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tensor; targets: Tensor; mask: Tensor }): Tensor {
-  return sum(mul(nn.crossEntropy(modelFwd(p, tokens), targets, { reduction: 'none' }), mask))
+  return sum(mul(crossEntropy(modelFwd(p, tokens), targets, { reduction: 'none' }), mask))
 }
 
 function predictFwd(p: Transformer, { tokens }: { tokens: Tensor }): Tensor {

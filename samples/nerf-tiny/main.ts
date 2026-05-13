@@ -18,7 +18,7 @@
 // as the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, Linear,
   mul, sub, mean, reshape, relu, sigmoid, concat,
   sin, cos, square,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -53,10 +53,10 @@ for (let row = 0; row < IMG_H; row++) {
 // ---------------------------------------------------------------------------
 
 class NeRFTiny extends Module {
-  l1 = new nn.Linear(4 * L_FREQS, HIDDEN)
-  l2 = new nn.Linear(HIDDEN, HIDDEN)
-  l3 = new nn.Linear(HIDDEN, HIDDEN)
-  l4 = new nn.Linear(HIDDEN, 3)
+  l1 = new Linear(4 * L_FREQS, HIDDEN)
+  l2 = new Linear(HIDDEN, HIDDEN)
+  l3 = new Linear(HIDDEN, HIDDEN)
+  l4 = new Linear(HIDDEN, 3)
 }
 
 // Sinusoidal positional encoding (NeRF / Tancik et al.). For each input

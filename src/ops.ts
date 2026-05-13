@@ -610,7 +610,7 @@ export function logSoftmax(a: Tensor, axis: number = -1): Tensor {
  *  — the stabilization happens inside the fused log-softmax kernel.
  *  Negative axis counts from the end; default is `-1`. For classifiers
  *  that want explicit class probabilities and for attention-distribution
- *  visualization. Use `nn.crossEntropy` for the training loss. */
+ *  visualization. Use `crossEntropy` for the training loss. */
 export function softmax(a: Tensor, axis: number = -1): Tensor {
   return exp(logSoftmax(a, axis))
 }
@@ -891,7 +891,7 @@ export interface Conv2dOptions {
 
 /** Normalize a number-or-pair to a concrete `[number, number]`, applying
  *  `defaultVal` to both dims when omitted. Shared by conv2d / maxPool2d /
- *  nn.Conv2d for stride/padding/kernel handling. */
+ *  Conv2d for stride/padding/kernel handling. */
 export function pairOpt(v: number | readonly [number, number] | undefined, defaultVal: number): [number, number] {
   if (v === undefined) return [defaultVal, defaultVal]
   if (typeof v === 'number') return [v, v]
@@ -900,7 +900,7 @@ export function pairOpt(v: number | readonly [number, number] | undefined, defau
 
 /** 2D convolution. Input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
  *  -> [B, C_out, H_out, W_out]. Bias is added separately via `add`; see
- *  `nn.Conv2d` for the canonical layer wrapper. */
+ *  `Conv2d` for the canonical layer wrapper. */
 export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOptions = {}): Tensor {
   const site = captureSite('conv2d')
   if (input.dtype !== 'f32') throw new ShapeError(`conv2d: input must be f32, got ${input.dtype}`, site)

@@ -17,7 +17,7 @@
 // as the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, Linear,
   add, sub, mul, sum, exp, sigmoid, relu,
   randn, square,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -59,13 +59,13 @@ async function loadImages(file: string): Promise<MnistSet> {
 // ---------------------------------------------------------------------------
 
 class VAE extends Module {
-  enc1     = new nn.Linear(INPUT_DIM, HIDDEN)
-  enc2     = new nn.Linear(HIDDEN,    HIDDEN)
-  encMu    = new nn.Linear(HIDDEN,    LATENT_DIM)
-  encLogV  = new nn.Linear(HIDDEN,    LATENT_DIM)
-  dec1     = new nn.Linear(LATENT_DIM, HIDDEN)
-  dec2     = new nn.Linear(HIDDEN,    HIDDEN)
-  decOut   = new nn.Linear(HIDDEN,    INPUT_DIM)
+  enc1     = new Linear(INPUT_DIM, HIDDEN)
+  enc2     = new Linear(HIDDEN,    HIDDEN)
+  encMu    = new Linear(HIDDEN,    LATENT_DIM)
+  encLogV  = new Linear(HIDDEN,    LATENT_DIM)
+  dec1     = new Linear(LATENT_DIM, HIDDEN)
+  dec2     = new Linear(HIDDEN,    HIDDEN)
+  decOut   = new Linear(HIDDEN,    INPUT_DIM)
 }
 
 function encoder(m: VAE, x: Tensor): { mu: Tensor; logVar: Tensor } {

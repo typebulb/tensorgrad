@@ -9,7 +9,7 @@
 // entirely in the UI section.
 
 import {
-  Module, compile, nn,
+  Module, compile, Linear,
   mul, sub, mean, relu,
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
@@ -22,9 +22,9 @@ const LR = 0.005
 const PLOT_N = 200
 
 class MLP extends Module {
-  l1 = new nn.Linear(1, HIDDEN)
-  l2 = new nn.Linear(HIDDEN, HIDDEN)
-  l3 = new nn.Linear(HIDDEN, 1)
+  l1 = new Linear(1, HIDDEN)
+  l2 = new Linear(HIDDEN, HIDDEN)
+  l3 = new Linear(HIDDEN, 1)
 }
 
 function modelFwd(p: MLP, x: Tensor): Tensor {

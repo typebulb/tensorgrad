@@ -35,7 +35,7 @@
 // entirely in the UI section.
 
 import {
-  Module, compile, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, Linear, crossEntropy,
   relu, dropout, softmax, singleFlight,
   type Tensor, type CompiledTraining, type CompiledForward, type SingleFlightResult,
 } from 'tensorgrad'
@@ -87,12 +87,12 @@ async function loadSet(imgFile: string, lblFile: string): Promise<MnistSet> {
 // ---------------------------------------------------------------------------
 
 class MLP extends Module {
-  layers: nn.Linear[]
+  layers: Linear[]
   constructor(sizes: readonly number[]) {
     super()
     this.layers = []
     for (let i = 0; i < sizes.length - 1; i++) {
-      this.layers.push(new nn.Linear(sizes[i]!, sizes[i + 1]!))
+      this.layers.push(new Linear(sizes[i]!, sizes[i + 1]!))
     }
   }
 }
@@ -112,7 +112,7 @@ function netFwd(m: MLP, x: Tensor, applyDropout: boolean): Tensor {
 function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   // Training-only: dropout active on hidden activations.
   const logits = netFwd(m, x, true)
-  return nn.crossEntropy(logits, y)
+  return crossEntropy(logits, y)
 }
 
 function predictFn(m: MLP, { x }: { x: Tensor }): Tensor {

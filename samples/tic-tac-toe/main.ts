@@ -21,7 +21,7 @@
 // as the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, nn,
+  Module, compile, isWebGPUAvailable, Linear,
   mul, sum,
   tanh, oneHot, logSoftmax, softmax,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -100,9 +100,9 @@ function packState(g: Game, out: Float32Array, offset: number): void {
 // ---------------------------------------------------------------------------
 
 class Policy extends Module {
-  l1 = new nn.Linear(STATE_DIM, HIDDEN)
-  l2 = new nn.Linear(HIDDEN,    HIDDEN)
-  out = new nn.Linear(HIDDEN,    N_ACTIONS)
+  l1 = new Linear(STATE_DIM, HIDDEN)
+  l2 = new Linear(HIDDEN,    HIDDEN)
+  out = new Linear(HIDDEN,    N_ACTIONS)
 }
 
 function policyLogits(m: Policy, state: Tensor): Tensor {

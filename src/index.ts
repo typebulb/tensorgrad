@@ -1,5 +1,5 @@
-// Public surface — `tensorgrad`. Documented end-user API: ops, modules,
-// the `nn` namespace, `compile`, runtime helpers.
+// Public surface — `tensorgrad`. Documented end-user API: ops, layer
+// modules (Linear, LayerNorm, ...), `compile`, runtime helpers.
 // Extension hooks (custom optimizers, IR walks, codegen visualization)
 // live in the sibling `tensorgrad/internal` barrel.
 
@@ -49,4 +49,9 @@ export {
 } from './compile.js'
 export { Module, init, type InitSpec, type ParamOptions } from './module.js'
 export { singleFlight, type SingleFlightResult } from './single-flight.js'
-export * as nn from './nn.js'
+export {
+  Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
+  crossEntropy, nllLoss,
+  type LinearOptions, type EmbeddingOptions, type Conv2dLayerOptions,
+  type LossOptions,
+} from './nn.js'
