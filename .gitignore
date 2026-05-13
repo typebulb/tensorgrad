@@ -16,7 +16,3 @@ typebulbs
 .claude/
 specs/
 temp/
-
-# experimental, not for publication
-samples/explorer-lab/
-samples/diffusion-tiny/

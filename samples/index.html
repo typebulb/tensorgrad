@@ -28,12 +28,8 @@
       <p>Two-block CNN trained from scratch on MNIST. Verifies the <code>conv2d</code> / <code>maxPool2D</code> / <code>flatten</code> path end-to-end on GPU. Status streams to the dev-server console.</p>
     </li>
     <li>
-      <a href="/diffusion-tiny/">Diffusion-tiny (MNIST)</a>
-      <p>A small DDPM trained from scratch on MNIST. Train for a few thousand steps then watch a digit emerge from noise as the model iteratively denoises. Conv-stack model (no U-Net), learnable timestep embedding, CPU-side noise generation.</p>
-    </li>
-    <li>
       <a href="/flow-matching-tiny/">Flow-matching-tiny (MNIST)</a>
-      <p>Same conv stack as <code>diffusion-tiny</code> on the same task, with the training objective swapped for rectified-flow / flow-matching: the model regresses on the data→noise velocity field, and sampling is Euler integration of <code>dx/dt = v_θ(x, t)</code> backward in time — same quality at fewer sampling steps.</p>
+      <p>A small rectified-flow / flow-matching model trained from scratch on MNIST. Train for a few thousand steps then watch a digit emerge from noise as the sampler Euler-integrates the learned velocity field backward in time. Conv-stack model (no U-Net), learnable timestep embedding, in-graph noise generation.</p>
     </li>
     <li>
       <a href="/nerf-tiny/">NeRF-tiny (image INR)</a>

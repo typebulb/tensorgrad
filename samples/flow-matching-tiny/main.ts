@@ -1,9 +1,8 @@
-// Tiny rectified-flow / flow-matching model on MNIST. Same conv stack as
-// `diffusion-tiny` — what changes is the training objective and the sampler.
-// Instead of denoising at a schedule of timesteps, the model learns the
+// Tiny rectified-flow / flow-matching model on MNIST. The model learns the
 // velocity field `v_θ(x_t, t)` that transports samples along the straight
-// line from data to noise. Generation is Euler integration of that field
-// backward in time — typically fewer steps than diffusion at similar quality.
+// line from data to noise; generation is Euler integration of that field
+// backward in time. Typically reaches diffusion-quality outputs at fewer
+// sampling steps.
 //
 // Training: draw x_1 ~ N(0,1) in-graph, mix with the clean image as
 // `x_t = (1 − t) · x_0 + t · x_1` = `x_0 + t · (x_1 − x_0)`, regress on the
@@ -11,8 +10,9 @@
 // is computed once and reused as both the path mixer and the loss target.
 //
 // Sampling: start at x = N(0,1) (t=1) and Euler-step toward t=0,
-// `x ← x − dt · v_θ(x, t)`. Discrete timestep embedding is reused from the
-// diffusion sample by snapping continuous t to the nearest of T_STEPS buckets.
+// `x ← x − dt · v_θ(x, t)`. A discrete timestep embedding (an `Embedding`
+// table indexed by integer t) handles the time conditioning — continuous t
+// is snapped to the nearest of T_STEPS buckets at training and sampling time.
 //
 // File layout: ML + app logic at the top, UI at the bottom. Pattern shared
 // with the other samples.
@@ -40,10 +40,10 @@ const EMB_DIM = 32
 
 // ---------------------------------------------------------------------------
 // Time schedule. Flow matching just needs t ∈ [0, 1]; we discretize into
-// T_STEPS buckets so the same integer-indexed Embedding pattern as
-// diffusion-tiny carries over. Index 0 is unused; the math reads naturally
-// with 1-indexed t. `tNormTable[t] = t / T_STEPS` is the only schedule table
-// the loss needs — `(1 − t)` falls out of `x_0 + t · (x_1 − x_0)`.
+// T_STEPS buckets so an integer-indexed `Embedding` handles the time
+// conditioning. Index 0 is unused; the math reads naturally with 1-indexed t.
+// `tNormTable[t] = t / T_STEPS` is the only schedule table the loss needs —
+// `(1 − t)` falls out of `x_0 + t · (x_1 − x_0)`.
 // ---------------------------------------------------------------------------
 
 const tNormTable = (() => {

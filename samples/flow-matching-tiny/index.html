@@ -73,9 +73,9 @@
 
   <p class="help">
     Architecture: 4 stride-1 3×3 convs at 28×28, learnable timestep embedding
-    added to feature maps (shared with <code>diffusion-tiny</code>). Training
-    forms <code>x_t = (1−t)·x_0 + t·x_1</code> and regresses on the velocity
-    target <code>v* = x_1 − x_0</code>. Sampling Euler-integrates
+    added to feature maps. Training forms
+    <code>x_t = (1−t)·x_0 + t·x_1</code> and regresses on the velocity target
+    <code>v* = x_1 − x_0</code>. Sampling Euler-integrates
     <code>dx/dt = v_θ(x, t)</code> from t=1 down to t=0 over
     <code>SAMPLE_STEPS=25</code> steps. MNIST data is fetched from
     solenya-media S3 on first load.

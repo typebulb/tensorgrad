@@ -40,7 +40,6 @@ export default defineConfig({
         'mlp-sin': 'mlp-sin/index.html',
         'digit-canvas': 'digit-canvas/index.html',
         'mnist-cnn': 'mnist-cnn/index.html',
-        'diffusion-tiny': 'diffusion-tiny/index.html',
         'flow-matching-tiny': 'flow-matching-tiny/index.html',
         'nerf-tiny': 'nerf-tiny/index.html',
         'kan-tiny': 'kan-tiny/index.html',

@@ -10,16 +10,26 @@
 // prediction; pad positions train the model to keep emitting '.' after EOS,
 // which is exactly what we want at sampling time. Sampling is autoregressive
 // with multinomial temperature-1 sampling, stops on '.' or SEQ_LEN.
+//
+// File layout: ML + training above, UI below. The ML section exposes a small
+// set of entry points (startTraining, stopTraining) and emits updates via the
+// `onStatus` hook the UI registers at boot. DOM access lives entirely in the
+// UI section.
 
 import {
   Module, compile, isWebGPUAvailable, lr, nn,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
   softmaxCausal, splitHeads, mergeHeads,
-  type Tensor,
+  type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
+// ============================================================================
+//                          MODEL / TRAINING
+// ============================================================================
+
 // ---------- Hyperparameters -------------------------------------------------
+
 const VOCAB = 27                              // 26 letters + '.' (BOS/EOS/pad)
 const D = 64
 const N_LAYERS = 3
@@ -112,7 +122,7 @@ function predictFwd(p: Transformer, { tokens }: { tokens: Tensor }): Tensor {
   return modelFwd(p, tokens)
 }
 
-// ---------- Sampling helpers ------------------------------------------------
+// ---------- Sampling helpers (CPU-side, on raw logits from infer.run) -------
 
 function softmaxRow(out: Float32Array, start: number, len: number): Float32Array {
   let max = -Infinity
@@ -184,47 +194,23 @@ function makeBatch(useTest: boolean): { tokens: Int32Array; targets: Int32Array;
   return { tokens, targets, mask }
 }
 
-// ---------- Logging UI ------------------------------------------------------
+// ---------- Training lifecycle ----------------------------------------------
 
-const logEl = document.getElementById('log')!
-const runBtn = document.getElementById('run') as HTMLButtonElement
-const stopBtn = document.getElementById('stop') as HTMLButtonElement
-let stopRequested = false
+let train: CompiledTraining<Transformer> | null = null
+let infer: CompiledForward<Transformer> | null = null
+let valLossFwd: CompiledForward<Transformer> | null = null
+let running = false
+let step = 0
 
-function log(msg: string, cls?: 'err' | 'ok') {
-  const line = document.createElement('div')
-  if (cls) line.className = cls
-  line.textContent = msg
-  logEl.appendChild(line)
-  logEl.scrollTop = logEl.scrollHeight
-  console.log(msg)
-  fetch('/__log', { method: 'POST', body: JSON.stringify({ msg }) }).catch(() => {})
-}
+// UI-supplied sink; assigned in the UI section so the ML side has zero DOM
+// dependencies. Default no-op lets this section behave in isolation.
+let onStatus: (msg: string, cls?: 'err' | 'ok') => void = () => {}
 
-window.addEventListener('error', e => log(`[error] ${e.message}`, 'err'))
-window.addEventListener('unhandledrejection', e => log(`[promise] ${String((e as any).reason?.message ?? (e as any).reason)}`, 'err'))
-
-stopBtn.onclick = () => { stopRequested = true }
-
-// ---------- Main ------------------------------------------------------------
-
-async function run() {
-  if (!isWebGPUAvailable()) { log('WebGPU not available. Use Chrome 113+ or Safari 17.4+.', 'err'); return }
-
-  runBtn.disabled = true; stopBtn.disabled = false; stopRequested = false; logEl.innerHTML = ''
-
-  log('Loading names corpus...')
-  const all = await loadNames()
-  TRAIN = []; TEST = []
-  for (const n of all) (isTestName(n) ? TEST : TRAIN).push(n)
-  TRAIN_SET = new Set(TRAIN)
-  const avgLen = all.reduce((s, n) => s + n.length, 0) / all.length
-  log(`  ${all.length.toLocaleString()} names loaded — ${TRAIN.length.toLocaleString()} train / ${TEST.length.toLocaleString()} val (avg length ${avgLen.toFixed(1)})`, 'ok')
-
-  log('Building model + compiling...')
+async function buildGraphs(): Promise<void> {
+  onStatus('Building model + compiling...')
   const t0 = performance.now()
   const model = new Transformer()
-  const train = await compile({
+  train = await compile({
     model,
     loss: lossFn,
     optimizer: { kind: 'adamw', lr: LR, weightDecay: 0.01 },
@@ -234,17 +220,17 @@ async function run() {
       mask:    [B, T],
     },
   })
-  log(`  ${train.paramNames.length} params, ${train.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
+  onStatus(`  ${train.paramNames.length} params, ${train.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
 
-  log('Compiling inference + val-loss graphs...')
+  onStatus('Compiling inference + val-loss graphs...')
   const tInfer = performance.now()
-  const infer = await train.attach({
+  infer = await train.attach({
     forward: predictFwd,
     inputs: { tokens: { shape: [1, T], dtype: 'i32' } },
   })
   // Forward-only loss graph at full batch shape — feeds the periodic val probe.
   // Attached to `train`, so val loss reflects the latest training state.
-  const valLossFwd = await train.attach({
+  valLossFwd = await train.attach({
     forward: lossFn,
     inputs: {
       tokens:  { shape: [B, T], dtype: 'i32' },
@@ -252,29 +238,64 @@ async function run() {
       mask:    [B, T],
     },
   })
-  log(`  compile ${(performance.now() - tInfer).toFixed(0)} ms`, 'ok')
+  onStatus(`  compile ${(performance.now() - tInfer).toFixed(0)} ms`, 'ok')
+}
 
-  const tokensBuf = new Int32Array(T)
-  async function sampleName(): Promise<string> {
-    const generated: number[] = []
-    while (generated.length + 1 < T) {
-      tokensBuf.fill(PAD)                       // tokens[0] = '.' (BOS)
-      for (let i = 0; i < generated.length; i++) tokensBuf[i + 1] = generated[i]!
-      const r = await infer.run({ tokens: tokensBuf })
-      if (r.kind === 'aborted') return generated.map(decodeChar).join('')
-      const readPos = generated.length          // next-token logits at the last written position
-      const probs = softmaxRow(r.output, readPos * VOCAB, VOCAB)
-      const next = sampleFromProbs(probs)
-      if (next === PAD) break
-      generated.push(next)
-    }
-    return generated.map(decodeChar).join('')
+const tokensBuf = new Int32Array(T)
+async function sampleName(): Promise<string> {
+  if (!infer) return ''
+  const generated: number[] = []
+  while (generated.length + 1 < T) {
+    tokensBuf.fill(PAD)                       // tokens[0] = '.' (BOS)
+    for (let i = 0; i < generated.length; i++) tokensBuf[i + 1] = generated[i]!
+    const r = await infer.run({ tokens: tokensBuf })
+    if (r.kind === 'aborted') return generated.map(decodeChar).join('')
+    const readPos = generated.length          // next-token logits at the last written position
+    const probs = softmaxRow(r.output, readPos * VOCAB, VOCAB)
+    const next = sampleFromProbs(probs)
+    if (next === PAD) break
+    generated.push(next)
   }
+  return generated.map(decodeChar).join('')
+}
 
-  log('Training...')
-  let step = 0
+async function startTraining(): Promise<void> {
+  if (running) return
+  running = true
+  step = 0
+  try {
+    if (!isWebGPUAvailable()) {
+      onStatus('WebGPU not available. Use Chrome 113+ or Safari 17.4+.', 'err')
+      running = false
+      return
+    }
+    if (TRAIN.length === 0) {
+      onStatus('Loading names corpus...')
+      const all = await loadNames()
+      TRAIN = []; TEST = []
+      for (const n of all) (isTestName(n) ? TEST : TRAIN).push(n)
+      TRAIN_SET = new Set(TRAIN)
+      const avgLen = all.reduce((s, n) => s + n.length, 0) / all.length
+      onStatus(`  ${all.length.toLocaleString()} names loaded — ${TRAIN.length.toLocaleString()} train / ${TEST.length.toLocaleString()} val (avg length ${avgLen.toFixed(1)})`, 'ok')
+    }
+    if (!train || !infer || !valLossFwd) await buildGraphs()
+    await runTraining()
+  } catch (e) {
+    running = false
+    onStatus(`error: ${(e as { message?: string })?.message ?? e}`, 'err')
+    throw e
+  }
+}
+
+function stopTraining(): void {
+  running = false
+}
+
+async function runTraining(): Promise<void> {
+  if (!train || !infer || !valLossFwd) return
+  onStatus('Training...')
   let stepStart = performance.now()
-  while (!stopRequested) {
+  while (running) {
     step++
     const sr = await train.step(makeBatch(false))
     if (sr.kind === 'aborted') break
@@ -284,7 +305,7 @@ async function run() {
       const dt = (performance.now() - stepStart) / Math.max(1, interval)
       stepStart = performance.now()
       const exPerSec = dt > 0 ? Math.round(B * 1000 / dt) : 0
-      log(`  step ${step.toString().padStart(4)}  loss ${lossVal.toFixed(4)}  (${exPerSec.toLocaleString()} ex/s)`)
+      onStatus(`  step ${step.toString().padStart(4)}  loss ${lossVal.toFixed(4)}  (${exPerSec.toLocaleString()} ex/s)`)
     }
     if (step === 1 || step % 100 === 0) {
       const vr = await valLossFwd.run(makeBatch(true))
@@ -293,13 +314,44 @@ async function run() {
       const samples: string[] = []
       for (let i = 0; i < 8; i++) samples.push(await sampleName())
       const novel = samples.filter(s => !TRAIN_SET.has(s) && s.length > 0).length
-      log(`  [val@${step}] loss ${valLoss.toFixed(4)}   [samples] ${samples.join(', ')}   (novel ${novel}/8)`)
+      onStatus(`  [val@${step}] loss ${valLoss.toFixed(4)}   [samples] ${samples.join(', ')}   (novel ${novel}/8)`)
     }
     if (step % 5 === 0) await new Promise(r => setTimeout(r, 0))
   }
-  log(`Stopped at step ${step}.`, 'ok')
-  infer.destroy(); valLossFwd.destroy(); train.destroy()
-  runBtn.disabled = false; stopBtn.disabled = true
+  onStatus(`Stopped at step ${step}.`, 'ok')
 }
 
-runBtn.onclick = () => { run().catch(e => log(`error: ${e?.message ?? e}\n${e?.stack ?? ''}`, 'err')) }
+// ============================================================================
+//                                   UI
+// ============================================================================
+
+const logEl = document.getElementById('log')!
+const runBtn = document.getElementById('run') as HTMLButtonElement
+const stopBtn = document.getElementById('stop') as HTMLButtonElement
+
+function log(msg: string, cls?: 'err' | 'ok'): void {
+  const line = document.createElement('div')
+  if (cls) line.className = cls
+  line.textContent = msg
+  logEl.appendChild(line)
+  logEl.scrollTop = logEl.scrollHeight
+  console.log(msg)
+  fetch('/__log', { method: 'POST', body: JSON.stringify({ msg }) }).catch(() => {})
+}
+
+onStatus = log
+
+window.addEventListener('error', e => log(`[error] ${e.message}`, 'err'))
+window.addEventListener('unhandledrejection', e => log(`[promise] ${String((e as any).reason?.message ?? (e as any).reason)}`, 'err'))
+
+runBtn.addEventListener('click', () => {
+  runBtn.disabled = true
+  stopBtn.disabled = false
+  logEl.innerHTML = ''
+  startTraining().finally(() => {
+    runBtn.disabled = false
+    stopBtn.disabled = true
+  })
+})
+
+stopBtn.addEventListener('click', () => { stopTraining() })
