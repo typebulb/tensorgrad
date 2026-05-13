@@ -505,7 +505,7 @@ await train.setLR(
 ```
 
 Which params receive weight decay is baked at compile time (per-param
-`{ decay: true | false }` metadata). To change `weightDecay`, `b1`, `b2`,
+`{ decay: true | false }` metadata). To change `weightDecay`, `beta1`, `beta2`,
 or any other non-LR hyperparameter, recompile via `replaceModel`.
 
 ### Gradient clipping
@@ -611,7 +611,7 @@ The library is small because of what it doesn't do. Plan accordingly:
 - **`f32` only.** No mixed precision. Inputs may be `i32` for indices.
 - **One transformation: `grad`.** No `vmap`, `pmap`, `jvp`, `custom_vjp`.
   Batch your data explicitly.
-- **Only `lr` is hot-mutable.** `weightDecay`, `b1`, `b2`, `clipGradNorm`,
+- **Only `lr` is hot-mutable.** `weightDecay`, `beta1`, `beta2`, `clipGradNorm`,
   and which params receive decay are baked at compile time. Use `setLR` for
   live LR changes; everything else needs `replaceModel({ optimizer })`.
 - **Loss must be a scalar.** A training spec's `loss` returns a rank-0 tensor.

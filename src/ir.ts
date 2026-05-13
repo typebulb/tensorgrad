@@ -152,11 +152,11 @@ export type OpNode =
   // ---- Optimizer-fused ops (Adam) ----------------------------------------
   // Single kernel per param-element. Used by appendAdam to avoid decomposing
   // the update into ~12 element-wise dispatches per param.
-  | { kind: 'adam_update_m'; out: number; m: number; g: number; b1: number }
-  | { kind: 'adam_update_v'; out: number; v: number; g: number; b2: number }
+  | { kind: 'adam_update_m'; out: number; m: number; g: number; beta1: number }
+  | { kind: 'adam_update_v'; out: number; v: number; g: number; beta2: number }
   // p_new = decayShrink * p - lrt[0] * m_new / (sqrt(v_new) + eps).
   // `lrt` is a 0-d scalar tensor_input updated per step, already including
-  // Adam's bias correction: lrt = lr * sqrt(1-b2^t) / (1-b1^t).
+  // Adam's bias correction: lrt = lr * sqrt(1-beta2^t) / (1-beta1^t).
   // `decayShrink` is AdamW's `1 - lr * weightDecay` (or 1 for non-decayed
   // params). Static-lr training bakes it as a literal; scheduled lr routes
   // it through `decayShrinkTensor` (a per-step scalar input), which takes

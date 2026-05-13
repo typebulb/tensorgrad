@@ -1,11 +1,11 @@
 // Adam / AdamW optimizer, in-graph. Per parameter P with gradient g:
-//   m_new = b1 * m + (1 - b1) * g
-//   v_new = b2 * v + (1 - b2) * g²
+//   m_new = beta1 * m + (1 - beta1) * g
+//   v_new = beta2 * v + (1 - beta2) * g²
 //   p_new = decayShrink * p - lrt * m_new / (sqrt(v_new) + eps)
 //
 // `decayShrink = 1 - lr * weightDecay` for decayed params (Loshchilov & Hutter
 // "AdamW"), else 1 (so the multiply folds out). `lrt` is supplied per step
-// from CPU and includes Adam's bias correction `sqrt(1-b2^t)/(1-b1^t)`.
+// from CPU and includes Adam's bias correction `sqrt(1-beta2^t)/(1-beta1^t)`.
 //
 // Static vs scheduled lr: a number bakes decayShrink as a kernel literal; a
 // schedule routes decayShrink through a per-step scalar input. lrt is always
@@ -137,8 +137,8 @@ export interface AdamConfig {
   /** Learning rate schedule. Pass a number for fixed lr, or a shape from
    *  the `lr` helpers (e.g., `lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 })`). */
   lr: LR
-  b1?: number   // default 0.9
-  b2?: number   // default 0.999
+  beta1?: number   // default 0.9
+  beta2?: number   // default 0.999
   eps?: number  // default 1e-8
   /** Global L2-norm gradient clipping. When set, every gradient is scaled
    *  by `min(1, maxNorm / (totalNorm + 1e-6))` before the Adam update,
@@ -182,8 +182,8 @@ function adamDecayFilter(c: AdamOrAdamW): (name: string) => boolean {
  *  shape (not pre-resolved) so the runtime can compute per-step values. */
 export interface AdamResolvedConfig {
   lr: LR
-  b1: number
-  b2: number
+  beta1: number
+  beta2: number
   eps: number
   weightDecay: number
   decayFilter: (name: string) => boolean
@@ -200,7 +200,7 @@ export interface AdamResult {
   /** Writebacks the buffer planner should wire into the runtime. */
   writebacks: WritebackDecl[]
   /** Name of the per-step scalar tensor_input. The runtime fills this each call
-   * with `lr * sqrt(1-b2^t)/(1-b1^t)` (Adam's bias-corrected effective LR). */
+   * with `lr * sqrt(1-beta2^t)/(1-beta1^t)` (Adam's bias-corrected effective LR). */
   lrtInputName: string
   /** Name of the per-step decayShrink scalar tensor_input, or null when lr is
    *  static (decayShrink baked into the kernel) or no params are decayed. */
@@ -278,8 +278,8 @@ export function appendAdam(
   const initialLr = resolveLR(config.lr, 1)
   const fullConfig: AdamResolvedConfig = {
     lr: config.lr,
-    b1: config.b1 ?? 0.9,
-    b2: config.b2 ?? 0.999,
+    beta1: config.beta1 ?? 0.9,
+    beta2: config.beta2 ?? 0.999,
     eps: config.eps ?? 1e-8,
     weightDecay: adamWeightDecay(config),
     decayFilter: adamDecayFilter(config),
@@ -326,8 +326,8 @@ export function appendAdam(
         : decayShrinkScalar !== null ? decayShrinkScalar
         : 1 - initialLr * fullConfig.weightDecay
 
-      const newM = adamUpdateM(mState, g, fullConfig.b1)
-      const newV = adamUpdateV(vState, g, fullConfig.b2)
+      const newM = adamUpdateM(mState, g, fullConfig.beta1)
+      const newV = adamUpdateV(vState, g, fullConfig.beta2)
       const newP = adamUpdateP(p, newM, newV, lrt, fullConfig.eps, decayShrink)
 
       writebacks.push({ source: newM, destName: `adam_m_${name}`, destKind: 'state' })

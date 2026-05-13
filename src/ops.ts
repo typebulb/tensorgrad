@@ -255,7 +255,7 @@ export function gelu(a: Tensor): Tensor {
 // Other axes compose as `permute-axis-to-end` + `*_last` + reshape/back-perm,
 // so there's no new codegen needed for arbitrary-axis reduction.
 
-export interface ReduceOpts {
+export interface ReduceOptions {
   /** Preserve the reduced axis as size 1 (PyTorch's `keepdim=True`).
    *  Default false (axis is removed from the output shape). Ignored when
    *  `axis` is omitted — the no-axis form always returns a 0-d scalar. */
@@ -316,7 +316,7 @@ export function argmin(a: Tensor, axis?: number): Tensor {
  *  mean(x, -1, { keepDims: true })  // preserve the trailing axis as size 1
  *  mean(x, 1)                       // reduce middle axis (permutes internally)
  *  ``` */
-export function mean(a: Tensor, axis?: number, opts?: ReduceOpts): Tensor {
+export function mean(a: Tensor, axis?: number, opts?: ReduceOptions): Tensor {
   if (axis === undefined) {
     const n = a.shape.reduce((p, d) => p * d, 1)
     if (n === 0) throw new ShapeError(`mean: cannot mean over zero elements`, captureSite('mean'))
@@ -334,7 +334,7 @@ export function mean(a: Tensor, axis?: number, opts?: ReduceOpts): Tensor {
  *  sum(x, -1)                      // PyTorch's x.sum(dim=-1)
  *  sum(x, -1, { keepDims: true })  // preserve the trailing axis as size 1
  *  ``` */
-export function sum(a: Tensor, axis?: number, opts?: ReduceOpts): Tensor {
+export function sum(a: Tensor, axis?: number, opts?: ReduceOptions): Tensor {
   if (axis === undefined) return sumLastIR(reshape(a, [-1]))
   return reduceAxis(a, axis, !!opts?.keepDims, 'sum')
 }
@@ -827,22 +827,22 @@ export function reluGrad(x: Tensor, dy: Tensor): Tensor {
 // Adam-fused ops. Each does its full per-element update in one kernel.
 // ----------------------------------------------------------------------------
 
-export function adamUpdateM(m: Tensor, g: Tensor, b1: number): Tensor {
+export function adamUpdateM(m: Tensor, g: Tensor, beta1: number): Tensor {
   const site = captureSite('adamUpdateM')
   if (m.dtype !== 'f32' || g.dtype !== 'f32') throw new ShapeError(`adamUpdateM: requires f32`, site)
   if (m.shape.length !== g.shape.length || m.shape.some((d, i) => d !== g.shape[i])) {
     throw new ShapeError(`adamUpdateM: shape mismatch`, site)
   }
-  return addOp(currentGraph(), 'adam_update_m', m.shape, 'f32', site, { m: m.id, g: g.id, b1 })
+  return addOp(currentGraph(), 'adam_update_m', m.shape, 'f32', site, { m: m.id, g: g.id, beta1 })
 }
 
-export function adamUpdateV(v: Tensor, g: Tensor, b2: number): Tensor {
+export function adamUpdateV(v: Tensor, g: Tensor, beta2: number): Tensor {
   const site = captureSite('adamUpdateV')
   if (v.dtype !== 'f32' || g.dtype !== 'f32') throw new ShapeError(`adamUpdateV: requires f32`, site)
   if (v.shape.length !== g.shape.length || v.shape.some((d, i) => d !== g.shape[i])) {
     throw new ShapeError(`adamUpdateV: shape mismatch`, site)
   }
-  return addOp(currentGraph(), 'adam_update_v', v.shape, 'f32', site, { v: v.id, g: g.id, b2 })
+  return addOp(currentGraph(), 'adam_update_v', v.shape, 'f32', site, { v: v.id, g: g.id, beta2 })
 }
 
 export function adamUpdateP(
@@ -882,7 +882,7 @@ export function adamUpdateP(
 
 // ---- 2D convolution and pooling (NCHW; layout matches PyTorch) ------------
 
-export interface Conv2dOptions {
+export interface Conv2dOpOptions {
   /** Strides along H and W. Number = same for both. Default 1. */
   stride?: number | readonly [number, number]
   /** Per-side padding along H and W (zero-padding). Default 0. */
@@ -901,7 +901,7 @@ export function pairOpt(v: number | readonly [number, number] | undefined, defau
 /** 2D convolution. Input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
  *  -> [B, C_out, H_out, W_out]. Bias is added separately via `add`; see
  *  `Conv2d` for the canonical layer wrapper. */
-export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOptions = {}): Tensor {
+export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOpOptions = {}): Tensor {
   const site = captureSite('conv2d')
   if (input.dtype !== 'f32') throw new ShapeError(`conv2d: input must be f32, got ${input.dtype}`, site)
   if (weight.dtype !== 'f32') throw new ShapeError(`conv2d: weight must be f32, got ${weight.dtype}`, site)

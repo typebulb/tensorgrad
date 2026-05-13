@@ -13,8 +13,8 @@ import type { LR } from './adam.js'
 
 export interface WireAdamConfig {
   lr: LR
-  b1: number
-  b2: number
+  beta1: number
+  beta2: number
   eps: number
   weightDecay: number
   lrIsScheduled: boolean

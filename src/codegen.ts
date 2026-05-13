@@ -719,12 +719,12 @@ ${broadcastIndexBlock('i', out.shape, a.shape, 'srcIdx')}
     }
 
     // ---- Adam (fused per-element) -----------------------------------------
-    // m_new = b1 * m + (1 - b1) * g
+    // m_new = beta1 * m + (1 - beta1) * g
     case 'adam_update_m': {
       const out = tof(op.out)
       const total = shapeSize(out.shape)
-      const b1 = op.b1
-      const oneMinusB1 = 1 - b1
+      const beta1 = op.beta1
+      const oneMinusBeta1 = 1 - beta1
       const wgsl = `
 @group(0) @binding(0) var<storage, read> m : array<f32>;
 @group(0) @binding(1) var<storage, read> g : array<f32>;
@@ -733,16 +733,16 @@ ${broadcastIndexBlock('i', out.shape, a.shape, 'srcIdx')}
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
-  out[i] = ${wgslLiteral(b1, 'f32')} * m[i] + ${wgslLiteral(oneMinusB1, 'f32')} * g[i];
+  out[i] = ${wgslLiteral(beta1, 'f32')} * m[i] + ${wgslLiteral(oneMinusBeta1, 'f32')} * g[i];
 }`.trim()
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.m), buf(op.g), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }
-    // v_new = b2 * v + (1 - b2) * g²
+    // v_new = beta2 * v + (1 - beta2) * g²
     case 'adam_update_v': {
       const out = tof(op.out)
       const total = shapeSize(out.shape)
-      const b2 = op.b2
-      const oneMinusB2 = 1 - b2
+      const beta2 = op.beta2
+      const oneMinusBeta2 = 1 - beta2
       const wgsl = `
 @group(0) @binding(0) var<storage, read> v : array<f32>;
 @group(0) @binding(1) var<storage, read> g : array<f32>;
@@ -752,7 +752,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
   let gv = g[i];
-  out[i] = ${wgslLiteral(b2, 'f32')} * v[i] + ${wgslLiteral(oneMinusB2, 'f32')} * gv * gv;
+  out[i] = ${wgslLiteral(beta2, 'f32')} * v[i] + ${wgslLiteral(oneMinusBeta2, 'f32')} * gv * gv;
 }`.trim()
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.v), buf(op.g), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
     }

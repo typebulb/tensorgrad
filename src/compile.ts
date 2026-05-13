@@ -835,8 +835,8 @@ function wireAdamConfig(r: AdamResult): WireAdamConfig {
   const c: AdamResolvedConfig = r.config
   return {
     lr: c.lr,
-    b1: c.b1,
-    b2: c.b2,
+    beta1: c.beta1,
+    beta2: c.beta2,
     eps: c.eps,
     weightDecay: c.weightDecay,
     lrIsScheduled: c.lrIsScheduled,

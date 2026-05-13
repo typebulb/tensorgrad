@@ -20,7 +20,7 @@ export {
   less, greater, where,
   // Reductions
   mean, sum, argmax, argmin,
-  type ReduceOpts,
+  type ReduceOptions,
   // Shape
   reshape, permute, swapAxes, flatten,
   splitHeads, mergeHeads,
@@ -32,7 +32,7 @@ export {
   softmaxCausal, logSoftmax, softmax, whereCausal,
   // 2D conv + pool (NCHW)
   conv2d, maxPool2d, nearestUpsample2d,
-  type Conv2dOptions, type MaxPool2dOptions,
+  type Conv2dOpOptions, type MaxPool2dOptions,
   // Slicing / structural
   narrow, concat, stack, split,
 } from './ops.js'
@@ -52,6 +52,6 @@ export { singleFlight, type SingleFlightResult } from './single-flight.js'
 export {
   Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
   crossEntropy, nllLoss,
-  type LinearOptions, type EmbeddingOptions, type Conv2dLayerOptions,
+  type LinearOptions, type EmbeddingOptions, type Conv2dOptions,
   type LossOptions,
 } from './nn.js'
