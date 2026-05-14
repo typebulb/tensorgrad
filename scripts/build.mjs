@@ -61,10 +61,11 @@ async function bundleMain(workerSource) {
 
 async function main() {
   await mkdir('dist', { recursive: true })
+  await mkdir('build-artifacts', { recursive: true })
   const workerSource = await bundleWorker()
-  // Optional debug artifact: write the worker bundle to dist/ so we can
-  // inspect it / source-map it if something blows up at runtime.
-  await writeFile('dist/worker.debug.js', workerSource)
+  // Optional debug artifact, written outside dist/ so it doesn't ship: lets us
+  // inspect / source-map the worker bundle if something blows up at runtime.
+  await writeFile('build-artifacts/worker.debug.js', workerSource)
   await bundleMain(workerSource)
   if (!watch) {
     const sizeKB = (workerSource.length / 1024).toFixed(1)
