@@ -48,6 +48,10 @@
       <p>A policy MLP plays itself; the gradient signal is just the terminal outcome of each game. Play the model while it trains and watch it get harder. Reaches optimal play (every game vs another optimal player ends in a draw) in a few hundred rollouts.</p>
     </li>
     <li>
+      <a href="/ir-viewer/">IR viewer</a>
+      <p>Pick any sample from the dropdown and see its compiled training graph as a layered DAG. Every tensor edge carries its resolved shape, color-coded by named dimension. Hover an op for the source line that produced it. Toggle between the forward-only view (just what you wrote) and the full training graph (forward + autograd + optimizer). A look under the hood at what <code>tensorgrad</code> compiles for each sample.</p>
+    </li>
+    <li>
       <a href="/transformer/">Transformer learns addition</a>
       <p>Multi-layer transformer training from scratch on 2-digit addition. Full forward + backward + Adam compiled to WGSL via tensorgrad. ~1000 examples/sec.</p>
     </li>

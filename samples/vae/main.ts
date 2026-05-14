@@ -17,21 +17,18 @@
 // as the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, Linear,
-  add, sub, mul, sum, exp, sigmoid, relu,
-  randn, square,
-  type Tensor, type CompiledTraining, type CompiledForward,
+  isWebGPUAvailable,
+  type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
+import {
+  VAE, encodeFn, decodeFn, compileTraining,
+  INPUT_DIM, LATENT_DIM, BATCH_SIZE,
+} from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
 
 const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
-const INPUT_DIM = 28 * 28
-const LATENT_DIM = 8
-const HIDDEN = 256
-const BATCH_SIZE = 128
 const N_SAMPLES = 9                   // 3×3 grid
-const BETA = 1.0                       // KL weight (vanilla VAE)
 
 // ---------------------------------------------------------------------------
 // MNIST loading. Same idx-ubyte/gzip pattern as the other MNIST samples.
@@ -54,62 +51,7 @@ async function loadImages(file: string): Promise<MnistSet> {
   return { images, count }
 }
 
-// ---------------------------------------------------------------------------
-// Model. MLP encoder + decoder; separate heads for μ and log σ².
-// ---------------------------------------------------------------------------
-
-class VAE extends Module {
-  enc1     = new Linear(INPUT_DIM, HIDDEN)
-  enc2     = new Linear(HIDDEN,    HIDDEN)
-  encMu    = new Linear(HIDDEN,    LATENT_DIM)
-  encLogV  = new Linear(HIDDEN,    LATENT_DIM)
-  dec1     = new Linear(LATENT_DIM, HIDDEN)
-  dec2     = new Linear(HIDDEN,    HIDDEN)
-  decOut   = new Linear(HIDDEN,    INPUT_DIM)
-}
-
-function encoder(m: VAE, x: Tensor): { mu: Tensor; logVar: Tensor } {
-  let h = relu(m.enc1.fwd(x))
-  h = relu(m.enc2.fwd(h))
-  return { mu: m.encMu.fwd(h), logVar: m.encLogV.fwd(h) }
-}
-
-function decoder(m: VAE, z: Tensor): Tensor {
-  let h = relu(m.dec1.fwd(z))
-  h = relu(m.dec2.fwd(h))
-  return sigmoid(m.decOut.fwd(h))
-}
-
-// Training loss = sum-over-pixels recon + β · sum-over-latent KL, both
-// averaged over the batch. KL closed form against N(0, 1):
-// `KL = -0.5 · sum(1 + log σ² − μ² − σ²)`. Recon is MSE in pixel space —
-// simpler than BCE-with-logits and converges fine on MNIST.
-function lossFn(m: VAE, { x }: { x: Tensor }): Tensor {
-  const B = x.shape[0]!
-  const { mu, logVar } = encoder(m, x)
-  // Reparameterize: z = μ + σ · ε, ε ~ N(0, 1).
-  const eps = randn([B, LATENT_DIM])
-  const sigma = exp(mul(logVar, 0.5))
-  const z = add(mu, mul(sigma, eps))
-  const xHat = decoder(m, z)
-  // Recon: per-batch mean of per-image sum of squared pixel error.
-  const recon = mul(sum(square(sub(xHat, x))), 1 / B)
-  // KL: per-batch mean of per-image sum over the latent axis.
-  const klElem = mul(sub(sub(add(logVar, 1), square(mu)), exp(logVar)), -0.5)
-  const kl = mul(sum(klElem), 1 / B)
-  return add(recon, mul(kl, BETA))
-}
-
-// Inference forwards. We expose encode-to-mean (drops σ — only the mode is
-// needed for the interpolation demo) and decode-from-latent (used for both
-// the random-samples grid and the interpolation output).
-function encodeFn(m: VAE, { x }: { x: Tensor }): Tensor {
-  return encoder(m, x).mu
-}
-
-function decodeFn(m: VAE, { z }: { z: Tensor }): Tensor {
-  return decoder(m, z)
-}
+// Model + loss + encode/decode forwards live in ./spec.ts.
 
 // ---------------------------------------------------------------------------
 // State + lifecycle
@@ -232,13 +174,7 @@ async function loadMnist(): Promise<void> {
 async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  const model = new VAE()
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adam', lr: 1e-3, clipGradNorm: 1.0 },
-    inputs: { x: [BATCH_SIZE, INPUT_DIM] },
-  })
+  train = await compileTraining()
   // Polymorphic batch for both inference proxies: encode is called at B=2
   // (interpolation endpoints), decode at B=1 (interpolation output) and
   // B=N_SAMPLES (random grid).

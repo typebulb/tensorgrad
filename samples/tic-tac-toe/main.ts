@@ -21,21 +21,15 @@
 // as the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, Linear,
-  mul, sum,
-  tanh, oneHot, logSoftmax, softmax,
-  type Tensor, type CompiledTraining, type CompiledForward,
+  isWebGPUAvailable,
+  type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
+import {
+  Policy, predictFn, compileTraining,
+  K, MAX_MOVES, N_SLOTS, STATE_DIM,
+} from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
-
-const K = 16                      // parallel games per rollout
-const MAX_MOVES = 9               // longest possible tic-tac-toe game
-const N_SLOTS = K * MAX_MOVES     // padded training batch size
-const STATE_DIM = 27              // 3 channels × 9 cells
-const N_ACTIONS = 9
-const HIDDEN = 64
-const LR = 5e-3
 
 // ---------------------------------------------------------------------------
 // Game engine. Pure CPU, board stored as `cells[0..8]` where 0 = empty,
@@ -95,37 +89,7 @@ function packState(g: Game, out: Float32Array, offset: number): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Policy model
-// ---------------------------------------------------------------------------
-
-class Policy extends Module {
-  l1 = new Linear(STATE_DIM, HIDDEN)
-  l2 = new Linear(HIDDEN,    HIDDEN)
-  out = new Linear(HIDDEN,    N_ACTIONS)
-}
-
-function policyLogits(m: Policy, state: Tensor): Tensor {
-  return m.out.fwd(tanh(m.l2.fwd(tanh(m.l1.fwd(state)))))
-}
-
-function lossFn(
-  m: Policy,
-  { states, actions, outcomes, mask }:
-    { states: Tensor; actions: Tensor; outcomes: Tensor; mask: Tensor },
-): Tensor {
-  // states: [N, 27], actions: [N] i32, outcomes: [N] f32, mask: [N] f32
-  // outcomes are pre-normalized to mean 0 / std 1 over the unmasked entries.
-  const logProbs = logSoftmax(policyLogits(m, states), -1)
-  const taken = sum(mul(logProbs, oneHot(actions, N_ACTIONS, 'f32')), -1)  // [N]
-  return mul(sum(mul(mul(taken, outcomes), mask)), -1 / N_SLOTS)
-}
-
-// Inference: softmax over action logits. Action masking happens CPU-side
-// because legality depends on the board state, which isn't in the tensor.
-function predictFn(m: Policy, { state }: { state: Tensor }): Tensor {
-  return softmax(policyLogits(m, state), -1)
-}
+// Model + loss + predict live in ./spec.ts.
 
 // ---------------------------------------------------------------------------
 // State + lifecycle
@@ -303,18 +267,7 @@ async function modelMove(g: Game): Promise<number> {
 async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  const model = new Policy()
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adam', lr: LR },
-    inputs: {
-      states:   [N_SLOTS, STATE_DIM],
-      actions:  { shape: [N_SLOTS], dtype: 'i32' },
-      outcomes: [N_SLOTS],
-      mask:     [N_SLOTS],
-    },
-  })
+  train = await compileTraining()
   // Polymorphic batch dim: K=16 during rollouts, B=1 for human-vs-AI moves.
   infer = await train.attach({
     forward: predictFn,

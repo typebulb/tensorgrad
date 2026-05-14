@@ -9,8 +9,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "domeleon": "^0.6.0",
     "tensorgrad": "workspace:*",
-    "domeleon": "^0.6.0"
+    "tensorgrad-viewer": "workspace:*"
   },
   "devDependencies": {
     "typescript": "*",

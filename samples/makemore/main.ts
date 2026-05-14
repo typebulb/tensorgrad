@@ -17,109 +17,22 @@
 // UI section.
 
 import {
-  Module, compile, isWebGPUAvailable, lr,
-  Linear, LayerNorm, crossEntropy,
-  add, mul, sum, swapAxes,
-  relu, matmul, embedding, arange,
-  softmaxCausal, splitHeads, mergeHeads,
-  type Tensor, type CompiledTraining, type CompiledForward,
+  isWebGPUAvailable,
+  type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
+import {
+  Transformer, lossFn, predictFwd, compileTraining,
+  B, T, VOCAB, SEQ_LEN,
+} from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
-
-// ---------- Hyperparameters -------------------------------------------------
-
-const VOCAB = 27                              // 26 letters + '.' (BOS/EOS/pad)
-const D = 64
-const N_LAYERS = 3
-const N_HEADS = 4
-const D_HEAD = D / N_HEADS
-const SEQ_LEN = 17                            // longest name is 15 chars: '.' + 15 + '.'
-const T = SEQ_LEN - 1                         // 16 input positions; targets shifted by 1
-const B = 32
-const LR = lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 })
-const SCALE_QK = 1 / Math.sqrt(D_HEAD)
 
 const PAD = 0                                 // '.' = 0; 'a'..'z' = 1..26
 const encodeChar = (ch: string) => ch === '.' ? PAD : (ch.charCodeAt(0) - 97 + 1)
 const decodeChar = (idx: number) => idx === PAD ? '.' : String.fromCharCode(idx - 1 + 97)
 
-// ---------- Modules: structure of the param tree ---------------------------
-
-class Attention extends Module {
-  q = new Linear(D, D, { bias: false })
-  k = new Linear(D, D, { bias: false })
-  v = new Linear(D, D, { bias: false })
-  o = new Linear(D, D, { bias: false })
-}
-
-class MLP extends Module {
-  up   = new Linear(D, 4 * D)
-  down = new Linear(4 * D, D)
-}
-
-class Block extends Module {
-  ln1  = new LayerNorm(D)
-  attn = new Attention()
-  ln2  = new LayerNorm(D)
-  mlp  = new MLP()
-}
-
-class Transformer extends Module {
-  tok_emb: Tensor; pos_emb: Tensor
-  layers: Block[]
-  lnf: LayerNorm
-  constructor() {
-    super()
-    this.tok_emb = this.param([VOCAB, D])
-    this.pos_emb = this.param([SEQ_LEN, D])
-    this.layers = []
-    for (let i = 0; i < N_LAYERS; i++) this.layers.push(new Block())
-    this.lnf = new LayerNorm(D)
-  }
-}
-
-// ---------- Forward functions ----------------------------------------------
-
-function attentionFwd(p: Attention, x: Tensor): Tensor {
-  const q = splitHeads(p.q.fwd(x), N_HEADS)
-  const k = splitHeads(p.k.fwd(x), N_HEADS)
-  const v = splitHeads(p.v.fwd(x), N_HEADS)
-  const scores = mul(matmul(q, swapAxes(k, -1, -2)), SCALE_QK)
-  return p.o.fwd(mergeHeads(matmul(softmaxCausal(scores), v)))
-}
-
-function mlpFwd(p: MLP, x: Tensor): Tensor {
-  return p.down.fwd(relu(p.up.fwd(x)))
-}
-
-function blockFwd(p: Block, x: Tensor): Tensor {
-  const a = attentionFwd(p.attn, p.ln1.fwd(x))
-  const x1 = add(x, a)
-  return add(x1, mlpFwd(p.mlp, p.ln2.fwd(x1)))
-}
-
-function modelFwd(p: Transformer, tokens: Tensor): Tensor {
-  const tokE = embedding(tokens, p.tok_emb)
-  const posE = embedding(arange(T), p.pos_emb)
-  let x = add(tokE, posE)
-  for (let i = 0; i < p.layers.length; i++) x = blockFwd(p.layers[i]!, x)
-  return matmul(p.lnf.fwd(x), swapAxes(p.tok_emb, -1, -2))   // tied output head
-}
-
-// Loss is mean cross-entropy over *valid* positions only — those predicting the
-// first char of the name through the EOS '.'. The mask is normalized by
-// makeBatch so sum(mask) = 1 over the whole batch, which makes sum(ce*mask)
-// the mean and lets the reported number compare directly with makemore
-// references (~2.0 at convergence) instead of being diluted ~2x by trivial
-// '.'-from-'.' pad positions.
-function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tensor; targets: Tensor; mask: Tensor }): Tensor {
-  return sum(mul(crossEntropy(modelFwd(p, tokens), targets, { reduction: 'none' }), mask))
-}
-
-function predictFwd(p: Transformer, { tokens }: { tokens: Tensor }): Tensor {
-  return modelFwd(p, tokens)
-}
+// Model + loss + predict live in ./spec.ts so the IR viewer can import them
+// without triggering this file's boot side effects.
 
 // ---------- Sampling helpers (CPU-side, on raw logits from infer.run) -------
 
@@ -208,17 +121,7 @@ let onStatus: (msg: string, cls?: 'err' | 'ok') => void = () => {}
 async function buildGraphs(): Promise<void> {
   onStatus('Building model + compiling...')
   const t0 = performance.now()
-  const model = new Transformer()
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adamw', lr: LR, weightDecay: 0.01 },
-    inputs: {
-      tokens:  { shape: [B, T], dtype: 'i32' },
-      targets: { shape: [B, T], dtype: 'i32' },
-      mask:    [B, T],
-    },
-  })
+  train = await compileTraining()
   onStatus(`  ${train.paramNames.length} params, ${train.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')
 
   onStatus('Compiling inference + val-loss graphs...')

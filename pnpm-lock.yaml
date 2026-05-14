@@ -35,6 +35,9 @@ importers:
       tensorgrad:
         specifier: workspace:*
         version: link:..
+      tensorgrad-viewer:
+        specifier: workspace:*
+        version: link:../viewer
     devDependencies:
       typescript:
         specifier: '*'
@@ -42,6 +45,19 @@ importers:
       vite:
         specifier: '*'
         version: 8.0.11(esbuild@0.28.0)(tsx@4.21.0)
+
+  viewer:
+    dependencies:
+      '@viz-js/viz':
+        specifier: ^3.27.0
+        version: 3.27.0
+      tensorgrad:
+        specifier: workspace:*
+        version: link:..
+    devDependencies:
+      typescript:
+        specifier: '*'
+        version: 6.0.3
 
 packages:
 
@@ -621,6 +637,9 @@ packages:
 
   '@types/estree@1.0.8':
     resolution: {integrity: sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w==}
+
+  '@viz-js/viz@3.27.0':
+    resolution: {integrity: sha512-XjU8elLpbRieto/kHYWqT01yXDDYBTZB/Ny8ZUuheQw3Kc61I5Eto5+3Lb1PMdjEkh+DKA4Or5b2kxUY3cEfnA==}
 
   balanced-match@4.0.4:
     resolution: {integrity: sha512-BLrgEcRTwX2o6gGxGOCNyMvGSp35YofuYzw9h1IMTRmKqttAZZVU67bdb9Pr2vUHA8+j3i2tJfjO6C6+4myGTA==}
@@ -1245,6 +1264,8 @@ snapshots:
     optional: true
 
   '@types/estree@1.0.8': {}
+
+  '@viz-js/viz@3.27.0': {}
 
   balanced-match@4.0.4: {}
 

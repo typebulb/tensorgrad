@@ -14,5 +14,6 @@ typebulbs
 # (excluded above with `typebulbs`).
 .github/
 .claude/
+.claude-paste
 specs/
 temp/

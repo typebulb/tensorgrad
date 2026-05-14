@@ -16,85 +16,16 @@
 // as the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, init,
-  add, sub, mul, mean, abs, neg, max, where, less, square,
-  silu, reshape, swapAxes, matmul, arange,
-  type Tensor, type CompiledTraining, type CompiledForward,
+  isWebGPUAvailable,
+  type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
+import {
+  KAN, predictFn, compileTraining,
+  KNOTS, HIDDEN, BATCH,
+} from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
-
-const G = 5
-const DEG = 3
-const KNOTS = G + DEG     // 8 basis functions per edge
-const HIDDEN = 4
-const BATCH = 256
-const LR = 0.005
-
-// ---------- KAN layer ------------------------------------------------------
-
-class KANLayer extends Module {
-  C: Tensor       // spline coefficients [O, I, KNOTS]
-  Wres: Tensor    // residual linear weight [I, O]
-  constructor(public readonly I: number, public readonly O: number) {
-    super()
-    this.C = this.param([O, I, KNOTS], { init: init.randn({ scale: 0.1 }) })
-    this.Wres = this.param([I, O])
-  }
-}
-
-// Cubic B-spline basis (closed form):
-//   |u| < 1:     2/3 - u² + |u|³/2
-//   1 ≤ |u| < 2: (2 - |u|)³ / 6
-//   |u| ≥ 2:     0
-// Outside |u| ≥ 1 we evaluate case2 with (2-|u|) clamped to ≥0, which naturally
-// yields 0 past the support — saves a chained `where`.
-function bsplineBasis(u: Tensor): Tensor {
-  const absU = abs(u)
-  const u2 = mul(u, u)
-  const absU3 = mul(absU, u2)
-  const case1 = add(sub(mul(absU3, 0.5), u2), 2 / 3)
-  const outerBase = max(neg(sub(absU, 2)), 0)
-  const case2 = mul(mul(outerBase, mul(outerBase, outerBase)), 1 / 6)
-  return where(less(absU, 1), case1, case2)
-}
-
-function kanFwd(layer: KANLayer, x: Tensor): Tensor {
-  const B = x.shape[0]!
-  const I = layer.I
-  const O = layer.O
-  // Map x ∈ [-1, 1] to xScaled ∈ [0, KNOTS-1]; basis functions live at integer
-  // positions 0..KNOTS-1, so this spreads inputs evenly across the grid.
-  const xScaled = mul(add(x, 1), (KNOTS - 1) / 2)
-  const kVec = arange(KNOTS, 'f32')
-  const u = sub(reshape(xScaled, [B, I, 1]), reshape(kVec, [1, 1, KNOTS]))
-  const basis = bsplineBasis(u)                                  // [B, I, KNOTS]
-  // einsum('bik,oik->bo', basis, C) via flatten + matmul.
-  const basisFlat = reshape(basis, [B, I * KNOTS])
-  const CFlat = reshape(layer.C, [O, I * KNOTS])
-  const Yspline = matmul(basisFlat, swapAxes(CFlat, 0, 1))       // [B, O]
-  const Yres = matmul(silu(x), layer.Wres)                       // [B, O]
-  return add(Yspline, Yres)
-}
-
-// ---------- Model: two stacked KAN layers ---------------------------------
-
-class KAN extends Module {
-  l1 = new KANLayer(1, HIDDEN)
-  l2 = new KANLayer(HIDDEN, 1)
-}
-
-function modelFwd(m: KAN, x: Tensor): Tensor {
-  return kanFwd(m.l2, kanFwd(m.l1, x))
-}
-
-function lossFn(m: KAN, { x, y }: { x: Tensor; y: Tensor }): Tensor {
-  return mean(square(sub(modelFwd(m, x), y)))
-}
-
-function predictFn(m: KAN, { x }: { x: Tensor }): Tensor {
-  return modelFwd(m, x)
-}
+// Model + loss + predict live in ./spec.ts.
 
 // ---------- Batch generation ----------------------------------------------
 
@@ -156,13 +87,7 @@ async function renderAll(): Promise<void> {
 async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  const model = new KAN()
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adam', lr: LR },
-    inputs: { x: [BATCH, 1], y: [BATCH, 1] },
-  })
+  train = await compileTraining()
   infer = await train.attach({
     forward: predictFn,
     inputs: { x: [null, 1] },

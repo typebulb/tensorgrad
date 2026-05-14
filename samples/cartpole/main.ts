@@ -21,21 +21,17 @@
 // as the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, Linear,
-  mul, sum,
-  tanh, oneHot, logSoftmax, softmax,
-  type Tensor, type CompiledTraining, type CompiledForward,
+  isWebGPUAvailable,
+  type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
+import {
+  Policy, predictFn, compileTraining,
+  K, MAX_T, STATE_DIM, N_ACTIONS,
+} from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
 
-const K = 16                                // parallel envs per rollout
-const MAX_T = 200                           // max steps per rollout
-const STATE_DIM = 4
-const N_ACTIONS = 2
-const HIDDEN = 16
 const GAMMA = 0.99                          // reward discount
-const LR = 5e-3
 
 // CartPole physics constants (OpenAI gym defaults).
 const GRAVITY = 9.8
@@ -85,41 +81,7 @@ function stepEnv(e: Env, action: number): Env {
   return { x, xDot, theta, thetaDot, done }
 }
 
-// ---------------------------------------------------------------------------
-// Policy model
-// ---------------------------------------------------------------------------
-
-class Policy extends Module {
-  l1 = new Linear(STATE_DIM, HIDDEN)
-  l2 = new Linear(HIDDEN, N_ACTIONS)
-}
-
-function policyLogits(m: Policy, state: Tensor): Tensor {
-  return m.l2.fwd(tanh(m.l1.fwd(state)))
-}
-
-// Training loss: -E[log π(a | s) · normalized_return · mask]. Masked steps
-// (past episode-done) contribute zero. We divide by total batch size (MAX_T·K)
-// rather than the unmasked count — biases the gradient magnitude slightly
-// but doesn't change direction, and Adam absorbs the rescaling.
-function lossFn(
-  m: Policy,
-  { states, actions, returns, mask }:
-    { states: Tensor; actions: Tensor; returns: Tensor; mask: Tensor },
-): Tensor {
-  const logits = policyLogits(m, states)              // [N, A]
-  const logProbs = logSoftmax(logits, -1)              // [N, A]
-  // Per-step log-prob of the action that was actually taken.
-  const taken = sum(mul(logProbs, oneHot(actions, N_ACTIONS, 'f32')), -1)  // [N]
-  return mul(sum(mul(mul(taken, returns), mask)), -1 / (MAX_T * K))
-}
-
-// Inference: softmax over logits, sampling happens CPU-side. The proxy is
-// polymorphic over batch — same graph serves the K-wide rollout and the
-// (unused here, but easy to add) B=1 case.
-function predictFn(m: Policy, { state }: { state: Tensor }): Tensor {
-  return softmax(policyLogits(m, state), -1)
-}
+// Model + loss + predict live in ./spec.ts.
 
 // ---------------------------------------------------------------------------
 // State + lifecycle
@@ -241,18 +203,7 @@ async function runTraining(): Promise<void> {
 async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  const model = new Policy()
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adam', lr: LR },
-    inputs: {
-      states:  [MAX_T * K, STATE_DIM],
-      actions: { shape: [MAX_T * K], dtype: 'i32' },
-      returns: [MAX_T * K],
-      mask:    [MAX_T * K],
-    },
-  })
+  train = await compileTraining()
   infer = await train.attach({
     forward: predictFn,
     inputs: { state: [K, STATE_DIM] },

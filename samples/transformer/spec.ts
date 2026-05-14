@@ -1,0 +1,127 @@
+// Import-safe spec for the addition-transformer sample. Consumed by main.ts
+// to drive the live sample, and by the IR viewer picker to render the
+// training graph.
+
+import {
+  Module, compile, lr, Linear, LayerNorm, crossEntropy, capture,
+  add, mul, sum, swapAxes,
+  relu, matmul, embedding, arange,
+  softmaxCausal, splitHeads, mergeHeads,
+  type Tensor, type CompiledTraining,
+} from 'tensorgrad'
+import type { IRSpec } from 'tensorgrad-viewer'
+
+export const VOCAB = 12
+export const D = 64
+export const N_LAYERS = 3
+export const N_HEADS = 4
+export const D_HEAD = D / N_HEADS
+export const SEQ_LEN = 9
+export const T = SEQ_LEN - 1
+export const RESULT_START = 6
+export const N_RESULT_DIGITS = 3
+export const TOK_PLUS = 10
+export const TOK_EQ = 11
+export const B = 128
+export const LR = lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 })
+const SCALE_QK = 1 / Math.sqrt(D_HEAD)
+
+export class Attention extends Module {
+  q = new Linear(D, D, { bias: false })
+  k = new Linear(D, D, { bias: false })
+  v = new Linear(D, D, { bias: false })
+  o = new Linear(D, D, { bias: false })
+}
+
+export class MLP extends Module {
+  up   = new Linear(D, 4 * D)
+  down = new Linear(4 * D, D)
+}
+
+export class Block extends Module {
+  ln1  = new LayerNorm(D)
+  attn = new Attention()
+  ln2  = new LayerNorm(D)
+  mlp  = new MLP()
+}
+
+export class Transformer extends Module {
+  tok_emb: Tensor; pos_emb: Tensor
+  layers: Block[]
+  lnf: LayerNorm
+  constructor() {
+    super()
+    this.tok_emb = this.param([VOCAB, D])
+    this.pos_emb = this.param([SEQ_LEN, D])
+    this.layers = []
+    for (let i = 0; i < N_LAYERS; i++) this.layers.push(new Block())
+    this.lnf = new LayerNorm(D)
+  }
+}
+
+function attentionFwd(p: Attention, x: Tensor, layerIdx: number): Tensor {
+  const q = splitHeads(p.q.fwd(x), N_HEADS)
+  const k = splitHeads(p.k.fwd(x), N_HEADS)
+  const v = splitHeads(p.v.fwd(x), N_HEADS)
+  const scores = mul(matmul(q, swapAxes(k, -1, -2)), SCALE_QK)
+  const attn = capture(`attn.${layerIdx}`, softmaxCausal(scores))
+  return p.o.fwd(mergeHeads(matmul(attn, v)))
+}
+
+function mlpFwd(p: MLP, x: Tensor): Tensor {
+  return p.down.fwd(relu(p.up.fwd(x)))
+}
+
+function blockFwd(p: Block, x: Tensor, layerIdx: number): Tensor {
+  const a = attentionFwd(p.attn, p.ln1.fwd(x), layerIdx)
+  const x1 = add(x, a)
+  return add(x1, mlpFwd(p.mlp, p.ln2.fwd(x1)))
+}
+
+export function modelFwd(p: Transformer, tokens: Tensor): Tensor {
+  const tokE = embedding(tokens, p.tok_emb)
+  const posE = embedding(arange(T), p.pos_emb)
+  let x = add(tokE, posE)
+  for (let i = 0; i < p.layers.length; i++) {
+    x = capture(`residual.${i}`, x)
+    x = blockFwd(p.layers[i]!, x, i)
+  }
+  const xn = p.lnf.fwd(x)
+  return matmul(xn, swapAxes(p.tok_emb, -1, -2))
+}
+
+export function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tensor; targets: Tensor; mask: Tensor }): Tensor {
+  const ce = crossEntropy(modelFwd(p, tokens), targets, { reduction: 'none' })
+  return mul(sum(mul(ce, mask)), 1 / (B * N_RESULT_DIGITS))
+}
+
+export function predictFwd(p: Transformer, { tokens }: { tokens: Tensor }): Tensor {
+  return modelFwd(p, tokens)
+}
+
+export const inputs = {
+  tokens:  { shape: [B, T], dtype: 'i32' },
+  targets: { shape: [B, T], dtype: 'i32' },
+  mask:    [T],
+} as const
+
+export const optimizer = { kind: 'adamw', lr: LR, weightDecay: 0.01 } as const
+
+export function compileTraining(): Promise<CompiledTraining<Transformer>> {
+  return compile({ model: new Transformer(), loss: lossFn, inputs, optimizer })
+}
+
+export const irSpec: IRSpec = {
+  label: 'Transformer learns addition',
+  compile: compileTraining,
+  dims: [
+    { size: B,      name: 'B',  desc: 'batch' },
+    { size: T,      name: 'T',  desc: 'seq len (8)' },
+    { size: SEQ_LEN, name: 'T+1', desc: 'full seq incl. last' },
+    { size: D,      name: 'D',  desc: 'model dim' },
+    { size: N_HEADS, name: 'H', desc: 'heads' },
+    { size: D_HEAD, name: 'D/H', desc: 'per-head dim' },
+    { size: VOCAB,  name: 'V',  desc: 'vocab' },
+    { size: 4 * D,  name: '4D', desc: 'MLP hidden' },
+  ],
+}

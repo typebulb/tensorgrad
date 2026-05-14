@@ -19,23 +19,17 @@
 // Status is streamed to the vite dev server via POST /__log so you can
 // tail it in the terminal instead of copying from the browser console.
 
+import { isWebGPUAvailable, type CompiledTraining, type CompiledForward } from 'tensorgrad'
 import {
-  Module, compile, isWebGPUAvailable, Linear, Conv2d, crossEntropy,
-  relu, flatten, maxPool2d,
-  type Tensor, type CompiledTraining, type CompiledForward,
-} from 'tensorgrad'
+  CNN, predictFn, compileTraining,
+  BATCH_SIZE, EVAL_BATCH, N_CLASSES,
+} from './spec.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
-const BATCH_SIZE = 64
-const EVAL_BATCH = 256
-const N_CLASSES = 10
-const CONV1_OUT = 16
-const CONV2_OUT = 32
-const HIDDEN = 64
 
 // UI-supplied sink; assigned in the UI section so the ML side has zero DOM
 // dependencies. Default no-op lets this section behave in isolation.
@@ -70,35 +64,8 @@ async function loadSet(imgFile: string, lblFile: string): Promise<MnistSet> {
   return { images, labels, count }
 }
 
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
-
-class CNN extends Module {
-  conv1 = new Conv2d(1, CONV1_OUT, 3, { padding: 1 })
-  conv2 = new Conv2d(CONV1_OUT, CONV2_OUT, 3, { padding: 1 })
-  // After two 2x2 pools: 28 → 14 → 7. Conv2 output is [B, 32, 7, 7] → 1568.
-  fc1 = new Linear(CONV2_OUT * 7 * 7, HIDDEN)
-  fc2 = new Linear(HIDDEN, N_CLASSES)
-}
-
-function forwardLogits(m: CNN, x: Tensor): Tensor {
-  let h = relu(m.conv1.fwd(x))     // [B, 16, 28, 28]
-  h = maxPool2d(h, 2)              // [B, 16, 14, 14]
-  h = relu(m.conv2.fwd(h))         // [B, 32, 14, 14]
-  h = maxPool2d(h, 2)              // [B, 32, 7, 7]
-  h = flatten(h, 1)                // [B, 1568]
-  h = relu(m.fc1.fwd(h))           // [B, 64]
-  return m.fc2.fwd(h)              // [B, 10] logits
-}
-
-function lossFn(m: CNN, { x, y }: { x: Tensor; y: Tensor }): Tensor {
-  return crossEntropy(forwardLogits(m, x), y)
-}
-
-function predictFn(m: CNN, { x }: { x: Tensor }): Tensor {
-  return forwardLogits(m, x)
-}
+// Model + loss + predict live in ./spec.ts so the IR viewer can import them
+// without triggering this file's boot side effects.
 
 // ---------------------------------------------------------------------------
 // State
@@ -210,16 +177,7 @@ async function boot(): Promise<void> {
 
   log('compiling CNN…')
   const t0 = performance.now()
-  const model = new CNN()
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adamw', lr: 1e-3, weightDecay: 0.01, clipGradNorm: 1.0 },
-    inputs: {
-      x: [BATCH_SIZE, 1, 28, 28],
-      y: { shape: [BATCH_SIZE], dtype: 'i32' },
-    },
-  })
+  train = await compileTraining()
   infer = await train.attach({
     forward: predictFn,
     inputs: { x: [EVAL_BATCH, 1, 28, 28] },

@@ -18,20 +18,15 @@
 // as the other samples.
 
 import {
-  Module, compile, isWebGPUAvailable, Linear,
-  mul, sub, mean, reshape, relu, sigmoid, concat,
-  sin, cos, square,
-  type Tensor, type CompiledTraining, type CompiledForward,
+  isWebGPUAvailable,
+  type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
+import {
+  NeRFTiny, predictFn, compileTraining,
+  IMG_H, IMG_W, N_PIXELS, BATCH_SIZE, L_FREQS,
+} from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
-
-const IMG_W = 64
-const IMG_H = 64
-const N_PIXELS = IMG_W * IMG_H
-const BATCH_SIZE = 1024
-const L_FREQS = 8                // π · 2^0 .. π · 2^7
-const HIDDEN = 64
 
 // Frequency bands π·2^k, used once per step as a tensor input. Pre-allocated
 // so we're not re-creating a 32-byte buffer every step.
@@ -48,52 +43,7 @@ for (let row = 0; row < IMG_H; row++) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
-
-class NeRFTiny extends Module {
-  l1 = new Linear(4 * L_FREQS, HIDDEN)
-  l2 = new Linear(HIDDEN, HIDDEN)
-  l3 = new Linear(HIDDEN, HIDDEN)
-  l4 = new Linear(HIDDEN, 3)
-}
-
-// Sinusoidal positional encoding (NeRF / Tancik et al.). For each input
-// coordinate, emit `sin(π·2^k·x), cos(π·2^k·x)` for k = 0..L-1, then
-// concat the sin features and cos features. Result: `[B, 4L]`.
-//
-// The encoding is the whole reason a tiny MLP can fit pixel detail at all:
-// raw coords give the network only smooth (low-frequency) representation
-// power; the sinusoidal expansion supplies the high-frequency basis the
-// network composes high-detail outputs from.
-function posEnc(coords: Tensor, freqs: Tensor): Tensor {
-  const B = coords.shape[0]!
-  // [B, 2, 1] × [1, 1, L] → [B, 2, L] via right-aligned broadcast.
-  const scaled = mul(reshape(coords, [B, 2, 1]), reshape(freqs, [1, 1, L_FREQS]))
-  const sinF = reshape(sin(scaled), [B, 2 * L_FREQS])
-  const cosF = reshape(cos(scaled), [B, 2 * L_FREQS])
-  return concat([sinF, cosF], 1)
-}
-
-function modelFwd(m: NeRFTiny, coords: Tensor, freqs: Tensor): Tensor {
-  let h = posEnc(coords, freqs)
-  h = relu(m.l1.fwd(h))
-  h = relu(m.l2.fwd(h))
-  h = relu(m.l3.fwd(h))
-  return sigmoid(m.l4.fwd(h))
-}
-
-function lossFn(
-  m: NeRFTiny,
-  { coords, rgb, freqs }: { coords: Tensor; rgb: Tensor; freqs: Tensor },
-): Tensor {
-  return mean(square(sub(modelFwd(m, coords, freqs), rgb)))
-}
-
-function predictFn(m: NeRFTiny, { coords, freqs }: { coords: Tensor; freqs: Tensor }): Tensor {
-  return modelFwd(m, coords, freqs)
-}
+// Model + loss + predict live in ./spec.ts.
 
 // ---------------------------------------------------------------------------
 // State + lifecycle
@@ -155,17 +105,7 @@ async function runTraining(): Promise<void> {
 async function buildGraphs(): Promise<void> {
   onStatus('compiling…')
   const t0 = performance.now()
-  const model = new NeRFTiny()
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adam', lr: 1e-3 },
-    inputs: {
-      coords: [BATCH_SIZE, 2],
-      rgb:    [BATCH_SIZE, 3],
-      freqs:  [L_FREQS],
-    },
-  })
+  train = await compileTraining()
   infer = await train.attach({
     forward: predictFn,
     inputs: {

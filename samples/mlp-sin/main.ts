@@ -8,37 +8,12 @@
 // `onStatus` and `onPlot` hooks the UI registers at boot. DOM access lives
 // entirely in the UI section.
 
-import {
-  Module, compile, Linear,
-  mul, sub, mean, relu,
-  type Tensor, type CompiledTraining, type CompiledForward,
-} from 'tensorgrad'
+import type { CompiledTraining, CompiledForward } from 'tensorgrad'
+import { MLP, B, predictFn, compileTraining } from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
 
-const HIDDEN = 64
-const B = 256                 // batch size
-const LR = 0.005
 const PLOT_N = 200
-
-class MLP extends Module {
-  l1 = new Linear(1, HIDDEN)
-  l2 = new Linear(HIDDEN, HIDDEN)
-  l3 = new Linear(HIDDEN, 1)
-}
-
-function modelFwd(p: MLP, x: Tensor): Tensor {
-  return p.l3.fwd(relu(p.l2.fwd(relu(p.l1.fwd(x)))))
-}
-
-function lossFn(p: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
-  const diff = sub(modelFwd(p, x), y)
-  return mean(mul(diff, diff))
-}
-
-function predictFn(p: MLP, { x }: { x: Tensor }): Tensor {
-  return modelFwd(p, x)
-}
 
 const plotXs = new Float32Array(PLOT_N)
 for (let i = 0; i < PLOT_N; i++) plotXs[i] = -Math.PI + (2 * Math.PI) * i / (PLOT_N - 1)
@@ -84,13 +59,7 @@ function stopTraining(): void {
 async function buildGraphs(): Promise<void> {
   onStatus('Compiling MLP + Adam...')
   const t0 = performance.now()
-  const model = new MLP()
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adam', lr: LR },
-    inputs: { x: [B, 1], y: [B, 1] },
-  })
+  train = await compileTraining()
   // Inference graph for plotting: shares param buffers with the training
   // graph, polymorphic over the batch dim so we can run it at PLOT_N=200
   // without recompiling per-shape.

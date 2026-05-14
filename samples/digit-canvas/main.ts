@@ -35,19 +35,17 @@
 // entirely in the UI section.
 
 import {
-  Module, compile, isWebGPUAvailable, Linear, crossEntropy,
-  relu, dropout, softmax, singleFlight,
-  type Tensor, type CompiledTraining, type CompiledForward, type SingleFlightResult,
+  isWebGPUAvailable, singleFlight,
+  type CompiledTraining, type CompiledForward, type SingleFlightResult,
 } from 'tensorgrad'
+import {
+  MLP, predictFn, compileTraining, type DigitInputs,
+  INPUT_DIM, N_CLASSES, BATCH_SIZE, EVAL_BATCH,
+} from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
 
 const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
-const INPUT_DIM = 784       // 28 * 28 grayscale pixels
-const N_CLASSES = 10
-const BATCH_SIZE = 64       // training-step batch
-const EVAL_BATCH = 256      // per-probe test-accuracy sample size
-const DROP_P = 0.1          // dropout probability on hidden activations
 
 // ---------------------------------------------------------------------------
 // MNIST loading. The files are the standard 60k-train / 10k-test idx-ubyte
@@ -80,46 +78,7 @@ async function loadSet(imgFile: string, lblFile: string): Promise<MnistSet> {
   return { images, labels, count }
 }
 
-// ---------------------------------------------------------------------------
-// Model. Plain MLP — INPUT_DIM → hidden → N_CLASSES with ReLU activations.
-// Train- and inference-forward share the structural pass through layers,
-// differing only in whether dropout is applied between hidden activations.
-// ---------------------------------------------------------------------------
-
-class MLP extends Module {
-  layers: Linear[]
-  constructor(sizes: readonly number[]) {
-    super()
-    this.layers = []
-    for (let i = 0; i < sizes.length - 1; i++) {
-      this.layers.push(new Linear(sizes[i]!, sizes[i + 1]!))
-    }
-  }
-}
-
-function netFwd(m: MLP, x: Tensor, applyDropout: boolean): Tensor {
-  let h = x
-  for (let i = 0; i < m.layers.length; i++) {
-    h = m.layers[i]!.fwd(h)
-    if (i < m.layers.length - 1) {
-      h = relu(h)
-      if (applyDropout) h = dropout(h, DROP_P)
-    }
-  }
-  return h
-}
-
-function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
-  // Training-only: dropout active on hidden activations.
-  const logits = netFwd(m, x, true)
-  return crossEntropy(logits, y)
-}
-
-function predictFn(m: MLP, { x }: { x: Tensor }): Tensor {
-  // Inference: no dropout. Returns softmax probabilities so the canvas can
-  // show a confidence breakdown without compiling a second forward sibling.
-  return softmax(netFwd(m, x, false))
-}
+// Model + loss + predict live in ./spec.ts.
 
 // ---------------------------------------------------------------------------
 // Training state + lifecycle. The UI calls into these entry points; status
@@ -131,9 +90,7 @@ let testData: MnistSet
 let trainOrder: number[] = []
 let trainCursor = 0
 
-// `any` here is the polymorphic-shape input type that includes `null` —
-// the public type signature doesn't yet narrow nicely with wildcards.
-let train: CompiledTraining<MLP, { x: readonly [number, number]; y: { shape: readonly [number]; dtype: 'i32' } }> | null = null
+let train: CompiledTraining<MLP, DigitInputs> | null = null
 let infer: CompiledForward<MLP, { x: readonly [null, number] }> | null = null
 let predictCanvas: ((input: Float32Array) => Promise<SingleFlightResult<Float32Array | null>>) | null = null
 
@@ -226,19 +183,9 @@ async function loadMnist(): Promise<void> {
 }
 
 async function buildGraphs(hidden: number, lr: number): Promise<void> {
-  const layers = [INPUT_DIM, hidden, N_CLASSES]
-  onStatus(`compiling MLP ${layers.join(' → ')}…`)
+  onStatus(`compiling MLP ${INPUT_DIM} → ${hidden} → ${N_CLASSES}…`)
   const t0 = performance.now()
-  const model = new MLP(layers)
-  train = await compile({
-    model,
-    loss: lossFn,
-    optimizer: { kind: 'adamw', lr, weightDecay: 0.01, clipGradNorm: 1.0 },
-    inputs: {
-      x: [BATCH_SIZE, INPUT_DIM],
-      y: { shape: [BATCH_SIZE], dtype: 'i32' },
-    },
-  })
+  train = await compileTraining(hidden, lr)
   // One polymorphic inference graph — the same infer serves the canvas
   // (B=1) and the accuracy probe (B=EVAL_BATCH).
   infer = await train.attach({
