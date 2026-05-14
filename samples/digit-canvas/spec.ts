@@ -46,7 +46,7 @@ export function lossFn(m: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   return crossEntropy(logits, y)
 }
 
-export function predictFn(m: MLP, { x }: { x: Tensor }): Tensor {
+function predictFn(m: MLP, { x }: { x: Tensor }): Tensor {
   return softmax(netFwd(m, x, false))
 }
 
@@ -54,6 +54,8 @@ const baseInputs = {
   x: [BATCH_SIZE, INPUT_DIM],
   y: { shape: [BATCH_SIZE], dtype: 'i32' },
 } as const
+
+export const predictInputs = { x: [BATCH_SIZE, INPUT_DIM] } as const
 
 export type DigitInputs = typeof baseInputs
 
@@ -74,6 +76,8 @@ export function compileTraining(
 export const irSpec = {
   label: 'Digit Canvas (MNIST)',
   compile: () => compileTraining(),
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: BATCH_SIZE,     name: 'B',   desc: 'batch' },
     { size: INPUT_DIM,      name: '784', desc: 'pixels (28²)' },

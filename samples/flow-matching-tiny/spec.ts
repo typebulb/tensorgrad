@@ -47,7 +47,7 @@ export function lossFn(
   return mean(square(sub(modelFwd(m, x_t, t), v_target)))
 }
 
-export function predictFn(m: TinyFlow, { x_t, t }: { x_t: Tensor; t: Tensor }): Tensor {
+function predictFn(m: TinyFlow, { x_t, t }: { x_t: Tensor; t: Tensor }): Tensor {
   return modelFwd(m, x_t, t)
 }
 
@@ -55,6 +55,11 @@ export const inputs = {
   x_0: [BATCH_SIZE, 1, IMG_H, IMG_W],
   t:            { shape: [BATCH_SIZE], dtype: 'i32' },
   tNorm_table:  [T_STEPS + 1],
+} as const
+
+export const predictInputs = {
+  x_t: [BATCH_SIZE, 1, IMG_H, IMG_W],
+  t:   { shape: [BATCH_SIZE], dtype: 'i32' },
 } as const
 
 export const optimizer = { kind: 'adam', lr: 2e-4, clipGradNorm: 1.0 } as const
@@ -68,6 +73,8 @@ export function compileTraining(): Promise<CompiledTraining<TinyFlow>> {
 export const irSpec = {
   label: 'Flow-matching-tiny (MNIST)',
   compile: compileTraining,
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: BATCH_SIZE, name: 'B',    desc: 'batch' },
     { size: 1,          name: 'C₁',   desc: 'image channel' },

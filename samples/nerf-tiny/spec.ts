@@ -45,13 +45,18 @@ export function lossFn(
   return mean(square(sub(modelFwd(m, coords, freqs), rgb)))
 }
 
-export function predictFn(m: NeRFTiny, { coords, freqs }: { coords: Tensor; freqs: Tensor }): Tensor {
+function predictFn(m: NeRFTiny, { coords, freqs }: { coords: Tensor; freqs: Tensor }): Tensor {
   return modelFwd(m, coords, freqs)
 }
 
 export const inputs = {
   coords: [BATCH_SIZE, 2],
   rgb:    [BATCH_SIZE, 3],
+  freqs:  [L_FREQS],
+} as const
+
+export const predictInputs = {
+  coords: [BATCH_SIZE, 2],
   freqs:  [L_FREQS],
 } as const
 
@@ -66,6 +71,8 @@ export function compileTraining(): Promise<CompiledTraining<NeRFTiny>> {
 export const irSpec = {
   label: 'NeRF-tiny (image INR)',
   compile: compileTraining,
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: BATCH_SIZE,    name: 'B',  desc: 'batch (random pixels)' },
     { size: 2,             name: '2',  desc: 'xy coords' },

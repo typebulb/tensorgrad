@@ -20,7 +20,7 @@ import {
   type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 import {
-  KAN, predictFn, compileTraining,
+  KAN, irSpec, compileTraining,
   KNOTS, HIDDEN, BATCH,
 } from './spec.ts'
 
@@ -89,7 +89,7 @@ async function buildGraphs(): Promise<void> {
   const t0 = performance.now()
   train = await compileTraining()
   infer = await train.attach({
-    forward: predictFn,
+    forward: irSpec.predict,
     inputs: { x: [null, 1] },
   })
   step = 0

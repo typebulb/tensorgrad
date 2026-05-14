@@ -36,7 +36,7 @@ export function lossFn(
   return mul(sum(mul(mul(taken, outcomes), mask)), -1 / N_SLOTS)
 }
 
-export function predictFn(m: Policy, { state }: { state: Tensor }): Tensor {
+function predictFn(m: Policy, { state }: { state: Tensor }): Tensor {
   return softmax(policyLogits(m, state), -1)
 }
 
@@ -46,6 +46,8 @@ export const inputs = {
   outcomes: [N_SLOTS],
   mask:     [N_SLOTS],
 } as const
+
+export const predictInputs = { state: [K, STATE_DIM] } as const
 
 export const optimizer = { kind: 'adam', lr: LR } as const
 
@@ -58,6 +60,8 @@ export function compileTraining(): Promise<CompiledTraining<Policy>> {
 export const irSpec = {
   label: 'Tic-Tac-Toe self-play',
   compile: compileTraining,
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: N_SLOTS,   name: 'N',  desc: 'rollout slots (K·9)' },
     { size: K,         name: 'K',  desc: 'parallel games' },

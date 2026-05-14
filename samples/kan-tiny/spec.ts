@@ -63,11 +63,12 @@ export function lossFn(m: KAN, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   return mean(square(sub(modelFwd(m, x), y)))
 }
 
-export function predictFn(m: KAN, { x }: { x: Tensor }): Tensor {
+function predictFn(m: KAN, { x }: { x: Tensor }): Tensor {
   return modelFwd(m, x)
 }
 
 export const inputs = { x: [BATCH, 1], y: [BATCH, 1] } as const
+export const predictInputs = { x: [BATCH, 1] } as const
 export const optimizer = { kind: 'adam', lr: LR } as const
 
 export function compileTraining(): Promise<CompiledTraining<KAN>> {
@@ -79,6 +80,8 @@ export function compileTraining(): Promise<CompiledTraining<KAN>> {
 export const irSpec = {
   label: 'KAN-tiny (per-edge splines)',
   compile: compileTraining,
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: BATCH,  name: 'B',   desc: 'batch' },
     { size: HIDDEN, name: 'H',   desc: 'hidden width' },

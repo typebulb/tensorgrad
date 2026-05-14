@@ -25,7 +25,7 @@ import {
   type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 import {
-  Policy, predictFn, compileTraining,
+  Policy, irSpec, compileTraining,
   K, MAX_MOVES, N_SLOTS, STATE_DIM,
 } from './spec.ts'
 
@@ -270,7 +270,7 @@ async function buildGraphs(): Promise<void> {
   train = await compileTraining()
   // Polymorphic batch dim: K=16 during rollouts, B=1 for human-vs-AI moves.
   infer = await train.attach({
-    forward: predictFn,
+    forward: irSpec.predict,
     inputs: { state: [null, STATE_DIM] },
   })
   rolloutCount = 0

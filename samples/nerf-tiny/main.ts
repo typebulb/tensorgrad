@@ -22,7 +22,7 @@ import {
   type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 import {
-  NeRFTiny, predictFn, compileTraining,
+  NeRFTiny, irSpec, compileTraining,
   IMG_H, IMG_W, N_PIXELS, BATCH_SIZE, L_FREQS,
 } from './spec.ts'
 
@@ -107,7 +107,7 @@ async function buildGraphs(): Promise<void> {
   const t0 = performance.now()
   train = await compileTraining()
   infer = await train.attach({
-    forward: predictFn,
+    forward: irSpec.predict,
     inputs: {
       coords: [N_PIXELS, 2],
       freqs:  [L_FREQS],

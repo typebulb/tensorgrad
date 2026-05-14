@@ -37,7 +37,7 @@ export function lossFn(m: CNN, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   return crossEntropy(forwardLogits(m, x), y)
 }
 
-export function predictFn(m: CNN, { x }: { x: Tensor }): Tensor {
+function predictFn(m: CNN, { x }: { x: Tensor }): Tensor {
   return forwardLogits(m, x)
 }
 
@@ -45,6 +45,8 @@ export const inputs = {
   x: [BATCH_SIZE, 1, 28, 28],
   y: { shape: [BATCH_SIZE], dtype: 'i32' },
 } as const
+
+export const predictInputs = { x: [BATCH_SIZE, 1, 28, 28] } as const
 
 export const optimizer = {
   kind: 'adamw', lr: 1e-3, weightDecay: 0.01, clipGradNorm: 1.0,
@@ -59,6 +61,8 @@ export function compileTraining(): Promise<CompiledTraining<CNN>> {
 export const irSpec = {
   label: 'MNIST CNN',
   compile: compileTraining,
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: BATCH_SIZE, name: 'B',   desc: 'batch' },
     { size: 1,          name: 'Cin', desc: 'input channels' },

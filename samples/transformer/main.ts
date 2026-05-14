@@ -12,7 +12,7 @@
 
 import type { CompiledTraining, CompiledForward } from 'tensorgrad'
 import {
-  Transformer, predictFwd, compileTraining,
+  Transformer, irSpec, compileTraining,
   B, T, VOCAB, N_HEADS, RESULT_START, N_RESULT_DIGITS, TOK_PLUS, TOK_EQ,
 } from './spec.ts'
 
@@ -65,7 +65,7 @@ async function buildGraphs(): Promise<void> {
   onStatus('Compiling inference graph (B=1)...')
   const tInfer = performance.now()
   infer = await train.attach({
-    forward: predictFwd,
+    forward: irSpec.predict,
     inputs: { tokens: { shape: [1, T], dtype: 'i32' } },
   })
   onStatus(`  compile ${(performance.now() - tInfer).toFixed(0)} ms`, 'ok')

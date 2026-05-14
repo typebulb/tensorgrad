@@ -25,7 +25,7 @@ import {
   type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 import {
-  Policy, predictFn, compileTraining,
+  Policy, irSpec, compileTraining,
   K, MAX_T, STATE_DIM, N_ACTIONS,
 } from './spec.ts'
 
@@ -205,7 +205,7 @@ async function buildGraphs(): Promise<void> {
   const t0 = performance.now()
   train = await compileTraining()
   infer = await train.attach({
-    forward: predictFn,
+    forward: irSpec.predict,
     inputs: { state: [K, STATE_DIM] },
   })
   rolloutCount = 0

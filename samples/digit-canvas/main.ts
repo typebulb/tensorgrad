@@ -39,7 +39,7 @@ import {
   type CompiledTraining, type CompiledForward, type SingleFlightResult,
 } from 'tensorgrad'
 import {
-  MLP, predictFn, compileTraining, type DigitInputs,
+  MLP, irSpec, compileTraining, type DigitInputs,
   INPUT_DIM, N_CLASSES, BATCH_SIZE, EVAL_BATCH,
 } from './spec.ts'
 
@@ -189,7 +189,7 @@ async function buildGraphs(hidden: number, lr: number): Promise<void> {
   // One polymorphic inference graph — the same infer serves the canvas
   // (B=1) and the accuracy probe (B=EVAL_BATCH).
   infer = await train.attach({
-    forward: predictFn,
+    forward: irSpec.predict,
     inputs: { x: [null, INPUT_DIM] },
   })
   // singleFlight: rapid strokes supersede each other; only the latest call

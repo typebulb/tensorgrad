@@ -9,7 +9,7 @@
 // entirely in the UI section.
 
 import type { CompiledTraining, CompiledForward } from 'tensorgrad'
-import { MLP, B, predictFn, compileTraining } from './spec.ts'
+import { MLP, B, irSpec, compileTraining } from './spec.ts'
 
 // ========== MODEL / TRAINING ==========
 
@@ -64,7 +64,7 @@ async function buildGraphs(): Promise<void> {
   // graph, polymorphic over the batch dim so we can run it at PLOT_N=200
   // without recompiling per-shape.
   infer = await train.attach({
-    forward: predictFn,
+    forward: irSpec.predict,
     inputs: { x: [null, 1] },
   })
   onStatus(`  ${train.kernels.length} kernels, compile ${(performance.now() - t0).toFixed(0)} ms`, 'ok')

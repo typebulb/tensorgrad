@@ -21,7 +21,7 @@ import {
   type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 import {
-  Transformer, lossFn, predictFwd, compileTraining,
+  Transformer, lossFn, irSpec, compileTraining,
   B, T, VOCAB, SEQ_LEN,
 } from './spec.ts'
 
@@ -127,7 +127,7 @@ async function buildGraphs(): Promise<void> {
   onStatus('Compiling inference + val-loss graphs...')
   const tInfer = performance.now()
   infer = await train.attach({
-    forward: predictFwd,
+    forward: irSpec.predict,
     inputs: { tokens: { shape: [1, T], dtype: 'i32' } },
   })
   // Forward-only loss graph at full batch shape — feeds the periodic val probe.

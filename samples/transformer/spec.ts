@@ -93,7 +93,7 @@ export function lossFn(p: Transformer, { tokens, targets, mask }: { tokens: Tens
   return mul(sum(mul(ce, mask)), 1 / (B * N_RESULT_DIGITS))
 }
 
-export function predictFwd(p: Transformer, { tokens }: { tokens: Tensor }): Tensor {
+function predictFwd(p: Transformer, { tokens }: { tokens: Tensor }): Tensor {
   return modelFwd(p, tokens)
 }
 
@@ -101,6 +101,10 @@ export const inputs = {
   tokens:  { shape: [B, T], dtype: 'i32' },
   targets: { shape: [B, T], dtype: 'i32' },
   mask:    [T],
+} as const
+
+export const predictInputs = {
+  tokens: { shape: [B, T], dtype: 'i32' },
 } as const
 
 export const optimizer = { kind: 'adamw', lr: LR, weightDecay: 0.01 } as const
@@ -114,6 +118,8 @@ export function compileTraining(): Promise<CompiledTraining<Transformer>> {
 export const irSpec = {
   label: 'Transformer learns addition',
   compile: compileTraining,
+  predict: predictFwd,
+  predictInputs,
   dims: [
     { size: B,      name: 'B',  desc: 'batch' },
     { size: T,      name: 'T',  desc: 'seq len (8)' },

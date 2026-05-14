@@ -57,7 +57,16 @@ export function decodeFn(m: VAE, { z }: { z: Tensor }): Tensor {
   return decoder(m, z)
 }
 
+// Full deterministic reconstruction: x → encoder.mu → decoder → xHat. Used
+// by the NN Blueprint bulb to render the inference graph; main.ts attaches
+// encodeFn/decodeFn separately for its UI's encode-only and decode-only
+// paths, so this function is not exported.
+function predictFn(m: VAE, { x }: { x: Tensor }): Tensor {
+  return decoder(m, encoder(m, x).mu)
+}
+
 export const inputs = { x: [BATCH_SIZE, INPUT_DIM] } as const
+export const predictInputs = { x: [BATCH_SIZE, INPUT_DIM] } as const
 export const optimizer = { kind: 'adam', lr: 1e-3, clipGradNorm: 1.0 } as const
 
 export function compileTraining(): Promise<CompiledTraining<VAE>> {
@@ -69,6 +78,8 @@ export function compileTraining(): Promise<CompiledTraining<VAE>> {
 export const irSpec = {
   label: 'VAE (MNIST)',
   compile: compileTraining,
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: BATCH_SIZE, name: 'B',   desc: 'batch' },
     { size: INPUT_DIM,  name: '784', desc: 'pixels (28²)' },

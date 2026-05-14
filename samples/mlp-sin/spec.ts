@@ -26,11 +26,12 @@ export function lossFn(p: MLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
   return mean(mul(diff, diff))
 }
 
-export function predictFn(p: MLP, { x }: { x: Tensor }): Tensor {
+function predictFn(p: MLP, { x }: { x: Tensor }): Tensor {
   return modelFwd(p, x)
 }
 
 export const inputs = { x: [B, 1], y: [B, 1] } as const
+export const predictInputs = { x: [B, 1] } as const
 export const optimizer = { kind: 'adam', lr: LR } as const
 
 export function compileTraining(): Promise<CompiledTraining<MLP>> {
@@ -42,6 +43,8 @@ export function compileTraining(): Promise<CompiledTraining<MLP>> {
 export const irSpec = {
   label: 'MLP fits sin(x)',
   compile: compileTraining,
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: B,      name: 'B', desc: 'batch' },
     { size: HIDDEN, name: 'H', desc: 'hidden width' },

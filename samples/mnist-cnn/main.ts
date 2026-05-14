@@ -21,7 +21,7 @@
 
 import { isWebGPUAvailable, type CompiledTraining, type CompiledForward } from 'tensorgrad'
 import {
-  CNN, predictFn, compileTraining,
+  CNN, irSpec, compileTraining,
   BATCH_SIZE, EVAL_BATCH, N_CLASSES,
 } from './spec.ts'
 
@@ -179,7 +179,7 @@ async function boot(): Promise<void> {
   const t0 = performance.now()
   train = await compileTraining()
   infer = await train.attach({
-    forward: predictFn,
+    forward: irSpec.predict,
     inputs: { x: [EVAL_BATCH, 1, 28, 28] },
   })
   log(`compiled in ${(performance.now() - t0).toFixed(0)} ms (${train.kernels.length} kernels) — training…`)

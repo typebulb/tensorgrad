@@ -35,7 +35,7 @@ export function lossFn(
   return mul(sum(mul(mul(taken, returns), mask)), -1 / (MAX_T * K))
 }
 
-export function predictFn(m: Policy, { state }: { state: Tensor }): Tensor {
+function predictFn(m: Policy, { state }: { state: Tensor }): Tensor {
   return softmax(policyLogits(m, state), -1)
 }
 
@@ -45,6 +45,8 @@ export const inputs = {
   returns: [MAX_T * K],
   mask:    [MAX_T * K],
 } as const
+
+export const predictInputs = { state: [K, STATE_DIM] } as const
 
 export const optimizer = { kind: 'adam', lr: LR } as const
 
@@ -57,6 +59,8 @@ export function compileTraining(): Promise<CompiledTraining<Policy>> {
 export const irSpec = {
   label: 'CartPole REINFORCE',
   compile: compileTraining,
+  predict: predictFn,
+  predictInputs,
   dims: [
     { size: MAX_T * K,  name: 'N',   desc: 'rollout slots (MAX_T·K)' },
     { size: K,          name: 'K',   desc: 'parallel envs' },

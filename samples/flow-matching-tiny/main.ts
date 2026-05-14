@@ -22,7 +22,7 @@ import {
   type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 import {
-  TinyFlow, predictFn, compileTraining,
+  TinyFlow, irSpec, compileTraining,
   IMG_H, IMG_W, IMG_LEN, T_STEPS, BATCH_SIZE,
 } from './spec.ts'
 
@@ -179,7 +179,7 @@ async function buildGraphs(): Promise<void> {
   const t0 = performance.now()
   train = await compileTraining()
   infer = await train.attach({
-    forward: predictFn,
+    forward: irSpec.predict,
     inputs: {
       x_t: [1, 1, IMG_H, IMG_W],
       t:   { shape: [1], dtype: 'i32' },
