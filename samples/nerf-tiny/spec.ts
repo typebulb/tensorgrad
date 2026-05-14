@@ -1,5 +1,5 @@
-// Import-safe spec for NeRF-tiny. Consumed by main.ts and the IR viewer
-// picker.
+// Import-safe spec for NeRF-tiny. Consumed by main.ts; also exports
+// `irSpec` for paste into the NN Blueprint bulb.
 
 import {
   Module, compile, Linear,
@@ -7,7 +7,6 @@ import {
   sin, cos, square,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const IMG_W = 64
 export const IMG_H = 64
@@ -62,7 +61,9 @@ export function compileTraining(): Promise<CompiledTraining<NeRFTiny>> {
   return compile({ model: new NeRFTiny(), loss: lossFn, inputs, optimizer })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'NeRF-tiny (image INR)',
   compile: compileTraining,
   dims: [
@@ -75,3 +76,4 @@ export const irSpec: IRSpec = {
     { size: HIDDEN,        name: 'H',  desc: 'hidden' },
   ],
 }
+

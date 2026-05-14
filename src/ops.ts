@@ -552,8 +552,11 @@ export function takeAlongAxis(input: Tensor, indices: Tensor, axis: number): Ten
  *  to `oneHot(indices, vocab) @ table` so autograd works without a dedicated
  *  scatter-with-atomic-add backward — the matmul adjoint rule handles it.
  *  `table` is `[vocab, dim]`; `indices` is any shape `[...]` of i32; result
- *  is `[..., dim]`. The vocab size is taken from `table.shape[0]`. */
-export function embedding(indices: Tensor, table: Tensor): Tensor {
+ *  is `[..., dim]`. The vocab size is taken from `table.shape[0]`. Argument
+ *  order matches PyTorch's functional `torch.embedding(weight, input)`,
+ *  JAX/NumPy `take(arr, indices)`, and the sibling `takeAlongAxis(input,
+ *  indices, axis)` in this library: array first, indices second. */
+export function embedding(table: Tensor, indices: Tensor): Tensor {
   const site = captureSite('embedding')
   if (table.shape.length !== 2) {
     throw new ShapeError(`embedding: table must be 2-d [vocab, dim], got ${showShape(table.shape)}`, site)
@@ -882,7 +885,7 @@ export function adamUpdateP(
 
 // ---- 2D convolution and pooling (NCHW; layout matches PyTorch) ------------
 
-export interface Conv2dOpOptions {
+export interface Conv2dOptions {
   /** Strides along H and W. Number = same for both. Default 1. */
   stride?: number | readonly [number, number]
   /** Per-side padding along H and W (zero-padding). Default 0. */
@@ -901,7 +904,7 @@ export function pairOpt(v: number | readonly [number, number] | undefined, defau
 /** 2D convolution. Input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
  *  -> [B, C_out, H_out, W_out]. Bias is added separately via `add`; see
  *  `Conv2d` for the canonical layer wrapper. */
-export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOpOptions = {}): Tensor {
+export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOptions = {}): Tensor {
   const site = captureSite('conv2d')
   if (input.dtype !== 'f32') throw new ShapeError(`conv2d: input must be f32, got ${input.dtype}`, site)
   if (weight.dtype !== 'f32') throw new ShapeError(`conv2d: weight must be f32, got ${weight.dtype}`, site)

@@ -1,5 +1,5 @@
-// Import-safe spec for makemore. Consumed by main.ts to drive the live
-// sample, and by the IR viewer picker to render the training graph.
+// Import-safe spec for makemore. Consumed by main.ts; also exports
+// `irSpec` for paste into the NN Blueprint bulb.
 
 import {
   Module, compile, lr,
@@ -9,7 +9,6 @@ import {
   softmaxCausal, splitHeads, mergeHeads,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const VOCAB = 27
 export const D = 64
@@ -74,8 +73,8 @@ function blockFwd(p: Block, x: Tensor): Tensor {
 }
 
 export function modelFwd(p: Transformer, tokens: Tensor): Tensor {
-  const tokE = embedding(tokens, p.tok_emb)
-  const posE = embedding(arange(T), p.pos_emb)
+  const tokE = embedding(p.tok_emb, tokens)
+  const posE = embedding(p.pos_emb, arange(T))
   let x = add(tokE, posE)
   for (let i = 0; i < p.layers.length; i++) x = blockFwd(p.layers[i]!, x)
   return matmul(p.lnf.fwd(x), swapAxes(p.tok_emb, -1, -2))
@@ -101,7 +100,9 @@ export function compileTraining(): Promise<CompiledTraining<Transformer>> {
   return compile({ model: new Transformer(), loss: lossFn, inputs, optimizer })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'Makemore (name generation)',
   compile: compileTraining,
   dims: [
@@ -115,3 +116,4 @@ export const irSpec: IRSpec = {
     { size: 4 * D,   name: '4D', desc: 'MLP hidden' },
   ],
 }
+

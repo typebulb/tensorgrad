@@ -1,5 +1,5 @@
 // Import-safe spec for KAN-tiny. Consumed by main.ts to drive the live
-// sample, and by the IR viewer picker.
+// sample.
 
 import {
   Module, compile, init,
@@ -7,7 +7,6 @@ import {
   silu, reshape, swapAxes, matmul, arange,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const G = 5
 export const DEG = 3
@@ -75,7 +74,9 @@ export function compileTraining(): Promise<CompiledTraining<KAN>> {
   return compile({ model: new KAN(), loss: lossFn, inputs, optimizer })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'KAN-tiny (per-edge splines)',
   compile: compileTraining,
   dims: [
@@ -85,3 +86,4 @@ export const irSpec: IRSpec = {
     { size: 1,      name: '1',   desc: 'scalar I/O' },
   ],
 }
+

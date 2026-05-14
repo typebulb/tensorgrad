@@ -1,14 +1,13 @@
 // Import-safe spec for the digit-canvas sample. The model is parameterized
 // (hidden layer size + LR are runtime-controlled via UI dropdowns), so
-// `compileTraining` takes those as arguments. The IR viewer picker uses the
-// defaults.
+// `compileTraining` takes those as arguments. Also exports `irSpec` for
+// paste into the NN Blueprint bulb (uses defaults).
 
 import {
   Module, compile, Linear, crossEntropy,
   relu, dropout, softmax,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const INPUT_DIM = 784
 export const N_CLASSES = 10
@@ -70,7 +69,9 @@ export function compileTraining(
   })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'Digit Canvas (MNIST)',
   compile: () => compileTraining(),
   dims: [
@@ -80,3 +81,4 @@ export const irSpec: IRSpec = {
     { size: N_CLASSES,      name: 'K',   desc: 'classes' },
   ],
 }
+

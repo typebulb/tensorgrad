@@ -1,12 +1,11 @@
 // Import-safe spec: model + loss + compile shape, with no boot side effects.
-// Consumed by main.ts to drive the live sample, and by the IR viewer picker
-// to render the training graph.
+// Consumed by main.ts; also exports `irSpec` for paste into the NN
+// Blueprint bulb.
 
 import {
   Module, compile, Linear, mul, sub, mean, relu,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const HIDDEN = 64
 export const B = 256
@@ -38,7 +37,9 @@ export function compileTraining(): Promise<CompiledTraining<MLP>> {
   return compile({ model: new MLP(), loss: lossFn, inputs, optimizer })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'MLP fits sin(x)',
   compile: compileTraining,
   dims: [
@@ -47,3 +48,4 @@ export const irSpec: IRSpec = {
     { size: 1,      name: '1', desc: 'scalar in/out' },
   ],
 }
+

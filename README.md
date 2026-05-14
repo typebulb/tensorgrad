@@ -312,7 +312,10 @@ specific resolved shape (compiles + caches lazily, like `run`).
 connectivity, captures, and outputs. `Graph`, `OpNode`, `Tensor`,
 `Shape`, `Dtype`, and `CallSite` are exported for walking it. Each
 `Tensor.site` carries the user-frame stack from op-call time, useful for
-"where in user code did this op come from" displays.
+"where in user code did this op come from" displays. Use
+`getOpInputs(op): readonly number[]` to read the input tensor ids of any
+op without re-implementing a switch over every kind — that switch belongs
+inside the library, where new op kinds get added.
 
 ```ts
 import type { Graph } from 'tensorgrad'
@@ -402,7 +405,7 @@ Imported from `'tensorgrad'`:
 - Shape: `reshape`, `permute`, `swapAxes` (`permute` is full-axis reorder, like PyTorch's `permute` / JAX's `jnp.transpose`)
 - Attention layout: `splitHeads(x, nHeads)`, `mergeHeads(x)`
 - Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank)
-- Indexing / casting: `oneHot`, `arange`, `embedding`, `takeAlongAxis(input, indices, axis)` (general per-axis gather)
+- Indexing / casting: `oneHot`, `arange`, `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (general per-axis gather; both array/data first to match PyTorch functional, JAX, NumPy)
 - Slicing / structural: `narrow(t, axis, start, length)` (PyTorch `torch.narrow`), `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal(x, fillValue)` (mask below the diagonal; pairs with `softmaxCausal` when you need a non-softmax causal mask)
 - 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`, `flatten(x, startAxis?)`

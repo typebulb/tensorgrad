@@ -17,6 +17,7 @@
 <body>
   <h1>tensorgrad samples</h1>
   <p class="subtitle">Small browser-side ML programs built on the <code>tensorgrad</code> library.</p>
+  <p class="subtitle">Want to see how these models compile to a computation graph? Try the <a href="https://typebulb.com">NN Blueprint</a> bulb — describe any network in plain English and watch its forward graph appear.</p>
 
   <ul>
     <li>
@@ -46,10 +47,6 @@
     <li>
       <a href="/tic-tac-toe/">Tic-Tac-Toe self-play</a>
       <p>A policy MLP plays itself; the gradient signal is just the terminal outcome of each game. Play the model while it trains and watch it get harder. Reaches optimal play (every game vs another optimal player ends in a draw) in a few hundred rollouts.</p>
-    </li>
-    <li>
-      <a href="/ir-viewer/">IR viewer</a>
-      <p>Pick any sample from the dropdown and see its compiled training graph as a layered DAG. Every tensor edge carries its resolved shape, color-coded by named dimension. Hover an op for the source line that produced it. Toggle between the forward-only view (just what you wrote) and the full training graph (forward + autograd + optimizer). A look under the hood at what <code>tensorgrad</code> compiles for each sample.</p>
     </li>
     <li>
       <a href="/transformer/">Transformer learns addition</a>

@@ -47,7 +47,7 @@ assertGradMatchesFD('matmul (linear algebra)', [4, 8], p => {
 //    where the indices point. No flow back through i32 indices.
 assertGradMatchesFD('embedding (gradient routes to selected rows)', [10, 4], p => {
   const idx = tensorInput('idx', [3], 'i32')
-  return mean(embedding(idx, p))
+  return mean(embedding(p, idx))
 }, { extraInputs: { idx: new Int32Array([2, 5, 7]) } })
 
 // 5. Fused ML primitive: softmax + mask combined in one IR op. The

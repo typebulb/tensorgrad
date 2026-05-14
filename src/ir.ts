@@ -305,6 +305,57 @@ export function addOp<K extends OpNode['kind']>(
   return out
 }
 
+/**
+ * The tensor ids an op reads as inputs, in a canonical order. Centralizes
+ * the op-kind → input-field mapping so external graph walkers (IR viewers,
+ * custom optimizers, correctness harnesses) don't have to maintain their
+ * own switch over every op kind — that switch silently breaks every time
+ * the IR grows a new op.
+ *
+ * Returns tensor ids only (the `out` field is the *output*, not an input,
+ * so it's excluded). Order matches the op's natural reading order: lhs
+ * before rhs for binops, condition before branches for `where`, etc. Scalar
+ * parameters baked into the op (e.g. `dropout.p`, `mul_scalar.scalar`) are
+ * not tensors and don't appear.
+ */
+export function getOpInputs(op: OpNode): readonly number[] {
+  switch (op.kind) {
+    case 'param_input': case 'tensor_input': case 'state_input':
+    case 'arange': case 'const_scalar': case 'randn':
+      return []
+    case 'add': case 'sub': case 'mul': case 'div': case 'min': case 'max':
+    case 'less': case 'greater':
+    case 'matmul': case 'matmul_batched':
+      return [op.a, op.b]
+    case 'mul_scalar': case 'add_scalar':
+    case 'sqrt': case 'rsqrt': case 'log': case 'exp': case 'relu':
+    case 'neg': case 'abs': case 'tanh': case 'sigmoid': case 'sin': case 'cos':
+    case 'mean_last': case 'sum_last': case 'argmax_last':
+    case 'reshape': case 'permute':
+    case 'softmax_causal_last': case 'log_softmax_last':
+    case 'where_causal': case 'stop_gradient':
+    case 'slice_last_range': case 'slice_range': case 'scatter_axis':
+    case 'broadcast_to': case 'sum_to_shape':
+      return [op.a]
+    case 'dropout': return [op.a, op.seed]
+    case 'one_hot': return [op.indices]
+    case 'where': return [op.cond, op.a, op.b]
+    case 'concat': return op.inputs
+    case 'relu_grad': return [op.x, op.dy]
+    case 'adam_update_m': return [op.m, op.g]
+    case 'adam_update_v': return [op.v, op.g]
+    case 'adam_update_p':
+      return op.decayShrinkTensor !== null
+        ? [op.p, op.mNew, op.vNew, op.lrt, op.decayShrinkTensor]
+        : [op.p, op.mNew, op.vNew, op.lrt]
+    case 'conv2d': return [op.input, op.weight]
+    case 'conv2d_input_grad': return [op.weight, op.dy]
+    case 'conv2d_weight_grad': return [op.input, op.dy]
+    case 'max_pool_2d': return [op.input]
+    case 'max_pool_2d_grad': return [op.input, op.dy]
+  }
+}
+
 // Cheap: materializes the stack string but defers parsing to format time.
 export function captureSite(opName: string): CallSite {
   const stack = (new Error()).stack ?? ''

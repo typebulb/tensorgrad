@@ -4,6 +4,7 @@
 // live in the sibling `tensorgrad/internal` barrel.
 
 export type { Tensor, Shape, Dtype, OpNode, Graph, CallSite } from './ir.js'
+export { getOpInputs } from './ir.js'
 export { ShapeError } from './shape.js'
 export { capture } from './capture.js'
 export {
@@ -32,7 +33,7 @@ export {
   softmaxCausal, logSoftmax, softmax, whereCausal,
   // 2D conv + pool (NCHW)
   conv2d, maxPool2d, nearestUpsample2d,
-  type Conv2dOpOptions, type MaxPool2dOptions,
+  type Conv2dOptions, type MaxPool2dOptions,
   // Slicing / structural
   narrow, concat, stack, split,
 } from './ops.js'
@@ -52,7 +53,7 @@ export { singleFlight, type SingleFlightResult } from './single-flight.js'
 export {
   Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
   crossEntropy, nllLoss,
-  type LinearOptions, type EmbeddingOptions, type Conv2dOptions,
+  type LinearOptions, type EmbeddingOptions, type Conv2dLayerOptions,
   type LayerNormOptions, type RMSNormOptions,
   type LossOptions,
 } from './nn.js'

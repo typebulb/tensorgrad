@@ -1,5 +1,5 @@
-// Import-safe spec for the flow-matching sample. Consumed by main.ts and
-// by the IR viewer picker.
+// Import-safe spec for the flow-matching sample. Consumed by main.ts;
+// also exports `irSpec` for paste into the NN Blueprint bulb.
 
 import {
   Module, compile, Linear, Embedding, Conv2d,
@@ -7,7 +7,6 @@ import {
   randn, takeAlongAxis, square,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const IMG_H = 28
 export const IMG_W = 28
@@ -64,7 +63,9 @@ export function compileTraining(): Promise<CompiledTraining<TinyFlow>> {
   return compile({ model: new TinyFlow(), loss: lossFn, inputs, optimizer })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'Flow-matching-tiny (MNIST)',
   compile: compileTraining,
   dims: [
@@ -76,3 +77,4 @@ export const irSpec: IRSpec = {
     { size: T_STEPS + 1, name: 'T+1', desc: 'time buckets' },
   ],
 }
+

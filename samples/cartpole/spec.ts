@@ -1,5 +1,5 @@
 // Import-safe spec for the CartPole REINFORCE sample. Consumed by main.ts
-// to drive the live sample, and by the IR viewer picker.
+// to drive the live sample.
 
 import {
   Module, compile, Linear,
@@ -7,7 +7,6 @@ import {
   tanh, oneHot, logSoftmax, softmax,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const K = 16
 export const MAX_T = 200
@@ -53,7 +52,9 @@ export function compileTraining(): Promise<CompiledTraining<Policy>> {
   return compile({ model: new Policy(), loss: lossFn, inputs, optimizer })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'CartPole REINFORCE',
   compile: compileTraining,
   dims: [
@@ -64,3 +65,4 @@ export const irSpec: IRSpec = {
     { size: HIDDEN,     name: 'H',   desc: 'hidden' },
   ],
 }
+

@@ -1,5 +1,5 @@
-// Import-safe spec for the tic-tac-toe self-play sample. Consumed by main.ts
-// and the IR viewer picker.
+// Import-safe spec for the tic-tac-toe self-play sample. Consumed by
+// main.ts; also exports `irSpec` for paste into the NN Blueprint bulb.
 
 import {
   Module, compile, Linear,
@@ -7,7 +7,6 @@ import {
   tanh, oneHot, logSoftmax, softmax,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const K = 16
 export const MAX_MOVES = 9
@@ -54,7 +53,9 @@ export function compileTraining(): Promise<CompiledTraining<Policy>> {
   return compile({ model: new Policy(), loss: lossFn, inputs, optimizer })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'Tic-Tac-Toe self-play',
   compile: compileTraining,
   dims: [
@@ -65,3 +66,4 @@ export const irSpec: IRSpec = {
     { size: HIDDEN,    name: 'H',  desc: 'hidden' },
   ],
 }
+

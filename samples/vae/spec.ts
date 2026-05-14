@@ -1,5 +1,5 @@
-// Import-safe spec for the VAE. Consumed by main.ts to drive the live
-// sample, and by the IR viewer picker to render the training graph.
+// Import-safe spec for the VAE. Consumed by main.ts; also exports
+// `irSpec` for paste into the NN Blueprint bulb.
 
 import {
   Module, compile, Linear,
@@ -7,7 +7,6 @@ import {
   randn, square,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
-import type { IRSpec } from 'tensorgrad-viewer'
 
 export const INPUT_DIM = 28 * 28
 export const LATENT_DIM = 8
@@ -65,7 +64,9 @@ export function compileTraining(): Promise<CompiledTraining<VAE>> {
   return compile({ model: new VAE(), loss: lossFn, inputs, optimizer })
 }
 
-export const irSpec: IRSpec = {
+// Used by the NN Blueprint bulb to visualize this network as a computation graph.
+// Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
+export const irSpec = {
   label: 'VAE (MNIST)',
   compile: compileTraining,
   dims: [
@@ -75,3 +76,4 @@ export const irSpec: IRSpec = {
     { size: LATENT_DIM, name: 'Z',   desc: 'latent dim' },
   ],
 }
+

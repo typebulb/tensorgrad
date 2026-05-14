@@ -10,8 +10,7 @@
   },
   "dependencies": {
     "domeleon": "^0.6.0",
-    "tensorgrad": "workspace:*",
-    "tensorgrad-viewer": "workspace:*"
+    "tensorgrad": "workspace:*"
   },
   "devDependencies": {
     "typescript": "*",

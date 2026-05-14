@@ -46,7 +46,6 @@ export default defineConfig({
         cartpole: 'cartpole/index.html',
         vae: 'vae/index.html',
         'tic-tac-toe': 'tic-tac-toe/index.html',
-        'ir-viewer': 'ir-viewer/index.html',
       },
     },
   },

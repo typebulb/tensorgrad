@@ -5,11 +5,11 @@
 import { Module, init, type InitSpec } from './module.js'
 import type { Tensor } from './ir.js'
 import { add, matmul, sub, mul, div, sqrt, mean, sum, reshape, oneHot, logSoftmax, embedding, conv2d, pairOpt } from './ops.js'
-import type { Conv2dOpOptions } from './ops.js'
+import type { Conv2dOptions } from './ops.js'
 import { ShapeError } from './shape.js'
 import { captureSite } from './ir.js'
 
-export interface Conv2dOptions extends Conv2dOpOptions {
+export interface Conv2dLayerOptions extends Conv2dOptions {
   /** Include a bias term. Default true. */
   bias?: boolean
   /** Init for the weight tensor. Defaults to `randn(scale=0.02)`. */
@@ -35,7 +35,7 @@ export class Conv2d extends Module {
     public readonly inC: number,
     public readonly outC: number,
     kernelSize: number | readonly [number, number],
-    opts: Conv2dOptions = {},
+    opts: Conv2dLayerOptions = {},
   ) {
     super()
     const [kH, kW] = pairOpt(kernelSize, 1)
@@ -76,7 +76,7 @@ export class Embedding extends Module {
   }
   /** Lookup: `idx` is `[...]` of i32, returns `[..., dim]` f32. */
   fwd(idx: Tensor): Tensor {
-    return embedding(idx, this.W)
+    return embedding(this.W, idx)
   }
 }
 
