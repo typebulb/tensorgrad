@@ -174,7 +174,7 @@ class Demo {
   s: AdamState
   exIdx = 0
   phase: Phase = "idle"
-  optimizer: "sgd" | "adam" = "adam"
+  optimizer: "sgd" | "adam" = "sgd"
   hiddenAct: HiddenAct = "tanh"
   lr = 0.1
   t = 0                  // Adam bias-correction counter (only increments on Adam updates, so it's distinct from trainStep)
@@ -260,7 +260,34 @@ const Y_TOP = 90, Y_BOT = 230, Y_OUT = 160
 const R = 24
 const yFor = (j: number) => j === 0 ? Y_TOP : Y_BOT
 
-interface IRoot { demo: Demo }
+interface IRoot {
+  demo: Demo
+  inspected: string | null
+  inspect(key: string | null): void
+}
+
+// Discriminated form of an inspected element. Click sites pass a string key
+// (e.g. "W1.0.1"); parseSel turns it into a typed object so dispatch is one
+// switch instead of six startsWith branches.
+type Selection =
+  | { kind: "x",  i: number }
+  | { kind: "h",  j: number }
+  | { kind: "y" }
+  | { kind: "b1", j: number }
+  | { kind: "b2" }
+  | { kind: "W1", j: number, i: number }
+  | { kind: "W2", j: number }
+
+function parseSel(key: string): Selection {
+  if (key === "y")  return { kind: "y" }
+  if (key === "b2") return { kind: "b2" }
+  if (key.startsWith("x."))  return { kind: "x",  i: parseInt(key.slice(2)) }
+  if (key.startsWith("h."))  return { kind: "h",  j: parseInt(key.slice(2)) }
+  if (key.startsWith("b1.")) return { kind: "b1", j: parseInt(key.slice(3)) }
+  if (key.startsWith("W2.")) return { kind: "W2", j: parseInt(key.slice(3)) }
+  if (key.startsWith("W1.")) { const [j, i] = key.slice(3).split(".").map(Number); return { kind: "W1", j, i } }
+  throw new Error("parseSel: unknown key " + key)
+}
 
 class Diagram extends Component {
   get root() { return this.ctx.root as any as IRoot }
@@ -292,6 +319,7 @@ class Diagram extends Component {
           d.bwd?.dW1[j][i] ?? null,
           d.deltas?.dW1[j][i] ?? null,
           labelT,
+          `W1.${j}.${i}`,
         ))
       }
     }
@@ -302,22 +330,32 @@ class Diagram extends Component {
         d.bwd?.dW2[j] ?? null,
         d.deltas?.dW2[j] ?? null,
         0.5,
+        `W2.${j}`,
       ))
     }
     return out
   }
 
+  // Accent halo around an inspected element (neuron). Same shape for inputs
+  // and bodyNeurons, so it's a helper.
+  selectionHalo(cx: number, cy: number) {
+    return circle({ cx, cy, r: R + 5, fill: "none", stroke: "var(--accent)", strokeWidth: "2", strokeOpacity: "0.6" })
+  }
+
   edge(x1: number, ya: number, x2: number, yb: number, w: number,
-       grad: number | null, delta: number | null, labelT: number) {
+       grad: number | null, delta: number | null, labelT: number, key: string) {
     const phase = this.demo.phase
+    const isSel = this.root.inspected === key
     const thickness = Math.min(0.8 + Math.abs(w) * 2.5, 5)
-    const stroke = w >= 0 ? "var(--w-pos)" : "var(--w-neg)"
+    const stroke = isSel ? "var(--accent)" : (w >= 0 ? "var(--w-pos)" : "var(--w-neg)")
     const lx = x1 + labelT * (x2 - x1)
     const ly = ya + labelT * (yb - ya)
     const showGrad  = (phase === "backward" || phase === "updated") && grad !== null
     const showDelta = phase === "updated" && delta !== null
-    return g(
-      line({ x1, y1: ya, x2, y2: yb, stroke, strokeWidth: String(thickness), strokeOpacity: "0.65" }),
+    return g({ style: { cursor: "pointer" }, onClick: () => this.root.inspect(key) },
+      // Wide transparent hit area so thin lines are still easy to click.
+      line({ x1, y1: ya, x2, y2: yb, stroke: "transparent", strokeWidth: "12" }),
+      line({ x1, y1: ya, x2, y2: yb, stroke, strokeWidth: String(isSel ? Math.max(thickness + 1, 3) : thickness), strokeOpacity: isSel ? "1" : "0.65" }),
       text({ x: lx, y: ly - 6,  textAnchor: "middle", class: "w-label" }, fmt(w, 2)),
       showGrad  ? text({ x: lx, y: ly - 22, textAnchor: "middle", class: "grad-label" },  "∂ " + fmtSign(grad!, 3))   : null,
       showDelta ? text({ x: lx, y: ly + 14, textAnchor: "middle", class: "delta-label" }, "Δ " + fmtSign(delta!, 4)) : null,
@@ -326,13 +364,32 @@ class Diagram extends Component {
 
   // Two-circle pattern: opaque base under the rgba tint, so edges passing
   // through the circle's footprint don't bleed through the semi-transparent fill.
-  bodyNeuron(cx: number, cy: number, label: string, post: number | null, bias: number, pre: number | null, dzg: number | null) {
+  bodyNeuron(cx: number, cy: number, label: string, post: number | null, bias: number, pre: number | null, dzg: number | null, neuronKey: string, biasKey: string) {
+    const root = this.root
+    const isNeuronSel = root.inspected === neuronKey
+    const isBiasSel   = root.inspected === biasKey
     return g(
       circle({ cx, cy, r: R, fill: "var(--neuron-bg)" }),
-      circle({ cx, cy, r: R, fill: post !== null ? neuronFill(post) : "transparent", stroke: "var(--border-strong)", strokeWidth: "1.5" }),
-      text({ x: cx, y: cy + 5,      textAnchor: "middle", class: "n-val" },   post !== null ? fmt(post, 2) : label),
+      isNeuronSel ? this.selectionHalo(cx, cy) : null,
+      circle({
+        cx, cy, r: R,
+        fill: post !== null ? neuronFill(post) : "transparent",
+        stroke: "var(--border-strong)",
+        strokeWidth: "1.5",
+        style: { cursor: "pointer" },
+        onClick: () => root.inspect(neuronKey),
+      }),
+      // pointer-events:none only on the value text — it sits over the
+      // clickable circle and would otherwise steal the click. The label /
+      // pre / grad texts are outside the circle and can't intercept.
+      text({ x: cx, y: cy + 5,      textAnchor: "middle", class: "n-val", style: { pointerEvents: "none" } }, post !== null ? fmt(post, 2) : label),
       text({ x: cx, y: cy - R - 16, textAnchor: "middle", class: "n-label" }, label),
-      text({ x: cx, y: cy - R - 4,  textAnchor: "middle", class: "n-sub" },   `b=${fmt(bias, 2)}`),
+      text({
+        x: cx, y: cy - R - 4, textAnchor: "middle",
+        class: ["n-sub", isBiasSel && "inspected-label"],
+        style: { cursor: "pointer" },
+        onClick: () => root.inspect(biasKey),
+      }, `b=${fmt(bias, 2)}`),
       pre !== null ? text({ x: cx, y: cy + R + 14, textAnchor: "middle", class: "n-sub"  }, `z=${fmt(pre, 2)}`)      : null,
       dzg !== null ? text({ x: cx, y: cy + R + 28, textAnchor: "middle", class: "n-grad" }, `∂z=${fmtSign(dzg, 3)}`) : null,
     )
@@ -344,13 +401,24 @@ class Diagram extends Component {
     const showFwd  = f !== null && d.phase !== "idle"
     const showGrad = (d.phase === "backward" || d.phase === "updated") && d.bwd !== null
     const out: any[] = []
+    const root = this.root
 
     for (let i = 0; i < 2; i++) {
       const y = yFor(i)
       const val = showFwd ? f!.x[i] : null
+      const key = `x.${i}`
+      const isSel = root.inspected === key
       out.push(g(
-        circle({ cx: X_IN, cy: y, r: R, fill: "var(--neuron-bg)", stroke: "var(--border-strong)", strokeWidth: "1.5" }),
-        text({ x: X_IN, y: y + 5,     textAnchor: "middle", class: "n-val" },   val !== null ? fmt(val, 1) : `x${i+1}`),
+        isSel ? this.selectionHalo(X_IN, y) : null,
+        circle({
+          cx: X_IN, cy: y, r: R,
+          fill: "var(--neuron-bg)",
+          stroke: "var(--border-strong)",
+          strokeWidth: "1.5",
+          style: { cursor: "pointer" },
+          onClick: () => root.inspect(key),
+        }),
+        text({ x: X_IN, y: y + 5,     textAnchor: "middle", class: "n-val", style: { pointerEvents: "none" } }, val !== null ? fmt(val, 1) : `x${i+1}`),
         text({ x: X_IN, y: y - R - 8, textAnchor: "middle", class: "n-label" }, `x${i+1}`),
       ))
     }
@@ -362,6 +430,7 @@ class Diagram extends Component {
         d.p.b1[j],
         showFwd  ? f!.z1[j]      : null,
         showGrad ? d.bwd!.dz1[j] : null,
+        `h.${j}`, `b1.${j}`,
       ))
     }
 
@@ -371,6 +440,7 @@ class Diagram extends Component {
       d.p.b2,
       showFwd  ? f!.z2   : null,
       showGrad ? d.bwd!.dz2 : null,
+      "y", "b2",
     ))
 
     return out
@@ -382,14 +452,20 @@ class Root extends Component implements IRoot {
   diagram = new Diagram()
   runTimer: number | null = null
   activeTab: "demo" | "code" = "demo"
+  inspected: string | null = null
 
   step()          { this.demo.step(); this.update() }
   stopRun()       { if (this.runTimer !== null) { clearInterval(this.runTimer); this.runTimer = null } }
   reset()         { this.stopRun(); this.demo.reset(); this.update() }
   reseed()        { this.stopRun(); this.demo.reseed(); this.update() }
-  setOptimizer(o: "sgd" | "adam") { this.stopRun(); this.demo.optimizer = o; this.demo.reset(); this.update() }
-  setHiddenAct(a: HiddenAct)      { this.stopRun(); this.demo.hiddenAct = a; this.demo.reset(); this.update() }
+  setOptimizer(o: "sgd" | "adam") { this.stopRun(); this.demo.optimizer = o; this.demo.reset(); this.inspected = null; this.update() }
+  setHiddenAct(a: HiddenAct)      { this.stopRun(); this.demo.hiddenAct = a; this.demo.reset(); this.inspected = null; this.update() }
   setLr(lr: number) { this.demo.lr = lr; this.update() }
+  inspect(key: string | null) {
+    // Same key = deselect; otherwise select. Lets callers just pass their key.
+    this.inspected = (key !== null && this.inspected === key) ? null : key
+    this.update()
+  }
 
   get running() { return this.runTimer !== null }
 
@@ -452,6 +528,7 @@ class Root extends Component implements IRoot {
 
         div({ class: ["panel", "diagram-panel"] },
           this.diagram.view(),
+          this.inspector(),
         ),
 
         div({ class: "subpanel-row" },
@@ -485,6 +562,150 @@ class Root extends Component implements IRoot {
         class: ["toggle", current === c.value && "active"],
       }, c.label)),
     )
+  }
+
+  inspector() {
+    const sel = this.inspected
+    if (!sel) {
+      return div({ class: "inspector inspector-empty" },
+        "Click any neuron or weight in the diagram to see its math here.",
+      )
+    }
+    return div({ class: "inspector" },
+      div({ class: "inspector-head" },
+        div({ class: "inspector-label" }, this.inspectorTitle(sel)),
+        button({ class: "inspector-close", onClick: () => this.inspect(null) }, "✕"),
+      ),
+      div({ class: "inspector-body" }, this.inspectorBody(sel)),
+    )
+  }
+
+  inspectorTitle(sel: string): string {
+    const p = parseSel(sel)
+    switch (p.kind) {
+      case "x":  return `Input x${p.i + 1}`
+      case "h":  return `Hidden neuron h${p.j + 1}`
+      case "y":  return "Output neuron y"
+      case "b1": return `Hidden bias b1[${p.j}]`
+      case "b2": return "Output bias b2"
+      case "W1": return `Weight W1[${p.j}][${p.i}] — input x${p.i + 1} → hidden h${p.j + 1}`
+      case "W2": return `Weight W2[${p.j}] — hidden h${p.j + 1} → output y`
+    }
+  }
+
+  // Each line is one step of the recipe with live values substituted. Phase-
+  // aware: forward shows the activation, backward adds gradient, updated adds
+  // optimizer step. Lines accumulate across phases (you see the full chain
+  // by the end of one training step).
+  inspectorBody(sel: string) {
+    const d = this.demo
+    const f = d.fwd
+    const b = d.bwd
+    const deltas = d.deltas
+    const lines: string[] = []
+    const p = parseSel(sel)
+
+    switch (p.kind) {
+      case "x": {
+        if (f) lines.push(`x${p.i + 1} = ${fmt(f.x[p.i])}   (this step's input)`)
+        else   lines.push(`x${p.i + 1} — input value (set by the current training example).`)
+        break
+      }
+      case "h": {
+        const j = p.j
+        if (!f) {
+          lines.push(`h${j + 1} — hidden neuron's activation. Press Step to compute.`)
+          break
+        }
+        lines.push(`h${j + 1} = ${d.hiddenAct}(W1[${j}]·x + b1[${j}])`)
+        lines.push(`     = ${d.hiddenAct}(${fmt(d.p.W1[j][0])}·${fmt(f.x[0])} + ${fmt(d.p.W1[j][1])}·${fmt(f.x[1])} + ${fmt(d.p.b1[j])})`)
+        lines.push(`     = ${d.hiddenAct}(${fmt(f.z1[j])})  =  ${fmt(f.h[j], 3)}`)
+        if (b) {
+          lines.push("")
+          const actDeriv = d.hiddenAct === "tanh" ? `(1 − h²) = ${fmt(1 - f.h[j] ** 2, 3)}` : `(z > 0) = ${f.z1[j] > 0 ? 1 : 0}`
+          lines.push(`∂h${j + 1} = ∂z2 · W2[${j}]  =  ${fmt(b.dz2, 3)} · ${fmt(d.p.W2[j])}  =  ${fmt(b.dh[j], 3)}`)
+          lines.push(`∂z${j + 1} = ∂h${j + 1} · ${actDeriv}  =  ${fmt(b.dz1[j], 3)}`)
+        }
+        break
+      }
+      case "y": {
+        if (!f) {
+          lines.push(`y — output neuron's activation. Press Step to compute.`)
+          break
+        }
+        lines.push(`y = tanh(W2·h + b2)`)
+        lines.push(`  = tanh(${fmt(d.p.W2[0])}·${fmt(f.h[0])} + ${fmt(d.p.W2[1])}·${fmt(f.h[1])} + ${fmt(d.p.b2)})`)
+        lines.push(`  = tanh(${fmt(f.z2)})  =  ${fmt(f.y, 3)}`)
+        lines.push("")
+        lines.push(`loss = (y − target)² = (${fmt(f.y, 3)} − ${f.target})² = ${fmt(f.loss, 4)}`)
+        if (b) {
+          lines.push("")
+          lines.push(`∂y  = 2·(y − target)  =  2·(${fmt(f.y, 3)} − ${f.target})  =  ${fmt(b.dy, 3)}`)
+          lines.push(`∂z2 = ∂y · (1 − y²)  =  ${fmt(b.dy, 3)} · ${fmt(1 - f.y ** 2, 3)}  =  ${fmt(b.dz2, 3)}`)
+        }
+        break
+      }
+      case "W1": {
+        const { j, i } = p
+        lines.push(`current value: ${fmt(d.p.W1[j][i], 3)}`)
+        if (f) lines.push(`forward contribution: w·x${i + 1} = ${fmt(d.p.W1[j][i])} · ${fmt(f.x[i])} = ${fmt(d.p.W1[j][i] * f.x[i], 3)}`)
+        if (b) {
+          lines.push("")
+          lines.push(`∂W1[${j}][${i}] = ∂z${j + 1} · x${i + 1}  =  ${fmt(b.dz1[j], 3)} · ${fmt(f!.x[i])}  =  ${fmt(b.dW1[j][i], 3)}`)
+        }
+        if (deltas) this.appendOptimizerLines(lines, b!.dW1[j][i], deltas.dW1[j][i], d.s.mW1[j][i], d.s.vW1[j][i])
+        break
+      }
+      case "W2": {
+        const j = p.j
+        lines.push(`current value: ${fmt(d.p.W2[j], 3)}`)
+        if (f) lines.push(`forward contribution: w·h${j + 1} = ${fmt(d.p.W2[j])} · ${fmt(f.h[j])} = ${fmt(d.p.W2[j] * f.h[j], 3)}`)
+        if (b) {
+          lines.push("")
+          lines.push(`∂W2[${j}] = ∂z2 · h${j + 1}  =  ${fmt(b.dz2, 3)} · ${fmt(f!.h[j])}  =  ${fmt(b.dW2[j], 3)}`)
+        }
+        if (deltas) this.appendOptimizerLines(lines, b!.dW2[j], deltas.dW2[j], d.s.mW2[j], d.s.vW2[j])
+        break
+      }
+      case "b1": {
+        const j = p.j
+        lines.push(`current value: ${fmt(d.p.b1[j], 3)}`)
+        if (b) {
+          lines.push("")
+          lines.push(`∂b1[${j}] = ∂z${j + 1}  =  ${fmt(b.dz1[j], 3)}    (bias gradient = pre-activation gradient)`)
+        }
+        if (deltas) this.appendOptimizerLines(lines, b!.db1[j], deltas.db1[j], d.s.mb1[j], d.s.vb1[j])
+        break
+      }
+      case "b2": {
+        lines.push(`current value: ${fmt(d.p.b2, 3)}`)
+        if (b) {
+          lines.push("")
+          lines.push(`∂b2 = ∂z2  =  ${fmt(b.dz2, 3)}`)
+        }
+        if (deltas) this.appendOptimizerLines(lines, b!.db2, deltas.db2, d.s.mb2, d.s.vb2)
+        break
+      }
+    }
+
+    return lines.map(l => div({ class: l === "" ? "inspector-gap" : "inspector-line" }, l))
+  }
+
+  // The optimizer math is the same shape for every parameter — factor it
+  // here so each parameter's inspector body just delegates.
+  appendOptimizerLines(lines: string[], grad: number, delta: number, m: number, v: number) {
+    const d = this.demo
+    lines.push("")
+    if (d.optimizer === "sgd") {
+      lines.push(`Δ = −lr · ∂  =  −${d.lr} · ${fmt(grad, 3)}  =  ${fmt(delta, 4)}    (current shown above is post-update)`)
+      return
+    }
+    const c1 = 1 - Math.pow(0.9,   d.t)
+    const c2 = 1 - Math.pow(0.999, d.t)
+    lines.push(`Adam (t=${d.t}, β₁=0.9, β₂=0.999):`)
+    lines.push(`  m̂ = m / (1 − 0.9^t)   =  ${fmt(m, 4)} / ${fmt(c1, 3)}  =  ${fmt(m / c1, 4)}`)
+    lines.push(`  v̂ = v / (1 − 0.999^t) =  ${fmt(v, 5)} / ${fmt(c2, 5)}  =  ${fmt(v / c2, 5)}`)
+    lines.push(`  Δ = −lr · m̂ / √v̂      =  ${fmt(delta, 4)}    (current shown above is post-update)`)
   }
 
   phaseInfo(): { title: string; desc: string; btn: string } {
@@ -766,6 +987,54 @@ body {
   overflow: hidden;
   background: var(--bg-canvas);
 }
+
+/* Inspector — clicking a neuron, weight, or bias in the diagram populates
+   this panel with the math for that element at the current phase. */
+.inspector {
+  border-top: 1px solid var(--border);
+  background: var(--bg-subpanel);
+  padding: 0.7rem 1rem;
+}
+.inspector-empty {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  font-style: italic;
+  text-align: center;
+}
+.inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+.inspector-label {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+.inspector-close {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.95rem;
+  padding: 0 0.25rem;
+  line-height: 1;
+}
+.inspector-close:hover { color: var(--text-primary); }
+.inspector-body {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+.inspector-line { padding: 0.05rem 0; }
+.inspector-gap  { height: 0.4rem; }
+
+/* Bias label is clickable too; show selected state by accent color so it
+   matches the neuron's selection halo. */
+.diagram-svg .inspected-label { fill: var(--accent); font-weight: 600; }
 
 .diagram-svg {
   display: block;
