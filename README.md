@@ -411,7 +411,9 @@ Imported from `'tensorgrad'`:
 - 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`, `flatten(x, startAxis?)`
 
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
-`(Tensor, Tensor)` or `(Tensor, number)` — scalar broadcasts. `argmax`
+`(Tensor, Tensor)`, `(Tensor, number)`, or `(number, Tensor)` — scalar
+broadcasts on either side. Non-commutative ops (`sub`, `div`, `less`,
+`greater`) honor the operand order: `sub(2, x) === 2 - x`. `argmax`
 and `argmin` return `i32` and are non-differentiable. The standard loss
 tail is `crossEntropy(logits, targets)` (reduces to scalar mean by
 default).

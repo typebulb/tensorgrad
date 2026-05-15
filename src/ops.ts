@@ -31,40 +31,66 @@ function binopOp(
 }
 
 /** Element-wise addition. Trailing-axis broadcast (smaller operand's shape
- *  is a suffix of the larger's). Scalar form: `add(x, 2)` adds 2 to every
- *  element via a fused scalar kernel. */
-export function add(a: Tensor, b: Tensor | number): Tensor {
-  return typeof b === 'number' ? addScalar(a, b) : binopOp('add', 'add', a, b)
+ *  is a suffix of the larger's). Scalar form: `add(x, 2)` (or `add(2, x)` —
+ *  commutative) adds 2 to every element via a fused scalar kernel. */
+export function add(a: Tensor, b: Tensor | number): Tensor
+export function add(a: number, b: Tensor): Tensor
+export function add(a: Tensor | number, b: Tensor | number): Tensor {
+  if (typeof a === 'number') return addScalar(b as Tensor, a)
+  if (typeof b === 'number') return addScalar(a, b)
+  return binopOp('add', 'add', a, b)
 }
-/** Element-wise subtraction. Same broadcast rules as `add`; scalar form
- *  subtracts a JS number. */
-export function sub(a: Tensor, b: Tensor | number): Tensor {
-  return typeof b === 'number' ? addScalar(a, -b) : binopOp('sub', 'sub', a, b)
+/** Element-wise subtraction. Same broadcast rules as `add`. Scalar forms:
+ *  `sub(x, 2)` fuses as a scalar kernel; `sub(2, x)` lifts the scalar to a
+ *  0-d constant and broadcasts (non-commutative — order matters). */
+export function sub(a: Tensor, b: Tensor | number): Tensor
+export function sub(a: number, b: Tensor): Tensor
+export function sub(a: Tensor | number, b: Tensor | number): Tensor {
+  if (typeof b === 'number') return addScalar(a as Tensor, -b)
+  if (typeof a === 'number') return binopOp('sub', 'sub', constScalar(a, b.dtype), b)
+  return binopOp('sub', 'sub', a, b)
 }
-/** Element-wise multiplication. Same broadcast rules as `add`; scalar form
- *  multiplies by a JS number via a fused scalar kernel. */
-export function mul(a: Tensor, b: Tensor | number): Tensor {
-  return typeof b === 'number' ? mulScalar(a, b) : binopOp('mul', 'mul', a, b)
+/** Element-wise multiplication. Same broadcast rules as `add`. Scalar form
+ *  (either order — commutative) multiplies by a JS number via a fused
+ *  scalar kernel. */
+export function mul(a: Tensor, b: Tensor | number): Tensor
+export function mul(a: number, b: Tensor): Tensor
+export function mul(a: Tensor | number, b: Tensor | number): Tensor {
+  if (typeof a === 'number') return mulScalar(b as Tensor, a)
+  if (typeof b === 'number') return mulScalar(a, b)
+  return binopOp('mul', 'mul', a, b)
 }
-/** Element-wise division. Same broadcast rules as `add`. Scalar form
- *  `div(x, k)` is rewritten as `mulScalar(x, 1/k)` (throws on `k === 0`). */
-export function div(a: Tensor, b: Tensor | number): Tensor {
+/** Element-wise division. Same broadcast rules as `add`. Scalar forms:
+ *  `div(x, k)` is rewritten as `mulScalar(x, 1/k)` (throws on `k === 0`);
+ *  `div(k, x)` lifts the scalar and broadcasts (non-commutative). */
+export function div(a: Tensor, b: Tensor | number): Tensor
+export function div(a: number, b: Tensor): Tensor
+export function div(a: Tensor | number, b: Tensor | number): Tensor {
   if (typeof b === 'number') {
     if (b === 0) throw new ShapeError(`div: scalar divisor cannot be zero`, captureSite('div'))
-    return mulScalar(a, 1 / b)
+    return mulScalar(a as Tensor, 1 / b)
   }
+  if (typeof a === 'number') return binopOp('div', 'div', constScalar(a, b.dtype), b)
   return binopOp('div', 'div', a, b)
 }
 
-/** Element-wise minimum. Scalar form clamps from above. Backward routes
- *  the gradient to whichever side won; ties go to `b`. */
-export function min(a: Tensor, b: Tensor | number): Tensor {
+/** Element-wise minimum. Scalar form (either order — commutative) clamps
+ *  from above. Backward routes the gradient to whichever side won; ties go
+ *  to `b`. */
+export function min(a: Tensor, b: Tensor | number): Tensor
+export function min(a: number, b: Tensor): Tensor
+export function min(a: Tensor | number, b: Tensor | number): Tensor {
+  if (typeof a === 'number') return min(b as Tensor, a)
   const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
   return binopOp('min', 'min', a, rhs)
 }
-/** Element-wise maximum. Scalar form clamps from below. Backward routes
- *  the gradient to whichever side won; ties go to `b`. */
-export function max(a: Tensor, b: Tensor | number): Tensor {
+/** Element-wise maximum. Scalar form (either order — commutative) clamps
+ *  from below. Backward routes the gradient to whichever side won; ties go
+ *  to `b`. */
+export function max(a: Tensor, b: Tensor | number): Tensor
+export function max(a: number, b: Tensor): Tensor
+export function max(a: Tensor | number, b: Tensor | number): Tensor {
+  if (typeof a === 'number') return max(b as Tensor, a)
   const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
   return binopOp('max', 'max', a, rhs)
 }
@@ -791,14 +817,22 @@ export function constScalar(value: number, dtype: Dtype = 'f32'): Tensor {
 // ---- Comparisons and selection --------------------------------------------
 
 /** Element-wise `a < b`. Same broadcast rules as `add`. Returns `bool` —
- *  pair with `where` to select. Non-differentiable. */
-export function less(a: Tensor, b: Tensor | number): Tensor {
+ *  pair with `where` to select. Non-differentiable. Number-left form
+ *  `less(n, x)` reroutes to `greater(x, n)`. */
+export function less(a: Tensor, b: Tensor | number): Tensor
+export function less(a: number, b: Tensor): Tensor
+export function less(a: Tensor | number, b: Tensor | number): Tensor {
+  if (typeof a === 'number') return greater(b as Tensor, a)
   const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
   return binopOp('less', 'less', a, rhs, 'bool')
 }
 /** Element-wise `a > b`. Same broadcast rules as `add`. Returns `bool` —
- *  pair with `where` to select. Non-differentiable. */
-export function greater(a: Tensor, b: Tensor | number): Tensor {
+ *  pair with `where` to select. Non-differentiable. Number-left form
+ *  `greater(n, x)` reroutes to `less(x, n)`. */
+export function greater(a: Tensor, b: Tensor | number): Tensor
+export function greater(a: number, b: Tensor): Tensor
+export function greater(a: Tensor | number, b: Tensor | number): Tensor {
+  if (typeof a === 'number') return less(b as Tensor, a)
   const rhs = typeof b === 'number' ? constScalar(b, a.dtype) : b
   return binopOp('greater', 'greater', a, rhs, 'bool')
 }
