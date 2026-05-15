@@ -8,11 +8,9 @@ build-artifacts/
 *.tsbuildinfo
 .env
 .env.local
-typebulbs
 
 # Excluded from publication. Specs are working design notes; .claude/.github
-# are local config; typebulbs are demo apps with their own deployment story
-# (excluded above with `typebulbs`).
+# are local config.
 .github/
 .claude/
 .claude-paste
