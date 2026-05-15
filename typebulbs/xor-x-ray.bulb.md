@@ -184,6 +184,10 @@ class Demo {
   bwd: Backward | null = null
   deltas: Deltas | null = null
   lossHistory: { loss: number, exIdx: number }[] = []
+  // All-time max loss for chart scaling. Monotonically non-decreasing so the
+  // y-axis doesn't rescale upward as old high-loss bars age out of the visible
+  // window (which would create a false "loss going back up" appearance).
+  lossMax = 0
 
   constructor() {
     this.p = initParams(this.seed)
@@ -199,6 +203,7 @@ class Demo {
     this.trainStep = 0
     this.fwd = null; this.bwd = null; this.deltas = null
     this.lossHistory = []
+    this.lossMax = 0
   }
 
   reseed() {
@@ -225,6 +230,7 @@ class Demo {
       }
       this.lossHistory.push({ loss: this.fwd!.loss, exIdx: this.exIdx })
       if (this.lossHistory.length > 200) this.lossHistory.shift()
+      if (this.fwd!.loss > this.lossMax) this.lossMax = this.fwd!.loss
       this.trainStep++
       this.phase = "updated"
     }
@@ -336,8 +342,6 @@ class Diagram extends Component {
     return out
   }
 
-  // Accent halo around an inspected element (neuron). Same shape for inputs
-  // and bodyNeurons, so it's a helper.
   selectionHalo(cx: number, cy: number) {
     return circle({ cx, cy, r: R + 5, fill: "none", stroke: "var(--accent)", strokeWidth: "2", strokeOpacity: "0.6" })
   }
@@ -593,10 +597,9 @@ class Root extends Component implements IRoot {
     }
   }
 
-  // Each line is one step of the recipe with live values substituted. Phase-
-  // aware: forward shows the activation, backward adds gradient, updated adds
-  // optimizer step. Lines accumulate across phases (you see the full chain
-  // by the end of one training step).
+  // Phase-accumulating: forward shows the element's activation; backward adds
+  // its gradient; updated adds the optimizer step. By 'updated' the user has
+  // seen the full chain for this element.
   inspectorBody(sel: string) {
     const d = this.demo
     const f = d.fwd
@@ -773,7 +776,7 @@ class Root extends Component implements IRoot {
   lossChart() {
     const d = this.demo
     const hist = d.lossHistory
-    const maxL = hist.length > 0 ? Math.max(...hist.map(h => h.loss), 0.01) : null
+    const maxL = d.lossMax > 0 ? d.lossMax : null
     return div({ class: ["panel", "subpanel"] },
       h3({},
         `Loss per step (last ${hist.length})`,
@@ -786,9 +789,9 @@ class Root extends Component implements IRoot {
           `(${ex.x[0]}, ${ex.x[1]})`,
         )),
       ),
-      maxL === null
+      hist.length < 1
         ? div({ class: "chart-empty" }, "(no training steps yet)")
-        : this.renderLossChart(hist, maxL),
+        : this.renderLossChart(hist, maxL ?? 0.01),
     )
   }
 
@@ -988,8 +991,6 @@ body {
   background: var(--bg-canvas);
 }
 
-/* Inspector — clicking a neuron, weight, or bias in the diagram populates
-   this panel with the math for that element at the current phase. */
 .inspector {
   border-top: 1px solid var(--border);
   background: var(--bg-subpanel);
