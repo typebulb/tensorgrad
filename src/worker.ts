@@ -58,7 +58,16 @@ async function ensureDevice(): Promise<GPUDevice> {
   if (typeof navigator === 'undefined' || !navigator.gpu) {
     throw new Error('tensorgrad worker: WebGPU not available in this environment')
   }
-  const adapter = await navigator.gpu.requestAdapter()
+  // requestAdapter() resolves with null (not throws) when the GPU process
+  // is transiently unhealthy — recent crash, power-state transition, sandboxed
+  // iframe+blob worker quirk, etc. Retry with backoff before giving up.
+  let adapter: GPUAdapter | null = null
+  const delays = [0, 100, 400]
+  for (const ms of delays) {
+    if (ms > 0) await new Promise(r => setTimeout(r, ms))
+    adapter = await navigator.gpu.requestAdapter()
+    if (adapter) break
+  }
   if (!adapter) throw new Error('tensorgrad worker: no WebGPU adapter')
   device = await adapter.requestDevice()
   return device
