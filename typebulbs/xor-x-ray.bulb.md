@@ -6,7 +6,7 @@ name: "XOR X-ray"
 **code.tsx**
 
 ```tsx
-import { App, Component, div, h1, h2, h3, p, pre, span, strong, button, svg, g, circle, line, path, rect, text } from "domeleon"
+import { App, Component, div, h1, h2, h3, p, pre, span, button, svg, g, circle, line, path, rect, text } from "domeleon"
 
 type Params = {
   W1: number[][]  // [hidden][input] — W1[j][i] is the weight from input i to hidden j
@@ -819,11 +819,8 @@ class Root extends Component implements IRoot {
   handoffPanel() {
     return div({ class: ["panel", "handoff"] },
       h2("The same network and training, in tensorgrad"),
-      p({}, "Everything above — forward arithmetic, chain-rule backward, Adam updates — is exactly what tensorgrad runs for any network, automatically. Here's this XOR training loop, rewritten with tensorgrad:"),
+      p({}, "This is how to write the same logic in tensorgrad. It's a tiny library that compiles neural networks to WebGPU, good for in-browser demos and visualisations. For training at scale or anything needing the Python ML ecosystem, you'll want PyTorch or JAX. The broad principle with any framework is the same: abstractly express a model, then let the framework automate the computation."),
       pre({ class: "code" }, this.handoffCode()),
-      p({}, "Two wins, and they're entangled — the abstraction is what gives you the performance."),
-      p({}, strong("Abstraction"), ": the hand-coded scalar version above is ~120 lines of math (forward, backward, both optimizers, all the per-parameter Adam state). The tensorgrad version is ~30. You write the forward; the rest is derived."),
-      p({}, strong("Performance"), ": that same ~30 lines compiles to GPU — which is why the Neural Network sample can learn to recognize handwritten digits from 60,000 examples in under a second on a modern GPU."),
     )
   }
 
@@ -1263,7 +1260,7 @@ body {
   line-height: 1.5;
   overflow-x: auto;
   border: 1px solid var(--border);
-  margin: 0.6rem 0 1rem;
+  margin: 0.6rem 0 0;
   white-space: pre;
 }
 ```
