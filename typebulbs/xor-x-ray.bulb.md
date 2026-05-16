@@ -728,11 +728,11 @@ class Root extends Component implements IRoot {
         }
       case "backward": {
         const actDeriv = d.hiddenAct === "tanh"
-          ? "Hidden activation is tanh, so its derivative is 1 − h² — smooth, always nonzero."
-          : "Hidden activation is ReLU, so its derivative is a 0/1 mask — ∂z at a hidden neuron is zero whenever its pre-activation z was negative (a 'dead' neuron, no gradient flows back)."
+          ? "With tanh, the hidden derivative is 1 − h² (smooth, always nonzero)."
+          : "With ReLU, the hidden derivative is a 0/1 mask — ∂z is zero at any 'dead' neuron (z ≤ 0)."
         return {
           title: "Backward done",
-          desc:  `Walked the network in reverse via the chain rule. ∂z on each neuron and ∂ on each edge are the local gradient — how much the loss would change if that quantity changed by 1. ${actDeriv} Also: ∂ on an input→hidden edge is zero whenever its input is zero (no signal to flow back through).`,
+          desc:  `Walked the network in reverse via the chain rule. ∂z at each neuron and ∂ on each edge is the local gradient — how much the loss changes per unit change there. ${actDeriv}`,
           btn:   "▷ Step: apply optimizer",
         }
       }
@@ -1022,7 +1022,7 @@ body {
 .inspector-close:hover { color: var(--text-primary); }
 .inspector-body {
   font-family: var(--font-mono);
-  font-size: 0.82rem;
+  font-size: 0.9rem;
   color: var(--text-primary);
   white-space: pre-wrap;
   overflow-x: auto;
@@ -1059,7 +1059,7 @@ body {
 }
 .phase-desc {
   color: var(--text-muted);
-  font-size: 0.85rem;
+  font-size: 0.92rem;
   line-height: 1.5;
 }
 
@@ -1200,7 +1200,7 @@ body {
 
 .pred-note {
   margin-top: 0.7rem;
-  font-size: 0.78rem;
+  font-size: 0.85rem;
   color: var(--text-muted);
   line-height: 1.4;
 }
