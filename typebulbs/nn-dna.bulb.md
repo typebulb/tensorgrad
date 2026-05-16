@@ -6,7 +6,7 @@ name: "NN DNA"
 **code.tsx**
 
 ```tsx
-import { App, Component, div as divH, h1, p, a, span, button, h2, textarea } from "domeleon"
+import { App, Component, div as divH, h1, p, a, span, button, h2, textarea, ul, li, code, strong, em } from "domeleon"
 import {
   type Tensor, type Graph, type OpNode, type Shape, type CallSite,
   isWebGPUAvailable, getOpInputs,
@@ -615,7 +615,7 @@ class IRViewer extends Component {
     return divH({ class: "ir-viewer" },
       divH({ class: "header" },
         h1("Diagram a neural network design with AI"),
-        p("Try: balance a rod, draw a sine wave, recognize handwritten digits, learn to add, dream up new images…"),
+        p("On the ", strong("Code"), " tab, ", em("Ask the AI"), ": balance a rod, draw a sine wave, recognize handwritten digits…"),
       ),
 
       divH({ class: "tabs" },
@@ -671,7 +671,7 @@ class IRViewer extends Component {
               class: "primary-btn",
               disabled: this.inferring,
               onClick: () => this.generateFromDescription(),
-            }, this.inferring ? "Asking AI…" : "Ask AI"),
+            }, this.inferring ? "Asking the AI…" : "Ask the AI"),
             button({ disabled: this.inferring, onClick: () => this.applySpec() }, "Apply"),
             button({ disabled: this.inferring, onClick: () => this.resetSpec() }, "Reset to default"),
           ),
@@ -690,16 +690,19 @@ class IRViewer extends Component {
       // === How-it-works tab ===
       divH({ class: "tab-content", style: { display: showInfo ? "block" : "none" } },
         divH({ class: "panel info-panel" },
-          h2("Visualizing a network"),
-          p(
-            "You can build neural-network experiments in your browser with tensorgrad, as the other samples demonstrate. But sometimes you don't want a running app. Sometimes you just want to see what a network looks like — what layers it has, what shapes flow through it, where the loss attaches. NN DNA takes a tensorgrad spec — yours via the Code tab, or one an AI writes from your plain-English description (\"balance a rod\", \"recognize handwritten digits\", \"draw a sine wave\") — and renders its computation graph."),
-          p("Each box is a tensor and shows the line of code that produced it; each arrow shows where the value flows next. The shape annotations and dim legend are the real reason for the visualization: TypeScript's tensor type erases dimensionality — every tensor is just `Tensor`, regardless of rank — so reading source gives no visual cue to the dimensions actually flowing through. The diagram surfaces what the type system can't."),
-          h2("What the diagram shows — and what it doesn't"),
-          p("The Training graph tab shows only the forward pass: the computation that takes inputs and parameters and produces a loss. That's the part that's specific to this architecture — what makes a transformer different from a CNN. The Inference graph tab (when the spec exposes a predict function) shows the same model with the loss tail replaced by the prediction output, so you can see exactly where the two graphs diverge."),
-          p("Training a neural network has three stages: (1) forward, the part you see; (2) backward, which propagates the gradient of the loss back through the network using the chain rule — structurally just the forward graph mirrored, one adjoint per forward op; (3) optimizer, which uses those gradients to actually nudge each parameter (Adam adds momentum and a per-parameter adaptive step size). Backward and optimizer aren't drawn here because they're universal training machinery — once you know they exist, they have the same shape for every architecture. At inference time (predicting from a trained model), only the forward pass runs."),
-          p("When an architecture has an inner loop — an RNN over a sequence, a rollout through a simulator, a diffusion sampler — the diagram shows just two or three iterations to convey the pattern. The spec's loop-count constant (often `HORIZON`) is set small for readability; you'd raise it to actually train."),
-          h2("Inspecting your own tensorgrad code"),
-          p("The generated tensorgrad code is the same code you'd use in a running neural network. That's why there's the option to paste your own code in — you might have already asked an AI to write a neural network with tensorgrad, and now you want to understand how it works."),
+          p("On the ", strong("Code"), " tab, ", em("Ask the AI"), ":"),
+          ul(
+            li('"balance a rod"'),
+            li('"draw a sine wave"'),
+            li('"recognize handwritten digits"'),
+            li("etc."),
+          ),
+          p("And out comes a diagram of the network."),
+          p("Tensor code can be hard to follow. It shows the ops but not the shapes flowing through them. Each box is a tensor that displays its dimensionality (e.g. [B, H]) and the line of code that produced it; arrows trace dataflow."),
+          p("Training and inference are written as two separate forward functions. Training ends in a scalar loss; inference returns the prediction and omits training-only ops like dropout."),
+          p("Only the forward is shown. It's the part specific to the architecture (what makes a transformer different from a CNN). The backprop and optimizer are automatic."),
+          p("Repeated structure is auto-detected (a transformer's stacked layers, an RNN's unroll) and shown as just two iterations for brevity."),
+          p("Already have tensorgrad code? Click ", em("Ask the AI"), ", paste in your model, and again, out comes the diagram."),
         ),
       ),
     )
