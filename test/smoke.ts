@@ -398,9 +398,9 @@ try {
   console.log('  ✓ SGD with weightDecay: config preserved through appendSGD')
 }
 
-// ---- Verify lr.step / lr.multiStep resolveLR values ------------------------
+// ---- Verify lr.staircase / lr.multiStep resolveLR values ------------------------
 
-console.log('\nVerifying lr.step / lr.multiStep schedules...')
+console.log('\nVerifying lr.staircase / lr.multiStep schedules...')
 
 const { lr } = await import('../src/index.js')
 const { resolveLR } = await import('../src/internal.js')
@@ -409,9 +409,9 @@ function approxEq(a: number, b: number, eps = 1e-9): boolean {
   return Math.abs(a - b) < eps
 }
 
-// lr.step: every=1, gamma=0.7 → peak * 0.7^(step-1)
+// lr.staircase: every=1, gamma=0.7 → peak * 0.7^(step-1)
 {
-  const sched = lr.step({ peak: 1.0, every: 1, gamma: 0.7 })
+  const sched = lr.staircase({ peak: 1.0, every: 1, gamma: 0.7 })
   const cases = [
     [1, 1.0],
     [2, 0.7],
@@ -421,16 +421,16 @@ function approxEq(a: number, b: number, eps = 1e-9): boolean {
   for (const [step, want] of cases) {
     const got = resolveLR(sched, step)
     if (!approxEq(got, want, 1e-7)) {
-      console.error(`FAIL: lr.step at step=${step} got ${got}, want ${want}`)
+      console.error(`FAIL: lr.staircase at step=${step} got ${got}, want ${want}`)
       process.exit(1)
     }
   }
-  console.log('  ✓ lr.step(every=1, gamma=0.7) decays geometrically per step')
+  console.log('  ✓ lr.staircase(every=1, gamma=0.7) decays geometrically per step')
 }
 
-// lr.step: every=3, gamma=0.5 → peak * 0.5^floor((step-1)/3)
+// lr.staircase: every=3, gamma=0.5 → peak * 0.5^floor((step-1)/3)
 {
-  const sched = lr.step({ peak: 0.1, every: 3, gamma: 0.5 })
+  const sched = lr.staircase({ peak: 0.1, every: 3, gamma: 0.5 })
   const cases = [
     [1, 0.1],
     [3, 0.1],
@@ -441,11 +441,11 @@ function approxEq(a: number, b: number, eps = 1e-9): boolean {
   for (const [step, want] of cases) {
     const got = resolveLR(sched, step)
     if (!approxEq(got, want, 1e-9)) {
-      console.error(`FAIL: lr.step(every=3) at step=${step} got ${got}, want ${want}`)
+      console.error(`FAIL: lr.staircase(every=3) at step=${step} got ${got}, want ${want}`)
       process.exit(1)
     }
   }
-  console.log('  ✓ lr.step(every=3, gamma=0.5) holds for `every` values then drops')
+  console.log('  ✓ lr.staircase(every=3, gamma=0.5) holds for `every` values then drops')
 }
 
 // lr.multiStep: milestones=[3, 7], gamma=0.1 → peak * 0.1^(milestones passed)

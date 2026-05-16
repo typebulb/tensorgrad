@@ -35,7 +35,7 @@ export type LR =
   | { readonly kind: 'linear'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
   | { readonly kind: 'cosineAnnealing'; readonly peak: number; readonly final: number; readonly steps: number; readonly startStep?: number }
   | { readonly kind: 'warmup'; readonly peak: number; readonly steps: number; readonly after: LR; readonly startStep?: number }
-  | { readonly kind: 'step'; readonly peak: number; readonly every: number; readonly gamma: number; readonly startStep?: number }
+  | { readonly kind: 'staircase'; readonly peak: number; readonly every: number; readonly gamma: number; readonly startStep?: number }
   | { readonly kind: 'multiStep'; readonly peak: number; readonly milestones: readonly number[]; readonly gamma: number; readonly startStep?: number }
 
 /** Ergonomic constructors for LR schedule shapes. For constant lr, pass a
@@ -60,9 +60,12 @@ export const lr = {
     ({ kind: 'warmup', ...opts }),
   /** Geometric decay: `peak * gamma^floor(step / every)`. PyTorch's
    *  `torch.optim.lr_scheduler.StepLR` (their `step_size`). With `every: 1`,
-   *  every step multiplies lr by `gamma` (exponential decay). */
-  step: (opts: { peak: number; every: number; gamma: number; startStep?: number }): LR =>
-    ({ kind: 'step', ...opts }),
+   *  every step multiplies lr by `gamma` (exponential decay). Named for the
+   *  staircase shape of the resulting LR-vs-step curve (and to keep the
+   *  schedule discriminator out of the `step` action-verb namespace — see
+   *  `specs/architecture.md`). */
+  staircase: (opts: { peak: number; every: number; gamma: number; startStep?: number }): LR =>
+    ({ kind: 'staircase', ...opts }),
   /** Piecewise-constant decay at specific step milestones: `peak * gamma^(count
    *  of milestones <= step)`. PyTorch's
    *  `torch.optim.lr_scheduler.MultiStepLR`. Useful for "drop lr by 10x at
@@ -95,7 +98,7 @@ export function resolveLR(schedule: LR, step: number): number {
       if (s <= schedule.steps) return schedule.peak * (s / schedule.steps)
       return resolveLR(schedule.after, s - schedule.steps)
     }
-    case 'step': {
+    case 'staircase': {
       // 1-based step indexing; `(s - 1) / every` matches PyTorch StepLR's
       // boundary semantics (first `every` values unscaled).
       const s = intrinsicStep(schedule.startStep, step)

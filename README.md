@@ -84,7 +84,7 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `optim.Adam(params, lr=...)` | `optimizer: { kind: 'adam', lr }` in `compile({ ... })` |
 | `optim.AdamW(params, lr=..., weight_decay=w)` | `optimizer: { kind: 'adamw', lr, weightDecay: w }` |
 | `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `optimizer: { kind: 'sgd', lr, momentum?, nesterov? }` in `compile({ ... })` |
-| `StepLR(opt, step_size=N, gamma=g)` | `lr.step({ peak, every: N, gamma: g })` |
+| `StepLR(opt, step_size=N, gamma=g)` | `lr.staircase({ peak, every: N, gamma: g })` |
 | `MultiStepLR(opt, milestones=[..], gamma=g)` | `lr.multiStep({ peak, milestones: [..], gamma: g })` |
 | `CosineAnnealingLR(opt, T_max=N, eta_min=m)` | `lr.cosineAnnealing({ peak, final: m, steps: N })` |
 | `LinearLR(opt, …, total_iters=N)` | `lr.linear({ peak, final, steps: N })` |
@@ -95,7 +95,7 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `x.mean(dim=k, keepdim=True)` | `mean(x, k, { keepDims: true })` |
 | `F.softmax(x, dim=k)` / `F.log_softmax(x, dim=k)` | `softmax(x, k)` / `logSoftmax(x, k)` — both default to last axis |
 | Causal-masked softmax (`tril` + `masked_fill` + `softmax`) | `softmaxCausal(scores)` (fused; preferred over composing the mask yourself) |
-| `x.argmax(dim=k)` / `x.argmin(dim=k)` | `argmax(x, k)` / `argmin(x, k)` (default to last axis; flat over the whole tensor with no axis) |
+| `x.argmax(dim=k)` / `x.argmin(dim=k)` | `argmax(x, k)` / `argmin(x, k)` (negative axes count from the end; flat over the whole tensor when no axis is given — returns a 0-d scalar i32, matching `np.argmax` / `torch.argmax` without `dim`) |
 | `x.transpose(a, b)` | `swapAxes(x, a, b)` (NumPy/JAX call this `swapaxes`; tensorgrad matches them — PyTorch's `transpose` is the cross-library outlier) |
 | `x.permute(*dims)` | `permute(x, [...])` (NumPy/JAX semantics: full-axis reorder) |
 | `x.view(B, T, H, -1)` / `x.reshape(B, -1)` | `reshape(x, [B, T, H, -1])` — exactly one `-1` allowed, inferred from total size |
@@ -490,7 +490,7 @@ optimizer: { kind: 'adamw', lr: lr.linear({ peak: 0.005, final: 0.0005, steps: 1
 optimizer: { kind: 'adam',  lr: lr.cosineAnnealing({ peak: 0.005, final: 0.0001, steps: 5000 }) }
 optimizer: { kind: 'sgd',   lr: lr.cosineAnnealing({ peak: 0.1, final: 0.001, steps: 10000 }), momentum: 0.9 }
 optimizer: { kind: 'adam',  lr: lr.warmup({ peak: 0.001, steps: 200, after: 0.001 }) }
-optimizer: { kind: 'adam',  lr: lr.step({ peak: 1.0, every: 1, gamma: 0.7 }) }               // PyTorch StepLR's step_size
+optimizer: { kind: 'adam',  lr: lr.staircase({ peak: 1.0, every: 1, gamma: 0.7 }) }          // PyTorch StepLR's step_size
 optimizer: { kind: 'adam', lr: lr.multiStep({ peak: 0.1, milestones: [30000, 60000], gamma: 0.1 }) }  // MultiStepLR
 ```
 
@@ -550,6 +550,15 @@ this.param([D],    { init: init.literal(myFloat32Array) })
 Default init is `init.randn()` (std 0.02). AdamW weight decay defaults to
 `true` for randn/kaiming/literal init, `false` for zeros/ones — override
 per-param with `{ decay: true | false }`.
+
+**Layer-level `decay` option, what it covers.** Convention varies by layer
+type. On `Linear`, `Conv2d`, `Embedding`, the `decay` option toggles decay
+on the weight tensor only — biases follow their init-type default (zeros
+init → no decay), matching the PyTorch convention that biases don't decay.
+On `LayerNorm`, `decay` toggles *both* gain and bias together; on
+`RMSNorm` it toggles the (only) gain. Both norm types default to
+`decay: false`, matching the canonical transformer pattern of excluding
+norm params from weight decay.
 
 ### Dropout (no mode flag)
 

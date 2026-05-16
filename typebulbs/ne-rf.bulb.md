@@ -511,7 +511,7 @@ code {
 {
   "description": "NeRF is a coordinate-network MLP learns the (x, y) → RGB mapping for one 64×64 image, using sinusoidal positional encoding so it can fit high-frequency detail.",
   "dependencies": {
-    "tensorgrad": "0.0.51",
+    "tensorgrad": "0.1.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   }
