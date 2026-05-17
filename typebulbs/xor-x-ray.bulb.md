@@ -169,18 +169,27 @@ const EXAMPLES = [
 // forward → backward → updated → (next click) advances exIdx and forwards next example.
 type Phase = "idle" | "forward" | "backward" | "updated"
 
+// Granularity of one "advance" — orthogonal from "advance once vs run":
+//   phase = one sub-step (forward, backward, or updated)
+//   step  = one full training step (3 phases, one example)
+//   epoch = one full pass through all 4 examples (12 phases)
+type StepUnit = "phase" | "step" | "epoch"
+
 class Demo {
-  p: Params
-  s: AdamState
+  p!: Params
+  s!: AdamState
   exIdx = 0
   phase: Phase = "idle"
   optimizer: "sgd" | "adam" = "sgd"
   hiddenAct: HiddenAct = "tanh"
+  stepUnit: StepUnit = "phase"
   lr = 0.1
   t = 0                  // Adam bias-correction counter (only increments on Adam updates, so it's distinct from trainStep)
   trainStep = 0
   seed = 7
-  fwd: Forward  | null = null
+  // fwd is always populated (constructor → reset() → forward on example 0);
+  // diagram never looks naked at idle.
+  fwd!: Forward
   bwd: Backward | null = null
   deltas: Deltas | null = null
   lossHistory: { loss: number, exIdx: number }[] = []
@@ -189,10 +198,7 @@ class Demo {
   // window (which would create a false "loss going back up" appearance).
   lossMax = 0
 
-  constructor() {
-    this.p = initParams(this.seed)
-    this.s = initAdam()
-  }
+  constructor() { this.reset() }
 
   reset() {
     this.p = initParams(this.seed)
@@ -201,7 +207,8 @@ class Demo {
     this.phase = "idle"
     this.t = 0
     this.trainStep = 0
-    this.fwd = null; this.bwd = null; this.deltas = null
+    this.fwd = forward(this.p, EXAMPLES[0].x, EXAMPLES[0].y, this.hiddenAct)
+    this.bwd = null; this.deltas = null
     this.lossHistory = []
     this.lossMax = 0
   }
@@ -219,7 +226,7 @@ class Demo {
       this.bwd = null; this.deltas = null
       this.phase = "forward"
     } else if (this.phase === "forward") {
-      this.bwd = backward(this.p, this.fwd!, this.hiddenAct)
+      this.bwd = backward(this.p, this.fwd, this.hiddenAct)
       this.phase = "backward"
     } else if (this.phase === "backward") {
       if (this.optimizer === "adam") {
@@ -228,9 +235,9 @@ class Demo {
       } else {
         this.deltas = applySGD(this.p, this.bwd!, this.lr)
       }
-      this.lossHistory.push({ loss: this.fwd!.loss, exIdx: this.exIdx })
+      this.lossHistory.push({ loss: this.fwd.loss, exIdx: this.exIdx })
       if (this.lossHistory.length > 200) this.lossHistory.shift()
-      if (this.fwd!.loss > this.lossMax) this.lossMax = this.fwd!.loss
+      if (this.fwd.loss > this.lossMax) this.lossMax = this.fwd.loss
       this.trainStep++
       this.phase = "updated"
     }
@@ -239,7 +246,26 @@ class Demo {
   fullStep() {
     do { this.step() } while (this.phase !== "updated")
   }
+
+  // 12 sub-steps = 4 examples × 3 phases. Lands back on the same
+  // (exIdx, phase), so the user can watch the network evolve from a
+  // fixed vantage point (e.g. backward-done for (1,0)).
+  cycleStep() {
+    for (let i = 0; i < 12; i++) this.step()
+  }
 }
+
+// Inline SVG icons. Font glyphs (▶ ⏸ ↺) center unpredictably across
+// platforms; SVG with a fixed viewBox is reliable. Shapes use currentColor
+// so the button's `color` flows through (e.g. `.accent` for purple).
+function btnIcon(...shapes: any[]) {
+  return svg({ viewBox: "0 0 16 16", width: "14", height: "14", class: "btn-icon" }, ...shapes)
+}
+const iconPlay  = () => btnIcon(path({ d: "M3 2 L13 8 L3 14 Z", fill: "currentColor" }))
+const iconPause = () => btnIcon(
+  rect({ x: 3,  y: 3, width: 3, height: 10, fill: "currentColor" }),
+  rect({ x: 10, y: 3, width: 3, height: 10, fill: "currentColor" }),
+)
 
 function fmt(x: number, d = 2): string {
   if (Number.isNaN(x)) return "NaN"
@@ -262,7 +288,7 @@ function neuronFill(v: number): string {
 }
 
 const X_IN = 80, X_HID = 410, X_OUT = 740
-const Y_TOP = 90, Y_BOT = 230, Y_OUT = 160
+const Y_TOP = 47, Y_BOT = 217, Y_OUT = 132
 const R = 24
 const yFor = (j: number) => j === 0 ? Y_TOP : Y_BOT
 
@@ -270,6 +296,7 @@ interface IRoot {
   demo: Demo
   inspected: string | null
   inspect(key: string | null): void
+  running: boolean
 }
 
 // Discriminated form of an inspected element. Click sites pass a string key
@@ -295,49 +322,95 @@ function parseSel(key: string): Selection {
   throw new Error("parseSel: unknown key " + key)
 }
 
+// Unified accessor for a learnable parameter: name, read/write into Params,
+// and the current ∂/Δ. Collapses what would otherwise be five separate
+// switches inside inlineChart (one per quantity).
+type ParamAccess = {
+  name:  string
+  read:  () => number
+  write: (v: number) => void
+  grad:  number | null
+  delta: number | null
+}
+function paramAccess(d: Demo, sel: Selection): ParamAccess {
+  const b = d.bwd, dt = d.deltas
+  switch (sel.kind) {
+    case "W1": {
+      const { j, i } = sel
+      return {
+        name:  `W1[${j}][${i}]`,
+        read:  () => d.p.W1[j][i],
+        write: v  => { d.p.W1[j][i] = v },
+        grad:  b  ? b.dW1[j][i]  : null,
+        delta: dt ? dt.dW1[j][i] : null,
+      }
+    }
+    case "W2": {
+      const { j } = sel
+      return {
+        name:  `W2[${j}]`,
+        read:  () => d.p.W2[j],
+        write: v  => { d.p.W2[j] = v },
+        grad:  b  ? b.dW2[j]  : null,
+        delta: dt ? dt.dW2[j] : null,
+      }
+    }
+    case "b1": {
+      const { j } = sel
+      return {
+        name:  `b1[${j}]`,
+        read:  () => d.p.b1[j],
+        write: v  => { d.p.b1[j] = v },
+        grad:  b  ? b.db1[j]  : null,
+        delta: dt ? dt.db1[j] : null,
+      }
+    }
+    case "b2":
+      return {
+        name:  "b2",
+        read:  () => d.p.b2,
+        write: v  => { d.p.b2 = v },
+        grad:  b  ? b.db2  : null,
+        delta: dt ? dt.db2 : null,
+      }
+    default:
+      throw new Error("paramAccess: not a learnable param")
+  }
+}
+
 class Diagram extends Component {
   get root() { return this.ctx.root as any as IRoot }
   get demo() { return this.root.demo }
 
   view() {
     return svg({
-      viewBox: "0 30 820 260",
+      viewBox: "0 0 820 264",
       width: "100%",
       preserveAspectRatio: "xMidYMid meet",
       class: "diagram-svg",
+      // Click on empty SVG background deselects. Child elements (neurons,
+      // edges, charts) bubble up here too, but their event.target points
+      // back to themselves; only a true background click has target === svg.
+      onClick: (e: any) => {
+        if (e.target === e.currentTarget) this.root.inspect(null)
+      },
     },
       this.edges(),
       this.neurons(),
+      this.paramCharts(),
     )
   }
 
   edges() {
     const d = this.demo
     const out: any[] = []
-    // Input → hidden. Label fractions offset crossing diagonals from sharing
-    // a midpoint label position.
     for (let j = 0; j < 2; j++) {
       for (let i = 0; i < 2; i++) {
-        const labelT = i === j ? 0.5 : (i === 0 ? 0.35 : 0.65)
-        out.push(this.edge(
-          X_IN, yFor(i), X_HID, yFor(j),
-          d.p.W1[j][i],
-          d.bwd?.dW1[j][i] ?? null,
-          d.deltas?.dW1[j][i] ?? null,
-          labelT,
-          `W1.${j}.${i}`,
-        ))
+        out.push(this.edge(X_IN, yFor(i), X_HID, yFor(j), d.p.W1[j][i], `W1.${j}.${i}`))
       }
     }
     for (let j = 0; j < 2; j++) {
-      out.push(this.edge(
-        X_HID, yFor(j), X_OUT, Y_OUT,
-        d.p.W2[j],
-        d.bwd?.dW2[j] ?? null,
-        d.deltas?.dW2[j] ?? null,
-        0.5,
-        `W2.${j}`,
-      ))
+      out.push(this.edge(X_HID, yFor(j), X_OUT, Y_OUT, d.p.W2[j], `W2.${j}`))
     }
     return out
   }
@@ -346,72 +419,61 @@ class Diagram extends Component {
     return circle({ cx, cy, r: R + 5, fill: "none", stroke: "var(--accent)", strokeWidth: "2", strokeOpacity: "0.6" })
   }
 
-  edge(x1: number, ya: number, x2: number, yb: number, w: number,
-       grad: number | null, delta: number | null, labelT: number, key: string) {
-    const phase = this.demo.phase
+  // Edge is just the connection line; the value, ∂, and Δ are shown inside
+  // the in-situ parameter chart positioned at the edge's midpoint (see
+  // paramCharts).
+  edge(x1: number, ya: number, x2: number, yb: number, w: number, key: string) {
     const isSel = this.root.inspected === key
     const thickness = Math.min(0.8 + Math.abs(w) * 2.5, 5)
     const stroke = isSel ? "var(--accent)" : (w >= 0 ? "var(--w-pos)" : "var(--w-neg)")
-    const lx = x1 + labelT * (x2 - x1)
-    const ly = ya + labelT * (yb - ya)
-    const showGrad  = (phase === "backward" || phase === "updated") && grad !== null
-    const showDelta = phase === "updated" && delta !== null
     return g({ style: { cursor: "pointer" }, onClick: () => this.root.inspect(key) },
       // Wide transparent hit area so thin lines are still easy to click.
       line({ x1, y1: ya, x2, y2: yb, stroke: "transparent", strokeWidth: "12" }),
       line({ x1, y1: ya, x2, y2: yb, stroke, strokeWidth: String(isSel ? Math.max(thickness + 1, 3) : thickness), strokeOpacity: isSel ? "1" : "0.65" }),
-      text({ x: lx, y: ly - 6,  textAnchor: "middle", class: "w-label" }, fmt(w, 2)),
-      showGrad  ? text({ x: lx, y: ly - 22, textAnchor: "middle", class: "grad-label" },  "∂ " + fmtSign(grad!, 3))   : null,
-      showDelta ? text({ x: lx, y: ly + 14, textAnchor: "middle", class: "delta-label" }, "Δ " + fmtSign(delta!, 4)) : null,
     )
   }
 
   // Two-circle pattern: opaque base under the rgba tint, so edges passing
-  // through the circle's footprint don't bleed through the semi-transparent fill.
-  bodyNeuron(cx: number, cy: number, label: string, post: number | null, bias: number, pre: number | null, dzg: number | null, neuronKey: string, biasKey: string) {
+  // through the circle's footprint don't bleed through the semi-transparent
+  // fill. `mirror=true` puts label-and-z below instead of above (bottom-row
+  // hidden neuron and the output). Label right-anchored at cx, z= left-anchored
+  // at cx+3 — keeps them visually adjacent regardless of value width.
+  bodyNeuron(cx: number, cy: number, label: string, post: number, pre: number, neuronKey: string, mirror = false) {
     const root = this.root
     const isNeuronSel = root.inspected === neuronKey
-    const isBiasSel   = root.inspected === biasKey
+    const labelY = mirror ? cy + R + 17 : cy - R - 11
     return g(
       circle({ cx, cy, r: R, fill: "var(--neuron-bg)" }),
       isNeuronSel ? this.selectionHalo(cx, cy) : null,
       circle({
         cx, cy, r: R,
-        fill: post !== null ? neuronFill(post) : "transparent",
+        fill: neuronFill(post),
         stroke: "var(--border-strong)",
         strokeWidth: "1.5",
         style: { cursor: "pointer" },
         onClick: () => root.inspect(neuronKey),
       }),
       // pointer-events:none only on the value text — it sits over the
-      // clickable circle and would otherwise steal the click. The label /
-      // pre / grad texts are outside the circle and can't intercept.
-      text({ x: cx, y: cy + 5,      textAnchor: "middle", class: "n-val", style: { pointerEvents: "none" } }, post !== null ? fmt(post, 2) : label),
-      text({ x: cx, y: cy - R - 16, textAnchor: "middle", class: "n-label" }, label),
-      text({
-        x: cx, y: cy - R - 4, textAnchor: "middle",
-        class: ["n-sub", isBiasSel && "inspected-label"],
-        style: { cursor: "pointer" },
-        onClick: () => root.inspect(biasKey),
-      }, `b=${fmt(bias, 2)}`),
-      pre !== null ? text({ x: cx, y: cy + R + 14, textAnchor: "middle", class: "n-sub"  }, `z=${fmt(pre, 2)}`)      : null,
-      dzg !== null ? text({ x: cx, y: cy + R + 28, textAnchor: "middle", class: "n-grad" }, `∂z=${fmtSign(dzg, 3)}`) : null,
+      // clickable circle and would otherwise steal the click.
+      text({ x: cx, y: cy + 5, textAnchor: "middle", class: "n-val", style: { pointerEvents: "none" } }, fmt(post, 2)),
+      text({ x: cx, y: labelY, textAnchor: "end", class: "n-label" }, label),
+      text({ x: cx + 3, y: labelY, textAnchor: "start", class: "n-sub" }, `z=${fmt(pre, 2)}`),
     )
   }
 
   neurons() {
     const d = this.demo
     const f = d.fwd
-    const showFwd  = f !== null && d.phase !== "idle"
-    const showGrad = (d.phase === "backward" || d.phase === "updated") && d.bwd !== null
     const out: any[] = []
     const root = this.root
 
     for (let i = 0; i < 2; i++) {
       const y = yFor(i)
-      const val = showFwd ? f!.x[i] : null
       const key = `x.${i}`
       const isSel = root.inspected === key
+      // Bottom-row input: label below the circle (mirrored), so the diagram
+      // is symmetric across the horizontal midline.
+      const labelY = i === 1 ? y + R + 17 : y - R - 11
       out.push(g(
         isSel ? this.selectionHalo(X_IN, y) : null,
         circle({
@@ -422,32 +484,131 @@ class Diagram extends Component {
           style: { cursor: "pointer" },
           onClick: () => root.inspect(key),
         }),
-        text({ x: X_IN, y: y + 5,     textAnchor: "middle", class: "n-val", style: { pointerEvents: "none" } }, val !== null ? fmt(val, 1) : `x${i+1}`),
-        text({ x: X_IN, y: y - R - 8, textAnchor: "middle", class: "n-label" }, `x${i+1}`),
+        text({ x: X_IN, y: y + 5, textAnchor: "middle", class: "n-val", style: { pointerEvents: "none" } }, fmt(f.x[i], 1)),
+        text({ x: X_IN, y: labelY, textAnchor: "middle", class: "n-label" }, `x${i+1}`),
       ))
     }
 
     for (let j = 0; j < 2; j++) {
       out.push(this.bodyNeuron(
         X_HID, yFor(j), `h${j+1}`,
-        showFwd  ? f!.h[j]       : null,
-        d.p.b1[j],
-        showFwd  ? f!.z1[j]      : null,
-        showGrad ? d.bwd!.dz1[j] : null,
-        `h.${j}`, `b1.${j}`,
+        f.h[j],
+        f.z1[j],
+        `h.${j}`,
+        j === 1, // mirror the bottom-row neuron
       ))
     }
 
     out.push(this.bodyNeuron(
       X_OUT, Y_OUT, "y",
-      showFwd  ? f!.y    : null,
-      d.p.b2,
-      showFwd  ? f!.z2   : null,
-      showGrad ? d.bwd!.dz2 : null,
-      "y", "b2",
+      f.y,
+      f.z2,
+      "y",
+      true, // label + z below — keeps the space above y clear for the b2 chart
     ))
 
     return out
+  }
+
+  // All 9 learnable parameters get an in-situ mini-chart. Layout:
+  //   - W1 charts: vertically stacked column at x=245 (diagonals would
+  //     otherwise overlap at the edge crossing).
+  //   - b1 charts: between h1 and h2 at equal thirds.
+  //   - W2 charts: at the hidden→output edge midpoints.
+  //   - b2 chart: above the output neuron.
+  paramCharts() {
+    const out: any[] = []
+    const W1_X = 245
+    const w1Stack: { j: 0|1, i: 0|1, cy: number }[] = [
+      { j: 0, i: 0, cy:  42 },
+      { j: 1, i: 0, cy: 102 },
+      { j: 0, i: 1, cy: 162 },
+      { j: 1, i: 1, cy: 222 },
+    ]
+    for (const p of w1Stack) {
+      out.push(this.inlineChart({ kind: "W1", j: p.j, i: p.i }, W1_X, p.cy, `W1.${p.j}.${p.i}`))
+    }
+    const b1Step = (Y_BOT - Y_TOP) / 3
+    out.push(this.inlineChart({ kind: "b1", j: 0 }, X_HID, Y_TOP + b1Step,                   "b1.0"))
+    out.push(this.inlineChart({ kind: "b1", j: 1 }, X_HID, Y_BOT - b1Step,                   "b1.1"))
+    out.push(this.inlineChart({ kind: "W2", j: 0 }, (X_HID + X_OUT) / 2, (Y_TOP + Y_OUT) / 2, "W2.0"))
+    out.push(this.inlineChart({ kind: "W2", j: 1 }, (X_HID + X_OUT) / 2, (Y_BOT + Y_OUT) / 2, "W2.1"))
+    out.push(this.inlineChart({ kind: "b2"        }, X_OUT, Y_OUT - 58,                       "b2"))
+    return out
+  }
+
+  // The actual mini-chart for one parameter. Sweeps the parameter through a
+  // range (everything else fixed), plots loss as a curve, marks the current
+  // value, and overlays a tangent whose slope IS ∂. Self-contained with
+  // overlaid name + value + ∂ + Δ.
+  inlineChart(sel: Selection, cx: number, cy: number, key: string) {
+    const d = this.demo
+    const acc = paramAccess(d, sel)
+    const cur = acc.read()
+    const ex = EXAMPLES[d.exIdx]
+    const curLoss = forward(d.p, ex.x, ex.y, d.hiddenAct).loss
+    const spread = Math.max(1.0, 2 * Math.abs(cur))
+    const N = 24
+    const pts: { v: number, loss: number }[] = []
+    for (let i = 0; i <= N; i++) {
+      const v = cur - spread + (2 * spread * i / N)
+      acc.write(v)
+      pts.push({ v, loss: forward(d.p, ex.x, ex.y, d.hiddenAct).loss })
+    }
+    acc.write(cur)
+
+    const grad        = (d.phase === "backward" || d.phase === "updated") ? acc.grad : null
+    const delta       = d.phase === "updated" ? acc.delta : null
+    // Tangent normally only when paused on `backward` (gradient and dot
+    // position are in sync there). While running, every render is in
+    // `updated` phase, so we relax the rule: show the tangent then too. The
+    // stored ∂ was computed at the pre-update position rather than the
+    // current dot, but the autoplay benefit of seeing slopes shift in real
+    // time outweighs the 1-step staleness.
+    const tangentGrad = (d.phase === "backward" || this.root.running) ? acc.grad : null
+
+    const W = 108, H = 46
+    const PLOT_LEFT = 4, PLOT_RIGHT = W - 4
+    const PLOT_TOP = 13, PLOT_BOT = H - 13
+    const xMin = pts[0].v, xMax = pts[pts.length - 1].v
+    const yMax = Math.max(0.001, ...pts.map(p => p.loss))
+    const sx = (v: number) => PLOT_LEFT + ((v - xMin) / (xMax - xMin)) * (PLOT_RIGHT - PLOT_LEFT)
+    const sy = (l: number) => PLOT_BOT - (l / yMax) * (PLOT_BOT - PLOT_TOP)
+
+    const pathD = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${sx(p.v).toFixed(1)} ${sy(p.loss).toFixed(1)}`).join(' ')
+    const cxPt = sx(cur), cyPt = sy(curLoss)
+
+    const tDx = (xMax - xMin) * 0.22
+    const tangentEl = tangentGrad !== null ? line({
+      x1: sx(cur - tDx), y1: sy(curLoss - tangentGrad * tDx),
+      x2: sx(cur + tDx), y2: sy(curLoss + tangentGrad * tDx),
+      stroke: "var(--grad-color)",
+      strokeWidth: "1.5",
+      strokeLineCap: "round",
+    }) : null
+
+    const isSel = this.root.inspected === key
+    return g({
+      transform: `translate(${(cx - W / 2).toFixed(1)}, ${(cy - H / 2).toFixed(1)})`,
+      style: { cursor: "pointer" },
+      onClick: () => this.root.inspect(key),
+    },
+      rect({
+        x: 0, y: 0, width: W, height: H,
+        fill: "var(--chart-tint)",
+        stroke: isSel ? "var(--accent)" : "var(--border)",
+        strokeWidth: isSel ? "1.5" : "0.6",
+        rx: "3",
+      }),
+      text({ x: 4,     y: 9, class: "il-name" }, acc.name),
+      text({ x: W - 4, y: 9, textAnchor: "end", class: "il-val" }, fmt(cur, 2)),
+      line({ x1: PLOT_LEFT, y1: PLOT_BOT, x2: PLOT_RIGHT, y2: PLOT_BOT, stroke: "var(--border)", strokeWidth: "0.4" }),
+      path({ d: pathD, stroke: "var(--text-muted)", strokeWidth: "1", fill: "none" }),
+      tangentEl,
+      circle({ cx: cxPt, cy: cyPt, r: "1.8", fill: "var(--accent)" }),
+      grad  !== null ? text({ x: 4,     y: H - 4, class: "il-grad"  }, `∂${fmtSign(grad,  2)}`) : null,
+      delta !== null ? text({ x: W - 4, y: H - 4, textAnchor: "end", class: "il-delta" }, `Δ${fmtSign(delta, 3)}`) : null,
+    )
   }
 }
 
@@ -458,12 +619,23 @@ class Root extends Component implements IRoot {
   activeTab: "demo" | "code" = "demo"
   inspected: string | null = null
 
-  step()          { this.demo.step(); this.update() }
+  // Advance by one of the currently-selected StepUnit. Used by both the
+  // Step button and the Run autoplay loop, so "advance once" and "play"
+  // share the same granularity setting.
+  advanceOnce() {
+    switch (this.demo.stepUnit) {
+      case "phase": this.demo.step(); return
+      case "step":  this.demo.fullStep(); return
+      case "epoch": this.demo.cycleStep(); return
+    }
+  }
+  step()          { this.advanceOnce(); this.update() }
   stopRun()       { if (this.runTimer !== null) { clearInterval(this.runTimer); this.runTimer = null } }
   reset()         { this.stopRun(); this.demo.reset(); this.update() }
   reseed()        { this.stopRun(); this.demo.reseed(); this.update() }
   setOptimizer(o: "sgd" | "adam") { this.stopRun(); this.demo.optimizer = o; this.demo.reset(); this.inspected = null; this.update() }
   setHiddenAct(a: HiddenAct)      { this.stopRun(); this.demo.hiddenAct = a; this.demo.reset(); this.inspected = null; this.update() }
+  setStepUnit(u: StepUnit)        { this.demo.stepUnit = u; this.update() }
   setLr(lr: number) { this.demo.lr = lr; this.update() }
   inspect(key: string | null) {
     // Same key = deselect; otherwise select. Lets callers just pass their key.
@@ -478,7 +650,7 @@ class Root extends Component implements IRoot {
       this.stopRun()
     } else {
       this.runTimer = window.setInterval(() => {
-        this.demo.fullStep()
+        this.advanceOnce()
         this.update()
       }, 80)
     }
@@ -503,12 +675,16 @@ class Root extends Component implements IRoot {
 
       div({ class: "tab-content", style: { display: showDemo ? "block" : "none" } },
         div({ class: "controls" },
-          button({ onClick: () => this.step(),      class: "primary" }, info.btn),
           div({ class: "btn-group" },
-            button({ onClick: () => this.toggleRun() }, this.running ? "⏸ Pause" : "▶ Run"),
-            button({ onClick: () => this.reset()     }, "Reset"),
-            button({ onClick: () => this.reseed()    }, "New seed"),
+            button({ onClick: () => this.toggleRun(), class: ["icon", "accent"] }, this.running ? iconPause() : iconPlay()),
+            button({ onClick: () => this.step()                                 }, "Step"),
+            button({ onClick: () => this.reset(),     class: "icon"             }, "↺"),
+            button({ onClick: () => this.reseed()                               }, "New seed"),
           ),
+
+          this.toggleGroup<StepUnit>("Advance by",
+            [{ value: "phase", label: "phase" }, { value: "step", label: "step" }, { value: "epoch", label: "epoch" }],
+            d.stepUnit, u => this.setStepUnit(u)),
 
           this.toggleGroup<HiddenAct>("Activation",
             [{ value: "tanh", label: "tanh" }, { value: "relu", label: "ReLU" }],
@@ -610,19 +786,14 @@ class Root extends Component implements IRoot {
 
     switch (p.kind) {
       case "x": {
-        if (f) lines.push(`x${p.i + 1} = ${fmt(f.x[p.i])}   (this step's input)`)
-        else   lines.push(`x${p.i + 1} — input value (set by the current training example).`)
+        lines.push(`x${p.i + 1} = ${fmt(f.x[p.i])}   (this step's input)`)
         break
       }
       case "h": {
         const j = p.j
-        if (!f) {
-          lines.push(`h${j + 1} — hidden neuron's activation. Press Step to compute.`)
-          break
-        }
         lines.push(`h${j + 1} = ${d.hiddenAct}(W1[${j}]·x + b1[${j}])`)
-        lines.push(`     = ${d.hiddenAct}(${fmt(d.p.W1[j][0])}·${fmt(f.x[0])} + ${fmt(d.p.W1[j][1])}·${fmt(f.x[1])} + ${fmt(d.p.b1[j])})`)
-        lines.push(`     = ${d.hiddenAct}(${fmt(f.z1[j])})  =  ${fmt(f.h[j], 3)}`)
+        lines.push(`   = ${d.hiddenAct}(${fmt(d.p.W1[j][0])}·${fmt(f.x[0])} + ${fmt(d.p.W1[j][1])}·${fmt(f.x[1])} + ${fmt(d.p.b1[j])})`)
+        lines.push(`   = ${d.hiddenAct}(${fmt(f.z1[j])})  =  ${fmt(f.h[j], 3)}`)
         if (b) {
           lines.push("")
           const actDeriv = d.hiddenAct === "tanh" ? `(1 − h²) = ${fmt(1 - f.h[j] ** 2, 3)}` : `(z > 0) = ${f.z1[j] > 0 ? 1 : 0}`
@@ -632,10 +803,6 @@ class Root extends Component implements IRoot {
         break
       }
       case "y": {
-        if (!f) {
-          lines.push(`y — output neuron's activation. Press Step to compute.`)
-          break
-        }
         lines.push(`y = tanh(W2·h + b2)`)
         lines.push(`  = tanh(${fmt(d.p.W2[0])}·${fmt(f.h[0])} + ${fmt(d.p.W2[1])}·${fmt(f.h[1])} + ${fmt(d.p.b2)})`)
         lines.push(`  = tanh(${fmt(f.z2)})  =  ${fmt(f.y, 3)}`)
@@ -651,10 +818,10 @@ class Root extends Component implements IRoot {
       case "W1": {
         const { j, i } = p
         lines.push(`current value: ${fmt(d.p.W1[j][i], 3)}`)
-        if (f) lines.push(`forward contribution: w·x${i + 1} = ${fmt(d.p.W1[j][i])} · ${fmt(f.x[i])} = ${fmt(d.p.W1[j][i] * f.x[i], 3)}`)
+        lines.push(`forward contribution: w·x${i + 1} = ${fmt(d.p.W1[j][i])} · ${fmt(f.x[i])} = ${fmt(d.p.W1[j][i] * f.x[i], 3)}`)
         if (b) {
           lines.push("")
-          lines.push(`∂W1[${j}][${i}] = ∂z${j + 1} · x${i + 1}  =  ${fmt(b.dz1[j], 3)} · ${fmt(f!.x[i])}  =  ${fmt(b.dW1[j][i], 3)}`)
+          lines.push(`∂W1[${j}][${i}] = ∂z${j + 1} · x${i + 1}  =  ${fmt(b.dz1[j], 3)} · ${fmt(f.x[i])}  =  ${fmt(b.dW1[j][i], 3)}`)
         }
         if (deltas) this.appendOptimizerLines(lines, b!.dW1[j][i], deltas.dW1[j][i], d.s.mW1[j][i], d.s.vW1[j][i])
         break
@@ -662,10 +829,10 @@ class Root extends Component implements IRoot {
       case "W2": {
         const j = p.j
         lines.push(`current value: ${fmt(d.p.W2[j], 3)}`)
-        if (f) lines.push(`forward contribution: w·h${j + 1} = ${fmt(d.p.W2[j])} · ${fmt(f.h[j])} = ${fmt(d.p.W2[j] * f.h[j], 3)}`)
+        lines.push(`forward contribution: w·h${j + 1} = ${fmt(d.p.W2[j])} · ${fmt(f.h[j])} = ${fmt(d.p.W2[j] * f.h[j], 3)}`)
         if (b) {
           lines.push("")
-          lines.push(`∂W2[${j}] = ∂z2 · h${j + 1}  =  ${fmt(b.dz2, 3)} · ${fmt(f!.h[j])}  =  ${fmt(b.dW2[j], 3)}`)
+          lines.push(`∂W2[${j}] = ∂z2 · h${j + 1}  =  ${fmt(b.dz2, 3)} · ${fmt(f.h[j])}  =  ${fmt(b.dW2[j], 3)}`)
         }
         if (deltas) this.appendOptimizerLines(lines, b!.dW2[j], deltas.dW2[j], d.s.mW2[j], d.s.vW2[j])
         break
@@ -711,40 +878,40 @@ class Root extends Component implements IRoot {
     lines.push(`  Δ = −lr · m̂ / √v̂      =  ${fmt(delta, 4)}    (current shown above is post-update)`)
   }
 
-  phaseInfo(): { title: string; desc: string; btn: string } {
+  phaseInfo(): { title: string; desc: string } {
     const d = this.demo
     switch (d.phase) {
       case "idle":
         return {
           title: "Ready",
           desc:  'Tiny network: 2 inputs, 2 hidden neurons (tanh), 1 output (tanh). Random weights. Click "Step" to start training on the four XOR examples, one at a time.',
-          btn:   "▷ Step: compute forward",
         }
-      case "forward":
+      case "forward": {
+        const opSentence = d.hiddenAct === "tanh"
+          ? "Each neuron multiplies its incoming values by the weight of their connections, adds its bias (learned value above each circle), then passes the result through tanh, squashing it to between −1 and 1."
+          : "Each neuron multiplies its incoming values by the weight of their connections, adds its bias (learned value above each circle). Hidden neurons then pass the result through ReLU (negative becomes 0, positive passes through); the output uses tanh, squashing to between −1 and 1."
         return {
           title: "Forward done",
-          desc:  "Computed hidden activations from inputs, then the output from hidden activations — each via tanh(W·x + b). The number inside each neuron is its activation. The target sits next to the output; loss = (output − target)².",
-          btn:   "▷ Step: compute backward",
+          desc:  `Walked the network forward. ${opSentence} The result appears inside. We compare the output to the target (the answer we want); loss = (output − target)².`,
         }
+      }
       case "backward": {
         const actDeriv = d.hiddenAct === "tanh"
           ? "With tanh, the hidden derivative is 1 − h² (smooth, always nonzero)."
           : "With ReLU, the hidden derivative is a 0/1 mask — ∂z is zero at any 'dead' neuron (z ≤ 0)."
         return {
           title: "Backward done",
-          desc:  `Walked the network in reverse via the chain rule. ∂z at each neuron and ∂ on each edge is the local gradient — how much the loss changes per unit change there. ${actDeriv}`,
-          btn:   "▷ Step: apply optimizer",
+          desc:  `Walked the network in reverse via the chain rule. ∂z (say "partial z") at each neuron and ∂ on each edge is the local gradient — how much the loss changes per unit change there. ${actDeriv}`,
         }
       }
       case "updated": {
         const opt = d.optimizer === "adam" ? "Adam" : "SGD"
         const desc = d.optimizer === "adam"
-          ? "Each weight moved by −lr · m̂ / (√v̂ + ε), where m̂ and v̂ are running averages of the gradient and its square (one m, one v per parameter — that's the 'adaptive per-parameter' part). After a few steps the Δ values stop being proportional to ∂. Toggle to SGD to see what proportional-to-∂ updates look like."
-          : "Each weight moved by −lr · ∂ — every edge gets the same lr factor, so Δ is directly proportional to gradient magnitude. Toggle to Adam to see per-parameter adaptive step sizes instead."
+          ? "Walked the network in reverse again (in practice this step can interleave with backprop). As each weight was traversed, it moved by −lr · m̂ / (√v̂ + ε), where m̂ and v̂ are running averages of the gradient and its square (one m, one v per parameter — that's the 'adaptive per-parameter' part). After a few steps the Δ values stop being proportional to ∂. Toggle to SGD to see what proportional-to-∂ updates look like."
+          : "Walked the network in reverse again (in practice this step can interleave with backprop). As each weight was traversed, it moved by −lr · ∂ — every edge gets the same lr factor, so Δ is directly proportional to gradient magnitude. Toggle to Adam to see per-parameter adaptive step sizes instead."
         return {
           title: `${opt} update done`,
           desc,
-          btn:   "▷ Step: next example",
         }
       }
     }
@@ -758,7 +925,7 @@ class Root extends Component implements IRoot {
         EXAMPLES.map((ex, i) => {
           const f = forward(d.p, ex.x, ex.y, d.hiddenAct)
           const correct = Math.abs(f.y - ex.y) < 0.3
-          const isCurrent = i === d.exIdx && d.fwd !== null
+          const isCurrent = i === d.exIdx
           return div({ class: ["pred-row", correct ? "correct" : "incorrect", isCurrent && "current"] },
             span({ class: "ex-dot", style: { background: `var(--ex-color-${i})` } }),
             span({ class: "pred-in"    }, `(${ex.x[0]}, ${ex.x[1]})`),
@@ -780,8 +947,8 @@ class Root extends Component implements IRoot {
     return div({ class: ["panel", "subpanel"] },
       h3({},
         `Loss per step (last ${hist.length})`,
-        d.fwd       ? span({ class: "chart-current" }, ` · loss ${fmt(d.fwd.loss, 4)}`) : null,
-        maxL !== null ? span({ class: "chart-current" }, ` · max ${fmt(maxL, 3)}`)     : null,
+        span({ class: "chart-current" }, ` · loss ${fmt(d.fwd.loss, 4)}`),
+        maxL !== null ? span({ class: "chart-current" }, ` · max ${fmt(maxL, 3)}`) : null,
       ),
       div({ class: "loss-legend" },
         EXAMPLES.map((ex, i) => span({ class: "ex-item" },
@@ -890,6 +1057,8 @@ new App({ root: new Root(), id: "app" })
   --accent:          #6366f1;
   --accent-hover:    #4f46e5;
   --neuron-bg:       #ffffff;
+  --chart-tint:      #fff4d6;
+  --grad-color:      #d97706;
   --w-pos:           rgb(34, 139, 34);
   --w-neg:           rgb(220, 38, 38);
   --phase-forward:   #2563eb;
@@ -898,9 +1067,9 @@ new App({ root: new Root(), id: "app" })
   /* Per-example identity colors. Tableau10 picks that avoid the correct/
      incorrect green/red and the indigo accent. */
   --ex-color-0:      #4e79a7;
-  --ex-color-1:      #f28e2c;
+  --ex-color-1:      #e377c2;
   --ex-color-2:      #76b7b2;
-  --ex-color-3:      #af7aa1;
+  --ex-color-3:      #9c755f;
   --font-mono:       ui-monospace, Menlo, monospace;
 }
 html[data-theme="dark"] {
@@ -917,15 +1086,17 @@ html[data-theme="dark"] {
   --accent:          #818cf8;
   --accent-hover:    #6366f1;
   --neuron-bg:       #1f1f24;
+  --chart-tint:      #1f1d16;
+  --grad-color:      #fb923c;
   --w-pos:           rgb(74, 222, 128);
   --w-neg:           rgb(248, 113, 113);
   --phase-forward:   #60a5fa;
   --phase-backward:  #f87171;
   --phase-optimizer: #4ade80;
   --ex-color-0:      #6f9bd1;
-  --ex-color-1:      #ffb24d;
+  --ex-color-1:      #ee9bd1;
   --ex-color-2:      #a5d4d0;
-  --ex-color-3:      #ce99c6;
+  --ex-color-3:      #c89e88;
 }
 
 body {
@@ -986,6 +1157,11 @@ body {
 .diagram-panel {
   overflow: hidden;
   background: var(--bg-canvas);
+  /* Joins seamlessly with the phase-banner above: square top, rounded
+     bottom, no top border (banner's bottom edge is the seam, supplied by
+     the bg-panel → bg-canvas tone shift). */
+  border-top: 0;
+  border-radius: 0 0 8px 8px;
 }
 
 .inspector {
@@ -1030,9 +1206,11 @@ body {
 .inspector-line { padding: 0.05rem 0; }
 .inspector-gap  { height: 0.4rem; }
 
-/* Bias label is clickable too; show selected state by accent color so it
-   matches the neuron's selection halo. */
-.diagram-svg .inspected-label { fill: var(--accent); font-weight: 600; }
+/* Text styles for the per-parameter mini-charts. */
+.diagram-svg .il-name  { font-family: var(--font-mono); font-size: 8px; font-weight: 600; fill: var(--text-primary); }
+.diagram-svg .il-val   { font-family: var(--font-mono); font-size: 8px; fill: var(--text-primary); }
+.diagram-svg .il-grad  { font-family: var(--font-mono); font-size: 8px; fill: var(--grad-color); }
+.diagram-svg .il-delta { font-family: var(--font-mono); font-size: 8px; fill: var(--phase-optimizer); }
 
 .diagram-svg {
   display: block;
@@ -1042,34 +1220,42 @@ body {
 }
 
 .phase-banner {
-  margin-bottom: 0.8rem;
+  margin-bottom: 0;
   padding: 0.85rem 1rem;
-  border-left: 4px solid var(--border-strong);
-  transition: border-left-color 0.15s;
+  /* Square bottom: joins seamlessly into the diagram-panel below. */
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  /* Reserved height so the panel doesn't bob between phases. Sized for the
+     longest case: forward desc with ReLU selected wraps to 3 lines because
+     it has to spell out the asymmetry (hidden uses ReLU, output stays tanh
+     — bounded range needed for MSE against {0,1} targets). */
+  min-height: 7.5rem;
 }
-.phase-banner.phase-idle     { border-left-color: var(--border-strong); }
-.phase-banner.phase-forward  { border-left-color: var(--phase-forward); }
-.phase-banner.phase-backward { border-left-color: var(--phase-backward); }
-.phase-banner.phase-updated  { border-left-color: var(--phase-optimizer); }
 
 .phase-title {
   font-weight: 600;
   font-size: 0.9rem;
   margin-bottom: 0.3rem;
+  text-decoration-line: underline;
+  text-decoration-thickness: 3px;
+  text-underline-offset: 4px;
+  transition: text-decoration-color 0.15s;
 }
+/* Phase indicator: title underlined in the phase color. Longhand props
+   throughout — the `text-decoration` shorthand resets text-decoration-thickness. */
+.phase-banner.phase-idle     .phase-title { text-decoration-color: var(--border-strong); }
+.phase-banner.phase-forward  .phase-title { text-decoration-color: var(--phase-forward); }
+.phase-banner.phase-backward .phase-title { text-decoration-color: var(--phase-backward); }
+.phase-banner.phase-updated  .phase-title { text-decoration-color: var(--phase-optimizer); }
 .phase-desc {
   color: var(--text-muted);
   font-size: 0.92rem;
   line-height: 1.5;
 }
 
-.diagram-svg .n-val      { font-family: var(--font-mono); font-size: 14px; font-weight: 600; fill: var(--text-primary); }
-.diagram-svg .n-label    { font-size: 12px; fill: var(--text-muted); }
-.diagram-svg .n-sub      { font-family: var(--font-mono); font-size: 10px; fill: var(--text-muted); }
-.diagram-svg .n-grad     { font-family: var(--font-mono); font-size: 11px; fill: var(--phase-backward); }
-.diagram-svg .w-label    { font-family: var(--font-mono); font-size: 11px; fill: var(--text-primary); }
-.diagram-svg .grad-label { font-family: var(--font-mono); font-size: 11px; fill: var(--phase-backward); }
-.diagram-svg .delta-label{ font-family: var(--font-mono); font-size: 11px; fill: var(--phase-optimizer); }
+.diagram-svg .n-val   { font-family: var(--font-mono); font-size: 14px; font-weight: 600; fill: var(--text-primary); }
+.diagram-svg .n-label { font-size: 12px; fill: var(--text-muted); }
+.diagram-svg .n-sub   { font-family: var(--font-mono); font-size: 10px; fill: var(--text-muted); }
 
 .controls {
   display: flex;
@@ -1091,15 +1277,21 @@ body {
 }
 .controls button:hover { border-color: var(--border-strong); }
 .btn-group { display: flex; gap: 0.5rem; }
-.controls button.primary {
-  background: var(--accent);
-  color: var(--text-on-accent);
-  border-color: var(--accent);
-  /* Reserve space for the longest label variant ("▷ Step: compute backward")
-     so phase changes don't push the rest of the strip sideways. */
-  min-width: 14rem;
+/* Icon-only buttons: fixed width and flex-centered for predictable SVG
+   placement. `.accent` paints the icon in the brand color (SVG uses
+   currentColor). */
+.controls button.icon {
+  width: 2.4rem;
+  padding-left: 0;
+  padding-right: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  line-height: 1;
 }
-.controls button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.controls button.icon.accent { color: var(--accent); }
+.btn-icon { display: block; }
 .controls button.toggle.active {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
