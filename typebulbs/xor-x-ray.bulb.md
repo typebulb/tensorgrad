@@ -266,6 +266,10 @@ const iconPause = () => btnIcon(
   rect({ x: 3,  y: 3, width: 3, height: 10, fill: "currentColor" }),
   rect({ x: 10, y: 3, width: 3, height: 10, fill: "currentColor" }),
 )
+const iconStep = () => btnIcon(
+  path({ d: "M3 3 L11 8 L3 13 Z", fill: "currentColor" }),
+  rect({ x: 12, y: 3, width: 2, height: 10, fill: "currentColor" }),
+)
 
 function fmt(x: number, d = 2): string {
   if (Number.isNaN(x)) return "NaN"
@@ -559,13 +563,11 @@ class Diagram extends Component {
 
     const grad        = (d.phase === "backward" || d.phase === "updated") ? acc.grad : null
     const delta       = d.phase === "updated" ? acc.delta : null
-    // Tangent normally only when paused on `backward` (gradient and dot
-    // position are in sync there). While running, every render is in
-    // `updated` phase, so we relax the rule: show the tangent then too. The
-    // stored ∂ was computed at the pre-update position rather than the
-    // current dot, but the autoplay benefit of seeing slopes shift in real
-    // time outweighs the 1-step staleness.
-    const tangentGrad = (d.phase === "backward" || this.root.running) ? acc.grad : null
+    // Tangent shows whenever a gradient is available — same condition as
+    // ∂. On `updated` the slope is one step stale (∂ was computed at the
+    // pre-update position), but the line is drawn through (cur, curLoss),
+    // so the dot still sits on it — only the slope direction is nudged.
+    const tangentGrad = grad
 
     const W = 108, H = 46
     const PLOT_LEFT = 4, PLOT_RIGHT = W - 4
@@ -620,7 +622,7 @@ class Root extends Component implements IRoot {
   inspected: string | null = null
 
   // Advance by one of the currently-selected StepUnit. Used by both the
-  // Step button and the Run autoplay loop, so "advance once" and "play"
+  // Advance button and the Run autoplay loop, so "advance once" and "play"
   // share the same granularity setting.
   advanceOnce() {
     switch (this.demo.stepUnit) {
@@ -677,7 +679,7 @@ class Root extends Component implements IRoot {
         div({ class: "controls" },
           div({ class: "btn-group" },
             button({ onClick: () => this.toggleRun(), class: ["icon", "accent"] }, this.running ? iconPause() : iconPlay()),
-            button({ onClick: () => this.step()                                 }, "Step"),
+            button({ onClick: () => this.step(), class: ["icon", "accent"], title: "Advance" }, iconStep()),
             button({ onClick: () => this.reset(),     class: "icon"             }, "↺"),
             button({ onClick: () => this.reseed()                               }, "New seed"),
           ),
@@ -891,7 +893,7 @@ class Root extends Component implements IRoot {
       case "idle":
         return {
           title: "Ready",
-          desc:  'Tiny network: 2 inputs, 2 hidden neurons (tanh), 1 output (tanh). Random weights. Click "Step" to start training on the four XOR examples, one at a time.',
+          desc:  'Tiny network: 2 inputs, 2 hidden neurons (tanh), 1 output (tanh). Random weights. Click "Advance" to start training on the four XOR examples, one at a time.',
         }
       case "forward": {
         const opSentence = d.hiddenAct === "tanh"
@@ -1117,17 +1119,12 @@ body {
 
 .app { max-width: 1180px; margin: 0 auto; }
 
-/* Sticky so the active tab stays visible while scrolling tall tab content. */
 .tabs {
   display: flex;
   gap: 1.2rem;
   margin: 0 0 1rem;
   padding: 0.4rem 0 0;
   border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  background: var(--bg-page);
 }
 .tab-btn {
   padding: 0.4rem 0.1rem 0.35rem;
