@@ -417,6 +417,9 @@ await b.replaceModel(newModel, { seed: b.seed })           // keep current
 
 ### Operators
 
+`Tensor` has no methods — every op is a free function `op(x, ...)`. Write
+`reshape(x, [B, -1])`, not `x.reshape(...)`.
+
 Imported from `'tensorgrad'`:
 
 - Arithmetic (binary): `add`, `sub`, `mul`, `div`, `min`, `max`
