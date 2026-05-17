@@ -156,15 +156,19 @@ async. `step` and `infer.run` return a discriminated result:
 ```ts
 const r = await train.step({ x, y })
 switch (r.kind) {
-  case 'completed': useLoss(r.loss); break  // r.captures also available
-  case 'aborted':   return                  // graph was replaced mid-flight
+  case 'completed': useLoss(r.loss); break        // r.captures also available
+  case 'aborted':   return                        // graph was replaced mid-flight
+  case 'failed':    console.error(r.error); break // execution error (NaN, dispatch, validation, …)
 }
 ```
 
-No try/catch on `AbortError` needed — the cancellation surfaces as the
-`'aborted'` discriminator across `step`, `run`, and the `singleFlight`
-helper (below) for displaced live-preview callers. One vocabulary for
-the whole library.
+`'aborted'` covers cancellation (graph replaced via `replaceModel`).
+`'failed'` covers anything else that goes wrong inside the worker
+pipeline — NaN loss, kernel dispatch errors, input validation, internal
+IR issues. No try/catch ever needed on `step` or `run`: the
+discriminator is the complete surface. That matters specifically for
+fire-and-forget training loops — an unawaited `runTrainLoop` can't catch
+thrown rejections, so silent loop death was the alternative.
 
 ## Public API
 
@@ -359,21 +363,26 @@ single `run()` must resolve to the same value (matches Keras `None` /
 ONNX dynamic-axis convention). Mismatched inferred dims throw at the
 call boundary, not deep in kernel dispatch.
 
-**Cancellation as value.** If your UI tears down or rebuilds the model
-while a `step` / `run` is in flight (e.g. the user picks a new layer
-size mid-training, triggering `replaceModel`), the in-flight call is
-aborted. The result discriminator surfaces this without try/catch:
+**Cancellation as value (and failure too).** If your UI tears down or
+rebuilds the model while a `step` / `run` is in flight (e.g. the user
+picks a new layer size mid-training, triggering `replaceModel`), the
+in-flight call resolves as `'aborted'`. Execution failures inside the
+worker — NaN, dispatch errors, input validation, internal IR — resolve
+as `'failed'` carrying the underlying `Error`. Both surface in the
+discriminator without try/catch:
 
 ```ts
 const r = await train.step(batch)
 switch (r.kind) {
-  case 'completed': useLoss(r.loss); break  // r.captures also available
-  case 'aborted':   return                  // graph was replaced
+  case 'completed': useLoss(r.loss); break
+  case 'aborted':   return
+  case 'failed':    logAndRetry(r.error); break
 }
 ```
 
-`r.captures` lives only on the `'completed'` branch; type narrowing
-makes it inaccessible from `'aborted'` paths.
+`r.captures` lives only on the `'completed'` branch; `r.error` lives
+only on `'failed'`. Type narrowing makes wrong-branch access a compile
+error.
 
 **Model is a value, not a factory.** Pass a `model: new Model()`
 instance to `compile({ model })`. The compile pipeline clones the module

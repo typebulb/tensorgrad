@@ -87,16 +87,22 @@ export type ForwardFn<M extends Module, I extends InputDecls = InputDecls> =
 /** Discriminated result of `compiled.step(...)`. `'completed'` carries the
  *  scalar loss plus a `Captures` instance (empty when the graph has no
  *  `capture(...)` sites). `'aborted'` is returned when the graph was
- *  destroyed mid-flight (e.g. by `replaceModel`); no try/catch needed. */
+ *  destroyed mid-flight (e.g. by `replaceModel`). `'failed'` is returned
+ *  when the worker pipeline (kernel dispatch, mapAsync, internal IR, input
+ *  validation) raises — the alternative would be a thrown rejection that
+ *  silently kills unawaited training loops. Discriminator-only: no
+ *  try/catch needed on `step` or `run` for any control-flow path. */
 export type StepResult =
   | { kind: 'completed'; loss: number; captures: Captures }
   | { kind: 'aborted' }
+  | { kind: 'failed'; error: Error }
 
 /** Discriminated result of `compiled.run(...)`. Same shape as `StepResult`
  *  but `'completed'` carries the full output tensor (not just a scalar). */
 export type RunResult =
   | { kind: 'completed'; output: Float32Array; captures: Captures }
   | { kind: 'aborted' }
+  | { kind: 'failed'; error: Error }
 
 /** The compile pipeline's IR bundle: the augmented graph, per-param
  *  gradient tensors, the loss output, the buffer plan, and the emitted
@@ -443,7 +449,7 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
       return { kind: 'completed', loss: r.loss, captures: makeCaptures(r.captures, this.meta.captureShapes) }
     } catch (e) {
       if ((e as { name?: string })?.name === 'AbortError') return { kind: 'aborted' }
-      throw e
+      return { kind: 'failed', error: e instanceof Error ? e : new Error(String(e)) }
     }
   }
 
@@ -606,7 +612,7 @@ class ForwardProxy<M extends Module, I extends InputDecls>
       return { kind: 'completed', output: r.output, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
     } catch (e) {
       if ((e as { name?: string })?.name === 'AbortError') return { kind: 'aborted' }
-      throw e
+      return { kind: 'failed', error: e instanceof Error ? e : new Error(String(e)) }
     }
   }
 
