@@ -104,6 +104,7 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `torch.matmul(a, b)` / `a @ b` | `matmul(a, b)` — dispatches between unbatched and batched on rhs rank |
 | `torch.split(x, sizes, dim)` | `split(x, sizes, dim)` |
 | `nn.Embedding(V, D)` | `new Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
+| `pos_emb(torch.arange(T))` (transformer position embeddings) | `pos_emb.fwd(arange(T))` |
 | `torch.flatten(x, start_dim=1)` | `flatten(x, 1)` (or `reshape(x, [B, -1])`) |
 | `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new Conv2d(in, out, k, { stride: s, padding: p })` |
 | `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2d(x, k, { stride: s, padding: p })` |
@@ -193,7 +194,9 @@ isWebGPUAvailable(): boolean                             // friendly pre-flight 
 `compile()` is the worker-spawning executor; `train.attach()` adds a
 sibling forward graph that shares the training compile's worker and
 param buffers. Both take plain options objects — types are inferred
-from the model + forward function, so you rarely need to import them:
+from the model + forward function, so you rarely need to import them
+(but `CompiledTraining<M, I>` / `CompiledForward<M, I>` are exported
+for class fields, `useRef`, and other storage that breaks inference):
 
 ```ts
 const model = new Model()
@@ -314,7 +317,9 @@ infer.run(inputs)                            // → { kind: 'completed', output,
 output staging buffer; the runtime chains the second call so the two
 `mapAsync`s don't collide. Useful for the "training in the background,
 refresh preview on every input change" pattern: just fire both — no
-manual lock needed.
+manual lock needed. The flip side: a long burst of `run()`s (e.g.
+autoregressive sampling — N sequential calls) stalls training for its
+full duration; batch with parametric `B` to do all N samples in one call.
 
 `train.graph`, `train.kernels`, `train.outputShape`, `train.paramNames`,
 and `train.seed` are sync properties for inspection. Forward compiles
@@ -460,7 +465,7 @@ new RMSNorm(dim, { eps?, decay? })           // .fwd(x); g (gain) only — Llama
 new Embedding(vocab, dim, { init?, decay? })          // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
 new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW; dense only (no `groups`); k/stride/padding accept int or [kH, kW]
                                       // x: [B, inC, H, W] -> [B, outC, H', W']
-crossEntropy(logits, targets, { reduction? })  // fused log-softmax + NLL; default mean
+crossEntropy(logits, targets, { reduction? })  // [..., V] + [...] → scalar; fused log-softmax + NLL; default mean
 nllLoss(logProbs, targets, { reduction? })     // NLL only; pair with logSoftmax for the log-prob intermediate
 ```
 
