@@ -236,7 +236,7 @@ async function predictAddition(
     const inputTokens = prefix.concat(generated)         // before this step's push
 
     const r = await infer.run({ tokens: tokensBuf })
-    if (r.kind === 'aborted') return { generated, generatedProbs, attnMaps: attnMapsPerStep, inside: insideSteps }
+    if (r.kind !== 'completed') return { generated, generatedProbs, attnMaps: attnMapsPerStep, inside: insideSteps }
     const logitsAll = r.output
     const captures = r.captures
 
@@ -478,7 +478,7 @@ class Model extends Component implements IModel {
     let lossVal: number
     try {
       const r = await this.#train.step({ tokens, targets, mask: RESULT_MASK })
-      if (r.kind === 'aborted') return
+      if (r.kind !== 'completed') return
       lossVal = r.loss
     } catch (e: any) {
       this.status = `Step error: ${e?.message ?? e}`
@@ -597,7 +597,7 @@ class Model extends Component implements IModel {
       const generated: number[][] = Array.from({ length: N_TEST }, () => [])
       for (let step = 0; step < N_RESULT_DIGITS; step++) {
         const r = await evalCompiled.run({ tokens: tokensBuf })  // [N_TEST, T_LEN, VOCAB]
-        if (r.kind === 'aborted') return
+        if (r.kind !== 'completed') return
         const logits = r.output
         const realLen = RESULT_START + step                                 // 6, 7, 8
         const readPos = realLen - 1

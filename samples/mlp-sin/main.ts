@@ -77,7 +77,7 @@ async function runTraining(): Promise<void> {
   while (running) {
     step++
     const r = await train.step(makeBatch())
-    if (r.kind === 'aborted') break
+    if (r.kind !== 'completed') break
 
     if (step === 1 || step % 100 === 0) {
       onStatus(`  step ${step.toString().padStart(4)}  loss ${r.loss.toFixed(6)}`)

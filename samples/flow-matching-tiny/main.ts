@@ -125,7 +125,7 @@ async function runTraining(): Promise<void> {
   let lastEval = 0
   while (running && train) {
     const r = await train.step(nextBatch())
-    if (r.kind === 'aborted') return
+    if (r.kind !== 'completed') return
     const lastLoss = r.loss
     step += 1
     if (!Number.isFinite(lastLoss)) {
@@ -157,7 +157,7 @@ async function generateOne(): Promise<Float32Array | null> {
     const tBucket = Math.max(1, Math.min(T_STEPS, Math.round(tCont * T_STEPS)))
     tBuf[0] = tBucket
     const vr = await infer.run({ x_t: x, t: tBuf })
-    if (vr.kind === 'aborted') return null
+    if (vr.kind !== 'completed') return null
     const v = vr.output
     for (let p = 0; p < IMG_LEN; p++) x[p] = x[p]! - dt * v[p]!
     if (i === SAMPLE_STEPS - 1 || i % 2 === 0) {

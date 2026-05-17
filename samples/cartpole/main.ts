@@ -131,7 +131,7 @@ async function rollout(): Promise<{
       stateBuf[o + 3] = envs[k]!.thetaDot
     }
     const probsR = await infer.run({ state: stateBuf })  // [K, A]
-    if (probsR.kind === 'aborted') break
+    if (probsR.kind !== 'completed') break
     const probs = probsR.output
 
     for (let k = 0; k < K; k++) {
@@ -183,7 +183,7 @@ async function runTraining(): Promise<void> {
     const stepR = await train.step({
       states: r.states, actions: r.actions, returns: r.returns, mask: r.mask,
     })
-    if (stepR.kind === 'aborted') return
+    if (stepR.kind !== 'completed') return
     const loss = stepR.loss
     if (!Number.isFinite(loss)) {
       onStatus(`rollout ${rolloutCount}: loss is ${loss} — NaN, aborting.`)

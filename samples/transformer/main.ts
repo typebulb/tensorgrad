@@ -86,7 +86,7 @@ async function predictPair(a: number, b: number): Promise<number[]> {
     for (let i = 0; i < prefix.length; i++) tokensBuf[i] = prefix[i]!
     for (let i = 0; i < generated.length; i++) tokensBuf[prefix.length + i] = generated[i]!
     const r = await infer.run({ tokens: tokensBuf })
-    if (r.kind === 'aborted') return generated
+    if (r.kind !== 'completed') return generated
     const output = r.output
     const lastStart = (realLen - 1) * VOCAB
     let best = 0
@@ -159,7 +159,7 @@ async function runTraining(): Promise<void> {
   while (running) {
     step++
     const sr = await train.step({ ...makeBatch(), mask: RESULT_MASK })
-    if (sr.kind === 'aborted') break
+    if (sr.kind !== 'completed') break
     const lossVal = sr.loss
     if (step === 1 || step % 20 === 0) {
       const interval = step === 1 ? 1 : 20
@@ -173,7 +173,7 @@ async function runTraining(): Promise<void> {
     // probe (autoregressive prediction on excluded test pairs).
     if (step === 1 || step % 100 === 0) {
       const rr = await infer.run({ tokens: inferTokens })
-      if (rr.kind === 'aborted') break
+      if (rr.kind !== 'completed') break
       const { output, captures } = rr
       const expectOutput = 1 * T * VOCAB
       const expectAttn = 1 * N_HEADS * T * T

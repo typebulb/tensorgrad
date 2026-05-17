@@ -123,7 +123,7 @@ async function rerollInterpEndpoints(): Promise<void> {
   x.set(testData.images.subarray(idxA * INPUT_DIM, (idxA + 1) * INPUT_DIM), 0)
   x.set(testData.images.subarray(idxB * INPUT_DIM, (idxB + 1) * INPUT_DIM), INPUT_DIM)
   const mr = await encode.run({ x })   // [2, LATENT_DIM]
-  if (mr.kind === 'aborted') return
+  if (mr.kind !== 'completed') return
   const mus = mr.output
   interpA = new Float32Array(mus.subarray(0, LATENT_DIM))
   interpB = new Float32Array(mus.subarray(LATENT_DIM, 2 * LATENT_DIM))
@@ -143,7 +143,7 @@ async function runTraining(): Promise<void> {
   let lastEval = 0
   while (running && train) {
     const sr = await train.step(nextBatch())
-    if (sr.kind === 'aborted') return
+    if (sr.kind !== 'completed') return
     const loss = sr.loss
     step += 1
     if (!Number.isFinite(loss)) {

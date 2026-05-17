@@ -84,7 +84,7 @@ async function runTraining(): Promise<void> {
   let lastLoss = 0
   while (running && train) {
     const sr = await train.step(nextBatch())
-    if (sr.kind === 'aborted') return
+    if (sr.kind !== 'completed') return
     lastLoss = sr.loss
     step += 1
     if (!Number.isFinite(lastLoss)) {

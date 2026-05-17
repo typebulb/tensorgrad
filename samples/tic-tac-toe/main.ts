@@ -145,7 +145,7 @@ async function rollout(): Promise<{
       if (!games[k]!.done) packState(games[k]!, stateBatch, k * STATE_DIM)
     }
     const probsR = await infer.run({ state: stateBatch })  // [K, 9]
-    if (probsR.kind === 'aborted') break
+    if (probsR.kind !== 'completed') break
     const probs = probsR.output
 
     for (let k = 0; k < K; k++) {
@@ -202,7 +202,7 @@ async function evalVsRandom(): Promise<number> {
       if (g.turn === modelIsPlayer) {
         packState(g, stateBatch, 0)
         const pr = await infer.run({ state: stateBatch })
-        if (pr.kind === 'aborted') return 0
+        if (pr.kind !== 'completed') return 0
         const probs = pr.output
         const legal = new Int8Array(9)
         for (let i = 0; i < 9; i++) legal[i] = g.cells[i] === 0 ? 0 : 1
@@ -231,7 +231,7 @@ async function runTraining(): Promise<void> {
     const sr = await train.step({
       states: r.states, actions: r.actions, outcomes: r.outcomes, mask: r.mask,
     })
-    if (sr.kind === 'aborted') return
+    if (sr.kind !== 'completed') return
     const loss = sr.loss
     if (!Number.isFinite(loss)) {
       onStatus(`rollout ${rolloutCount}: loss is ${loss} — NaN, aborting.`)
@@ -254,7 +254,7 @@ async function modelMove(g: Game): Promise<number> {
   const stateBuf = new Float32Array(STATE_DIM)
   packState(g, stateBuf, 0)
   const pr = await infer.run({ state: stateBuf })
-  if (pr.kind === 'aborted') return -1
+  if (pr.kind !== 'completed') return -1
   const probs = pr.output
   let bestIdx = -1, bestVal = -Infinity
   for (let i = 0; i < 9; i++) {

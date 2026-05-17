@@ -133,7 +133,7 @@ async function probeAccuracy(): Promise<number> {
   // First call at B=EVAL_BATCH triggers a sibling compile + cache;
   // subsequent calls hit the cache.
   const r = await infer.run({ x })
-  if (r.kind === 'aborted') return 0
+  if (r.kind !== 'completed') return 0
   const probs = r.output
   let correct = 0
   for (let b = 0; b < EVAL_BATCH; b++) {
@@ -154,7 +154,7 @@ async function runTraining(): Promise<void> {
     while (running && train) {
       const batch = nextTrainBatch()
       const r = await train.step(batch)
-      if (r.kind === 'aborted') return   // graph was replaced; quietly bail
+      if (r.kind !== 'completed') return   // graph was replaced or call failed; quietly bail
       lastLoss = r.loss
       step += 1
       const now = Date.now()

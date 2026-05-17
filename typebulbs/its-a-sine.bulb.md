@@ -106,7 +106,7 @@ runBtn.onclick = async () => {
     while (!stopRequested) {
       step++
       const r = await train.step(makeBatch())
-      if (r.kind === 'aborted') break
+      if (r.kind !== 'completed') break
       const now = performance.now()
       if (now - lastViz > 200) {
         lastViz = now

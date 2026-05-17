@@ -151,7 +151,7 @@ async function sampleName(): Promise<string> {
     tokensBuf.fill(PAD)                       // tokens[0] = '.' (BOS)
     for (let i = 0; i < generated.length; i++) tokensBuf[i + 1] = generated[i]!
     const r = await infer.run({ tokens: tokensBuf })
-    if (r.kind === 'aborted') return generated.map(decodeChar).join('')
+    if (r.kind !== 'completed') return generated.map(decodeChar).join('')
     const readPos = generated.length          // next-token logits at the last written position
     const probs = softmaxRow(r.output, readPos * VOCAB, VOCAB)
     const next = sampleFromProbs(probs)
@@ -200,7 +200,7 @@ async function runTraining(): Promise<void> {
   while (running) {
     step++
     const sr = await train.step(makeBatch(false))
-    if (sr.kind === 'aborted') break
+    if (sr.kind !== 'completed') break
     const lossVal = sr.loss
     if (step === 1 || step % 20 === 0) {
       const interval = step === 1 ? 1 : 20
@@ -211,7 +211,7 @@ async function runTraining(): Promise<void> {
     }
     if (step === 1 || step % 100 === 0) {
       const vr = await valLossFwd.run(makeBatch(true))
-      if (vr.kind === 'aborted') break
+      if (vr.kind !== 'completed') break
       const valLoss = vr.output[0]!
       const samples: string[] = []
       for (let i = 0; i < 8; i++) samples.push(await sampleName())

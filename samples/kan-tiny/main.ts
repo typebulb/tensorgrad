@@ -79,7 +79,7 @@ for (let i = 0; i < PLOT_N; i++) PLOT_XS[i] = -1 + 2 * i / (PLOT_N - 1)
 async function renderAll(): Promise<void> {
   if (!infer || !train) return
   const r = await infer.run({ x: PLOT_XS })
-  if (r.kind === 'aborted') return
+  if (r.kind !== 'completed') return
   const params = await train.downloadParams()
   onRender(r.output, { l1C: params['l1.C']!, l2C: params['l2.C']! })
 }
@@ -101,7 +101,7 @@ async function trainLoop(): Promise<void> {
   let lastLoss = 0
   while (running && train) {
     const sr = await train.step(makeBatch())
-    if (sr.kind === 'aborted') return
+    if (sr.kind !== 'completed') return
     lastLoss = sr.loss
     step += 1
     if (!Number.isFinite(lastLoss)) {

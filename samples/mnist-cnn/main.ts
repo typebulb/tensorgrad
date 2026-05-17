@@ -108,7 +108,7 @@ async function probeAccuracy(): Promise<number> {
     truth[b] = testData.labels[idx]!
   }
   const r = await infer.run({ x })
-  if (r.kind === 'aborted') return 0
+  if (r.kind !== 'completed') return 0
   const logits = r.output
   let correct = 0
   for (let b = 0; b < EVAL_BATCH; b++) {
@@ -126,7 +126,7 @@ async function runTraining(): Promise<void> {
   while (running && train) {
     const batch = nextTrainBatch()
     const sr = await train.step(batch)
-    if (sr.kind === 'aborted') return
+    if (sr.kind !== 'completed') return
     lastLoss = sr.loss
     step += 1
     if (!Number.isFinite(lastLoss)) {

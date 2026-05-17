@@ -133,7 +133,7 @@ class Model extends Component implements IModel {
     const x = new Float32Array(INPUT_DIM)
     for (let i = 0; i < INPUT_DIM; i++) x[i] = bytes[i]! / 256
     const r = await this.#infer.run({ x })
-    if (r.kind === 'aborted') return
+    if (r.kind !== 'completed') return
     this.manualPredictionResult = Array.from(r.output)
     this.update()
   })
@@ -297,7 +297,7 @@ class Model extends Component implements IModel {
     this.#makeBatch(this.#trainSet)
     try {
       const r = await this.#train.step({ x: this.#batchX, y: this.#batchY })
-      if (r.kind === 'aborted') return
+      if (r.kind !== 'completed') return
     } catch (e: any) {
       this.isRunning = false
       this.status = `Step error: ${e?.message ?? e}`
@@ -321,7 +321,7 @@ class Model extends Component implements IModel {
       this.#makeBatch(set)
       const labels = Array.from(this.#batchY)
       const r = await this.#infer!.run({ x: this.#batchX })
-      if (r.kind === 'aborted') return false
+      if (r.kind !== 'completed') return false
       const logits = r.output
       for (let i = 0; i < BATCH_SIZE; i++) {
         let best = 0

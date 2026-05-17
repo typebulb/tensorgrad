@@ -135,7 +135,7 @@ function App() {
     let lastLoss = 0
     while (runningRef.current && trainRef.current) {
       const sr = await trainRef.current.step(nextBatch())
-      if (sr.kind === 'aborted') return
+      if (sr.kind !== 'completed') return
       lastLoss = sr.loss
       stepRef.current += 1
       if (!Number.isFinite(lastLoss)) {
