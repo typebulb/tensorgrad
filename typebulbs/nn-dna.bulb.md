@@ -1181,6 +1181,13 @@ The source MUST end with:
       h = add(mul(a_t, h), mul(b_t, X_t))
     }
 
+**1D conv via Conv2d** — no `Conv1d` primitive; reshape sequence data `[B, C, T]` to `[B, C, 1, T]` and use a `[1, K]` kernel:
+
+    conv = new Conv2d(C_in, C_out, [1, K], { padding: [0, K - 1] })
+    // in the forward:
+    const x4 = reshape(x, [B, C_in, 1, T])
+    const y  = reshape(conv.fwd(x4), [B, C_out, T_out])
+
 ## Available tensorgrad symbols (already in scope at eval time)
 
 **Layer modules** — instantiate as class fields; each instance exposes `.fwd(x)`:
@@ -1189,7 +1196,7 @@ The source MUST end with:
     new LayerNorm(dim, { eps?, bias?, decay? })
     new RMSNorm(dim, { eps?, decay? })
     new Embedding(vocab, dim, { init?, decay? })
-    new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? })  // dense only; no groups
+    new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? })  // dense only; no groups; k/stride/padding accept int or [kH, kW]
 **Compile/lifecycle**: `Module`, `compile`, `lr`, `init`.
 **Losses**: `crossEntropy(logits, targets, { reduction? })`, `nllLoss(logProbs, targets, { reduction? })` — default reduction is mean; use `'none'` for per-position output.
 **Arithmetic**: `add`, `sub`, `mul`, `div`, `min`, `max` — each takes `(Tensor, Tensor)` or `(Tensor, number)`.
@@ -1212,6 +1219,7 @@ The source MUST end with:
 
 - **`Tensor` has no methods.** Every operation is a free function from the symbols list, applied as `op(x, ...)` — e.g. `reshape(x, [B, -1])`, `sum(x, axis)`, `swapAxes(x, -2, -1)`, `narrow(x, axis, start, len)`.
 - **Operators have no PyTorch-style optional flags.** The symbols list is the full signature. `matmul(a, b)` is two args; to transpose the rhs, write `matmul(a, swapAxes(b, -2, -1))`.
+- **`reshape` doesn't transpose.** It reinterprets memory layout — to reorder axes use `permute(x, [perm])` or `swapAxes(x, a, b)`. Same total element count means `reshape` won't error on a wrong-axes pass, so this is a silent correctness bug.
 - **Static shapes only** — every dim is a compile-time `const` in your code, not a value read from a tensor.
 - **Pass raw logits to `crossEntropy`** — it fuses log-softmax internally. Don't apply `logSoftmax` first.
 - **Loss must be scalar** (rank-0). Use `mean`/`sum` to reduce.

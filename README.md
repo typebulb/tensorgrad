@@ -150,6 +150,15 @@ intermediate, mark it with `capture(name, t)` inside the forward; the
 activation surfaces on the result's `captures` field every call. Graphs
 with no `capture()` sites pay nothing.
 
+**`reshape` doesn't transpose.** It reinterprets the linear memory layout;
+total element count is preserved but axis order in memory is not.
+To reorder axes use `permute` / `swapAxes`:
+
+```ts
+permute(x, [0, 2, 1])  // [B, E, T] → [B, T, E], correct
+reshape(x, [B, T, E])  // same shape, scrambled — silent correctness bug
+```
+
 **Tensorgrad runs in a worker.** Every method on a compiled module is
 async. `step` and `infer.run` return a discriminated result:
 
@@ -449,7 +458,7 @@ new Linear(inDim, outDim, { bias?, init?, decay? })   // .fwd(x); W: [inDim, out
 new LayerNorm(dim, { eps?, bias?, decay? })  // .fwd(x); g (gain) [dim], b (bias) [dim] or null when bias:false
 new RMSNorm(dim, { eps?, decay? })           // .fwd(x); g (gain) only — Llama-style
 new Embedding(vocab, dim, { init?, decay? })          // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
-new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW; dense only (no `groups`)
+new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW; dense only (no `groups`); k/stride/padding accept int or [kH, kW]
                                       // x: [B, inC, H, W] -> [B, outC, H', W']
 crossEntropy(logits, targets, { reduction? })  // fused log-softmax + NLL; default mean
 nllLoss(logProbs, targets, { reduction? })     // NLL only; pair with logSoftmax for the log-prob intermediate
