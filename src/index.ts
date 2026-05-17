@@ -29,6 +29,8 @@ export {
   matmul,
   // Indexing / casting
   oneHot, arange, embedding, takeAlongAxis,
+  // Const-tensor builders
+  zeros, ones,
   // ML primitives
   softmaxCausal, logSoftmax, softmax, whereCausal,
   // 2D conv + pool (NCHW)

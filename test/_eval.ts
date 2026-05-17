@@ -117,6 +117,12 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       buf[0] = op.value
       return buf
     }
+    case 'const_fill': {
+      const size = shapeSize(shape)
+      const buf = makeBuf(size, dtype)
+      if (op.value !== 0) (buf as Float32Array | Int32Array).fill(op.value)
+      return buf
+    }
     case 'arange': {
       const buf = makeBuf(op.n, dtype)
       for (let i = 0; i < op.n; i++) buf[i] = i

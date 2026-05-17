@@ -11,6 +11,7 @@ build-artifacts/
 
 # Excluded from publication. Specs are working design notes; .claude/.github
 # are local config.
+/typebulbs-tentative
 .github/
 .claude/
 .claude-paste

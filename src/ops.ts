@@ -604,6 +604,31 @@ export function arange(n: number, dtype: Dtype = 'i32'): Tensor {
   return addOp(currentGraph(), 'arange', [n], dtype, site, { n, dtype })
 }
 
+/** `zeros(shape)` → tensor of given shape filled with 0. Default dtype is
+ *  `f32`. Used for initial-state buffers in unrolled recurrences, accumulators,
+ *  and any "explicit zero" tensor a forward needs. Backward is no-op (the
+ *  value is constant). */
+export function zeros(shape: Shape, dtype: Dtype = 'f32'): Tensor {
+  return constFill('zeros', shape, dtype, 0)
+}
+
+/** `ones(shape)` → tensor of given shape filled with 1. Default dtype is
+ *  `f32`. Symmetric with `zeros`; used for masks-of-ones, identity scales,
+ *  and similar. */
+export function ones(shape: Shape, dtype: Dtype = 'f32'): Tensor {
+  return constFill('ones', shape, dtype, 1)
+}
+
+function constFill(opName: string, shape: Shape, dtype: Dtype, value: number): Tensor {
+  const site = captureSite(opName)
+  for (const d of shape) {
+    if (!Number.isInteger(d) || d <= 0) {
+      throw new ShapeError(`${opName}: shape must be positive integers, got ${showShape(shape)}`, site)
+    }
+  }
+  return addOp(currentGraph(), 'const_fill', shape, dtype, site, { value, dtype })
+}
+
 // ---- ML primitives (fused for cleaner autograd + hand-tuned kernels) ------
 
 function softmaxCausalLastIR(a: Tensor): Tensor {

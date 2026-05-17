@@ -89,6 +89,19 @@ fn main() {
 }`.trim()
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.out)], threads: 1, workgroupSize: 1 }
     }
+    case 'const_fill': {
+      const out = tof(op.out)
+      const total = shapeSize(out.shape)
+      const wgsl = `
+@group(0) @binding(0) var<storage, read_write> buf : array<${wgslDtype(op.dtype)}>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${total}u) { return; }
+  buf[i] = ${wgslLiteral(op.value, op.dtype)};
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+    }
 
     // ---- Element-wise binops with broadcast --------------------------------
     case 'add':

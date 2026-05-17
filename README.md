@@ -58,6 +58,8 @@ for (let step = 0; step < 1000; step++) {
 
 - A `Module` subclass declares parameters via `this.param([shape], opts)` and
   composes child modules as plain fields. The class is a tree of params.
+  Params are registered during class-field initialization or in the constructor —
+  never inside a forward function.
 - A *forward function* takes the materialized module + a record of named
   input tensors and returns a tensor — the loss for a training spec, or
   any output for a forward spec. Forwards are free functions, not methods.
@@ -406,6 +408,7 @@ Imported from `'tensorgrad'`:
 - Attention layout: `splitHeads(x, nHeads)`, `mergeHeads(x)`
 - Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank)
 - Indexing / casting: `oneHot`, `arange`, `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (general per-axis gather; both array/data first to match PyTorch functional, JAX, NumPy)
+- Const-tensor builders: `zeros(shape, dtype?)`, `ones(shape, dtype?)` (default `f32`; non-differentiable; pair with `randn`/`arange` as the complete set — no `full`, `eye`, `linspace`, `tril`, `zerosLike`, or `like`-variants)
 - Slicing / structural: `narrow(t, axis, start, length)` (PyTorch `torch.narrow`), `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal(x, fillValue)` (mask below the diagonal; pairs with `softmaxCausal` when you need a non-softmax causal mask)
 - 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`, `flatten(x, startAxis?)`
@@ -437,7 +440,7 @@ new Linear(inDim, outDim, { bias?, init?, decay? })   // .fwd(x); W: [inDim, out
 new LayerNorm(dim, { eps?, bias?, decay? })  // .fwd(x); g (gain) [dim], b (bias) [dim] or null when bias:false
 new RMSNorm(dim, { eps?, decay? })           // .fwd(x); g (gain) only — Llama-style
 new Embedding(vocab, dim, { init?, decay? })          // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
-new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW
+new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW; dense only (no `groups`)
                                       // x: [B, inC, H, W] -> [B, outC, H', W']
 crossEntropy(logits, targets, { reduction? })  // fused log-softmax + NLL; default mean
 nllLoss(logProbs, targets, { reduction? })     // NLL only; pair with logSoftmax for the log-prob intermediate

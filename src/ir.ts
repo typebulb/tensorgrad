@@ -191,6 +191,10 @@ export type OpNode =
   | { kind: 'sum_to_shape'; out: number; a: number; targetShape: Shape }
   // 0-d const. Used to seed the loss cotangent (1.0).
   | { kind: 'const_scalar'; out: number; value: number; dtype: Dtype }
+  // n-d const fill of a single value. Backs `zeros` / `ones` (user-facing) and
+  // any future const-tensor builder restricted to a uniform value. Shape lives
+  // on the output tensor as usual; `value` and `dtype` ride on the op.
+  | { kind: 'const_fill'; out: number; value: number; dtype: Dtype }
   // ReLU's backward: dy where x > 0, else 0. Fused so autograd doesn't have
   // to emit a where+const-zero+broadcast chain.
   | { kind: 'relu_grad'; out: number; x: number; dy: number }
@@ -321,7 +325,7 @@ export function addOp<K extends OpNode['kind']>(
 export function getOpInputs(op: OpNode): readonly number[] {
   switch (op.kind) {
     case 'param_input': case 'tensor_input': case 'state_input':
-    case 'arange': case 'const_scalar': case 'randn':
+    case 'arange': case 'const_scalar': case 'const_fill': case 'randn':
       return []
     case 'add': case 'sub': case 'mul': case 'div': case 'min': case 'max':
     case 'less': case 'greater':

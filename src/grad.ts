@@ -125,6 +125,7 @@ function runAdjointRule(
     case 'state_input':
     case 'arange':
     case 'const_scalar':
+    case 'const_fill':
       return
 
     // ---- Element-wise binops (with broadcast) ------------------------------

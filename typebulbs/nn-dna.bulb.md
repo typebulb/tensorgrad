@@ -23,6 +23,7 @@ import {
   splitHeads, mergeHeads,
   matmul,
   oneHot, arange, embedding, takeAlongAxis,
+  zeros, ones,
   narrow, concat, stack, split,
   softmax, logSoftmax, softmaxCausal, whereCausal,
   conv2d, maxPool2d, nearestUpsample2d, flatten
@@ -84,6 +85,7 @@ const _tgKeepalive = {
   splitHeads, mergeHeads,
   matmul,
   oneHot, arange, embedding, takeAlongAxis,
+  zeros, ones,
   narrow, concat, stack, split,
   softmax, logSoftmax, softmaxCausal, whereCausal,
   conv2d, maxPool2d, nearestUpsample2d, flatten,
@@ -1172,9 +1174,22 @@ The source MUST end with:
     // or { kind: 'sgd', lr: ..., momentum: 0.9 }
     // `lr` may also be a schedule: `lr.linear({ peak, final, steps })` etc.
 
+**Recurrent state in unrolled loops** — initialize with `zeros(shape)`, then the loop body reads as the pure recurrence:
+
+    let h = zeros([B, H, P, N])
+    for (let t = 0; t < T; t++) {
+      h = add(mul(a_t, h), mul(b_t, X_t))
+    }
+
 ## Available tensorgrad symbols (already in scope at eval time)
 
-**Layer modules**: `Linear`, `LayerNorm`, `RMSNorm`, `Embedding`, `Conv2d` — each instance exposes `.fwd(x)`.
+**Layer modules** — instantiate as class fields; each instance exposes `.fwd(x)`:
+
+    new Linear(inDim, outDim, { bias?, init?, decay? })
+    new LayerNorm(dim, { eps?, bias?, decay? })
+    new RMSNorm(dim, { eps?, decay? })
+    new Embedding(vocab, dim, { init?, decay? })
+    new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? })  // dense only; no groups
 **Compile/lifecycle**: `Module`, `compile`, `lr`, `init`.
 **Losses**: `crossEntropy(logits, targets, { reduction? })`, `nllLoss(logProbs, targets, { reduction? })` — default reduction is mean; use `'none'` for per-position output.
 **Arithmetic**: `add`, `sub`, `mul`, `div`, `min`, `max` — each takes `(Tensor, Tensor)` or `(Tensor, number)`.
@@ -1186,6 +1201,7 @@ The source MUST end with:
 **Shape**: `reshape(x, [dims])` (one `-1` allowed, inferred from total size), `permute`, `swapAxes` (= PyTorch `transpose`), `flatten`.
 **Linear algebra**: `matmul`.
 **Indexing**: `oneHot(idx, depth)`, `arange(n)`, `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (= PyTorch `gather`).
+**Const-tensor builders**: `zeros(shape, dtype?)`, `ones(shape, dtype?)` — default `f32`. The full set is `randn` / `arange` / `oneHot` / `zeros` / `ones`; no `full`, `eye`, `linspace`, `tril`, or `like`-variants.
 **Slicing/structural**: `narrow(t, axis, start, len)`, `concat([a, b, ...], axis)`, `stack([a, b, ...], axis)`, `split(t, [size1, size2, ...], axis)`.
 **Fused ML**: `softmax`, `logSoftmax`, `softmaxCausal`, `whereCausal`.
 **Attention layout**: `splitHeads(x, nHeads)`, `mergeHeads(x)`.
@@ -1202,6 +1218,9 @@ The source MUST end with:
 - **`splitHeads(x, nHeads)`** reshapes one tensor: `[B, T, D] → [B, H, T, D/H]`. For Q/K/V, use three independent `Linear(D, D)` projections and call `splitHeads` on each.
 - **Attention scaling**: multiply scores by `1 / Math.sqrt(D_HEAD)` before `softmaxCausal`.
 - **Iterative architectures: small loop counts.** For RNN unrolls, diff-physics rollouts, diffusion samplers, multi-round message passing, etc., set the inner loop count to a small constant (typically `2`) — large unrolls produce diagrams the renderer can't draw. Add a comment with the production value: `const HORIZON = 2  // 32+ for actual training`.
+- **No `groups` on Conv2d, no `Conv1d`.** Conv2d is dense conv only.
+- **No in-forward param creation.** `this.param` is class-field only; forwards are pure tensor compositions over the already-built module.
+- **No `scan` / `cumsum`.** Unroll trace-time loops; keep T small.
 
 ## Reference example (small)
 
