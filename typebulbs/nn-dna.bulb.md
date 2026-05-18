@@ -31,10 +31,7 @@ import {
 import { instance } from "@viz-js/viz"
 import { transform as sucraseTransform } from "sucrase"
 
-// Domeleon's `div` (DOM helper) is renamed to `divH` so tensorgrad's `div`
-// (tensor element-wise division) keeps its natural name — which is what
-// specs pasted from the samples expect. The `H` suffix echoes Domeleon's
-// general-purpose `h(...)` for arbitrarily-named elements.
+// Domeleon's `div` renamed to `divH` so tensorgrad's `div` (tensor /) keeps its natural name in pasted specs.
 
 // ===== Spec evaluation ======================================================
 
@@ -65,12 +62,9 @@ interface IRSpec {
   dims?: DimSpec[]
 }
 
-// Keepalive object — statically references every tensorgrad import so the
-// build pipeline can't tree-shake them. The bulb's body never uses most of
-// these directly; they're consumed by the eval'd spec source, which the
-// tree-shaker can't see into. Without this, imports like `Module`, `Linear`,
-// `add`, etc. get stripped from the bulb's compiled output, and the eval
-// fails with `ReferenceError: Module is not defined`.
+// Defeats tree-shaking: tensorgrad symbols are referenced at runtime by
+// eval'd spec source, which the bundler can't see. Removing this breaks
+// specs with `ReferenceError: Module is not defined`.
 const _tgKeepalive = {
   Module, compile, lr, init, isWebGPUAvailable,
   Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
@@ -92,14 +86,9 @@ const _tgKeepalive = {
 }
 ;(globalThis as any).__tg_keepalive = _tgKeepalive
 
-// Returns the evaluated spec and the cleaned source (line numbers preserved
-// from the original) so the viewer can look up spec lines by stack-frame
-// line number after compile.
+// Cleaned source returned alongside spec so stack-frame lines map back to the original.
 function evaluateSpec(source: string): { spec: IRSpec; cleanedSource: string } {
-  // Strip imports but PRESERVE line breaks — the regex match spans multiple
-  // lines for `import { ... } from '...'`, so we replace non-newline chars
-  // with empty string instead of removing the match entirely. This keeps
-  // line numbers in the eval'd source aligned with the original spec.
+  // Multi-line imports stripped but newlines kept, so eval'd line numbers stay aligned with the original.
   let s = source.replace(
     /^\s*import\b[\s\S]*?['"][^'"]+['"];?\s*$/gm,
     (m) => m.replace(/[^\n]/g, ""),
@@ -130,33 +119,24 @@ function forwardReachable(graph: Graph, outputs: readonly number[]): Set<number>
 
 // ===== Source attribution ===================================================
 
-type UserFrame = { fn: string; url: string; file: string; line: number }
+type UserFrame = { url: string; line: number }
 
-// The spec lives inside an eval, so V8 reports its frames as
-// `<anonymous>:LINE:COL` (sometimes wrapped in `eval at outer (url:N:C),
-// <anonymous>:M:K`). Every other frame is bundled library / runtime code
-// that we want to skip. Strategy: find the topmost frame containing an
-// `<anonymous>:LINE:COL` token; that's spec code.
+// Spec lives inside eval, so V8 reports its frames as `<anonymous>:LINE:COL`
+// (sometimes wrapped: `eval at outer (url:N:C), <anonymous>:M:K`). Every
+// other frame is bundled library/runtime — skip. Strategy: walk frames
+// top-down, take the first containing an `<anonymous>:LINE:COL` token, and
+// within that line take the LAST match (innermost position for nested eval).
 function firstUserFrame(site: CallSite | null): UserFrame | null {
   if (!site) return null
   for (const raw of site.stack.split("\n").slice(1)) {
     const line = raw.trim()
     if (!line) continue
-    // Eval'd spec frame — take the LAST `<anonymous>:N:M` on the line so
-    // nested-eval cases (eval-within-eval) report the innermost position.
     const matches = [...line.matchAll(/<anonymous>:(\d+):\d+/g)]
     if (matches.length > 0) {
-      const lineNo = parseInt(matches[matches.length - 1]![1]!, 10)
-      return { fn: "<spec>", url: "__spec__", file: "spec", line: lineNo }
+      return { url: "__spec__", line: parseInt(matches[matches.length - 1]![1]!, 10) }
     }
   }
   return null
-}
-
-function getSourceLine(cache: Map<string, string[]>, url: string, line: number): string | null {
-  const lines = cache.get(url)
-  if (!lines) return null
-  return lines[line - 1] ?? null
 }
 
 // ===== Palettes + dim resolver =============================================
@@ -303,34 +283,26 @@ function groupBySourceLine(graph: Graph, included: Set<number>): Group[] {
 }
 
 function buildDag(graph: Graph, groups: Group[]): DagNode[] {
-  const producingGroup = new Map<number, number>()
-  for (let gi = 0; gi < groups.length; gi++) {
-    for (const opIdx of groups[gi]!.ops) producingGroup.set(graph.ops[opIdx]!.out, gi)
-  }
-  const consumers = new Map<number, Set<number>>()
-  for (let gi = 0; gi < groups.length; gi++) {
-    for (const opIdx of groups[gi]!.ops) {
-      for (const tid of getOpInputs(graph.ops[opIdx]!)) {
-        let s = consumers.get(tid); if (!s) { s = new Set(); consumers.set(tid, s) }
-        s.add(gi)
-      }
+  // Tids referenced as inputs by any included op — gates which tensor_inputs become nodes.
+  const consumedTids = new Set<number>()
+  for (const g of groups) {
+    for (const opIdx of g.ops) {
+      for (const tid of getOpInputs(graph.ops[opIdx]!)) consumedTids.add(tid)
     }
   }
-  const nodeTids = new Set<number>()
-  for (const g of groups) nodeTids.add(g.output)
-  for (const op of graph.ops) if (op.kind === "tensor_input" && consumers.has(op.out)) nodeTids.add(op.out)
-  const nodeByTid = new Map<number, DagNode>()
+  // Tensor_inputs first (in op order) so they appear at the top of the DAG, then group outputs.
   const nodes: DagNode[] = []
-  const ordered: number[] = []
-  for (const op of graph.ops) if (op.kind === "tensor_input" && nodeTids.has(op.out)) ordered.push(op.out)
-  for (const g of groups) if (nodeTids.has(g.output)) ordered.push(g.output)
-  for (const tid of ordered) {
-    const t = graph.tensors[tid]!
-    const gi = producingGroup.get(tid)
-    const node: DagNode = { tensorId: tid, shape: t.shape, group: gi !== undefined ? groups[gi]! : null, inputs: [] }
-    nodes.push(node)
-    nodeByTid.set(tid, node)
+  const builtTids = new Set<number>()
+  const pushNode = (tid: number, group: Group | null) => {
+    nodes.push({ tensorId: tid, shape: graph.tensors[tid]!.shape, group, inputs: [] })
+    builtTids.add(tid)
   }
+  for (const op of graph.ops) {
+    if (op.kind === "tensor_input" && consumedTids.has(op.out)) pushNode(op.out, null)
+  }
+  for (const g of groups) pushNode(g.output, g)
+
+  // Wire inputs: tids consumed by the group but produced outside it.
   for (const node of nodes) {
     if (!node.group) continue
     const inGroupOps = new Set(node.group.ops)
@@ -339,9 +311,9 @@ function buildDag(graph: Graph, groups: Group[]): DagNode[] {
       for (const tid of getOpInputs(graph.ops[opIdx]!)) {
         if (seen.has(tid)) continue
         seen.add(tid)
-        const t = graph.tensors[tid]!
-        if (t.source !== null && inGroupOps.has(t.source)) continue
-        if (!nodeByTid.has(tid)) continue
+        const src = graph.tensors[tid]!.source
+        if (src !== null && inGroupOps.has(src)) continue
+        if (!builtTids.has(tid)) continue
         node.inputs.push(tid)
       }
     }
@@ -354,8 +326,10 @@ function buildDag(graph: Graph, groups: Group[]): DagNode[] {
 // the same sequence, so loops are period-k repetition in the signature array.
 // const_scalars/tensor_inputs are keyed by value/name (not source line) so
 // they match across iterations even though their op indices differ. Greedy
-// by coverage k*n; ties favor longer bodies so 5-group × 2-iter beats a
-// 1-group × 10-iter degenerate.
+// by coverage k*n; ties favor SMALLER k — tightest period = the natural body
+// the user wrote. A 3-group × 8-iter loop has the same coverage as 6×4 and
+// 12×2 super-periods; we want the 3×8 view, not "2 iterations" of a body
+// that's actually 4 real iterations smushed together.
 
 type LoopRun = { start: number; period: number; iterations: number }
 
@@ -392,7 +366,7 @@ function detectLoops(groups: readonly Group[], graph: Graph): LoopRun[] {
         if (!match) break
         n++
       }
-      if (n >= 2 && (k * n > bestK * bestN || (k * n === bestK * bestN && k > bestK))) {
+      if (n >= 2 && (k * n > bestK * bestN || (k * n === bestK * bestN && k < bestK))) {
         bestK = k
         bestN = n
       }
@@ -447,8 +421,8 @@ function resolveSourceLabel(graph: Graph, node: DagNode, srcCache: Map<string, s
   }
   const frame = node.group?.frame
   if (frame) {
-    const src = getSourceLine(srcCache, frame.url, frame.line)
-    return src ? src.trim() : `${frame.fn}:${frame.line}`
+    const src = srcCache.get(frame.url)?.[frame.line - 1]
+    return src ? src.trim() : `<spec>:${frame.line}`
   }
   return "(unattributed)"
 }
@@ -484,10 +458,33 @@ function buildDOT(
     }
   }
 
-  // Precompute tid → color so edges (which only have the source tid) can
-  // look up the node-aware color without rebuilding the key.
+  // Truncate long loops: show first 2 + last iteration, with a "…" cluster
+  // for the elided middle. Threshold ≥ 4 — 3 iterations are already brief.
+  // Spec stays honest at full T; only the diagram abbreviates.
+  const isHiddenIter = (loopId: number, iter: number): boolean => {
+    const loop = loops[loopId]!
+    return loop.iterations >= 4 && iter >= 2 && iter <= loop.iterations - 2
+  }
+  const hiddenTidLoop = new Map<number, number>()  // tid → ghost loopId for hidden-iter tids only
+  for (const node of dag) {
+    if (!node.group) continue
+    const m = memberOf.get(node.group)
+    if (m && isHiddenIter(m.loopId, m.iter)) hiddenTidLoop.set(node.tensorId, m.loopId)
+  }
+
   const tidToColor = new Map<number, string>()
   for (const node of dag) tidToColor.set(node.tensorId, nodeColor(node, graph))
+
+  const ghostId = (loopId: number) => `tghost${loopId}`
+  const emitCluster = (id: string, label: string, body: () => void) => {
+    lines.push(`  subgraph cluster_${id} {`)
+    lines.push(`    label="${label}"`)
+    for (const a of [`style="dashed"`, `color="#888"`, `fontcolor="#888"`, `fontsize=10`, `fontname="sans-serif"`, `labelloc=t`, `labeljust=l`]) {
+      lines.push(`    ${a}`)
+    }
+    body()
+    lines.push(`  }`)
+  }
 
   const emitNode = (dagIdx: number, indent: string) => {
     const node = dag[dagIdx]!
@@ -500,14 +497,15 @@ function buildDOT(
     lines.push(`${indent}"t${tid}" [label=${label} color="${color}" class="ti-${tid}"]`)
   }
 
-  // Bucket by membership. Map insertion order = op-index order, so iteration
-  // 0's cluster emits before iteration 1's.
+  // Bucket dag nodes by loop iter. Map insertion order = op-index order so
+  // iter 0's cluster emits before iter 1's. Hidden iters skip bucketing —
+  // they're folded into the ghost cluster.
   const flatIdxs: number[] = []
   const buckets = new Map<string, { loopId: number; iter: number; idxs: number[] }>()
   for (let i = 0; i < dag.length; i++) {
     const m = dag[i]!.group ? memberOf.get(dag[i]!.group!) : undefined
     if (!m) flatIdxs.push(i)
-    else {
+    else if (!isHiddenIter(m.loopId, m.iter)) {
       const key = `${m.loopId}:${m.iter}`
       let b = buckets.get(key)
       if (!b) { b = { loopId: m.loopId, iter: m.iter, idxs: [] }; buckets.set(key, b) }
@@ -518,23 +516,46 @@ function buildDOT(
   for (const i of flatIdxs) emitNode(i, "  ")
   for (const b of buckets.values()) {
     const loop = loops[b.loopId]!
-    lines.push(`  subgraph cluster_loop_${b.loopId}_iter_${b.iter} {`)
-    lines.push(`    label="iteration ${b.iter + 1} of ${loop.iterations}"`)
-    lines.push(`    style="dashed"`)
-    lines.push(`    color="#888"`)
-    lines.push(`    fontcolor="#888"`)
-    lines.push(`    fontsize=10`)
-    lines.push(`    fontname="sans-serif"`)
-    lines.push(`    labelloc=t`)
-    lines.push(`    labeljust=l`)
-    for (const i of b.idxs) emitNode(i, "    ")
-    lines.push(`  }`)
+    emitCluster(`loop_${b.loopId}_iter_${b.iter}`, `iteration ${b.iter + 1} of ${loop.iterations}`, () => {
+      for (const i of b.idxs) emitNode(i, "    ")
+    })
   }
 
+  // One ghost cluster per loop with a hidden middle. The "…" node inside
+  // catches every edge crossing in or out of the hidden range.
+  for (let loopId = 0; loopId < loops.length; loopId++) {
+    const loop = loops[loopId]!
+    if (loop.iterations < 4) continue
+    const start = 2, end = loop.iterations - 2
+    emitCluster(`loop_${loopId}_ghost`, `iterations ${start + 1}..${end + 1} of ${loop.iterations}`, () => {
+      lines.push(`    "${ghostId(loopId)}" [label="…" shape=plaintext fontsize=22 fontcolor="#888" class="ti-ghost-${loopId}"]`)
+    })
+  }
+
+  // Edges: a hidden endpoint redirects to its loop's ghost. Both-hidden
+  // edges drop (internal to elided middle). Ghost-touching edges dedupe by
+  // (src,dst) so many-iter fan-in (e.g. stack consuming every state)
+  // collapses to a single line.
+  type Endpoint = { id: string; cls: string; hidden: boolean }
+  const endpoint = (tid: number): Endpoint => {
+    const loop = hiddenTidLoop.get(tid)
+    return loop !== undefined
+      ? { id: ghostId(loop), cls: `ti-ghost-${loop}`, hidden: true }
+      : { id: `t${tid}`, cls: `ti-${tid}`, hidden: false }
+  }
+  const emittedGhostEdges = new Set<string>()
   for (const node of dag) {
+    const dst = endpoint(node.tensorId)
     for (const inTid of node.inputs) {
-      const color = tidToColor.get(inTid)!
-      lines.push(`  "t${inTid}" -> "t${node.tensorId}" [color="${color}" class="ti-${inTid}"]`)
+      const src = endpoint(inTid)
+      if (src.hidden && dst.hidden) continue
+      const color = src.hidden ? "#888" : tidToColor.get(inTid)!
+      if (src.hidden || dst.hidden) {
+        const key = `${src.id}->${dst.id}`
+        if (emittedGhostEdges.has(key)) continue
+        emittedGhostEdges.add(key)
+      }
+      lines.push(`  "${src.id}" -> "${dst.id}" [color="${color}" class="${src.cls} ${dst.cls}"]`)
     }
   }
   lines.push("}")
@@ -557,19 +578,13 @@ function attachHoverTrace(svg: SVGElement): void {
 }
 
 // ===== Stats ================================================================
-// Total trainable scalars: walk the graph's leaf param_input ops, multiply
-// their shape dims, sum. State tensors (Adam m/v moments) are excluded —
-// those are optimizer bookkeeping, not model parameters.
+// Trainable scalars only — Adam m/v moments are optimizer bookkeeping, not model params.
 
 function countParams(graph: Graph): number {
   let total = 0
   for (const op of graph.ops) {
-    if (op.kind === "param_input") {
-      const shape = graph.tensors[op.out]!.shape
-      let n = 1
-      for (const d of shape) n *= d
-      total += n
-    }
+    if (op.kind !== "param_input") continue
+    total += graph.tensors[op.out]!.shape.reduce((a, b) => a * b, 1)
   }
   return total
 }
@@ -582,8 +597,10 @@ function formatParamCount(n: number): string {
 
 // ===== Component ============================================================
 
+type GraphView = { graph: Graph; kernelCount: number; fwdOps: Set<number> }
+
 class IRViewer extends Component {
-  // Inference tab is omitted from the strip entirely when the spec has no predict function.
+  // Inference tab is omitted entirely when the spec has no predict function.
   activeTab: "training" | "inference" | "code" | "info" = "training"
   status = "Loading…"
   legend: LegendItem[] = []
@@ -591,18 +608,14 @@ class IRViewer extends Component {
   modelLabel = ""
   modelDescription = ""
 
-  private readonly defaultSource: string = (tb.insight<{ source: string }>()?.source ?? "")
-  private specSource: string = (tb.insight<{ source: string }>()?.source ?? "")
+  private readonly defaultSource: string = tb.insight<{ source: string }>()?.source ?? ""
+  private specSource: string = this.defaultSource
   private inferring = false
 
-  // Training and inference graphs cached separately so tab switches don't recompile.
+  // Cached per-graph; tab switches don't recompile.
   private viz: any = null
-  private trainGraph: Graph | null = null
-  private trainKernelCount = 0
-  private trainFwdOps: Set<number> = new Set()
-  private inferGraph: Graph | null = null
-  private inferKernelCount = 0
-  private inferFwdOps: Set<number> = new Set()
+  private train: GraphView | null = null
+  private infer: GraphView | null = null
   private resolveDim: ((size: number, pos: number, rank: number) => ResolvedDim) | null = null
   private srcCache: Map<string, string[]> = new Map()
   private canvasEl: HTMLDivElement | null = null
@@ -622,7 +635,7 @@ class IRViewer extends Component {
 
       divH({ class: "tabs" },
         this.tabBtn("training", "Training graph"),
-        this.inferGraph ? this.tabBtn("inference", "Inference graph") : null,
+        this.infer ? this.tabBtn("inference", "Inference graph") : null,
         this.tabBtn("code", "Code"),
         this.tabBtn("info", "How it works"),
       ),
@@ -648,10 +661,7 @@ class IRViewer extends Component {
           this.dimCollisions.length > 0
             ? divH({ class: "diagram-legend-note" },
                 "The IR tracks dim sizes, not names. When dims share a size and can't be resolved by position, the diagram joins the candidates with a slash. Affected: ",
-                ...this.dimCollisions.flatMap((c, i) => {
-                  const prefix = i > 0 ? ", " : ""
-                  return [prefix, `${c.names.join("/")} = ${c.size}`]
-                }),
+                this.dimCollisions.map(c => `${c.names.join("/")} = ${c.size}`).join(", "),
                 ".",
               )
             : null,
@@ -703,7 +713,7 @@ class IRViewer extends Component {
           p("Tensor code can be hard to follow. It shows the ops but not the shapes flowing through them. Each box is a tensor that displays its dimensionality (e.g. [B, H]) and the line of code that produced it; arrows trace dataflow."),
           p("Training and inference are written as two separate forward functions. Training ends in a scalar loss; inference returns the prediction and omits training-only ops like dropout."),
           p("Only the forward is shown. It's the part specific to the architecture (what makes a transformer different from a CNN). The backprop and optimizer are automatic."),
-          p("Repeated structure is auto-detected (a transformer's stacked layers, an RNN's unroll) and shown as just two iterations for brevity."),
+          p("Repeated structure (transformer block stack, RNN unroll, etc.) auto-detects and renders as iter 1 + iter 2 + '…' + iter N — initial wiring, recurrence pattern, terminal handoff."),
           p("Already have tensorgrad code? Click ", em("Ask the AI"), ", paste in your model, and again, out comes the diagram."),
         ),
       ),
@@ -715,25 +725,9 @@ class IRViewer extends Component {
       class: ["tab-btn", this.activeTab === key && "active"],
       onClick: () => {
         if (this.activeTab === key) return
-        const prevTab = this.activeTab
-        // Bottom-anchored users comparing training vs inference want the
-        // loss/prediction tail (where the graphs diverge) to stay in view
-        // across switches, even when graph heights differ. Capture pre-
-        // swap so we can re-anchor below.
-        const wasAtBottom = window.scrollY + window.innerHeight
-          >= document.documentElement.scrollHeight - 5
         this.activeTab = key
         this.update()
-        if (key === "training" || key === "inference") {
-          this.rerender()
-          // Anchor-to-new-bottom only when switching between viz tabs
-          // (the comparison case). Entering from Code/How-it-works is a
-          // context shift; let the browser preserve absolute scrollY.
-          const switchedBetweenVizTabs = prevTab === "training" || prevTab === "inference"
-          if (wasAtBottom && switchedBetweenVizTabs) {
-            window.scrollTo(0, document.documentElement.scrollHeight)
-          }
-        }
+        if (key === "training" || key === "inference") this.rerender()
       },
     }, label)
   }
@@ -785,8 +779,14 @@ class IRViewer extends Component {
     await this.compileFromSource(this.specSource)
   }
 
+  private fail(msg: string, e: unknown): void {
+    this.status = msg
+    this.update()
+    console.error(e)
+  }
+
   private async compileFromSource(source: string): Promise<void> {
-    // Null both refs explicitly: a partial re-compile failure must not leave stale state.
+    // Null both refs: a partial re-compile failure must not leave stale state.
     if (this.currentTrain) {
       try { this.currentTrain.destroy() } catch { /* ignore */ }
       this.currentTrain = null
@@ -795,8 +795,8 @@ class IRViewer extends Component {
     if (this.canvasEl) this.canvasEl.innerHTML = ""
     this.legend = []
     this.dimCollisions = []
-    this.inferGraph = null
-    // If the new spec has no predict, Inference tab disappears — don't strand the user there.
+    this.infer = null
+    // If the new spec has no predict, the Inference tab disappears — don't strand the user there.
     if (this.activeTab === "inference") this.activeTab = "training"
 
     this.status = "Evaluating spec…"
@@ -808,9 +808,7 @@ class IRViewer extends Component {
       spec = ev.spec
       cleanedSource = ev.cleanedSource
     } catch (e) {
-      this.status = `spec error: ${(e as Error)?.message ?? e}`
-      this.update()
-      console.error(e)
+      this.fail(`spec error: ${(e as Error)?.message ?? e}`, e)
       return
     }
 
@@ -820,70 +818,52 @@ class IRViewer extends Component {
       if (!this.viz) this.viz = await instance()
       const train = await spec.compile()
       this.currentTrain = train
-      this.trainGraph = train.graph
-      this.trainKernelCount = train.kernels.length
-      this.trainFwdOps = forwardReachable(train.graph, train.graph.outputs)
+      this.train = {
+        graph: train.graph,
+        kernelCount: train.kernels.length,
+        fwdOps: forwardReachable(train.graph, train.graph.outputs),
+      }
 
       this.modelLabel = spec.label
       this.modelDescription = spec.description ?? ""
 
       const { resolve, legend, collisions } = buildDimResolver(train.graph, spec.dims)
       this.resolveDim = resolve
-
       // Spec frames have URL "__spec__" — inject the cleaned source directly.
-      this.srcCache = new Map()
-      this.srcCache.set("__spec__", cleanedSource.split("\n"))
-
+      this.srcCache = new Map([["__spec__", cleanedSource.split("\n")]])
       this.legend = legend
       this.dimCollisions = collisions
 
-      // Inference compile: same model, prediction output instead of loss.
-      // train.attach shares the worker and param buffers; the inference
-      // graph is a sibling, not a clone. Best-effort — if attach fails the
-      // training graph is still useful, so we warn and continue.
+      // Best-effort inference compile — training graph still useful if attach fails.
       try {
-        const infer = await train.attach({
-          forward: spec.predict,
-          inputs: spec.predictInputs,
-        })
+        const infer = await train.attach({ forward: spec.predict, inputs: spec.predictInputs })
         this.currentInfer = infer
         const ir = await infer.graphFor(spec.predictInputs)
-        this.inferGraph = ir.graph
-        this.inferKernelCount = ir.kernels.length
-        this.inferFwdOps = forwardReachable(ir.graph, ir.graph.outputs)
+        this.infer = {
+          graph: ir.graph,
+          kernelCount: ir.kernels.length,
+          fwdOps: forwardReachable(ir.graph, ir.graph.outputs),
+        }
       } catch (e) {
         console.warn("inference attach failed:", e)
-        this.inferGraph = null
+        this.infer = null
       }
 
       this.update()
       this.rerender()
     } catch (e) {
-      this.status = `compile error: ${(e as Error)?.message ?? e}`
-      this.update()
-      console.error(e)
+      this.fail(`compile error: ${(e as Error)?.message ?? e}`, e)
     }
   }
 
   private rerender(): void {
-    // Pick the active graph based on activeTab. Training is always
-    // available after a successful compile; inference is opt-in. If the
-    // user is on activeTab="inference" without an inference graph (which
-    // shouldn't happen — the Inference tab only renders when one exists),
-    // fall back to training rather than blanking the canvas.
-    const showingInference = this.activeTab === "inference" && this.inferGraph !== null
-    const graph = showingInference ? this.inferGraph! : this.trainGraph
-    const fwdOps = showingInference ? this.inferFwdOps : this.trainFwdOps
-    const kernelCount = showingInference ? this.inferKernelCount : this.trainKernelCount
-    if (!this.viz || !graph || !this.resolveDim || !this.canvasEl) return
-    // Only render the forward graph — backward and optimizer are universal
-    // training machinery (one mirrored gradient per forward op, one Adam
-    // update per param). Showing those literally adds compiler emissions
-    // not architectural insight. Also hide param_input leaves: the Linear/
-    // LayerNorm/etc. boxes already imply "this has weights"; rendering W
-    // and b as separate nodes adds clutter without insight. Param count
-    // is in the header subtitle. The how-it-works tab covers backward
-    // + optimizer in prose.
+    const view = this.activeTab === "inference" && this.infer ? this.infer : this.train
+    if (!this.viz || !view || !this.resolveDim || !this.canvasEl) return
+    const { graph, fwdOps, kernelCount } = view
+    // Forward-only graph: backward and optimizer are universal training
+    // machinery, not architecture. Param_input leaves hidden too — Linear/
+    // LayerNorm boxes already imply "has weights"; param count is in the
+    // header. How-it-works tab covers what's not shown.
     const included = new Set<number>()
     for (const i of fwdOps) {
       if (graph.ops[i]!.kind !== "param_input") included.add(i)
@@ -896,11 +876,9 @@ class IRViewer extends Component {
     this.canvasEl.innerHTML = ""
     this.canvasEl.appendChild(svg)
     attachHoverTrace(svg)
-    // Param count comes from the training graph in both views — the
-    // inference graph shares the same params, but the bulb intentionally
-    // hides param_input leaves in the diagram so iterating the inference
-    // graph's ops wouldn't double-count anything.
-    const params = this.trainGraph ? countParams(this.trainGraph) : 0
+    // Param count always reads from training graph — params are shared, and
+    // we hide param_input leaves so the inference graph wouldn't see them.
+    const params = this.train ? countParams(this.train.graph) : 0
     this.status = `${formatParamCount(params)} parameters · ${kernelCount} kernels`
     this.update()
   }
@@ -1174,12 +1152,16 @@ The source MUST end with:
     // or { kind: 'sgd', lr: ..., momentum: 0.9 }
     // `lr` may also be a schedule: `lr.linear({ peak, final, steps })` etc.
 
-**Recurrent state in unrolled loops** — initialize with `zeros(shape)`, then the loop body reads as the pure recurrence:
+**Recurrent state in unrolled loops** — initialize with `zeros(shape)`, slice each timestep with `narrow`, collect per-step outputs into an array, `stack` at the end. `stack` *adds* the T axis; the per-step `h` stays `[B, H]` (no reshape):
 
-    let h = zeros([B, H, P, N])
+    let h = zeros([B, H])
+    const outs: Tensor[] = []
     for (let t = 0; t < T; t++) {
-      h = add(mul(a_t, h), mul(b_t, X_t))
+      const xt = reshape(narrow(x, 1, t, 1), [B, D])
+      h = tanh(add(m.ih.fwd(xt), m.hh.fwd(h)))
+      outs.push(h)
     }
+    const seq = stack(outs, 1)   // [B, T, H]
 
 **1D conv via Conv2d** — no `Conv1d` primitive; reshape sequence data `[B, C, T]` to `[B, C, 1, T]` and use a `[1, K]` kernel:
 
@@ -1218,6 +1200,7 @@ The source MUST end with:
 ## Gotchas
 
 - **`Tensor` has no methods.** Every operation is a free function from the symbols list, applied as `op(x, ...)` — e.g. `reshape(x, [B, -1])`, `sum(x, axis)`, `swapAxes(x, -2, -1)`, `narrow(x, axis, start, len)`.
+- **Shape tracing — the most common compile error.** Every `Linear`/`matmul` input dim must equal the last dim of the upstream tensor. Don't pattern-match by layer name: `attn_proj = Linear(D, D)` and `mlp_proj = Linear(4*D, D)` look parallel but have different shapes because attention preserves `D` while the MLP expands then contracts. Watch any layer immediately after a dim-changing op (`Linear(D, ≠D)`, `splitHeads`, `reshape`, `narrow`, `embedding`): the next layer's input dim is the NEW last dim, not the original. Expansion-then-contraction pairs (MLP up/down, autoencoder bottleneck) always swap dim orders by design. Before returning, mentally run the forward once: every `Linear`'s first arg = the last dim of what feeds it; every `reshape` preserves total element count; every broadcast is trailing-suffix compatible.
 - **Operators have no PyTorch-style optional flags.** The symbols list is the full signature. `matmul(a, b)` is two args; to transpose the rhs, write `matmul(a, swapAxes(b, -2, -1))`.
 - **`reshape` doesn't transpose.** It reinterprets memory layout — to reorder axes use `permute(x, [perm])` or `swapAxes(x, a, b)`. Same total element count means `reshape` won't error on a wrong-axes pass, so this is a silent correctness bug.
 - **Static shapes only** — every dim is a compile-time `const` in your code, not a value read from a tensor.
@@ -1225,7 +1208,7 @@ The source MUST end with:
 - **Loss must be scalar** (rank-0). Use `mean`/`sum` to reduce.
 - **`splitHeads(x, nHeads)`** reshapes one tensor: `[B, T, D] → [B, H, T, D/H]`. For Q/K/V, use three independent `Linear(D, D)` projections and call `splitHeads` on each.
 - **Attention scaling**: multiply scores by `1 / Math.sqrt(D_HEAD)` before `softmaxCausal`.
-- **Iterative architectures: small loop counts.** For RNN unrolls, diff-physics rollouts, diffusion samplers, multi-round message passing, etc., set the inner loop count to a small constant (typically `2`) — large unrolls produce diagrams the renderer can't draw. Add a comment with the production value: `const HORIZON = 2  // 32+ for actual training`.
+- **`stack` adds a new axis; `concat` joins an existing one.** `stack([a, b, …], axis)` of N tensors of shape `[B, H]` gives `[B, N, H]` (or wherever `axis` puts it). Don't `reshape(h, [B, 1, H])` and then `stack(outs, 1)` — that double-adds the axis, producing `[B, T, 1, H]` instead of `[B, T, H]`. The bug runs: downstream Linear/reshape silently swallow the extra size-1 dim until something stricter (MSE `sub`, broadcasting) catches it.
 - **No `groups` on Conv2d, no `Conv1d`.** Conv2d is dense conv only.
 - **No in-forward param creation.** `this.param` is class-field only; forwards are pure tensor compositions over the already-built module.
 - **No `scan` / `cumsum`.** Unroll trace-time loops; keep T small.
@@ -1284,7 +1267,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
 
 ```json
 {
-  "source": "import {\n  Module, compile, Linear,\n  mul, sub, mean, reshape, relu, sigmoid, concat,\n  sin, cos, square,\n  type Tensor,\n} from 'tensorgrad'\n\nconst BATCH_SIZE = 1024\nconst L_FREQS = 8        // π·2^0 .. π·2^7\nconst HIDDEN = 64\n\nclass NeRFTiny extends Module {\n  l1 = new Linear(4 * L_FREQS, HIDDEN)\n  l2 = new Linear(HIDDEN, HIDDEN)\n  l3 = new Linear(HIDDEN, HIDDEN)\n  l4 = new Linear(HIDDEN, 3)\n}\n\n// Sinusoidal positional encoding (NeRF / Tancik et al.). For each input\n// coord, emit sin(π·2^k·x), cos(π·2^k·x) for k = 0..L-1; concat sin and\n// cos features. Output: [B, 4L].\nfunction posEnc(coords: Tensor, freqs: Tensor): Tensor {\n  const B = coords.shape[0]!\n  const scaled = mul(reshape(coords, [B, 2, 1]), reshape(freqs, [1, 1, L_FREQS]))\n  const sinF = reshape(sin(scaled), [B, 2 * L_FREQS])\n  const cosF = reshape(cos(scaled), [B, 2 * L_FREQS])\n  return concat([sinF, cosF], 1)\n}\n\nfunction modelFwd(m: NeRFTiny, coords: Tensor, freqs: Tensor): Tensor {\n  let h = posEnc(coords, freqs)\n  h = relu(m.l1.fwd(h))\n  h = relu(m.l2.fwd(h))\n  h = relu(m.l3.fwd(h))\n  return sigmoid(m.l4.fwd(h))\n}\n\nfunction lossFn(\n  m: NeRFTiny,\n  { coords, rgb, freqs }: { coords: Tensor; rgb: Tensor; freqs: Tensor },\n): Tensor {\n  return mean(square(sub(modelFwd(m, coords, freqs), rgb)))\n}\n\nfunction predictFn(\n  m: NeRFTiny,\n  { coords, freqs }: { coords: Tensor; freqs: Tensor },\n): Tensor {\n  return modelFwd(m, coords, freqs)\n}\n\nconst inputs = {\n  coords: [BATCH_SIZE, 2],\n  rgb:    [BATCH_SIZE, 3],\n  freqs:  [L_FREQS],\n} as const\n\nconst predictInputs = {\n  coords: [BATCH_SIZE, 2],\n  freqs:  [L_FREQS],\n} as const\n\nconst optimizer = { kind: 'adam', lr: 1e-3 } as const\n\nexport const irSpec = {\n  label: 'An MLP that learns an image',\n  description: 'A 4-layer MLP that fits a single image as an implicit function (x, y) → (r, g, b). Uses sinusoidal positional encoding with 8 frequency bands (π·2^0 through π·2^7) before the MLP, giving the network the high-frequency basis it needs to represent fine image detail. 1024 random pixels per batch, MSE loss in RGB space, Adam at 1e-3.',\n  compile: () => compile({ model: new NeRFTiny(), loss: lossFn, inputs, optimizer }),\n  predict: predictFn,\n  predictInputs,\n  dims: [\n    { size: BATCH_SIZE,  name: 'B',  desc: 'batch (random pixels)' },\n    { size: 2,           name: '2',  desc: 'xy coords' },\n    { size: 3,           name: '3',  desc: 'RGB' },\n    { size: L_FREQS,     name: 'L',  desc: 'frequency bands' },\n    { size: 4 * L_FREQS, name: '4L', desc: 'pos-enc features' },\n    { size: 2 * L_FREQS, name: '2L', desc: 'sin/cos features' },\n    { size: HIDDEN,      name: 'H',  desc: 'hidden' },\n  ],\n}\n"
+  "source": "import {\n  Module, compile, Linear,\n  sub, mul, gelu, mean, square,\n  type Tensor,\n} from 'tensorgrad'\n\nconst B = 256\nconst D = 32\nconst HIDDEN = 128\nconst N_STEPS = 12\nconst STEP_SIZE = 0.1\n\nclass Denoiser extends Module {\n  l1 = new Linear(D, HIDDEN)\n  l2 = new Linear(HIDDEN, HIDDEN)\n  l3 = new Linear(HIDDEN, D)\n}\n\n// One step of the denoiser: noisy x -> predicted noise.\nfunction denoise(m: Denoiser, x: Tensor): Tensor {\n  return m.l3.fwd(gelu(m.l2.fwd(gelu(m.l1.fwd(x)))))\n}\n\n// Training: predict the noise added to a clean signal (single forward pass).\nfunction lossFn(m: Denoiser, { clean, noisy }: { clean: Tensor; noisy: Tensor }): Tensor {\n  const predNoise = denoise(m, noisy)\n  const trueNoise = sub(noisy, clean)\n  return mean(square(sub(predNoise, trueNoise)))\n}\n\n// Inference: start from pure noise and iterate N_STEPS Euler-style denoising steps.\nfunction predictFn(m: Denoiser, { xInit }: { xInit: Tensor }): Tensor {\n  let x = xInit\n  for (let t = 0; t < N_STEPS; t++) {\n    x = sub(x, mul(denoise(m, x), STEP_SIZE))\n  }\n  return x\n}\n\nconst inputs = {\n  clean: [B, D],\n  noisy: [B, D],\n} as const\n\nconst predictInputs = { xInit: [B, D] } as const\nconst optimizer = { kind: 'adamw', lr: 1e-3, weightDecay: 0.01 } as const\n\nexport const irSpec = {\n  label: 'Iterative diffusion denoiser',\n  description: 'A 3-layer MLP trained to predict the noise added to a 32-d signal. Training is a single forward pass plus MSE on the predicted noise. Inference is the same MLP applied iteratively over 12 Euler-style denoising steps starting from pure noise. The two graphs diverge sharply because inference unrolls the recurrence; the same weights are reused at every step.',\n  compile: () => compile({ model: new Denoiser(), loss: lossFn, inputs, optimizer }),\n  predict: predictFn,\n  predictInputs,\n  dims: [\n    { size: B,      name: 'B', desc: 'batch' },\n    { size: D,      name: 'D', desc: 'signal dim' },\n    { size: HIDDEN, name: 'H', desc: 'denoiser hidden' },\n  ],\n}\n"
 }
 ```
 
@@ -1299,7 +1282,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "submitTitle": "Diagram It"
   },
   "dependencies": {
-    "tensorgrad": "^0.1.1",
+    "tensorgrad": "^0.1.2",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
     "domeleon": "^0.6.0"
