@@ -1,8 +1,8 @@
 // MNIST CNN — primary purpose is GPU verification of the conv2d /
-// maxPool2d / Conv2d / flatten path. If anything in the WGSL is broken,
+// maxPool2d / Conv2d path. If anything in the WGSL is broken,
 // training either crashes at compile, NaNs, or fails to converge.
 //
-// Architecture: two conv+pool blocks → flatten → MLP head. Standard
+// Architecture: two conv+pool blocks → reshape → MLP head. Standard
 // MNIST-CNN template (the kind of model an LLM would write from a PyTorch
 // tutorial port).
 //
@@ -10,7 +10,7 @@
 //                  -> MaxPool2D(2)          [B, 16, 14, 14]
 //                  -> Conv2d(16,32,3,pad=1) + ReLU
 //                  -> MaxPool2D(2)          [B, 32, 7, 7]
-//                  -> flatten               [B, 1568]
+//                  -> reshape [B, -1]       [B, 1568]
 //                  -> Linear(1568, 64) + ReLU
 //                  -> Linear(64, 10)        [B, 10] logits
 //

@@ -411,25 +411,6 @@ export function reshape(a: Tensor, newShape: Shape): Tensor {
   return addOp(currentGraph(), 'reshape', outShape, a.dtype, site, { a: a.id, newShape: outShape })
 }
 
-/** Flatten axes `[startAxis, end)` into a single trailing axis. Pure
- *  reshape; no new IR op.
- *
- *  **Default differs from PyTorch.** Tensorgrad defaults to `startAxis=1`
- *  (preserve the batch dim — the canonical CNN classifier-head transition
- *  from `[B, C, H, W]` to `[B, C*H*W]`). PyTorch's `torch.flatten` defaults
- *  to `start_dim=0` (collapse everything to 1-d). Pass `0` explicitly if
- *  you want full flattening. */
-export function flatten(a: Tensor, startAxis: number = 1): Tensor {
-  const r = a.shape.length
-  const s = startAxis < 0 ? r + startAxis : startAxis
-  const site = captureSite('flatten')
-  if (s < 0 || s > r) {
-    throw new ShapeError(`flatten: startAxis ${startAxis} out of range for rank-${r}`, site)
-  }
-  if (s === r) return a
-  return reshape(a, [...a.shape.slice(0, s), -1])
-}
-
 /** Permute the axes of a tensor by `perm`. Matches PyTorch's `x.permute(*dims)`
  *  / JAX's `jnp.transpose(x, axes)` / NumPy's `np.transpose(x, axes)`. For the
  *  common case of swapping two axes (PyTorch's `x.transpose(a, b)`), use

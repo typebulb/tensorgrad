@@ -105,7 +105,7 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `torch.split(x, sizes, dim)` | `split(x, sizes, dim)` |
 | `nn.Embedding(V, D)` | `new Embedding(V, D)` — `.fwd(idx)` returns `[..., D]` |
 | `pos_emb(torch.arange(T))` (transformer position embeddings) | `pos_emb.fwd(arange(T))` |
-| `torch.flatten(x, start_dim=1)` | `flatten(x, 1)` (or `reshape(x, [B, -1])`) |
+| `torch.flatten(x, start_dim=1)` / `nn.Flatten()` | `reshape(x, [B, -1])` (no `flatten` op — `reshape` is the only shape primitive) |
 | `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new Conv2d(in, out, k, { stride: s, padding: p })` |
 | `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2d(x, k, { stride: s, padding: p })` |
 | `F.interpolate(x, scale_factor=k, mode='nearest')` | `nearestUpsample2d(x, k)` |
@@ -158,6 +158,17 @@ To reorder axes use `permute` / `swapAxes`:
 ```ts
 permute(x, [0, 2, 1])  // [B, E, T] → [B, T, E], correct
 reshape(x, [B, T, E])  // same shape, scrambled — silent correctness bug
+```
+
+**Raw `matmul` is right-multiply `[..., K] · [K, N]`, not PyTorch's
+`[..., D] · [N, D].T`.** `Linear` stores weights `[in, out]`, so
+`matmul(x, W)` is the projection case — no transpose. But for raw params
+shaped as a *stack of vectors* (codebook `[N, D]`, memory bank,
+prototypes), `matmul(x, codebook)` errors on inner dims. Transpose first:
+
+```ts
+const codebook = this.param([N, D])
+const scores = matmul(x, swapAxes(codebook, -1, -2))   // [B, D] · [D, N] → [B, N]
 ```
 
 **Tensorgrad runs in a worker.** Every method on a compiled module is
@@ -437,7 +448,7 @@ Imported from `'tensorgrad'`:
 - Const-tensor builders: `zeros(shape, dtype?)`, `ones(shape, dtype?)` (default `f32`; non-differentiable; pair with `randn`/`arange` as the complete set — no `full`, `eye`, `linspace`, `tril`, `zerosLike`, or `like`-variants)
 - Slicing / structural: `narrow(t, axis, start, length)` (PyTorch `torch.narrow`), `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal(x, fillValue)` (mask below the diagonal; pairs with `softmaxCausal` when you need a non-softmax causal mask)
-- 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`, `flatten(x, startAxis?)`
+- 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`
 
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept
 `(Tensor, Tensor)`, `(Tensor, number)`, or `(number, Tensor)` — scalar

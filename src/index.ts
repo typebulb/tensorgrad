@@ -23,7 +23,7 @@ export {
   mean, sum, argmax, argmin,
   type ReduceOptions,
   // Shape
-  reshape, permute, swapAxes, flatten,
+  reshape, permute, swapAxes,
   splitHeads, mergeHeads,
   // Linear algebra
   matmul,

@@ -4,7 +4,7 @@
 
 import {
   Module, compile, Linear, Conv2d, crossEntropy,
-  relu, flatten, maxPool2d,
+  relu, reshape, maxPool2d,
   type Tensor, type CompiledTraining,
 } from 'tensorgrad'
 
@@ -28,7 +28,7 @@ export function forwardLogits(m: CNN, x: Tensor): Tensor {
   h = maxPool2d(h, 2)
   h = relu(m.conv2.fwd(h))
   h = maxPool2d(h, 2)
-  h = flatten(h, 1)
+  h = reshape(h, [BATCH_SIZE, -1])
   h = relu(m.fc1.fwd(h))
   return m.fc2.fwd(h)
 }
@@ -71,7 +71,7 @@ export const irSpec = {
     { size: 28,         name: '28',  desc: 'image H/W' },
     { size: 14,         name: '14',  desc: 'after pool1' },
     { size: 7,          name: '7',   desc: 'after pool2' },
-    { size: CONV2_OUT * 7 * 7, name: '1568', desc: 'flatten size' },
+    { size: CONV2_OUT * 7 * 7, name: '1568', desc: 'fc input' },
     { size: HIDDEN,     name: 'H',   desc: 'fc hidden' },
     { size: N_CLASSES,  name: 'K',   desc: 'classes' },
   ],

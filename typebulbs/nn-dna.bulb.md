@@ -26,7 +26,7 @@ import {
   zeros, ones,
   narrow, concat, stack, split,
   softmax, logSoftmax, softmaxCausal, whereCausal,
-  conv2d, maxPool2d, nearestUpsample2d, flatten
+  conv2d, maxPool2d, nearestUpsample2d
 } from "tensorgrad"
 import { instance } from "@viz-js/viz"
 import { transform as sucraseTransform } from "sucrase"
@@ -82,7 +82,7 @@ const _tgKeepalive = {
   zeros, ones,
   narrow, concat, stack, split,
   softmax, logSoftmax, softmaxCausal, whereCausal,
-  conv2d, maxPool2d, nearestUpsample2d, flatten,
+  conv2d, maxPool2d, nearestUpsample2d,
 }
 ;(globalThis as any).__tg_keepalive = _tgKeepalive
 
@@ -711,9 +711,8 @@ class IRViewer extends Component {
           ),
           p("And out comes a diagram of the network."),
           p("Tensor code can be hard to follow. It shows the ops but not the shapes flowing through them. Each box is a tensor that displays its dimensionality (e.g. [B, H]) and the line of code that produced it; arrows trace dataflow."),
-          p("Training and inference are written as two separate forward functions. Training ends in a scalar loss; inference returns the prediction and omits training-only ops like dropout."),
+          p("Training and inference have different inputs and outputs because they have different goals. Training takes an input plus the correct answer, and outputs a single number measuring how wrong the model's guess was; that number drives the weight updates. Inference takes only the input and outputs the model's prediction, which is what you wanted in the first place."),
           p("Only the forward is shown. It's the part specific to the architecture (what makes a transformer different from a CNN). The backprop and optimizer are automatic."),
-          p("Repeated structure (transformer block stack, RNN unroll, etc.) auto-detects and renders as iter 1 + iter 2 + '…' + iter N — initial wiring, recurrence pattern, terminal handoff."),
           p("Already have tensorgrad code? Click ", em("Ask the AI"), ", paste in your model, and again, out comes the diagram."),
         ),
       ),
@@ -1130,6 +1129,16 @@ The source MUST end with:
       return mean(square(sub(modelFwd(p, x), y)))
     }
 
+**Token-classification loss** — for sequence models where `logits: [B, T, V]` and `targets: [B, T]` (i32). Collapse both with `reshape` to `[-1, V]` / `[-1]`:
+
+    function lossFn(p: GPT, { tokens, targets }: { tokens: Tensor; targets: Tensor }): Tensor {
+      const logits = modelFwd(p, tokens)                  // [B, T, V]
+      return crossEntropy(
+        reshape(logits,  [-1, VOCAB]),                    // [B*T, V]
+        reshape(targets, [-1]),                           // [B*T]
+      )
+    }
+
 **Predict function** — same model forward as the loss uses internally, but without the loss tail. Returns the network's prediction directly (logits, regression output, etc.):
 
     function predictFn(p: MLP, { x }: { x: Tensor }): Tensor {
@@ -1187,7 +1196,7 @@ The source MUST end with:
 **Activations**: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`.
 **Clamping**: `clamp(x, lo, hi)` — `lo` and `hi` are numbers.
 **Reductions**: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax`, `argmin`.
-**Shape**: `reshape(x, [dims])` (one `-1` allowed, inferred from total size), `permute`, `swapAxes` (= PyTorch `transpose`), `flatten`.
+**Shape**: `reshape(x, [dims])` (one `-1` allowed, inferred from total size — use `reshape(x, [B, -1])` or `reshape(x, [-1])` instead of a `flatten` op; tensorgrad doesn't have one), `permute`, `swapAxes` (= PyTorch `transpose`).
 **Linear algebra**: `matmul`.
 **Indexing**: `oneHot(idx, depth)`, `arange(n)`, `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (= PyTorch `gather`).
 **Const-tensor builders**: `zeros(shape, dtype?)`, `ones(shape, dtype?)` — default `f32`. The full set is `randn` / `arange` / `oneHot` / `zeros` / `ones`; no `full`, `eye`, `linspace`, `tril`, or `like`-variants.
@@ -1203,6 +1212,7 @@ The source MUST end with:
 - **Shape tracing — the most common compile error.** Every `Linear`/`matmul` input dim must equal the last dim of the upstream tensor. Don't pattern-match by layer name: `attn_proj = Linear(D, D)` and `mlp_proj = Linear(4*D, D)` look parallel but have different shapes because attention preserves `D` while the MLP expands then contracts. Watch any layer immediately after a dim-changing op (`Linear(D, ≠D)`, `splitHeads`, `reshape`, `narrow`, `embedding`): the next layer's input dim is the NEW last dim, not the original. Expansion-then-contraction pairs (MLP up/down, autoencoder bottleneck) always swap dim orders by design. Before returning, mentally run the forward once: every `Linear`'s first arg = the last dim of what feeds it; every `reshape` preserves total element count; every broadcast is trailing-suffix compatible.
 - **Operators have no PyTorch-style optional flags.** The symbols list is the full signature. `matmul(a, b)` is two args; to transpose the rhs, write `matmul(a, swapAxes(b, -2, -1))`.
 - **`reshape` doesn't transpose.** It reinterprets memory layout — to reorder axes use `permute(x, [perm])` or `swapAxes(x, a, b)`. Same total element count means `reshape` won't error on a wrong-axes pass, so this is a silent correctness bug.
+- **`matmul(x, codebook)` against `[N, D]` raw params errors on inner dims.** `Linear` weights are `[in, out]` so direct `matmul(x, W)` works for projections, but raw codebook / memory / prototype params shaped `[N, D]` need `matmul(x, swapAxes(codebook, -1, -2))`. Common when porting "score query against learned vectors" patterns from PyTorch.
 - **Static shapes only** — every dim is a compile-time `const` in your code, not a value read from a tensor.
 - **Pass raw logits to `crossEntropy`** — it fuses log-softmax internally. Don't apply `logSoftmax` first.
 - **Loss must be scalar** (rank-0). Use `mean`/`sum` to reduce.
@@ -1267,7 +1277,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
 
 ```json
 {
-  "source": "import {\n  Module, compile, Linear,\n  sub, mul, gelu, mean, square,\n  type Tensor,\n} from 'tensorgrad'\n\nconst B = 256\nconst D = 32\nconst HIDDEN = 128\nconst N_STEPS = 12\nconst STEP_SIZE = 0.1\n\nclass Denoiser extends Module {\n  l1 = new Linear(D, HIDDEN)\n  l2 = new Linear(HIDDEN, HIDDEN)\n  l3 = new Linear(HIDDEN, D)\n}\n\n// One step of the denoiser: noisy x -> predicted noise.\nfunction denoise(m: Denoiser, x: Tensor): Tensor {\n  return m.l3.fwd(gelu(m.l2.fwd(gelu(m.l1.fwd(x)))))\n}\n\n// Training: predict the noise added to a clean signal (single forward pass).\nfunction lossFn(m: Denoiser, { clean, noisy }: { clean: Tensor; noisy: Tensor }): Tensor {\n  const predNoise = denoise(m, noisy)\n  const trueNoise = sub(noisy, clean)\n  return mean(square(sub(predNoise, trueNoise)))\n}\n\n// Inference: start from pure noise and iterate N_STEPS Euler-style denoising steps.\nfunction predictFn(m: Denoiser, { xInit }: { xInit: Tensor }): Tensor {\n  let x = xInit\n  for (let t = 0; t < N_STEPS; t++) {\n    x = sub(x, mul(denoise(m, x), STEP_SIZE))\n  }\n  return x\n}\n\nconst inputs = {\n  clean: [B, D],\n  noisy: [B, D],\n} as const\n\nconst predictInputs = { xInit: [B, D] } as const\nconst optimizer = { kind: 'adamw', lr: 1e-3, weightDecay: 0.01 } as const\n\nexport const irSpec = {\n  label: 'Iterative diffusion denoiser',\n  description: 'A 3-layer MLP trained to predict the noise added to a 32-d signal. Training is a single forward pass plus MSE on the predicted noise. Inference is the same MLP applied iteratively over 12 Euler-style denoising steps starting from pure noise. The two graphs diverge sharply because inference unrolls the recurrence; the same weights are reused at every step.',\n  compile: () => compile({ model: new Denoiser(), loss: lossFn, inputs, optimizer }),\n  predict: predictFn,\n  predictInputs,\n  dims: [\n    { size: B,      name: 'B', desc: 'batch' },\n    { size: D,      name: 'D', desc: 'signal dim' },\n    { size: HIDDEN, name: 'H', desc: 'denoiser hidden' },\n  ],\n}\n"
+  "source": "import {\n  Module, compile, Linear,\n  sub, mul, gelu, mean, square,\n  type Tensor,\n} from 'tensorgrad'\n\nconst B = 256\nconst D = 32\nconst HIDDEN = 128\nconst N_STEPS = 12\nconst STEP_SIZE = 0.1\n\nclass Denoiser extends Module {\n  l1 = new Linear(D, HIDDEN)\n  l2 = new Linear(HIDDEN, HIDDEN)\n  l3 = new Linear(HIDDEN, D)\n}\n\n// One step of the denoiser: noisy x -> predicted noise.\nfunction denoise(m: Denoiser, x: Tensor): Tensor {\n  return m.l3.fwd(gelu(m.l2.fwd(gelu(m.l1.fwd(x)))))\n}\n\n// Training: predict the noise added to a clean signal (single forward pass).\nfunction lossFn(m: Denoiser, { clean, noisy }: { clean: Tensor; noisy: Tensor }): Tensor {\n  const predNoise = denoise(m, noisy)\n  const trueNoise = sub(noisy, clean)\n  return mean(square(sub(predNoise, trueNoise)))\n}\n\n// Inference: start from pure noise and iterate N_STEPS Euler-style denoising steps.\nfunction predictFn(m: Denoiser, { xInit }: { xInit: Tensor }): Tensor {\n  let x = xInit\n  for (let t = 0; t < N_STEPS; t++) {\n    x = sub(x, mul(denoise(m, x), STEP_SIZE))\n  }\n  return x\n}\n\nconst inputs = {\n  clean: [B, D],\n  noisy: [B, D],\n} as const\n\nconst predictInputs = { xInit: [B, D] } as const\nconst optimizer = { kind: 'adamw', lr: 1e-3, weightDecay: 0.01 } as const\n\nexport const irSpec = {\n  label: 'Iterative diffusion denoiser',\n  description: 'A 3-layer MLP trained to predict the noise added to a 32-d signal. Training is a single forward pass plus MSE on the predicted noise. Inference is the same MLP applied iteratively over 12 Euler-style denoising steps starting from pure noise.',\n  compile: () => compile({ model: new Denoiser(), loss: lossFn, inputs, optimizer }),\n  predict: predictFn,\n  predictInputs,\n  dims: [\n    { size: B,      name: 'B', desc: 'batch' },\n    { size: D,      name: 'D', desc: 'signal dim' },\n    { size: HIDDEN, name: 'H', desc: 'denoiser hidden' },\n  ],\n}\n"
 }
 ```
 
