@@ -7,7 +7,7 @@ name: Transformer (tensorgrad)
 
 ```tsx
 import presetWind3 from '@unocss/preset-wind3'
-import { App, Component, div, h1, button, span, p, svg, rect, path, line, text, circle, animate, formField, inputRange, type VElement } from 'domeleon'
+import { App, Component, div, h1, button, span, p, a, svg, rect, path, line, text, circle, animate, formField, inputRange, type VElement } from 'domeleon'
 import { UnoThemeManager, type ThemeProxy } from 'domeleon/unocss'
 import { inputNumber } from 'domeleon/maskito'
 
@@ -712,6 +712,7 @@ const darkTheme = {
 const globalUnoCss = (theme: ThemeProxy<typeof lightTheme>) => ({
   'body': `m-0 bg-${theme.colors.background} text-${theme.colors.text} font-sans antialiased overflow-x-hidden`,
   'button': `transition-colors duration-200 ease-in-out`,
+  'a': `text-${theme.colors.primary} underline hover:text-${theme.colors.primaryStrong} transition-colors`,
   '*': `box-border`
 })
 
@@ -1951,7 +1952,8 @@ class ExplainerPanel extends Component {
   architectureView() {
     return div(
       p('Each character of the sequence is a "token" at a numbered "position" (so "27+45=270" has nine positions). The model first turns each token into a vector — its "embedding" — and adds a learned position vector to it, so layer 1 can tell slot 0 from slot 5 even when they hold the same digit. From then on every layer reads and rewrites these vectors at each position. Each layer does two things at each position: attention (which moves information between positions) and a per-position MLP (which transforms what the position has).'),
-      p('The diagram below shows the actual computation for the operands you have entered, with the model\'s current predictions. At each layer the residual stream (green) flows up through two ⊕ merges. Below each merge, a side trip computes a block — attention below, MLP above — and adds its output back into the residual. The attn side trip contains the K/V circle (purple), where Q, K, and V are all projected from the residual — K and V join the layer\'s K/V bus (a horizontal line that every K/V circle writes to and every attention block reads from), while Q stays local and is consumed by this position\'s attention block. The bus is the visual analog of the K/V cache, with causal flow left-to-right.')
+      p('The diagram below shows the actual computation for the operands you have entered, with the model\'s current predictions. At each layer the residual stream (green) flows up through two ⊕ merges. Below each merge, a side trip computes a block — attention below, MLP above — and adds its output back into the residual. The attn side trip contains the K/V circle (purple), where Q, K, and V are all projected from the residual — K and V join the layer\'s K/V bus (a horizontal line that every K/V circle writes to and every attention block reads from), while Q stays local and is consumed by this position\'s attention block. The bus is the visual analog of the K/V cache, with causal flow left-to-right.'),
+      p('The precise architecture for this transformer looks like ', a({ href: 'https://tinyurl.com/yhyywhd9', target: '_blank' }, 'this'), ', diagramed by nn-dna, a tool that turns plain-English descriptions of neural networks into architecture diagrams.')
     )
   }
 
@@ -2462,7 +2464,7 @@ new App({
   "dependencies": {
     "domeleon": "^0.6.0",
     "@unocss/preset-wind3": "^66.5.3",
-    "tensorgrad": "^0.1.1"
+    "tensorgrad": "^0.1.3"
   },
   "description": "Watch a transformer learn 2-digit addition from scratch in your browser. Type two numbers and see it predict the sum digit by digit. Built with tensorgrad (autograd + WebGPU)."
 }

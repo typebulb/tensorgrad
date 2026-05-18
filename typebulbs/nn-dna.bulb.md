@@ -1079,7 +1079,7 @@ Return JSON of the form:
 
     { "source": "<the full TS source of the spec, as a single string>" }
 
-The `source` is real TypeScript — newlines and indentation included. Nothing else: no commentary, no markdown.
+The `source` is real TypeScript — newlines and indentation included. Nothing else: no commentary, no markdown, no "scratch" calls (unused-result ops still trace into the graph).
 
 ## What the source must contain
 
@@ -1211,6 +1211,7 @@ The source MUST end with:
 - **`Tensor` has no methods.** Every operation is a free function from the symbols list, applied as `op(x, ...)` — e.g. `reshape(x, [B, -1])`, `sum(x, axis)`, `swapAxes(x, -2, -1)`, `narrow(x, axis, start, len)`.
 - **Shape tracing — the most common compile error.** Every `Linear`/`matmul` input dim must equal the last dim of the upstream tensor. Don't pattern-match by layer name: `attn_proj = Linear(D, D)` and `mlp_proj = Linear(4*D, D)` look parallel but have different shapes because attention preserves `D` while the MLP expands then contracts. Watch any layer immediately after a dim-changing op (`Linear(D, ≠D)`, `splitHeads`, `reshape`, `narrow`, `embedding`): the next layer's input dim is the NEW last dim, not the original. Expansion-then-contraction pairs (MLP up/down, autoencoder bottleneck) always swap dim orders by design. Before returning, mentally run the forward once: every `Linear`'s first arg = the last dim of what feeds it; every `reshape` preserves total element count; every broadcast is trailing-suffix compatible.
 - **Operators have no PyTorch-style optional flags.** The symbols list is the full signature. `matmul(a, b)` is two args; to transpose the rhs, write `matmul(a, swapAxes(b, -2, -1))`.
+- **Module internals aren't public.** Call `embedding.fwd(idx)`, never `embedding(module.weight, idx)`. The free function `embedding(table, indices)` is for raw `this.param([V, D])` tables; on an `Embedding` instance, use `.fwd`.
 - **`reshape` doesn't transpose.** It reinterprets memory layout — to reorder axes use `permute(x, [perm])` or `swapAxes(x, a, b)`. Same total element count means `reshape` won't error on a wrong-axes pass, so this is a silent correctness bug.
 - **`matmul(x, codebook)` against `[N, D]` raw params errors on inner dims.** `Linear` weights are `[in, out]` so direct `matmul(x, W)` works for projections, but raw codebook / memory / prototype params shaped `[N, D]` need `matmul(x, swapAxes(codebook, -1, -2))`. Common when porting "score query against learned vectors" patterns from PyTorch.
 - **Static shapes only** — every dim is a compile-time `const` in your code, not a value read from a tensor.
@@ -1292,7 +1293,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "submitTitle": "Diagram It"
   },
   "dependencies": {
-    "tensorgrad": "^0.1.2",
+    "tensorgrad": "^0.1.3",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
     "domeleon": "^0.6.0"
