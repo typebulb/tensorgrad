@@ -6,7 +6,7 @@ name: "XOR X-ray"
 **code.tsx**
 
 ```tsx
-import { App, Component, div, h1, h2, h3, p, pre, span, button, svg, g, circle, line, path, rect, text } from "domeleon"
+import { App, Component, div, h1, h2, h3, p, pre, span, button, a, svg, g, circle, line, path, rect, text } from "domeleon"
 
 type Params = {
   W1: number[][]  // [hidden][input] — W1[j][i] is the weight from input i to hidden j
@@ -995,7 +995,8 @@ class Root extends Component implements IRoot {
   handoffPanel() {
     return div({ class: ["panel", "handoff"] },
       h2("The same network and training, in tensorgrad"),
-      p({}, "This is how to write the same logic in tensorgrad. It's a tiny library that compiles neural networks to WebGPU, good for in-browser demos and visualisations. For training at scale or anything needing the Python ML ecosystem, you'll want PyTorch or JAX. The broad principle with any framework is the same: abstractly express a model, then let the framework automate the computation."),
+      p({}, "This is how to write the same logic in tensorgrad. It's a tiny library that compiles neural networks to WebGPU, good for in-browser demos and visualisations."),
+      p({}, "Visualize ", a({ href: 'https://tinyurl.com/mtca47db', target: '_blank' }, 'this network as a dataflow diagram'), ", drawn by nn-dna, a tool that turns plain-English descriptions of neural networks into architecture diagrams."),
       pre({ class: "code" }, this.handoffCode()),
     )
   }
