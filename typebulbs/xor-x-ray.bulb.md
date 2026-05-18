@@ -247,11 +247,11 @@ class Demo {
     do { this.step() } while (this.phase !== "updated")
   }
 
-  // 12 sub-steps = 4 examples × 3 phases. Lands back on the same
-  // (exIdx, phase), so the user can watch the network evolve from a
-  // fixed vantage point (e.g. backward-done for (1,0)).
+  // One pass through all 4 examples. Always lands on "updated" so the
+  // user sees the post-update state — a partial start (mid-step) gets
+  // completed by the first fullStep, then 3 more full steps follow.
   cycleStep() {
-    for (let i = 0; i < 12; i++) this.step()
+    for (let i = 0; i < 4; i++) this.fullStep()
   }
 }
 
