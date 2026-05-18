@@ -199,6 +199,8 @@ thrown rejections, so silent loop death was the alternative.
 compile(trainingSpec): Promise<CompiledTraining>
 train.attach(forwardSpec): Promise<CompiledForward>      // shares worker + param buffers
 train.replaceModel(newModel, { seed?, optimizer? }): Promise<void>
+trace(trainingSpec): Promise<CompiledIR>                 // IR only — no worker, no GPU
+traceForward(forwardSpec): Promise<CompiledIR>           // forward-only IR
 isWebGPUAvailable(): boolean                             // friendly pre-flight check
 ```
 

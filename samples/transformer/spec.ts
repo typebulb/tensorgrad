@@ -109,15 +109,17 @@ export const predictInputs = {
 
 export const optimizer = { kind: 'adamw', lr: LR, weightDecay: 0.01 } as const
 
+const trainingSpec = { model: new Transformer(), loss: lossFn, inputs, optimizer }
+
 export function compileTraining(): Promise<CompiledTraining<Transformer>> {
-  return compile({ model: new Transformer(), loss: lossFn, inputs, optimizer })
+  return compile(trainingSpec)
 }
 
 // Used by the NN Blueprint bulb to visualize this network as a computation graph.
 // Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
 export const irSpec = {
   label: 'Transformer learns addition',
-  compile: compileTraining,
+  ...trainingSpec,
   predict: predictFwd,
   predictInputs,
   dims: [

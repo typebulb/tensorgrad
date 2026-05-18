@@ -12,7 +12,7 @@
 // of `(1 - c²)`) fails the FD comparison; the shape-only check passes.
 
 import type { Tensor, Graph } from '../src/index.js'
-import { trace, paramInput, appendGrad } from '../src/internal.js'
+import { traceFn, paramInput, appendGrad } from '../src/internal.js'
 import { evalGraph, evalOutput } from './_eval.js'
 import { fail, ok } from './_assert.js'
 
@@ -52,7 +52,7 @@ export function assertGradMatchesFD(
   const fdStride = opts.fdStride ?? 1
 
   // Build the graph once for autograd evaluation.
-  const graph: Graph = trace(() => build(paramInput('w', paramShape as number[])))
+  const graph: Graph = traceFn(() => build(paramInput('w', paramShape as number[])))
   appendGrad(graph)
 
   const paramSize = paramShape.reduce((p, d) => p * d, 1)
@@ -63,7 +63,7 @@ export function assertGradMatchesFD(
   // on the graph itself — the param_input op's `out` is the param tensor; we
   // located the grad through paramGrads which we lost when we threw away the
   // appendGrad return. Re-call appendGrad on a fresh graph to get the handle.
-  const freshGraph: Graph = trace(() => build(paramInput('w', paramShape as number[])))
+  const freshGraph: Graph = traceFn(() => build(paramInput('w', paramShape as number[])))
   const { paramGrads } = appendGrad(freshGraph)
   const gradTensor = paramGrads['w']
   if (!gradTensor) fail(`${name}: appendGrad produced no gradient for 'w'`)

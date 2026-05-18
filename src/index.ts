@@ -44,8 +44,8 @@ export { lr, type AdamConfig, type AdamWConfig, type LR } from './adam.js'
 export { type SGDConfig } from './sgd.js'
 export { Captures } from './runtime.js'
 export {
-  compile, isWebGPUAvailable,
-  type TrainingSpec, type ForwardSpec, type CompiledIR,
+  compile, trace, traceForward, isWebGPUAvailable,
+  type TrainingSpec, type ForwardSpec, type CompiledIR, type ForwardFn,
   type CompiledTraining, type CompiledForward, type OptimizerConfig,
   type StepResult, type RunResult,
   type InputDecl, type InputDecls, type TypedInputs,

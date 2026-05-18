@@ -71,15 +71,17 @@ export const inputs = { x: [BATCH, 1], y: [BATCH, 1] } as const
 export const predictInputs = { x: [BATCH, 1] } as const
 export const optimizer = { kind: 'adam', lr: LR } as const
 
+const trainingSpec = { model: new KAN(), loss: lossFn, inputs, optimizer }
+
 export function compileTraining(): Promise<CompiledTraining<KAN>> {
-  return compile({ model: new KAN(), loss: lossFn, inputs, optimizer })
+  return compile(trainingSpec)
 }
 
 // Used by the NN Blueprint bulb to visualize this network as a computation graph.
 // Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
 export const irSpec = {
   label: 'KAN-tiny (per-edge splines)',
-  compile: compileTraining,
+  ...trainingSpec,
   predict: predictFn,
   predictInputs,
   dims: [

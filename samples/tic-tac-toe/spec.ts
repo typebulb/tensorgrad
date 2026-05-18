@@ -51,15 +51,17 @@ export const predictInputs = { state: [K, STATE_DIM] } as const
 
 export const optimizer = { kind: 'adam', lr: LR } as const
 
+const trainingSpec = { model: new Policy(), loss: lossFn, inputs, optimizer }
+
 export function compileTraining(): Promise<CompiledTraining<Policy>> {
-  return compile({ model: new Policy(), loss: lossFn, inputs, optimizer })
+  return compile(trainingSpec)
 }
 
 // Used by the NN Blueprint bulb to visualize this network as a computation graph.
 // Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
 export const irSpec = {
   label: 'Tic-Tac-Toe self-play',
-  compile: compileTraining,
+  ...trainingSpec,
   predict: predictFn,
   predictInputs,
   dims: [

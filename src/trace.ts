@@ -12,7 +12,7 @@ let _captureEnabled = false
 export function currentGraph(): Graph {
   if (!_current) {
     throw new Error(
-      'tensorgrad: ops can only be called inside trace(). ' +
+      'tensorgrad: ops can only be called inside traceFn(). ' +
       'Did you forget to wrap your forward pass?',
     )
   }
@@ -28,12 +28,17 @@ export function isCaptureEnabled(): boolean {
  * Every op call inside `fn` appends to this graph. `fn` returns the tensor
  * (or array of tensors) to mark as the graph's outputs.
  *
- * Single-threaded and non-reentrant — calling `trace` while another trace is
- * active throws. Op calls outside any `trace(...)` also throw.
+ * Single-threaded and non-reentrant — calling `traceFn` while another trace
+ * is active throws. Op calls outside any `traceFn(...)` also throw.
+ *
+ * Lower-level than the public `trace(spec)` / `traceForward(spec)` — those
+ * orchestrate cloning + materialization + autograd + optimizer passes around
+ * a single `traceFn` call. Reach for `traceFn` when you're building tooling
+ * that constructs graphs from raw op calls (custom optimizers, IR fuzzers).
  */
-export function trace(fn: () => Tensor | Tensor[]): Graph {
+export function traceFn(fn: () => Tensor | Tensor[]): Graph {
   if (_current) {
-    throw new Error('tensorgrad: nested trace() is not supported')
+    throw new Error('tensorgrad: nested traceFn() is not supported')
   }
   const g = makeGraph()
   _current = g
@@ -60,7 +65,7 @@ export function trace(fn: () => Tensor | Tensor[]): Graph {
  */
 export function traceInto<T>(g: Graph, fn: () => T): T {
   if (_current) {
-    throw new Error('tensorgrad: traceInto() called while another trace is active')
+    throw new Error('tensorgrad: traceInto() called while another traceFn is active')
   }
   _current = g
   try {

@@ -64,15 +64,17 @@ export const predictInputs = {
 
 export const optimizer = { kind: 'adam', lr: 2e-4, clipGradNorm: 1.0 } as const
 
+const trainingSpec = { model: new TinyFlow(), loss: lossFn, inputs, optimizer }
+
 export function compileTraining(): Promise<CompiledTraining<TinyFlow>> {
-  return compile({ model: new TinyFlow(), loss: lossFn, inputs, optimizer })
+  return compile(trainingSpec)
 }
 
 // Used by the NN Blueprint bulb to visualize this network as a computation graph.
 // Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
 export const irSpec = {
   label: 'Flow-matching-tiny (MNIST)',
-  compile: compileTraining,
+  ...trainingSpec,
   predict: predictFn,
   predictInputs,
   dims: [

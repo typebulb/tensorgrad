@@ -34,15 +34,17 @@ export const inputs = { x: [B, 1], y: [B, 1] } as const
 export const predictInputs = { x: [B, 1] } as const
 export const optimizer = { kind: 'adam', lr: LR } as const
 
+const trainingSpec = { model: new MLP(), loss: lossFn, inputs, optimizer }
+
 export function compileTraining(): Promise<CompiledTraining<MLP>> {
-  return compile({ model: new MLP(), loss: lossFn, inputs, optimizer })
+  return compile(trainingSpec)
 }
 
 // Used by the NN Blueprint bulb to visualize this network as a computation graph.
 // Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
 export const irSpec = {
   label: 'MLP fits sin(x)',
-  compile: compileTraining,
+  ...trainingSpec,
   predict: predictFn,
   predictInputs,
   dims: [

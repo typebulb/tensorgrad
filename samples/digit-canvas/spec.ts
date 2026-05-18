@@ -59,23 +59,31 @@ export const predictInputs = { x: [BATCH_SIZE, INPUT_DIM] } as const
 
 export type DigitInputs = typeof baseInputs
 
+// Build the training spec for arbitrary hidden width / LR. compileTraining
+// uses this with caller-provided params; irSpec uses the defaults.
+function makeTrainingSpec(hidden: number, lr: number) {
+  return {
+    model: new MLP([INPUT_DIM, hidden, N_CLASSES]),
+    loss: lossFn,
+    optimizer: { kind: 'adamw' as const, lr, weightDecay: 0.01, clipGradNorm: 1.0 },
+    inputs: baseInputs,
+  }
+}
+
+const defaultTrainingSpec = makeTrainingSpec(DEFAULT_HIDDEN, DEFAULT_LR)
+
 export function compileTraining(
   hidden: number = DEFAULT_HIDDEN,
   lr: number = DEFAULT_LR,
 ): Promise<CompiledTraining<MLP, DigitInputs>> {
-  return compile({
-    model: new MLP([INPUT_DIM, hidden, N_CLASSES]),
-    loss: lossFn,
-    optimizer: { kind: 'adamw', lr, weightDecay: 0.01, clipGradNorm: 1.0 },
-    inputs: baseInputs,
-  })
+  return compile(makeTrainingSpec(hidden, lr))
 }
 
 // Used by the NN Blueprint bulb to visualize this network as a computation graph.
 // Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
 export const irSpec = {
   label: 'Digit Canvas (MNIST)',
-  compile: () => compileTraining(),
+  ...defaultTrainingSpec,
   predict: predictFn,
   predictInputs,
   dims: [

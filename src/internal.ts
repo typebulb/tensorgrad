@@ -3,7 +3,7 @@
 // building something on top of tensorgrad rather than just calling
 // `spec` + `compile`. Public end-user code should import from `tensorgrad`.
 
-export { trace, traceInto, paramInput, tensorInput, stateInput } from './trace.js'
+export { traceFn, traceInto, paramInput, tensorInput, stateInput } from './trace.js'
 export { appendGrad, type GradResult } from './grad.js'
 export {
   appendAdam, appendGradClip, resolveLR,

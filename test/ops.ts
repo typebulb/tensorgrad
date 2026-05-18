@@ -9,7 +9,7 @@
 // stable shape rules and obvious literal guards were pruned as padding.
 
 import { dropout } from '../src/index.js'
-import { trace, tensorInput } from '../src/internal.js'
+import { traceFn, tensorInput } from '../src/internal.js'
 import { section, ok, fail, done } from './_assert.js'
 
 section('dropout — auto-managed per-op salt + shared seed input')
@@ -18,7 +18,7 @@ section('dropout — auto-managed per-op salt + shared seed input')
 //    The fast-path is what makes `dropout(x, cfg.pDrop)` with cfg.pDrop=0
 //    a true no-op rather than a useless mask-of-ones kernel.
 {
-  const g = trace(() => dropout(tensorInput('x', [4]), 0))
+  const g = traceFn(() => dropout(tensorInput('x', [4]), 0))
   if (g.ops.some(o => o.kind === 'dropout')) fail('dropout(x, 0) should not emit an op')
   ok('dropout(x, 0) short-circuits (no IR emitted)')
 }
@@ -29,7 +29,7 @@ section('dropout — auto-managed per-op salt + shared seed input')
 //    makes different dropout calls produce different masks while
 //    forward + backward of the same call produce identical masks.
 {
-  const g = trace(() => {
+  const g = traceFn(() => {
     const x = tensorInput('x', [4])
     return dropout(dropout(x, 0.1), 0.2)
   })

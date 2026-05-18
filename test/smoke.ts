@@ -23,7 +23,7 @@ import {
   type Tensor, type Graph,
 } from '../src/index.js'
 import {
-  trace, traceInto, paramInput, tensorInput,
+  traceFn, traceInto, paramInput, tensorInput,
   appendGrad,
   planBuffers, emitKernels,
 } from '../src/internal.js'
@@ -106,7 +106,7 @@ function lossFn(p: Params, tokens: Tensor, targets: Tensor): Tensor {
 // ---- Run the trace + autograd ----------------------------------------------
 
 console.log('Tracing transformer forward + loss...')
-const graph: Graph = trace(() => {
+const graph: Graph = traceFn(() => {
   const p = declareParams()
   const tokens = tensorInput('tokens', [B, T], 'i32')
   const targets = tensorInput('targets', [B, T], 'i32')
@@ -236,7 +236,7 @@ else process.exit(1)
 
 console.log('\nVerifying shape-error attribution...')
 try {
-  trace(() => {
+  traceFn(() => {
     const a = tensorInput('a', [3, 4])
     const b = tensorInput('b', [5, 4])
     return add(a, b)  // <-- this line should appear in the error stack
@@ -263,7 +263,7 @@ try {
 console.log('\nVerifying activation capture...')
 
 // 1. capture() registers a tensor on graph.captures during forward trace.
-const capGraph = trace(() => {
+const capGraph = traceFn(() => {
   const a = tensorInput('a', [3, 4])
   const b = tensorInput('b', [3, 4])
   const c = capture('cap.sum', add(a, b))
@@ -285,7 +285,7 @@ console.log('  ✓ planBuffers populates capturesByName')
 
 // 3. Duplicate capture name throws.
 try {
-  trace(() => {
+  traceFn(() => {
     const a = tensorInput('a', [2, 2])
     capture('dup', a)
     capture('dup', a)  // should throw
@@ -303,7 +303,7 @@ try {
 
 // 4. capture() inside traceInto (autograd re-entry) is a no-op — backward
 //    rules and optimizer ops shouldn't accidentally publish their tensors.
-const reentry = trace(() => {
+const reentry = traceFn(() => {
   const a = tensorInput('a', [2, 2])
   return a
 })
@@ -330,7 +330,7 @@ import { appendSGD } from '../src/internal.js'
 // Build a trivial training graph: one param p, loss = sum(p * p).
 function buildTrivialTrainingGraph(): { graph: Graph; paramGrads: Record<string, Tensor>; paramTensors: Record<string, Tensor> } {
   let pTensor: Tensor | null = null
-  const g = trace(() => {
+  const g = traceFn(() => {
     const p = paramInput('p', [4])
     pTensor = p
     return sum(mul(p, p))
@@ -468,6 +468,121 @@ function approxEq(a: number, b: number, eps = 1e-9): boolean {
     }
   }
   console.log('  ✓ lr.multiStep([3, 7], gamma=0.1) drops at each milestone')
+}
+
+// ---- Verify public trace() / traceForward() -------------------------------
+
+console.log('\nVerifying public trace() / traceForward() inspection API...')
+
+import { trace as tracePublic, traceForward } from '../src/index.js'
+import { Module, Linear } from '../src/index.js'
+import { ok, fail } from './_assert.js'
+
+class TinyMLP extends Module {
+  l1 = new Linear(4, 8)
+  l2 = new Linear(8, 4)
+}
+
+function mlpForward(m: TinyMLP, { x }: { x: Tensor }): Tensor {
+  return m.l2.fwd(relu(m.l1.fwd(x)))
+}
+
+function mlpLoss(m: TinyMLP, { x, y }: { x: Tensor; y: Tensor }): Tensor {
+  const out = mlpForward(m, { x })
+  const diff = sub(out, y)
+  return mean(mul(diff, diff))
+}
+
+// 1. trace() returns CompiledIR (async): graph + kernels + plan.
+{
+  const model = new TinyMLP()
+  const ir = await tracePublic({
+    model,
+    loss: mlpLoss,
+    inputs: { x: [2, 4] as const, y: [2, 4] as const },
+    optimizer: { kind: 'adam', lr: 0.001 } as const,
+  })
+  const paramCount = ir.graph.ops.filter(o => o.kind === 'param_input').length
+  if (paramCount !== 4) fail(`trace: expected 4 param_inputs (l1.W, l1.b, l2.W, l2.b); got ${paramCount}`)
+  const hasMatmul = ir.graph.ops.some(o => o.kind === 'matmul')
+  if (!hasMatmul) fail('trace: expected matmul ops in graph')
+  const hasAdamUpdate = ir.graph.ops.some(o => o.kind === 'adam_update_p')
+  if (!hasAdamUpdate) fail('trace: expected adam_update_p ops (optimizer pass should have run)')
+  if (ir.kernels.length === 0) fail('trace: expected non-zero kernels.length')
+  ok(`trace(): ${ir.graph.ops.length} ops, ${paramCount} params, ${ir.kernels.length} kernels`)
+}
+
+// 2. traceForward() returns CompiledIR with NO backward / NO optimizer ops.
+{
+  const model = new TinyMLP()
+  const ir = await traceForward({
+    model,
+    forward: mlpForward,
+    inputs: { x: [2, 4] as const },
+  })
+  const hasAdamUpdate = ir.graph.ops.some(o => o.kind === 'adam_update_p')
+  if (hasAdamUpdate) fail('traceForward: should not contain optimizer ops')
+  const hasReluGrad = ir.graph.ops.some(o => o.kind === 'relu_grad')
+  if (hasReluGrad) fail('traceForward: should not contain backward ops')
+  const hasMatmul = ir.graph.ops.some(o => o.kind === 'matmul')
+  if (!hasMatmul) fail('traceForward: expected matmul ops')
+  if (ir.kernels.length === 0) fail('traceForward: expected non-zero kernels.length')
+  ok(`traceForward(): ${ir.graph.ops.length} ops, ${ir.kernels.length} kernels, forward-only`)
+}
+
+// 3. The caller's model instance is not mutated — trace clones internally.
+//    (Same contract as compile().) Reusing the same instance must work.
+{
+  const model = new TinyMLP()
+  const ir1 = await tracePublic({
+    model,
+    loss: mlpLoss,
+    inputs: { x: [2, 4] as const, y: [2, 4] as const },
+    optimizer: { kind: 'adam', lr: 0.001 } as const,
+  })
+  const ir2 = await tracePublic({
+    model,  // same instance — must work
+    loss: mlpLoss,
+    inputs: { x: [2, 4] as const, y: [2, 4] as const },
+    optimizer: { kind: 'adam', lr: 0.001 } as const,
+  })
+  if (ir1.graph.ops.length !== ir2.graph.ops.length) {
+    fail(`trace: reusing model produced different graphs (${ir1.graph.ops.length} vs ${ir2.graph.ops.length} ops)`)
+  }
+  ok('trace(): reusing the same model instance produces identical graphs (cloning is correct)')
+}
+
+// 4. trace() with SGD optimizer produces SGD update ops (not Adam).
+{
+  const model = new TinyMLP()
+  const ir = await tracePublic({
+    model,
+    loss: mlpLoss,
+    inputs: { x: [2, 4] as const, y: [2, 4] as const },
+    optimizer: { kind: 'sgd', lr: 0.01 } as const,
+  })
+  const hasAdam = ir.graph.ops.some(o => o.kind === 'adam_update_p')
+  if (hasAdam) fail('trace+sgd: should not emit adam_update ops')
+  ok('trace() with SGD optimizer: no Adam-update ops in graph')
+}
+
+// 5. Pipeline-structural-completeness: param count must match adam_update_p
+//    count (the optimizer pass produces one update op per param). Catches
+//    drift where a refactor skips part of the pipeline — e.g. trace()
+//    running appendGrad but not appendAdam would surface here as 0 updates.
+{
+  const ir = await tracePublic({
+    model: new TinyMLP(),
+    loss: mlpLoss,
+    inputs: { x: [2, 4] as const, y: [2, 4] as const },
+    optimizer: { kind: 'adam', lr: 0.001 } as const,
+  })
+  const params = ir.graph.ops.filter(o => o.kind === 'param_input').length
+  const adamUpdates = ir.graph.ops.filter(o => o.kind === 'adam_update_p').length
+  if (adamUpdates !== params) {
+    fail(`pipeline: expected ${params} adam_update_p ops (one per param); got ${adamUpdates}`)
+  }
+  ok(`pipeline: ${params} params → ${adamUpdates} adam_update_p ops (1:1)`)
 }
 
 console.log('\nPhase 1 smoke test complete.')

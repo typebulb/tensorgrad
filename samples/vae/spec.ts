@@ -69,15 +69,17 @@ export const inputs = { x: [BATCH_SIZE, INPUT_DIM] } as const
 export const predictInputs = { x: [BATCH_SIZE, INPUT_DIM] } as const
 export const optimizer = { kind: 'adam', lr: 1e-3, clipGradNorm: 1.0 } as const
 
+const trainingSpec = { model: new VAE(), loss: lossFn, inputs, optimizer }
+
 export function compileTraining(): Promise<CompiledTraining<VAE>> {
-  return compile({ model: new VAE(), loss: lossFn, inputs, optimizer })
+  return compile(trainingSpec)
 }
 
 // Used by the NN Blueprint bulb to visualize this network as a computation graph.
 // Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
 export const irSpec = {
   label: 'VAE (MNIST)',
-  compile: compileTraining,
+  ...trainingSpec,
   predict: predictFn,
   predictInputs,
   dims: [

@@ -62,15 +62,17 @@ export const predictInputs = {
 
 export const optimizer = { kind: 'adam', lr: 1e-3 } as const
 
+const trainingSpec = { model: new NeRFTiny(), loss: lossFn, inputs, optimizer }
+
 export function compileTraining(): Promise<CompiledTraining<NeRFTiny>> {
-  return compile({ model: new NeRFTiny(), loss: lossFn, inputs, optimizer })
+  return compile(trainingSpec)
 }
 
 // Used by the NN Blueprint bulb to visualize this network as a computation graph.
 // Paste the whole file at typebulb.com/u/samples/nn-blueprint/full to render it.
 export const irSpec = {
   label: 'NeRF-tiny (image INR)',
-  compile: compileTraining,
+  ...trainingSpec,
   predict: predictFn,
   predictInputs,
   dims: [

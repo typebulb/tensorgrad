@@ -258,7 +258,7 @@ export type OpNode =
 
 /**
  * A traced computation graph: a flat array of ops in topological (=
- * construction) order, plus the tensors they produce. Built by `trace(...)`;
+ * construction) order, plus the tensors they produce. Built by `traceFn(...)`;
  * consumed by `appendGrad` (autograd), `planBuffers` (memory layout), and
  * `emitKernels` (codegen).
  *

@@ -14,7 +14,7 @@
 // compiled + cached per distinct resolved shape.
 
 import type { Tensor, Shape, Dtype } from './ir.js'
-import { trace, tensorInput } from './trace.js'
+import { traceFn, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
 import {
   appendAdam, resolveLR,
@@ -338,45 +338,123 @@ export function isWebGPUAvailable(): boolean {
   return typeof navigator !== 'undefined' && 'gpu' in navigator
 }
 
-interface BuiltTrainingGraph {
-  ir: CompiledIR
-  meta: CompileResult
-  initFns: Record<string, InitFn>
+/**
+ * Build the full training IR (forward + backward + optimizer ops + buffer
+ * plan + emitted kernels) without spawning a worker, compiling WGSL in the
+ * GPU driver, or allocating GPU memory. Pair with `compile()` for execution.
+ *
+ * Async because the JS pipeline can run for several seconds at frontier
+ * scales (~5s for a GPT-4-shaped model). Yields between phases keep the
+ * host's main thread responsive — without them, a browser tab calling
+ * this would freeze for the duration.
+ *
+ * ```ts
+ * const { graph, kernels } = await trace({ model, loss, inputs, optimizer })
+ * ```
+ */
+export async function trace<M extends Module, I extends InputDecls>(
+  opts: TrainingSpec<M, I>,
+): Promise<CompiledIR> {
+  const { ir } = await buildTrainingIR(opts)
+  return ir
 }
 
-// Trace + autograd + optimizer + buffer-plan + codegen + worker createRuntime,
-// using an existing worker proxy. Shared by `compile` (fresh worker)
-// and `replaceModel` (existing worker, same graphId).
-async function buildTrainingGraph<M extends Module, I extends InputDecls>(
-  proxy: WorkerProxy,
-  opts: TrainingSpecSealed<M, I>,
-  graphId: number,
-): Promise<BuiltTrainingGraph> {
+/**
+ * Build a forward-only IR — same as what `train.attach({ forward, inputs })`
+ * produces internally, but as a standalone `CompiledIR` with no parent
+ * `CompiledTraining` and no GPU work.
+ *
+ * `inputs` must be fully concrete — null-wildcard dims aren't supported
+ * (there's no per-shape cache to lazily compile against). Returned
+ * `loss` field is the forward output tensor; `paramGrads` is empty.
+ *
+ * ```ts
+ * const { graph, kernels } = await traceForward({ model, forward, inputs })
+ * ```
+ */
+export async function traceForward<M extends Module, I extends InputDecls>(
+  opts: { model: M; forward: ForwardFn<M, I>; inputs: I },
+): Promise<CompiledIR> {
+  return buildForwardIR(opts.model, opts.forward as unknown as ForwardFn<M, InputDecls>, opts.inputs)
+}
+
+/** Yields a macrotask via setTimeout(0) so the browser can paint between
+ *  phases. Microtasks (queueMicrotask, Promise.resolve) don't release the
+ *  thread to the renderer — only macrotasks do. */
+function yieldToUI(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0))
+}
+
+interface BuiltTrainingIR {
+  ir: CompiledIR
+  materialized: MaterializedParams
+  adamResult: AdamResult | undefined
+  sgdResult: SGDResult | undefined
+}
+
+/** Pure-JS portion of the training pipeline: trace + autograd + optimizer
+ *  pass + plan + emit. Shared by `trace()` (public inspection) and
+ *  `buildTrainingGraph()` (which adds worker setup). Yields between phases
+ *  for UI responsiveness; see `yieldToUI`. */
+async function buildTrainingIR<M extends Module, I extends InputDecls>(
+  opts: TrainingSpec<M, I>,
+): Promise<BuiltTrainingIR> {
   const loss = opts.loss as unknown as ForwardFn<M, InputDecls>
   const inputs = opts.inputs as InputDecls
   const { graph, materialized } = traceModule(opts.model, loss, inputs)
+  await yieldToUI()
   const { paramGrads, loss: lossTensor } = appendGrad(graph)
+  await yieldToUI()
   const adamResult = opts.optimizer.kind === 'adam' || opts.optimizer.kind === 'adamw'
     ? appendAdam(graph, paramGrads, materialized.tensors, opts.optimizer, materialized.decayFlags)
     : undefined
   const sgdResult = opts.optimizer.kind === 'sgd'
     ? appendSGD(graph, paramGrads, materialized.tensors, opts.optimizer, materialized.decayFlags)
     : undefined
-
-  const optimizerWritebacks =
-    adamResult?.writebacks ?? sgdResult?.writebacks ?? []
-  const plan = planBuffers(graph, paramGrads, optimizerWritebacks)
+  const writebacks = adamResult?.writebacks ?? sgdResult?.writebacks ?? []
+  await yieldToUI()
+  const plan = planBuffers(graph, paramGrads, writebacks)
   const kernels = emitKernels(graph, plan)
   const ir: CompiledIR = { graph, paramGrads, loss: lossTensor, plan, kernels }
+  return { ir, materialized, adamResult, sgdResult }
+}
 
-  const initialParams = buildInitialParams(plan, materialized.initFns, mulberry32(opts.seed))
-  const wireIR: WireIR = { graph, plan, kernels }
+/** Pure-JS portion of a forward-only graph build. Shared by `traceForward()`
+ *  (public inspection) and `compileSibling()` (per-shape lazy compile). */
+async function buildForwardIR<M extends Module>(
+  model: M,
+  forward: ForwardFn<M, InputDecls>,
+  decls: InputDecls,
+): Promise<CompiledIR> {
+  const { graph } = traceModule(model, forward, decls)
+  await yieldToUI()
+  const outputTensor = graph.tensors[graph.outputs[0]!]!
+  const plan = planBuffers(graph, {})
+  const kernels = emitKernels(graph, plan)
+  return { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
+}
+
+interface BuiltTrainingGraph {
+  ir: CompiledIR
+  meta: CompileResult
+  initFns: Record<string, InitFn>
+}
+
+// Builds the IR via `buildTrainingIR`, then submits it to the worker.
+// Shared by `compile` (fresh worker) and `replaceModel` (existing worker).
+async function buildTrainingGraph<M extends Module, I extends InputDecls>(
+  proxy: WorkerProxy,
+  opts: TrainingSpecSealed<M, I>,
+  graphId: number,
+): Promise<BuiltTrainingGraph> {
+  const { ir, materialized, adamResult, sgdResult } = await buildTrainingIR(opts)
+  const initialParams = buildInitialParams(ir.plan, materialized.initFns, mulberry32(opts.seed))
+  const wireIR: WireIR = { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
   const wireOptimizer: WireOptimizerConfig | null =
     adamResult ? { kind: 'adam', config: wireAdamConfig(adamResult) }
     : sgdResult ? { kind: 'sgd', config: wireSGDConfig(sgdResult) }
     : null
   const transfers = transferablesOfRecord(initialParams)
-
   const meta = await proxy.request<CompileResult>(
     { kind: 'createRuntime', payload: { graphId, ir: wireIR, initialParams, optimizer: wireOptimizer } },
     transfers,
@@ -672,21 +750,16 @@ async function compileSibling<M extends Module, I extends InputDecls>(
   decls: ResolvedDecls,
   nextGraphId: { v: number },
 ): Promise<ForwardSiblingMeta> {
-  const { graph } = traceModule(model, forward as ForwardFn<M, InputDecls>, decls)
-  const outputTensor = graph.tensors[graph.outputs[0]!]!
-  const plan = planBuffers(graph, {})
-  const kernels = emitKernels(graph, plan)
-  const ir: CompiledIR = { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
-
+  const ir = await buildForwardIR(model, forward as unknown as ForwardFn<M, InputDecls>, decls)
   const childGraphId = nextGraphId.v++
-  const wireIR: WireIR = { graph, plan, kernels }
+  const wireIR: WireIR = { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
   const meta = await proxy.request<CompileResult>(
     { kind: 'compileForward', payload: { graphId: childGraphId, parentGraphId, ir: wireIR } },
   )
   return { graphId: childGraphId, ir, meta }
 }
 
-type Graph = ReturnType<typeof trace>
+type Graph = ReturnType<typeof traceFn>
 
 /** Normalized inputs decl: concrete dtype, shape with possibly-null wildcards. */
 type NormalizedDecls = Record<string, { shape: InputShape; dtype: Dtype }>
@@ -718,7 +791,7 @@ function traceModule<M extends Module>(
   const cloned = cloneModule(model)
   const normalized = normalizeDecls(inputDecls)
   let materialized: MaterializedParams = { tensors: {}, initFns: {}, decayFlags: {} }
-  const graph = trace(() => {
+  const graph = traceFn(() => {
     materialized = materializeParams(cloned)
     const inputTensors: Record<string, Tensor> = {}
     for (const [name, n] of Object.entries(normalized)) {

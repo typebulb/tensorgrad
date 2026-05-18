@@ -22,7 +22,7 @@ import {
   conv2d, maxPool2d,
   stopGradient,
 } from '../src/index.js'
-import { trace, paramInput, tensorInput, appendGrad } from '../src/internal.js'
+import { traceFn, paramInput, tensorInput, appendGrad } from '../src/internal.js'
 import { evalGraph } from './_eval.js'
 import { section, ok, fail, done } from './_assert.js'
 import { assertGradMatchesFD } from './_fdgrad.js'
@@ -129,7 +129,7 @@ assertGradMatchesFD('maxPool2d (argmax-routing gradient)', [1, 2, 4, 4], p => {
 {
   const N = 6
   const init = new Float32Array(N).map((_, i) => i * 0.1 - 0.3)
-  const graph = trace(() => {
+  const graph = traceFn(() => {
     const p = paramInput('w', [N])
     return mean(add(stopGradient(p), p))
   })

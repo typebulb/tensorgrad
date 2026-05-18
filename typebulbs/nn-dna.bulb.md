@@ -8,9 +8,10 @@ name: "NN DNA"
 ```tsx
 import { App, Component, div as divH, h1, p, a, span, button, h2, textarea, ul, li, code, strong, em } from "domeleon"
 import {
-  type Tensor, type Graph, type OpNode, type Shape, type CallSite,
+  type Tensor, type Graph, type OpNode, type Shape, type CallSite, type CompiledIR,
+  type ForwardFn, type InputDecls, type OptimizerConfig,
   isWebGPUAvailable, getOpInputs,
-  Module, compile, lr, init,
+  Module, trace, traceForward, lr, init,
   Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
   crossEntropy, nllLoss,
   capture, dropout, stopGradient, singleFlight,
@@ -36,29 +37,20 @@ import { transform as sucraseTransform } from "sucrase"
 // ===== Spec evaluation ======================================================
 
 type DimSpec = { size: number; name: string; desc?: string; color?: string }
-type PredictFn = (m: any, inputs: any) => Tensor
-type PredictInputs = Record<string, unknown>
 
-interface InspectableForward {
-  graphFor(inputs: PredictInputs): Promise<{ graph: Graph; kernels: readonly unknown[] }>
-  destroy(): void
-}
-interface InspectableTraining {
-  readonly graph: Graph
-  readonly kernels: readonly unknown[]
-  attach(spec: { forward: PredictFn; inputs: PredictInputs }): Promise<InspectableForward>
-  destroy(): void
-}
+// Data the bulb traces via trace() / traceForward(). The spec author's
+// concrete Module / InputDecls types are erased to base types here — the
+// spec's own internal types are validated when the spec is written, not
+// at the bulb's consumption point.
 interface IRSpec {
   label: string
   description?: string
-  compile: () => Promise<InspectableTraining>
-  /** Inference forward — same model, returns the prediction tensor instead
-   *  of a scalar loss. The bulb compiles a sibling inference graph via
-   *  `train.attach({ forward: predict, inputs: predictInputs })` and
-   *  renders it as the Inference tab. */
-  predict: PredictFn
-  predictInputs: PredictInputs
+  model: Module
+  loss: ForwardFn<Module, InputDecls>
+  inputs: InputDecls
+  optimizer: OptimizerConfig
+  predict: ForwardFn<Module, InputDecls>
+  predictInputs: InputDecls
   dims?: DimSpec[]
 }
 
@@ -66,7 +58,7 @@ interface IRSpec {
 // eval'd spec source, which the bundler can't see. Removing this breaks
 // specs with `ReferenceError: Module is not defined`.
 const _tgKeepalive = {
-  Module, compile, lr, init, isWebGPUAvailable,
+  Module, lr, init, isWebGPUAvailable,
   Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
   crossEntropy, nllLoss,
   capture, dropout, stopGradient, singleFlight,
@@ -595,14 +587,125 @@ function formatParamCount(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`
 }
 
+// matmul + conv2d only — everything else is single-digit ops per element,
+// rounding error next to a 2·M·K·N matmul. Includes conv backward kinds;
+// matmul backward is free because it still has kind 'matmul'.
+function countFlops(graph: Graph, opIds: Iterable<number>): number {
+  let total = 0
+  for (const i of opIds) {
+    const op = graph.ops[i]!
+    if (op.kind === "matmul" || op.kind === "matmul_batched") {
+      const K = graph.tensors[op.a]!.shape.at(-1)!
+      const outN = graph.tensors[op.out]!.shape.reduce((a, b) => a * b, 1)
+      total += 2 * outN * K
+    } else if (op.kind === "conv2d") {
+      const w = graph.tensors[op.weight]!.shape
+      const outN = graph.tensors[op.out]!.shape.reduce((a, b) => a * b, 1)
+      total += 2 * outN * w[1]! * w[2]! * w[3]!
+    } else if (op.kind === "conv2d_input_grad") {
+      const w = graph.tensors[op.weight]!.shape
+      const dyN = graph.tensors[op.dy]!.shape.reduce((a, b) => a * b, 1)
+      total += 2 * dyN * w[1]! * w[2]! * w[3]!
+    } else if (op.kind === "conv2d_weight_grad") {
+      const out = graph.tensors[op.out]!.shape
+      const dyN = graph.tensors[op.dy]!.shape.reduce((a, b) => a * b, 1)
+      total += 2 * dyN * out[1]! * out[2]! * out[3]!
+    }
+  }
+  return total
+}
+
+function formatFlops(n: number): string {
+  if (n < 1_000) return `${n}`
+  if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}K`
+  if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n < 1_000_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}G`
+  return `${(n / 1_000_000_000_000).toFixed(2)}T`
+}
+
+// Bytes of forward intermediate tensors. Excludes params, external inputs,
+// and shape-only ops (reshape/permute are views). Upper bound — the buffer
+// planner aliases non-overlapping lifetimes in practice.
+function countActivationBytes(graph: Graph, opIds: Iterable<number>): number {
+  let total = 0
+  for (const i of opIds) {
+    const op = graph.ops[i]!
+    if (op.kind === "param_input" || op.kind === "tensor_input") continue
+    if (op.kind === "reshape" || op.kind === "permute") continue
+    const n = graph.tensors[op.out]!.shape.reduce((a, b) => a * b, 1)
+    total += 4 * n
+  }
+  return total
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+// ===== Metric definitions ===================================================
+// Four header metrics with definitional hover tooltips.
+
+type MetricData = { display: string; tooltip: string }
+
+function buildMetrics(args: {
+  graph: Graph
+  fwdOps: Set<number>
+  isInference: boolean
+  trainGraph: Graph
+  kernelCount: number
+}): MetricData[] {
+  const { graph, fwdOps, isInference, trainGraph, kernelCount } = args
+  const params = countParams(trainGraph)
+  const flops = countFlops(graph, isInference ? fwdOps : graph.ops.keys())
+  const flopsLabel = isInference ? "FLOPs/forward" : "FLOPs/step"
+  const activations = countActivationBytes(graph, fwdOps)
+
+  return [
+    {
+      display: `${formatParamCount(params)} parameters`,
+      tooltip: "The model's trainable weights — what the optimizer updates each step.",
+    },
+    {
+      display: `${formatBytes(activations)} activations`,
+      tooltip: "Memory for the intermediate tensors created during a forward pass.",
+    },
+    {
+      display: `${formatFlops(flops)} ${flopsLabel}`,
+      tooltip: isInference
+        ? "Arithmetic operations per forward pass (mostly matrix multiplies)."
+        : "Arithmetic operations per training step (mostly matrix multiplies).",
+    },
+    {
+      display: `${kernelCount} kernels`,
+      tooltip: "Compiled GPU programs the model dispatches each step.",
+    },
+  ]
+}
+
 // ===== Component ============================================================
 
 type GraphView = { graph: Graph; kernelCount: number; fwdOps: Set<number> }
 
+// Reduce a CompiledIR to the slim view the bulb actually walks: graph,
+// kernel count, and the forward-reachable op set used to filter the diagram.
+function viewOf(ir: CompiledIR): GraphView {
+  return {
+    graph: ir.graph,
+    kernelCount: ir.kernels.length,
+    fwdOps: forwardReachable(ir.graph, ir.graph.outputs),
+  }
+}
+
 class IRViewer extends Component {
   // Inference tab is omitted entirely when the spec has no predict function.
   activeTab: "training" | "inference" | "code" | "info" = "training"
+  // `status` is the loading/error string shown when no metrics yet exist.
+  // Once a graph compiles, `metrics` takes over and `status` is ignored.
   status = "Loading…"
+  metrics: MetricData[] = []
   legend: LegendItem[] = []
   dimCollisions: DimCollision[] = []
   modelLabel = ""
@@ -620,8 +723,6 @@ class IRViewer extends Component {
   private srcCache: Map<string, string[]> = new Map()
   private canvasEl: HTMLDivElement | null = null
   private textareaEl: HTMLTextAreaElement | null = null
-  private currentTrain: InspectableTraining | null = null
-  private currentInfer: InspectableForward | null = null
 
   view() {
     const showViz = this.activeTab === "training" || this.activeTab === "inference"
@@ -645,7 +746,12 @@ class IRViewer extends Component {
         divH({ class: "panel" },
           divH({ class: "model-header" },
             this.modelLabel ? h2({ class: "model-title" }, this.modelLabel) : null,
-            divH({ class: "model-stats" }, this.status),
+            this.metrics.length > 0
+              ? divH({ class: "model-stats" }, ...this.metrics.flatMap((m, i) => {
+                  const chip = span({ class: "metric-chip", "data-tooltip": m.tooltip }, m.display)
+                  return i === 0 ? [chip] : [span({ class: "metric-sep" }, "·"), chip]
+                }))
+              : divH({ class: "model-stats" }, this.status),
             this.modelDescription ? p({ class: "model-description" }, this.modelDescription) : null,
           ),
           this.legend.length > 0
@@ -785,15 +891,11 @@ class IRViewer extends Component {
   }
 
   private async compileFromSource(source: string): Promise<void> {
-    // Null both refs: a partial re-compile failure must not leave stale state.
-    if (this.currentTrain) {
-      try { this.currentTrain.destroy() } catch { /* ignore */ }
-      this.currentTrain = null
-      this.currentInfer = null
-    }
     if (this.canvasEl) this.canvasEl.innerHTML = ""
     this.legend = []
     this.dimCollisions = []
+    this.metrics = []
+    this.train = null
     this.infer = null
     // If the new spec has no predict, the Inference tab disappears — don't strand the user there.
     if (this.activeTab === "inference") this.activeTab = "training"
@@ -811,47 +913,45 @@ class IRViewer extends Component {
       return
     }
 
-    this.status = `Compiling "${spec.label}"…`
+    this.status = `Tracing "${spec.label}"…`
     this.update()
     try {
       if (!this.viz) this.viz = await instance()
-      const train = await spec.compile()
-      this.currentTrain = train
-      this.train = {
-        graph: train.graph,
-        kernelCount: train.kernels.length,
-        fwdOps: forwardReachable(train.graph, train.graph.outputs),
-      }
+      const trainIR = await trace({
+        model: spec.model,
+        loss: spec.loss,
+        inputs: spec.inputs,
+        optimizer: spec.optimizer,
+      })
+      this.train = viewOf(trainIR)
 
       this.modelLabel = spec.label
       this.modelDescription = spec.description ?? ""
 
-      const { resolve, legend, collisions } = buildDimResolver(train.graph, spec.dims)
+      const { resolve, legend, collisions } = buildDimResolver(trainIR.graph, spec.dims)
       this.resolveDim = resolve
       // Spec frames have URL "__spec__" — inject the cleaned source directly.
       this.srcCache = new Map([["__spec__", cleanedSource.split("\n")]])
       this.legend = legend
       this.dimCollisions = collisions
 
-      // Best-effort inference compile — training graph still useful if attach fails.
+      // Best-effort inference trace — training graph still useful if it fails.
       try {
-        const infer = await train.attach({ forward: spec.predict, inputs: spec.predictInputs })
-        this.currentInfer = infer
-        const ir = await infer.graphFor(spec.predictInputs)
-        this.infer = {
-          graph: ir.graph,
-          kernelCount: ir.kernels.length,
-          fwdOps: forwardReachable(ir.graph, ir.graph.outputs),
-        }
+        const inferIR = await traceForward({
+          model: spec.model,
+          forward: spec.predict,
+          inputs: spec.predictInputs,
+        })
+        this.infer = viewOf(inferIR)
       } catch (e) {
-        console.warn("inference attach failed:", e)
+        console.warn("inference trace failed:", e)
         this.infer = null
       }
 
       this.update()
       this.rerender()
     } catch (e) {
-      this.fail(`compile error: ${(e as Error)?.message ?? e}`, e)
+      this.fail(`trace error: ${(e as Error)?.message ?? e}`, e)
     }
   }
 
@@ -875,10 +975,14 @@ class IRViewer extends Component {
     this.canvasEl.innerHTML = ""
     this.canvasEl.appendChild(svg)
     attachHoverTrace(svg)
-    // Param count always reads from training graph — params are shared, and
-    // we hide param_input leaves so the inference graph wouldn't see them.
-    const params = this.train ? countParams(this.train.graph) : 0
-    this.status = `${formatParamCount(params)} parameters · ${kernelCount} kernels`
+    // Params always read from train graph (shared); FLOPs cover the full
+    // training step or forward-only inference depending on tab.
+    const isInference = view === this.infer
+    this.metrics = buildMetrics({
+      graph, fwdOps, isInference,
+      trainGraph: this.train!.graph,
+      kernelCount,
+    })
     this.update()
   }
 }
@@ -1030,7 +1134,58 @@ body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 
 /* Shares the canvas background so header + SVG read as one visual group. */
 .ir-viewer .model-header { padding: 0.9rem 1rem 0.75rem; background: var(--bg-canvas); text-align: center; }
 .ir-viewer .model-title { font-size: 1.18rem; margin: 0 0 0.3rem; color: var(--text-primary); font-weight: 600; }
-.ir-viewer .model-stats { font-size: 0.88rem; font-weight: 600; color: var(--text-primary); margin: 0 0 0.6rem; }
+.ir-viewer .model-stats {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 0.6rem;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 0.15rem 0.45rem;
+}
+.ir-viewer .metric-sep { color: var(--text-muted); user-select: none; }
+
+/* Below the chip, not above: `.panel` has overflow:hidden (textarea
+   corners) which would clip anything extending past its top edge. */
+.ir-viewer .metric-chip {
+  position: relative;
+  padding: 0.05rem 0.2rem;
+  border-bottom: 1px dotted var(--border-strong);
+  cursor: help;
+}
+.ir-viewer .metric-chip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  top: calc(100% + 0.45rem);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.65rem;
+  font-size: 0.78rem;
+  font-weight: 400;
+  line-height: 1.4;
+  white-space: normal;
+  width: max-content;
+  max-width: 32ch;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s;
+  z-index: 20;
+  text-align: left;
+}
+html[data-theme="dark"] .ir-viewer .metric-chip::after {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+.ir-viewer .metric-chip:hover::after,
+.ir-viewer .metric-chip:focus::after {
+  opacity: 1;
+}
 .ir-viewer .model-description { margin: 0 auto; color: var(--text-muted); font-size: 0.9rem; line-height: 1.5; max-width: 72ch; }
 
 .ir-viewer .canvas { background: var(--bg-canvas); width: 100%; padding: 0.85rem 0.5rem; box-sizing: border-box; }
@@ -1090,7 +1245,10 @@ The source MUST end with:
     export const irSpec = {
       label: '...',
       description: '...',
-      compile: () => compile({ model: new MyModel(), loss: lossFn, inputs, optimizer }),
+      model: new MyModel(),
+      loss: lossFn,
+      inputs,
+      optimizer,
       predict: predictFn,
       predictInputs: { /* same shape as `inputs` but without target/label fields */ },
       dims: [ { size: N, name: 'B', desc: '...' }, ... ],
@@ -1100,11 +1258,11 @@ The source MUST end with:
 
 - **`description`**: 2–3 sentences explaining the architecture in plain English. Cover the model type, the task, key design choices (positional encoding, causal masking, normalization, gating, etc.), and the relevant hyperparameter scales (batch size, depth, width, head count). This is what someone seeing only the rendered graph would need to know to understand what they're looking at.
 
-- **`compile`**: zero-arg thunk returning the `compile({...})` promise.
+- **`model`**, **`loss`**, **`inputs`**, **`optimizer`**: ingredients for tracing the training graph. Same shape as you'd pass to tensorgrad's `compile({ model, loss, inputs, optimizer })` — the bulb traces these directly without GPU work via `trace()`.
 
-- **`predict`**: forward function returning the network's *prediction* (logits, regression output, generated sample) rather than a scalar loss. Same shape as a forward but without the loss tail. Compiled as a sibling graph via `train.attach({ forward: predict, inputs: predictInputs })` for visualizing what the network actually produces at inference time.
+- **`predict`**: forward function returning the network's *prediction* (logits, regression output, generated sample) rather than a scalar loss. Same shape as a forward but without the loss tail. Traced separately for the Inference tab via `traceForward({ model, forward: predict, inputs: predictInputs })` — the model is shared with training.
 
-- **`predictInputs`**: same shape as `inputs` but without target/label fields (a classifier's `{ x, y }` becomes `{ x }`). Use the same concrete batch size as `inputs` — the inference graph compiles at a fixed shape for rendering.
+- **`predictInputs`**: same shape as `inputs` but without target/label fields (a classifier's `{ x, y }` becomes `{ x }`). Use the same concrete batch size as `inputs`.
 
 - **`dims`**: metadata labeling distinct integer dim sizes in the IR. One entry per architecturally meaningful dim (batch, hidden width, sequence length, head count, vocab, etc.). Use single-letter `name` for canonical dims (B, T, D, H) and a concise `desc`.
 
@@ -1229,7 +1387,7 @@ The source MUST end with:
 Use this as a structural template. Substitute the model logic for the user's request.
 
     import {
-      Module, compile, Linear,
+      Module, Linear,
       mul, sub, mean, relu,
       type Tensor,
     } from 'tensorgrad'
@@ -1262,7 +1420,10 @@ Use this as a structural template. Substitute the model logic for the user's req
     export const irSpec = {
       label: 'MLP fits sin(x)',
       description: 'A 2-layer MLP that approximates y = sin(x) over [-π, π]. Single scalar input, single scalar output, 64 hidden units with ReLU. MSE loss, Adam at 5e-3, batches of 256 random samples.',
-      compile: () => compile({ model: new MLP(), loss: lossFn, inputs, optimizer }),
+      model: new MLP(),
+      loss: lossFn,
+      inputs,
+      optimizer,
       predict: predictFn,
       predictInputs,
       dims: [
@@ -1278,7 +1439,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
 
 ```json
 {
-  "source": "import {\n  Module, compile, Linear,\n  sub, mul, gelu, mean, square,\n  type Tensor,\n} from 'tensorgrad'\n\nconst B = 256\nconst D = 32\nconst HIDDEN = 128\nconst N_STEPS = 12\nconst STEP_SIZE = 0.1\n\nclass Denoiser extends Module {\n  l1 = new Linear(D, HIDDEN)\n  l2 = new Linear(HIDDEN, HIDDEN)\n  l3 = new Linear(HIDDEN, D)\n}\n\n// One step of the denoiser: noisy x -> predicted noise.\nfunction denoise(m: Denoiser, x: Tensor): Tensor {\n  return m.l3.fwd(gelu(m.l2.fwd(gelu(m.l1.fwd(x)))))\n}\n\n// Training: predict the noise added to a clean signal (single forward pass).\nfunction lossFn(m: Denoiser, { clean, noisy }: { clean: Tensor; noisy: Tensor }): Tensor {\n  const predNoise = denoise(m, noisy)\n  const trueNoise = sub(noisy, clean)\n  return mean(square(sub(predNoise, trueNoise)))\n}\n\n// Inference: start from pure noise and iterate N_STEPS Euler-style denoising steps.\nfunction predictFn(m: Denoiser, { xInit }: { xInit: Tensor }): Tensor {\n  let x = xInit\n  for (let t = 0; t < N_STEPS; t++) {\n    x = sub(x, mul(denoise(m, x), STEP_SIZE))\n  }\n  return x\n}\n\nconst inputs = {\n  clean: [B, D],\n  noisy: [B, D],\n} as const\n\nconst predictInputs = { xInit: [B, D] } as const\nconst optimizer = { kind: 'adamw', lr: 1e-3, weightDecay: 0.01 } as const\n\nexport const irSpec = {\n  label: 'Iterative diffusion denoiser',\n  description: 'A 3-layer MLP trained to predict the noise added to a 32-d signal. Training is a single forward pass plus MSE on the predicted noise. Inference is the same MLP applied iteratively over 12 Euler-style denoising steps starting from pure noise.',\n  compile: () => compile({ model: new Denoiser(), loss: lossFn, inputs, optimizer }),\n  predict: predictFn,\n  predictInputs,\n  dims: [\n    { size: B,      name: 'B', desc: 'batch' },\n    { size: D,      name: 'D', desc: 'signal dim' },\n    { size: HIDDEN, name: 'H', desc: 'denoiser hidden' },\n  ],\n}\n"
+  "source": "import {\n  Module, Linear,\n  sub, mul, gelu, mean, square,\n  type Tensor,\n} from 'tensorgrad'\n\nconst B = 256\nconst D = 32\nconst HIDDEN = 128\nconst N_STEPS = 12\nconst STEP_SIZE = 0.1\n\nclass Denoiser extends Module {\n  l1 = new Linear(D, HIDDEN)\n  l2 = new Linear(HIDDEN, HIDDEN)\n  l3 = new Linear(HIDDEN, D)\n}\n\n// One step of the denoiser: noisy x -> predicted noise.\nfunction denoise(m: Denoiser, x: Tensor): Tensor {\n  return m.l3.fwd(gelu(m.l2.fwd(gelu(m.l1.fwd(x)))))\n}\n\n// Training: predict the noise added to a clean signal (single forward pass).\nfunction lossFn(m: Denoiser, { clean, noisy }: { clean: Tensor; noisy: Tensor }): Tensor {\n  const predNoise = denoise(m, noisy)\n  const trueNoise = sub(noisy, clean)\n  return mean(square(sub(predNoise, trueNoise)))\n}\n\n// Inference: start from pure noise and iterate N_STEPS Euler-style denoising steps.\nfunction predictFn(m: Denoiser, { xInit }: { xInit: Tensor }): Tensor {\n  let x = xInit\n  for (let t = 0; t < N_STEPS; t++) {\n    x = sub(x, mul(denoise(m, x), STEP_SIZE))\n  }\n  return x\n}\n\nconst inputs = {\n  clean: [B, D],\n  noisy: [B, D],\n} as const\n\nconst predictInputs = { xInit: [B, D] } as const\nconst optimizer = { kind: 'adamw', lr: 1e-3, weightDecay: 0.01 } as const\n\nexport const irSpec = {\n  label: 'Iterative diffusion denoiser',\n  description: 'A 3-layer MLP trained to predict the noise added to a 32-d signal. Training is a single forward pass plus MSE on the predicted noise. Inference is the same MLP applied iteratively over 12 Euler-style denoising steps starting from pure noise.',\n  model: new Denoiser(),\n  loss: lossFn,\n  inputs,\n  optimizer,\n  predict: predictFn,\n  predictInputs,\n  dims: [\n    { size: B,      name: 'B', desc: 'batch' },\n    { size: D,      name: 'D', desc: 'signal dim' },\n    { size: HIDDEN, name: 'H', desc: 'denoiser hidden' },\n  ],\n}\n"
 }
 ```
 
@@ -1293,7 +1454,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "submitTitle": "Diagram It"
   },
   "dependencies": {
-    "tensorgrad": "^0.1.3",
+    "tensorgrad": "^0.1.4",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
     "domeleon": "^0.6.0"
