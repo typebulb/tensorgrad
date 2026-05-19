@@ -442,6 +442,21 @@ function resolveSourceLabel(graph: Graph, node: DagNode, srcCache: Map<string, s
   return "(unattributed)"
 }
 
+// Strip a trailing "// [B, T, V]" comment when its dims match the node's
+// inferred shape — the colored shape badge below already shows the same info.
+// Anchored to end-of-line so prefixed/suffixed comments ("// shape: [...]",
+// "// [...] later flattened") are left intact.
+function stripRedundantShapeComment(src: string, shapeNames: readonly string[]): string {
+  const m = src.match(/^(.*?)\s*\/\/\s*\[([^\]]*)\]\s*$/)
+  if (!m) return src
+  const commentDims = m[2]!.split(",").map(s => s.trim()).filter(s => s.length > 0)
+  if (commentDims.length !== shapeNames.length) return src
+  for (let i = 0; i < commentDims.length; i++) {
+    if (commentDims[i] !== shapeNames[i]) return src
+  }
+  return m[1]!.trimEnd()
+}
+
 function buildDOT(
   graph: Graph,
   dag: DagNode[],
@@ -529,7 +544,9 @@ function buildDOT(
   const emitNode = (dagIdx: number) => {
     const node = dag[dagIdx]!
     const tid = node.tensorId
-    const wrapped = wrapForLabel(resolveSourceLabel(graph, node, srcCache), 36)
+    const shapeNames = node.shape.map((d, i) => resolveDim(d, i, node.shape.length).name)
+    const rawLabel = resolveSourceLabel(graph, node, srcCache)
+    const wrapped = wrapForLabel(stripRedundantShapeComment(rawLabel, shapeNames), 36)
     const shapeHtml = shapeHtmlLabel(node.shape, resolveDim)
     const color = tidToColor.get(tid)!
     const label = `<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="3" CELLSPACING="0">` +
@@ -1396,6 +1413,11 @@ The source MUST end with:
     const posE = pos_emb.fwd(arange(T))                  // [T, D]
     let h = add(tok_emb.fwd(tokens), posE)               // [B, T, D]
 
+**Tied input/output embeddings** — declare `tok_emb` as a raw `this.param([VOCAB, D])` (not `new Embedding`, which is lookup-only). Use `embedding(tok_emb, tokens)` for the input side and `matmul(h, swapAxes(tok_emb, -1, -2))` for the output tail:
+
+    tok_emb = this.param([VOCAB, D])
+    const logits = matmul(h, swapAxes(p.tok_emb, -1, -2))   // [B, T, V]
+
 **Sinusoidal time/position embedding** — encode a continuous index `t: [B]` (declare `f32`) as concatenated sin+cos of log-spaced frequencies. `arange(half, 'f32')` because i32 won't multiply with the f32 freqs:
 
     const half = D / 2
@@ -1475,7 +1497,7 @@ The source MUST end with:
 - **`Tensor` has no methods.** Every operation is a free function from the symbols list, applied as `op(x, ...)` — e.g. `reshape(x, [B, -1])`, `sum(x, axis)`, `swapAxes(x, -2, -1)`, `narrow(x, axis, start, len)`.
 - **Shape tracing — the most common compile error.** Every `Linear`/`matmul` input dim must equal the last dim of the upstream tensor. Don't pattern-match by layer name: `attn_proj = Linear(D, D)` and `mlp_proj = Linear(4*D, D)` look parallel but have different shapes because attention preserves `D` while the MLP expands then contracts. Watch any layer immediately after a dim-changing op (`Linear(D, ≠D)`, `splitHeads`, `reshape`, `narrow`, `embedding`): the next layer's input dim is the NEW last dim, not the original. Expansion-then-contraction pairs (MLP up/down, autoencoder bottleneck) always swap dim orders by design. Before returning, mentally run the forward once: every `Linear`'s first arg = the last dim of what feeds it; every `reshape` preserves total element count; every broadcast is trailing-suffix compatible.
 - **Operators have no PyTorch-style optional flags.** The symbols list is the full signature. `matmul(a, b)` is two args; to transpose the rhs, write `matmul(a, swapAxes(b, -2, -1))`.
-- **Module internals aren't public.** Call `embedding.fwd(idx)`, never `embedding(module.weight, idx)`. The free function `embedding(table, indices)` is for raw `this.param([V, D])` tables; on an `Embedding` instance, use `.fwd`.
+- **Module internals aren't public.** Call `embedding.fwd(idx)`, never `embedding(module.weight, idx)`. The free function `embedding(table, indices)` is for raw `this.param([V, D])` tables; on an `Embedding` instance, use `.fwd`. For tied input/output embeddings, declare the raw `this.param([V, D])` table (see Conventions).
 - **`reshape` doesn't transpose.** It reinterprets memory layout — to reorder axes use `permute(x, [perm])` or `swapAxes(x, a, b)`. Same total element count means `reshape` won't error on a wrong-axes pass, so this is a silent correctness bug.
 - **`matmul(x, codebook)` against `[N, D]` raw params errors on inner dims.** `Linear` weights are `[in, out]` so direct `matmul(x, W)` works for projections, but raw codebook / memory / prototype params shaped `[N, D]` need `matmul(x, swapAxes(codebook, -1, -2))`. Common when porting "score query against learned vectors" patterns from PyTorch.
 - **Static shapes only** — every dim is a compile-time `const` in your code, not a value read from a tensor.

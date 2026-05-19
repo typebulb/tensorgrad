@@ -317,6 +317,7 @@ interface IModel {
   embeddingHistory: { step: number; tokEmb: Float32Array }[]
   getTokEmbSnapshot(): Float32Array | null
   getMlpWeights(layerIdx: number): { w1: Float32Array; w2: Float32Array; b2: Float32Array } | null
+  getAttnWeights(layerIdx: number): { wQ: Float32Array; wK: Float32Array; wV: Float32Array; wO: Float32Array } | null
   refreshPrediction(): Promise<void>
 }
 
@@ -391,6 +392,15 @@ class Model extends Component implements IModel {
     const w2 = this.#params[`${lp}.down.W`]
     const b2 = this.#params[`${lp}.down.b`]
     return w1 && w2 && b2 ? { w1, w2, b2 } : null
+  }
+
+  getAttnWeights(layerIdx: number): { wQ: Float32Array; wK: Float32Array; wV: Float32Array; wO: Float32Array } | null {
+    const lp = `layers.${layerIdx}.attn`
+    const wQ = this.#params[`${lp}.q.W`]
+    const wK = this.#params[`${lp}.k.W`]
+    const wV = this.#params[`${lp}.v.W`]
+    const wO = this.#params[`${lp}.o.W`]
+    return wQ && wK && wV && wO ? { wQ, wK, wV, wO } : null
   }
 
   // Idempotent — concurrent callers await the same in-flight compile.
@@ -654,7 +664,7 @@ const bareStageName = (s: string) => s.replace(/^After /, '')
 
 // Sequence layout during prediction: hundreds digit is being generated at the
 // final step, so it never appears as a captured position in attention.
-const POSITION_LABELS: string[] = ['A_tens', 'A_ones', '+', 'B_tens', 'B_ones', '=', 'ones', 'tens']
+const POSITION_LABELS: string[] = ['A tens', 'A ones', '+', 'B tens', 'B ones', '=', 'ones', 'tens']
 
 // ---------- UI interfaces ----------
 
@@ -981,10 +991,14 @@ function countFiring(vals: ArrayLike<number>): number {
 }
 
 // ---------- Attention panel ----------
+type AttnDetailTab = 'project' | 'score' | 'output'
+
 class AttentionPanel extends Component {
   selectedAttnCell: { layer: number; head: number; qPos: number; kPos: number } | null = null
   // Default to the last step; sticky across prediction refreshes.
   activeAttnStep = N_RESULT_DIGITS - 1
+  // Sticky across cell selections.
+  attnDetailTab: AttnDetailTab = 'project'
 
   get root() { return this.ctx.root as any as IRoot }
 
@@ -1023,7 +1037,7 @@ class AttentionPanel extends Component {
     const freshLabel = freshIdx >= 0 ? POSITION_LABELS[freshIdx] : null
     const caption = active === 0
       ? `Generation Step 1/${numSteps}: the model sees the prompt (${T_len} tokens, all K/V fresh). It's about to generate the ${stepNames[active]} digit.`
-      : `Generation Step ${active + 1}/${numSteps}: the model has just generated the ${stepNames[active - 1]} digit (position ${freshIdx} = "${freshLabel}"). Only that position's K/V was freshly computed this step; positions 0–${freshIdx - 1} would be reused from the K/V cache in real LLM inference. (This demo recomputes them for code simplicity, but the values are identical.)`
+      : `Generation Step ${active + 1}/${numSteps}: the model has just generated the ${stepNames[active - 1]} digit (position ${freshIdx} = "${freshLabel}"). Only that position's K/V was freshly computed this step; positions 0–${freshIdx - 1} would be reused from the K/V cache in real LLM inference.`
     return div({ class: 'mb-4' },
       div({ class: 'flex items-center gap-3 flex-wrap mb-2' },
         range(numSteps).map(s => {
@@ -1079,10 +1093,10 @@ class AttentionPanel extends Component {
         ),
         div({ class: 'flex-1 min-w-0' },
           div({ class: styles.panelTitle },
-            `Query @ "${qLabel}" attending to Key @ "${kLabel}"`
+            `Attention weight: query at "${qLabel}" → key at "${kLabel}"`
           ),
           div({ class: styles.body },
-            `Each head projects every position's ${D_MODEL}-dim residual into three ${D_HEAD}-dim vectors via slices of W_q, W_k, and W_v: Q (query — "what is this position looking for?"), K (key — "what does this position offer to be looked at?"), and V (value — "what info should this position pass forward to whoever attends here?"). The score for this cell is Q · K / √${D_HEAD}. Softmax across the row's keys turns scores into attention weights. The head's actual output for this row is the attention-weighted sum of V values across all keys — that's what gets concatenated with the other heads' outputs, projected through W_o, and added back into the residual stream.`
+            `Every cell in this heatmap is one attention weight — how much one query position attends to one key position, after softmax. You clicked the cell where the query at "${qLabel}" attends to the key at "${kLabel}". Walk through the stages below in order.`
           )
         )
       ),
@@ -1099,14 +1113,9 @@ class AttentionPanel extends Component {
     const T_len = am.T
     if (sel.qPos >= T_len || sel.kPos >= T_len) return div()
 
-    const qVec: number[] = []
-    const kVec: number[] = []
-    const vVec: number[] = []
-    for (let d = 0; d < D_HEAD; d++) {
-      qVec.push(am.q[sel.qPos * D_HEAD + d])
-      kVec.push(am.k[sel.kPos * D_HEAD + d])
-      vVec.push(am.v[sel.kPos * D_HEAD + d])
-    }
+    const qVec = am.q.slice(sel.qPos * D_HEAD, (sel.qPos + 1) * D_HEAD)
+    const kVec = am.k.slice(sel.kPos * D_HEAD, (sel.kPos + 1) * D_HEAD)
+    const vVec = am.v.slice(sel.kPos * D_HEAD, (sel.kPos + 1) * D_HEAD)
     const products = qVec.map((q, i) => q * kVec[i])
     const dotProduct = products.reduce((a, b) => a + b, 0)
     const score = dotProduct / Math.sqrt(D_HEAD)
@@ -1118,7 +1127,6 @@ class AttentionPanel extends Component {
     const rowWeights: number[] = []
     for (let j = 0; j <= sel.qPos; j++) rowWeights.push(am.data[sel.qPos * T_len + j])
 
-    // headOutput = Σⱼ wⱼ · Vⱼ
     const headOutput: number[] = new Array(D_HEAD).fill(0)
     for (let j = 0; j <= sel.qPos; j++) {
       const w = rowWeights[j]
@@ -1127,57 +1135,212 @@ class AttentionPanel extends Component {
       }
     }
 
-    const stripColor = makeDivergingStripColor(maxAbs([...qVec, ...kVec, ...vVec, ...products, ...headOutput]))
+    const stripColor = makeDivergingStripColor(maxAbs([...products, ...headOutput]))
 
     const cellH = this.root.isNarrow ? 18 : 24
     const labelW = this.root.isNarrow ? 100 : 140
-    const textCol = themeMgr.theme.colors.text.rawValue
-    const primary = themeMgr.theme.colors.primary.rawValue
 
-    const renderStrip = (vec: number[], label: string) =>
-      div({ class: 'flex items-center gap-2 mb-1' },
-        div({ class: [styles.monoLabelTiny, styles.stripRowLabel], style: { width: labelW + 'px' } }, label),
-        div({ class: 'flex gap-0 flex-1 min-w-0' },
-          stripCells(vec, stripColor, cellH, (i, v) => `dim ${i}: ${v.toFixed(3)}`)
-        )
+    const renderStrip = (vec: number[], label?: string) => {
+      const cells = div({ class: 'flex gap-0 flex-1 min-w-0' },
+        stripCells(vec, stripColor, cellH, (i, v) => `dim ${i}: ${v.toFixed(3)}`)
       )
+      return label
+        ? div({ class: 'flex items-center gap-2 mb-1' },
+            div({ class: [styles.monoLabelTiny, styles.stripRowLabel], style: { width: labelW + 'px' } }, label),
+            cells)
+        : div({ class: 'flex mb-1' }, cells)
+    }
 
-    return div({ class: styles.detailPanelTight },
-      renderStrip(qVec, `Query @ ${qLabel}`),
-      renderStrip(kVec, `Key @ ${kLabel}`),
-      renderStrip(vVec, `Value @ ${kLabel}`),
-      renderStrip(products, `q ⊙ k (per dim)`),
-      div({ class: [styles.bodyMono, 'mt-2.5 text-center'] },
-        `Σ = ${dotProduct.toFixed(2)}  →  score = Σ / √${D_HEAD} = ${score.toFixed(3)}`
+    const inside = this.root.model.inside[this.activeAttnStep]
+    const attnW = this.root.model.getAttnWeights(sel.layer)
+
+    // Per-head slice of the layer's [D_MODEL, D_MODEL] projection matrix.
+    // Q/K/V take a column slice → [D_MODEL, D_HEAD]; W_o takes a row slice → [D_HEAD, D_MODEL].
+    const colSliceHead = (W: Float32Array): Float32Array => {
+      const out = new Float32Array(D_MODEL * D_HEAD)
+      for (let i = 0; i < D_MODEL; i++) {
+        for (let j = 0; j < D_HEAD; j++) {
+          out[i * D_HEAD + j] = W[i * D_MODEL + sel.head * D_HEAD + j]
+        }
+      }
+      return out
+    }
+    const rowSliceHead = (W: Float32Array): Float32Array => {
+      const out = new Float32Array(D_HEAD * D_MODEL)
+      for (let i = 0; i < D_HEAD; i++) {
+        for (let j = 0; j < D_MODEL; j++) {
+          out[i * D_MODEL + j] = W[(sel.head * D_HEAD + i) * D_MODEL + j]
+        }
+      }
+      return out
+    }
+
+    // Per-head contribution to residual_out at qPos = head_output @ W_o_slice.
+    // The full residual sums all heads' contributions; this drilldown shows only one.
+    let headContrib: Float32Array | null = null
+    let wOSlice: Float32Array | null = null
+    if (attnW) {
+      wOSlice = rowSliceHead(attnW.wO)
+      headContrib = new Float32Array(D_MODEL)
+      for (let i = 0; i < D_MODEL; i++) {
+        let s = 0
+        for (let d = 0; d < D_HEAD; d++) s += headOutput[d] * wOSlice[d * D_MODEL + i]
+        headContrib[i] = s
+      }
+    }
+
+    const projectSection = inside && attnW
+      ? div({ class: 'mb-3' },
+          div({ class: [styles.body, 'mb-1.5 text-center'] },
+            `First, project each position's residual to produce Q (the query), K (the key), and V (the value). The (query, key) pair you selected needs Q at "${qLabel}" and K, V at "${kLabel}". Lines = strongest weights of each projection (green positive, blue negative); residual on top, projected vector below.`
+          ),
+          div({ class: [styles.body, 'mb-3 text-center'] },
+            `(Q = what each position is looking for; K = what it offers; V = what it would pass forward.)`
+          ),
+          this.renderProjectionWires(inside.lattice[sel.layer][sel.qPos].residual, qVec, colSliceHead(attnW.wQ), D_MODEL, D_HEAD, `Residual at "${qLabel}"`, `Query at "${qLabel}"`),
+          this.renderProjectionWires(inside.lattice[sel.layer][sel.kPos].residual, kVec, colSliceHead(attnW.wK), D_MODEL, D_HEAD, `Residual at "${kLabel}"`, `Key at "${kLabel}"`),
+          this.renderProjectionWires(inside.lattice[sel.layer][sel.kPos].residual, vVec, colSliceHead(attnW.wV), D_MODEL, D_HEAD, `Residual at "${kLabel}" (shared with K)`, `Value at "${kLabel}"`)
+        )
+      : div()
+
+    const scoreSection = div(
+      div({ class: [styles.body, 'mb-2 text-center'] },
+        `Next, take Q (at "${qLabel}") and K (at "${kLabel}") from Project. Multiply piece by piece → sum and scale to a raw score → softmax against the row's other scores → attention weights for the query's row. (One of those weights is what colors the heatmap cell you clicked.)`
+      ),
+      div({ class: [styles.body, 'mb-1.5 text-center'] },
+        `The ${D_HEAD} cells below are Q (at "${qLabel}") × K (at "${kLabel}") multiplied piece by piece — one product per dimension. Bright = strong agreement (score up); pale cells contribute little either way.`
+      ),
+      renderStrip(products),
+      div({ class: [styles.body, 'mt-2.5 text-center'] },
+        `Adding these ${D_HEAD} cells gives ${dotProduct.toFixed(2)}. Scaled by √${D_HEAD}, that's this pair's raw score: ${score.toFixed(3)}.`
       ),
       div({ class: [styles.body, 'mt-3.5 mb-2 text-center'] },
-        `Softmax across this query's row → attention weights (${sel.qPos + 1} keys due to causal mask):`
+        `Softmax across all keys in this row turns scores into attention weights (${sel.qPos + 1} keys due to causal mask):`
       ),
-      div({ class: 'flex items-end gap-0.5 justify-center', style: { minHeight: '54px' } },
-        range(sel.qPos + 1).map(j => {
-          const w = rowWeights[j]
-          const isSelKey = j === sel.kPos
-          const heightPx = Math.max(2, Math.round(w * 45))
-          return div({ class: 'flex flex-col items-center w-8' },
-            div({ class: 'box-content', style: {
-              width: '22px',
-              height: heightPx + 'px',
-              backgroundColor: isSelKey ? primary : textCol,
-              opacity: String(0.3 + 0.7 * w),
-              border: isSelKey ? `2px solid ${themeMgr.theme.colors.accent.css}` : 'none'
-            } }),
-            div({ class: styles.softmaxPosLabel }, POSITION_LABELS[j] ?? `${j}`)
-          )
-        })
-      ),
-      div({ class: [styles.body, 'mt-1.5 mb-2.5 text-center'] },
-        `Selected key gets ${(rowWeights[sel.kPos] * 100).toFixed(1)}% of the attention (purple outline).`
-      ),
-      renderStrip(headOutput, `head output @ ${qLabel}`),
-      div({ class: [styles.body, 'mt-1 text-center'] },
-        `= Σⱼ wⱼ · Vⱼ (this is what attention actually outputs — gets added to the residual stream after concat + W_o).`
+      this.renderSoftmaxBars(rowWeights, sel.qPos, sel.kPos),
+      div({ class: [styles.body, 'mt-1.5 text-center'] },
+        `Selected key "${kLabel}" gets ${(rowWeights[sel.kPos] * 100).toFixed(1)}% (purple outline) — that's how much query "${qLabel}" attends to key "${kLabel}". (Also what colors the heatmap cell you clicked.)`
       )
     )
+
+    const outputSection = div(
+      div({ class: [styles.body, 'mb-2 text-center'] },
+        `Finally, take the row's attention weights (from Score) and use them to blend the V vectors of every attended key into the head's output, then project the result back into the residual stream.`
+      ),
+      div({ class: [styles.body, 'mb-1.5 text-center'] },
+        `Head output (top row below) is the attention-weighted blend of V vectors across all attended keys — ${D_HEAD} dims. The wires project it back to ${D_MODEL}-dim; that's this head's contribution to the residual at "${qLabel}" (bottom row). Summed with the other ${N_HEADS - 1} heads' contributions, the result is added to the residual stream.`
+      ),
+      headContrib && wOSlice
+        ? this.renderProjectionWires(headOutput, headContrib, wOSlice, D_HEAD, D_MODEL, `Head output at "${qLabel}"`, `This head's contribution to residual at "${qLabel}"`)
+        : renderStrip(headOutput, `head output at "${qLabel}"`)
+    )
+
+    const tabs: { id: AttnDetailTab; label: string }[] = [
+      { id: 'project', label: 'Project →' },
+      { id: 'score',   label: 'Score →' },
+      { id: 'output',  label: 'Feed Residual' },
+    ]
+    const tabBar = div({ class: 'flex gap-3 mb-3' },
+      tabs.map(t => button({
+        class: [styles.subTabBtn, this.attnDetailTab === t.id ? styles.subTabBtnActive : styles.subTabBtnInactive],
+        onClick: () => { this.attnDetailTab = t.id; this.update() }
+      }, t.label))
+    )
+
+    return div({ class: styles.detailPanelTight },
+      tabBar,
+      this.attnDetailTab === 'project' ? projectSection
+        : this.attnDetailTab === 'score' ? scoreSection
+        : outputSection
+    )
+  }
+
+  // Bar chart of the row's softmaxed attention weights. The selected key's bar
+  // gets a purple outline matching the heatmap cell highlight.
+  renderSoftmaxBars(rowWeights: number[], qPos: number, kPos: number): VElement {
+    const textCol = themeMgr.theme.colors.text.rawValue
+    const primary = themeMgr.theme.colors.primary.rawValue
+    const accentCss = themeMgr.theme.colors.accent.css
+    return div({ class: 'flex items-end gap-0.5 justify-center', style: { minHeight: '54px' } },
+      range(qPos + 1).map(j => {
+        const w = rowWeights[j]
+        const isSelKey = j === kPos
+        const heightPx = Math.max(2, Math.round(w * 45))
+        return div({ class: 'flex flex-col items-center w-8' },
+          div({ class: 'box-content', style: {
+            width: '22px',
+            height: heightPx + 'px',
+            backgroundColor: isSelKey ? primary : textCol,
+            opacity: String(0.3 + 0.7 * w),
+            border: isSelKey ? `2px solid ${accentCss}` : 'none'
+          } }),
+          div({ class: styles.softmaxPosLabel }, POSITION_LABELS[j] ?? `${j}`)
+        )
+      })
+    )
+  }
+
+  // Source-strip → top-N weight fan → dest-strip diagram. Caller pre-slices the
+  // per-head weight matrix to [srcN, dstN]; this method is direction-agnostic.
+  renderProjectionWires(
+    srcVec: ArrayLike<number>,
+    dstVec: ArrayLike<number>,
+    headW: Float32Array,
+    srcN: number,
+    dstN: number,
+    srcLabel: string,
+    dstLabel: string,
+  ): VElement {
+    const W = 700, H = 110
+    const PAD_X = 24
+    const STRIP_X0 = PAD_X
+    const STRIP_W = W - 2 * PAD_X
+    const ROW_H = STRIP_CELL_H
+    const Y_TOP = 24
+    const Y_BOT = 76
+
+    const xCenter = (j: number, n: number) => STRIP_X0 + STRIP_W * (j + 0.5) / n
+    const xEdge = (j: number, n: number) => STRIP_X0 + STRIP_W * j / n
+
+    const TOP_N = 80
+    const wTop = pickTopWeights(headW, srcN, dstN, TOP_N)
+    const wColor = makeDivergingStripColor(Math.abs(wTop[0]?.w ?? 1e-6))
+
+    const renderRow = (vals: ArrayLike<number>, n: number, y: number): VElement[] => {
+      const color = makeDivergingStripColor(maxAbs(vals) || 1)
+      const cellW = STRIP_W / n
+      const cells: VElement[] = []
+      for (let i = 0; i < n; i++) {
+        cells.push(rect({
+          // +0.5 closes hairline gaps from non-integer cellW.
+          x: xEdge(i, n), y, width: cellW + 0.5, height: ROW_H,
+          fill: color(vals[i])
+        }))
+      }
+      return cells
+    }
+
+    const fanLines = wTop.map(c => line({
+      x1: xCenter(c.i, srcN), y1: Y_TOP + ROW_H,
+      x2: xCenter(c.j, dstN), y2: Y_BOT,
+      stroke: wColor(c.w), strokeWidth: 0.6
+    }))
+
+    const topCells = renderRow(srcVec, srcN, Y_TOP)
+    const botCells = renderRow(dstVec, dstN, Y_BOT)
+
+    const labelColor = themeMgr.theme.colors.textMuted.css
+    const labels: VElement[] = [
+      text({ x: PAD_X, y: 16, fill: labelColor, fontSize: '11', textAnchor: 'start' }, srcLabel),
+      text({ x: PAD_X, y: Y_BOT + ROW_H + 14, fill: labelColor, fontSize: '11', textAnchor: 'start' }, dstLabel)
+    ]
+
+    return svg({
+      viewBox: `0 0 ${W} ${H}`,
+      width: '100%',
+      class: 'block max-w-full mb-6',
+      preserveAspectRatio: 'xMidYMid meet'
+    }, ...fanLines, ...topCells, ...botCells, ...labels)
   }
 
   attnGridView() {
@@ -1953,7 +2116,7 @@ class ExplainerPanel extends Component {
     return div(
       p('Each character of the sequence is a "token" at a numbered "position" (so "27+45=270" has nine positions). The model first turns each token into a vector — its "embedding" — and adds a learned position vector to it, so layer 1 can tell slot 0 from slot 5 even when they hold the same digit. From then on every layer reads and rewrites these vectors at each position. Each layer does two things at each position: attention (which moves information between positions) and a per-position MLP (which transforms what the position has).'),
       p('The diagram below shows the actual computation for the operands you have entered, with the model\'s current predictions. At each layer the residual stream (green) flows up through two ⊕ merges. Below each merge, a side trip computes a block — attention below, MLP above — and adds its output back into the residual. The attn side trip contains the K/V circle (purple), where Q, K, and V are all projected from the residual — K and V join the layer\'s K/V bus (a horizontal line that every K/V circle writes to and every attention block reads from), while Q stays local and is consumed by this position\'s attention block. The bus is the visual analog of the K/V cache, with causal flow left-to-right.'),
-      p('The precise architecture for this transformer looks like ', a({ href: 'https://tinyurl.com/me2m3ycb', target: '_blank' }, 'this'), ', diagramed by nn-dna, a tool that turns plain-English descriptions of neural networks into architecture diagrams.')
+      p('The precise architecture for this transformer looks like ', a({ href: 'https://tinyurl.com/44ayrzfp', target: '_blank' }, 'this'), ', diagramed by nn-dna, a tool that turns plain-English descriptions of neural networks into architecture diagrams.')
     )
   }
 
@@ -2464,7 +2627,7 @@ new App({
   "dependencies": {
     "domeleon": "^0.6.0",
     "@unocss/preset-wind3": "^66.5.3",
-    "tensorgrad": "^0.1.3"
+    "tensorgrad": "^0.1.6"
   },
   "description": "Watch a transformer learn 2-digit addition from scratch in your browser. Type two numbers and see it predict the sum digit by digit. Built with tensorgrad (autograd + WebGPU)."
 }
