@@ -1019,7 +1019,7 @@ class AttentionPanel extends Component {
     }
     return div(
       this.kvCacheStepNav(),
-      div({ class: [styles.body, 'mb-2'] }, 'Each row shows where that position is looking; brighter cells = more attention. Click any cell to drill in and see the math behind it (Q · K · V).'),
+      div({ class: [styles.body, 'mb-2'] }, 'Each row shows where that position is looking; brighter cells = more attention. Click any cell to drill in and see the math behind it (Q, K, V).'),
       this.attnGridView(),
       this.freshColumnHint()
     )
@@ -1036,8 +1036,8 @@ class AttentionPanel extends Component {
     const freshIdx = this.freshColIdx
     const freshLabel = freshIdx >= 0 ? POSITION_LABELS[freshIdx] : null
     const caption = active === 0
-      ? `Generation Step 1/${numSteps}: the model sees the prompt (${T_len} tokens, all K/V fresh). It's about to generate the ${stepNames[active]} digit.`
-      : `Generation Step ${active + 1}/${numSteps}: the model has just generated the ${stepNames[active - 1]} digit (position ${freshIdx} = "${freshLabel}"). Only that position's K/V was freshly computed this step; positions 0–${freshIdx - 1} would be reused from the K/V cache in real LLM inference.`
+      ? `Generation Step 1/${numSteps}: the model sees the prompt (${T_len} tokens). It's about to generate the ${stepNames[active]} digit.`
+      : `Generation Step ${active + 1}/${numSteps}: the model has just generated the ${stepNames[active - 1]} digit (position ${freshIdx} = "${freshLabel}"). Only this new position needed fresh K and V values this step; positions 0–${freshIdx - 1} already had theirs from earlier steps (real LLMs save and reuse those past values — this is the K/V cache).`
     return div({ class: 'mb-4' },
       div({ class: 'flex items-center gap-3 flex-wrap mb-2' },
         range(numSteps).map(s => {
@@ -1096,10 +1096,10 @@ class AttentionPanel extends Component {
             `Attention weight: query at "${qLabel}" → key at "${kLabel}"`
           ),
           div({ class: styles.body },
-            `Attention lets each position selectively read context from earlier positions. Every query (one per position) learns how much to weight each key (one per earlier position), and those weights blend each earlier position's value vector (V — its payload to share) into the query's read.`
+            `Attention lets each position selectively read context from earlier positions. Each position acts as three things: a query ("what am I looking for?"), a key ("what do I offer?"), and a value (the payload to share). Every query weights each earlier key, and those weights blend the values into the query's read.`
           ),
           div({ class: [styles.body, 'mt-2'] },
-            `Every cell in this heatmap is one such weight, post-softmax. You clicked the cell where the query at "${qLabel}" attends to the key at "${kLabel}". Walk through the stages below in order.`
+            `Every cell in this heatmap is one such weight, post-softmax. You clicked the cell where the query at "${qLabel}" attends to the key at "${kLabel}".`
           )
         )
       ),
@@ -1194,11 +1194,8 @@ class AttentionPanel extends Component {
 
     const projectSection = inside && attnW
       ? div({ class: 'mb-3' },
-          div({ class: [styles.body, 'mb-1.5 text-center'] },
-            `First, project each position's residual to produce Q (the query), K (the key), and V (the value). For your selected (query, key) pair, that means Q at "${qLabel}" and K, V at "${kLabel}". Q and K will combine in Score; V waits until Attend, where it gets blended into the head's output. Lines = strongest weights of each projection (green positive, blue negative); residual on top, projected vector below.`
-          ),
           div({ class: [styles.body, 'mb-3 text-center'] },
-            `(Q = what each position is looking for; K = what it offers; V = what it would pass forward.)`
+            `First, project each position's residual to produce its Q, K, V. For this pair: Q from the residual at "${qLabel}", K and V from the residual at "${kLabel}". Residual on top, projected vector below.`
           ),
           this.renderProjectionWires(inside.lattice[sel.layer][sel.qPos].residual, qVec, colSliceHead(attnW.wQ), D_MODEL, D_HEAD, `Residual at "${qLabel}"`, `Query at "${qLabel}"`),
           this.renderProjectionWires(inside.lattice[sel.layer][sel.kPos].residual, kVec, colSliceHead(attnW.wK), D_MODEL, D_HEAD, `Residual at "${kLabel}"`, `Key at "${kLabel}"`),
@@ -1208,34 +1205,35 @@ class AttentionPanel extends Component {
 
     const scoreSection = div(
       div({ class: [styles.body, 'mb-2 text-center'] },
-        `Next, take Q (at "${qLabel}") and K (at "${kLabel}") from Project. Multiply piece by piece → sum and scale to a raw score → softmax against the row's other scores → attention weights for the query's row. These weights are the recipe Attend uses to blend each key's V into the head's output. (One of those weights colors the heatmap cell you clicked.)`
+        `Next, measure how well every query matches every key (one matmul). Below, we zoom into your selected pair: Q at "${qLabel}" against K at "${kLabel}".`
       ),
       div({ class: [styles.body, 'mb-1.5 text-center'] },
-        `The ${D_HEAD} cells below are Q (at "${qLabel}") × K (at "${kLabel}") multiplied piece by piece — one product per dimension. Bright = strong agreement (score up); pale cells contribute little either way.`
+        `The ${D_HEAD} cells below are the element-wise product of Q (at "${qLabel}") and K (at "${kLabel}") — one cell per dimension, each cell = Q[d] × K[d]. Bright = strong agreement (score up); pale cells contribute little either way.`
       ),
       renderStrip(products),
       div({ class: [styles.body, 'mt-2.5 text-center'] },
         `Adding these ${D_HEAD} cells gives ${dotProduct.toFixed(2)}. Scaled by √${D_HEAD}, that's this pair's raw score: ${score.toFixed(3)}.`
       ),
       div({ class: [styles.body, 'mt-3.5 mb-2 text-center'] },
-        `Softmax across all keys in this row turns scores into attention weights (${sel.qPos + 1} keys due to causal mask):`
+        `Softmax across this row's scores (one per attended key — ${sel.qPos + 1} here, due to causal mask) → attention weights. The one for the selected key "${kLabel}" is `,
+        span({ style: { color: themeMgr.theme.colors.accent.css } }, '['),
+        span({ style: {
+          fontWeight: 'bold',
+          color: lerpRgb(themeMgr.theme.colors.surface.rawValue, themeMgr.theme.colors.primary.rawValue, rowWeights[sel.kPos])
+        } }, `${(rowWeights[sel.kPos] * 100).toFixed(1)}%`),
+        span({ style: { color: themeMgr.theme.colors.accent.css } }, ']'),
+        ` of query "${qLabel}" 's attention.`
       ),
-      this.renderSoftmaxBars(rowWeights, sel.qPos, sel.kPos),
-      div({ class: [styles.body, 'mt-1.5 text-center'] },
-        `Selected key "${kLabel}" gets ${(rowWeights[sel.kPos] * 100).toFixed(1)}% (purple outline) — that's how much query "${qLabel}" attends to key "${kLabel}". (Also what colors the heatmap cell you clicked.)`
-      )
+      this.renderSoftmaxBars(rowWeights, sel.qPos, sel.kPos)
     )
 
     const outputSection = div(
       div({ class: [styles.body, 'mb-2 text-center'] },
-        `Finally, take the row's attention weights (from Score) and the V vectors (built in Project, one per attended key). The weights blend the V vectors into the head's output, then we project the result back into the residual stream.`
-      ),
-      div({ class: [styles.body, 'mb-1.5 text-center'] },
-        `Head output (top row below) is the attention-weighted blend of V vectors across all attended keys — ${D_HEAD} dims. The wires project it back to ${D_MODEL}-dim; that's this head's contribution to the residual at "${qLabel}" (bottom row). Summed with the other ${N_HEADS - 1} heads' contributions, the result is added to the residual stream.`
+        `Finally, compute the weighted sum of the V vectors using the row's attention weights (one matmul). The result is a ${D_HEAD}-dim vector. Project that back into a ${D_MODEL}-dim vector. At this point, this head is done; its output will be merged with those of the other heads, and the result ⊕'d to the residual stream.`
       ),
       headContrib && wOSlice
-        ? this.renderProjectionWires(headOutput, headContrib, wOSlice, D_HEAD, D_MODEL, `Head output at "${qLabel}"`, `This head's contribution to residual at "${qLabel}"`)
-        : renderStrip(headOutput, `head output at "${qLabel}"`)
+        ? this.renderProjectionWires(headOutput, headContrib, wOSlice, D_HEAD, D_MODEL, `V blend at "${qLabel}"`, `This head's output at "${qLabel}"`)
+        : renderStrip(headOutput, `This head's output at "${qLabel}"`)
     )
 
     const tabs: { id: AttnDetailTab; label: string }[] = [
@@ -1480,7 +1478,7 @@ class InsidePanel extends Component implements IInsidePanel {
     const step = this.root.model.inside[this.root.model.inside.length - 1]
     return div(
       div({ class: [styles.body, 'mb-2 text-center'] },
-        `One forward pass producing the final result. Each cell shows the model's TOP-1 next-token prediction at that (depth, position), with intensity = confidence. The three circled digits in the bottom row are the generation events. Click any cell for its full distribution.`
+        `One forward pass producing the final result. Each cell shows the model's most-likely next-token prediction at that (depth, position), with brightness = confidence. The three circled digits in the bottom row are the digits the model produced. Click any cell for its full distribution.`
       ),
       this.latticeView(step)
     )
@@ -1603,7 +1601,7 @@ class InsidePanel extends Component implements IInsidePanel {
     const primaryCss = themeMgr.theme.colors.primary.css
     return div({ class: 'mb-4' },
       div({ class: [styles.body, 'mb-1.5 text-center'] },
-        `Residual stream across all stages at this position. Each row = the ${D_MODEL} channels at one stage (just numbers riding along the bus — they don't compute anything by themselves; the MLP and attention blocks do). Green = positive, blue = negative, intensity = |value| / max across all 4 rows (so you can see how magnitudes evolve through depth). Watch how the pattern transforms layer-by-layer — each layer is the network rewriting the residual based on attention + MLP.`
+        `Residual stream at this position, across all stages (block boundaries). After attention heads and MLPs have ⊕'d into it.`
       ),
       allStageResiduals.map((sRes, sIdx) => {
         const isSel = sIdx === layerIdx
@@ -1710,8 +1708,8 @@ class TokenEmbeddingsPanel extends Component {
     const sliderMax = histLen > 0 ? histLen - 1 : 0
 
     return div(
-      div({ class: [styles.body, 'mb-2'] }, 'Each token\'s 64-dim embedding, projected to 2D via PCA (the two axes capturing the most variance across all 12 tokens). As training progresses, the digit tokens walk into a circle in numerical order — 0, 1, 2, …, 9, with 9 next to 0 — and the model has discovered the cyclic structure of mod-10 arithmetic. The "+" and "=" tokens sit near the center. The PCA axes are locked to the latest snapshot, so when you scrub backward through training history the projection doesn\'t wobble — you watch the circle actually form.'),
-      div({ class: [styles.body, 'mb-2'] }, 'Same phenomenon as the "grokking" paper (Power et al.): small transformers spontaneously discovering the algebraic structure of modular arithmetic, often after a long memorization plateau before the click. Click any token to see its raw 64-dim embedding row.'),
+      div({ class: [styles.body, 'mb-2'] }, 'Each token\'s 64-dim embedding, shown in 2D — the plane that spreads the 12 tokens as far apart as possible (PCA). As training progresses, the digit tokens walk into a circle in numerical order — 0, 1, 2, …, 9, with 9 next to 0 — and the model has discovered the cyclic structure of mod-10 arithmetic. The "+" and "=" tokens sit near the center. The axes are locked to the latest snapshot, so when you scrub backward through training history the projection doesn\'t wobble — you watch the circle actually form.'),
+      div({ class: [styles.body, 'mb-2'] }, 'Same phenomenon as the "grokking" paper (Power et al.): small transformers spontaneously discovering the algebraic structure of modular arithmetic, often after a long memorization plateau before the breakthrough. Click any token to see its raw 64-dim embedding row.'),
       div({ class: styles.chartBox },
         svg({
           viewBox: `0 0 ${W} ${H}`,
@@ -1738,7 +1736,7 @@ class TokenEmbeddingsPanel extends Component {
       ),
       sel != null && displayedRows[sel] ? div({ class: 'mt-3' },
         div({ class: [styles.body, 'mb-1'] },
-          `Token "${TOKEN_LABELS[sel]}" — its ${D_MODEL}-dim row from tok_emb. These are the numbers PCA projects to the (x,y) point above. Click another token to switch, or click "${TOKEN_LABELS[sel]}" again to hide. Color scale is global across all 12 tokens, and follows the scrubbed snapshot so you can watch this token's coordinates form during training.`
+          `Token "${TOKEN_LABELS[sel]}" — its ${D_MODEL}-dim row from tok_emb. These are the numbers PCA projects to the (x,y) point above. Click another token to switch, or click "${TOKEN_LABELS[sel]}" again to hide.`
         ),
         div({ class: 'flex gap-0' },
           stripCells(displayedRows[sel], embStripColor, STRIP_CELL_H, (i, v) => `dim ${i}: ${v.toFixed(3)}`)
@@ -1979,12 +1977,9 @@ class WiresPanel extends Component {
 
     return div(
       div({ class: [styles.body, 'mb-1 text-center'] },
-        `Inside layer ${mlpLayerIdx + 1}'s MLP at this position. Top row = ${D_MODEL} residual channels going in. Strip = ${HIDDEN} hidden ReLU neurons${firingNote}. Bottom row = ${D_MODEL} numbers the MLP outputs, added back into the residual. Lines = strongest learned weights (green positive, blue negative). Watch them sharpen as training progresses.`
+        `Inside layer ${mlpLayerIdx + 1}'s MLP at this position. The hidden layer in the MLP allows non-linear behaviour in the transformer layer. It's never blue (ReLU forbids it).`
       ),
-      this.renderSvg(w1, w2, residualIn, hidden, residualOut),
-      div({ class: [styles.body, 'mt-2 mb-4 text-center'] },
-        `Each layer has one MLP like this; each also has four ${D_MODEL}×${D_MODEL}-style grids for attention's Q/K/V/O. Every "d²" in the parameter count — about 12·d² per layer — is one of these dense grids of learnable wires.`
-      )
+      this.renderSvg(w1, w2, residualIn, hidden, residualOut)
     )
   }
 
@@ -2056,7 +2051,7 @@ class WiresPanel extends Component {
       text({ x: PAD_X, y: 14, fill: labelColor, fontSize: '11', textAnchor: 'start' }, `Residual in (${D_MODEL} channels) — flows into MLP`),
       text({ x: W - PAD_X, y: 14, fill: labelColor, fontSize: '11', textAnchor: 'end' }, 'mlp.up.W wires below ↓'),
       text({ x: W / 2, y: stripCenterY, fill: textColor, fontSize: '11', textAnchor: 'middle', fontWeight: 'bold' as any }, `Hidden ReLU (${HIDDEN} neurons)`),
-      text({ x: PAD_X, y: Y_BOT + ROW_H + 14, fill: labelColor, fontSize: '11', textAnchor: 'start' }, `Residual out (${D_MODEL} channels) — added back into stream`),
+      text({ x: PAD_X, y: Y_BOT + ROW_H + 14, fill: labelColor, fontSize: '11', textAnchor: 'start' }, `MLP output (${D_MODEL} channels) — added into the residual stream`),
       text({ x: W - PAD_X, y: Y_BOT + ROW_H + 14, fill: labelColor, fontSize: '11', textAnchor: 'end' }, '↑ mlp.down.W wires above')
     ]
 
@@ -2070,7 +2065,7 @@ class WiresPanel extends Component {
 }
 
 // ---------- Explainer panel ----------
-type ExplainerTopic = 'training' | 'architecture' | 'streams' | 'attention' | 'takeaways'
+type ExplainerTopic = 'training' | 'vectors' | 'streams' | 'takeaways'
 
 class ExplainerPanel extends Component {
   get root() { return this.ctx.root as any as IRoot }
@@ -2080,9 +2075,8 @@ class ExplainerPanel extends Component {
   view() {
     const topics: { id: ExplainerTopic; label: string }[] = [
       { id: 'training', label: 'Training' },
-      { id: 'architecture', label: 'Architecture' },
+      { id: 'vectors', label: '⊕ Vectors' },
       { id: 'streams', label: 'Streams' },
-      { id: 'attention', label: 'Attention & MLP' },
       { id: 'takeaways', label: 'Takeaways' }
     ]
     return div({ class: styles.explainerContainer },
@@ -2100,9 +2094,8 @@ class ExplainerPanel extends Component {
   topicView() {
     switch (this.selectedTopic) {
       case 'training': return this.trainingView()
-      case 'architecture': return this.architectureView()
+      case 'vectors': return this.vectorsView()
       case 'streams': return this.streamsView()
-      case 'attention': return this.attentionView()
       case 'takeaways': return this.takeawaysView()
     }
   }
@@ -2115,33 +2108,25 @@ class ExplainerPanel extends Component {
     )
   }
 
-  architectureView() {
+  vectorsView() {
     return div(
-      p('Each character of the sequence is a "token" at a numbered "position" (so "27+45=270" has nine positions). The model first turns each token into a vector — its "embedding" — and adds a learned position vector to it, so layer 1 can tell slot 0 from slot 5 even when they hold the same digit. From then on every layer reads and rewrites these vectors at each position. Each layer does two things at each position: attention (which moves information between positions) and a per-position MLP (which transforms what the position has).'),
-      p('The diagram below shows the actual computation for the operands you have entered, with the model\'s current predictions. At each layer the residual stream (green) flows up through two ⊕ merges. Below each merge, a side trip computes a block — attention below, MLP above — and adds its output back into the residual. The attn side trip contains the K/V circle (purple), where Q, K, and V are all projected from the residual — K and V join the layer\'s K/V bus (a horizontal line that every K/V circle writes to and every attention block reads from), while Q stays local and is consumed by this position\'s attention block. The bus is the visual analog of the K/V cache, with causal flow left-to-right.'),
-      p('The precise architecture for this transformer looks like ', a({ href: 'https://tinyurl.com/44ayrzfp', target: '_blank' }, 'this'), ', diagramed by nn-dna, a tool that turns plain-English descriptions of neural networks into architecture diagrams.')
+      p(`A ${D_MODEL}-dim vector is a single point in ${D_MODEL}-dimensional space, not ${D_MODEL} separate facts. The model uses *directions* in that space to encode information — there might be a direction that means "digit 7", another that means "units slot", another for "this is an operator".`),
+      p(`Now the surprising part: when you add two same-shape vectors, A ⊕ B = C, you get a new vector C of the same shape. This looks lossy — two things squashed into one? In 1 or 2 dimensions it would be. But ${D_MODEL} dimensions is a lot of room. If A points mostly along one direction and B mostly along another (near-orthogonal), C still contains both A's and B's contributions, recoverable downstream by reading along the corresponding directions. Adding isn't averaging or overwriting — it's stacking contributions in a space wide enough that they don't collide. This is sometimes called "superposition".`),
+      p('This is why neural networks can keep using a single fixed-width vector to carry more and more information through a sequence of layers — the ⊕ is doing real work. Anywhere two same-shape vectors are added in this architecture (token + position embedding at layer 0, or residual + each block\'s output through the layers), this mechanism is what\'s happening. Watch for the ⊕ symbol in the diagram below — that\'s the operator at work.')
     )
   }
 
   streamsView() {
     return div(
-      p('The vertical stream (the residual stream) carries information up through the layers at each position. Every layer reads from it and writes back to it via additive residual connections — nothing is overwritten, just accumulated. That\'s why the original token embedding is still mathematically present in the residual at layer 3, and why later layers can read information that early layers wrote.'),
-      p('The horizontal stream (the K/V stream) is how attention is wired across positions: each layer\'s K and V values, computed from earlier positions\' residuals, are made available to all later positions at that layer. In real LLMs at inference time, K/V at past positions is computed once and cached — only the new column is fresh. The attention drawn here is the result of that read.')
-    )
-  }
-
-  attentionView() {
-    return div(
-      p('Attention is how each position "looks back" at earlier ones to fetch information it needs. At every layer, every position emits a query (a question, shaped like "I\'m computing X — who has information for me?"), and every position offers a key (advertising what kind of query it can answer) and a value (the actual content it would hand over). Queries are matched against keys to produce a weight per source position, and values are then blended in those proportions. Each position gets a bespoke read of the past, tailored to what it\'s computing.'),
-      p('In practice, each layer runs several attention computations in parallel — "heads" — each with its own learned Q/K/V projections; their outputs are concatenated and combined. You\'ll see them in the Attention tab as a grid of heatmaps labeled L1 H1, L1 H2, etc.'),
-      p('Each transformer "layer" is an attention block plus an MLP (multi-layer perceptron — a small feed-forward network: a learned projection up to a wider hidden dimension, a nonlinearity, then a projection back down). Both have layer-level weights — one set per layer, applied at every position. Attention moves information *between* positions; the MLP does the at-each-position computation, applying that nonlinear transformation to the residual with the result added back into the stream. Most of the model\'s parameters live in MLPs, and they\'re where a lot of the "thinking" happens at each position once attention has routed the right context to it.')
+      p(`The residual stream is the vertical channel: at every position, it runs upward through all ${N_LAYERS} layers. Every block in every layer reads from it and writes back into it at ⊕. In the diagram, it's the green vertical line at each position; ⊕ marks where a block writes back.`),
+      p('The K/V stream is the horizontal channel: at each layer, K and V at every position are made available to all later positions in that same layer. Only attention reads from it; each position\'s MLP reads only its own residual. In the diagram, the K/V bus is the horizontal line under each layer; each purple K/V circle writes to it, each attention block reads from it. Causal flow runs left-to-right.')
     )
   }
 
   takeawaysView() {
     return div(
-      p('Information flowing from any (layer, position) to a later (layer, position) can travel up through the residual stream and right through the K/V stream in any order, taking any of an astronomical number of compositional paths. The residual connections (which also keep gradients flowing through deep stacks during training) are what makes this trainable, and they\'re why information from deep layers can still reference what earlier layers wrote.'),
-      p(`The residual stream's width — D_MODEL = ${D_MODEL} here, called the "hidden dimension" — is the central bottleneck of the architecture. Every piece of information that moves between layers, between positions (via the K/V stream's V values), or between distant heads in the network has to fit through these ${D_MODEL} numbers. In production LLMs the hidden dimension is much larger (Llama 3 70B uses 8192) precisely because that bandwidth determines how much compositional state the model can carry.`),
+      p('The MLPs are responsible for roughly two-thirds of the computation, including all the non-linear behaviour. Most of the rest is by the attention heads, that serve as information routers.'),
+      p('The precise architecture for this transformer also looks like ', a({ href: 'https://tinyurl.com/44ayrzfp', target: '_blank' }, 'this'), ', diagrammed by nn-dna, a tool that turns plain-English descriptions of neural networks into architecture diagrams.'),
       p('Co-built with Claude Opus 4.7; inspired by @repligate / j⧉nus\'s "How Information Flows Through Transformers".')
     )
   }
@@ -2572,7 +2557,7 @@ class Root extends Component implements IRoot {
     const tabs: { id: typeof this.activeTab; label: string }[] = [
       { id: 'explainer', label: 'Explainer' },
       { id: 'attention', label: 'Attention' },
-      { id: 'inside', label: 'Inside the model' },
+      { id: 'inside', label: 'Blocks' },
       { id: 'embeddings', label: 'Token embeddings' }
     ]
     return div({ class: styles.panel },
