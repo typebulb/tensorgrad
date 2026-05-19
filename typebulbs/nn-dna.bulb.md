@@ -17,7 +17,7 @@ import {
   capture, dropout, stopGradient, singleFlight,
   add, sub, mul, div, min, max, less, greater, where,
   sqrt, rsqrt, log, exp, neg, abs, square, sin, cos,
-  relu, tanh, sigmoid, gelu, silu, leakyRelu,
+  relu, tanh, sigmoid, gelu, silu, leakyRelu, softplus,
   clamp, randn,
   mean, sum, argmax, argmin,
   reshape, permute, swapAxes,
@@ -64,7 +64,7 @@ const _tgKeepalive = {
   capture, dropout, stopGradient, singleFlight,
   add, sub, mul, div, min, max, less, greater, where,
   sqrt, rsqrt, log, exp, neg, abs, square, sin, cos,
-  relu, tanh, sigmoid, gelu, silu, leakyRelu,
+  relu, tanh, sigmoid, gelu, silu, leakyRelu, softplus,
   clamp, randn,
   mean, sum, argmax, argmin,
   reshape, permute, swapAxes,
@@ -324,9 +324,11 @@ function buildDag(graph: Graph, groups: Group[]): DagNode[] {
 // by coverage k*n; ties favor SMALLER k — tightest period = the natural body
 // the user wrote. A 3-group × 8-iter loop has the same coverage as 6×4 and
 // 12×2 super-periods; we want the 3×8 view, not "2 iterations" of a body
-// that's actually 4 real iterations smushed together.
+// that's actually 4 real iterations smushed together. Recurses into iter-0's
+// body of each detected run; matching outer signatures guarantee identical
+// inner structure across all iterations.
 
-type LoopRun = { start: number; period: number; iterations: number }
+type LoopRun = { start: number; period: number; iterations: number; children: LoopRun[] }
 
 function groupSignature(group: Group, graph: Graph): string {
   if (group.ops.length === 1) {
@@ -341,19 +343,23 @@ function groupSignature(group: Group, graph: Graph): string {
 
 function detectLoops(groups: readonly Group[], graph: Graph): LoopRun[] {
   const signatures = groups.map(g => groupSignature(g, graph))
+  return detectLoopsInRange(signatures, 0, signatures.length)
+}
+
+function detectLoopsInRange(signatures: readonly string[], lo: number, hi: number): LoopRun[] {
   const loops: LoopRun[] = []
-  let i = 0
-  while (i < signatures.length) {
+  let i = lo
+  while (i < hi) {
     let bestK = 0
     let bestN = 0
     // Period >= 2: single-line iteration bodies merge into one group via
     // groupBySourceLine, so legit period-1 loops can't exist; any period-1
     // match is coincidence.
-    for (let k = 2; k <= Math.floor((signatures.length - i) / 2); k++) {
+    for (let k = 2; k <= Math.floor((hi - i) / 2); k++) {
       let n = 1
       while (true) {
         const next = i + n * k
-        if (next + k > signatures.length) break
+        if (next + k > hi) break
         let match = true
         for (let j = 0; j < k; j++) {
           if (signatures[i + j] !== signatures[next + j]) { match = false; break }
@@ -367,13 +373,27 @@ function detectLoops(groups: readonly Group[], graph: Graph): LoopRun[] {
       }
     }
     if (bestN >= 2) {
-      loops.push({ start: i, period: bestK, iterations: bestN })
+      const children = detectLoopsInRange(signatures, i, i + bestK)
+      loops.push({ start: i, period: bestK, iterations: bestN, children })
       i += bestK * bestN
     } else {
       i++
     }
   }
   return loops
+}
+
+// Each visible outer iter contains a fresh inner-loop instance with its own
+// truncation, so inner savings multiply by visibleIters.
+function countHiddenGroups(loops: readonly LoopRun[]): number {
+  let total = 0
+  for (const loop of loops) {
+    const hiddenIters = loop.iterations >= 4 ? loop.iterations - 3 : 0
+    const visibleIters = loop.iterations - hiddenIters
+    total += hiddenIters * loop.period
+    total += visibleIters * countHiddenGroups(loop.children)
+  }
+  return total
 }
 
 // ===== DOT generation =======================================================
@@ -441,36 +461,61 @@ function buildDOT(
     "  ranksep=0.3",
   ]
 
-  type Membership = { loopId: number; iter: number }
-  const memberOf = new Map<Group, Membership>()
-  for (let li = 0; li < loops.length; li++) {
-    const loop = loops[li]!
-    for (let it = 0; it < loop.iterations; it++) {
-      for (let gj = 0; gj < loop.period; gj++) {
-        const grp = groups[loop.start + it * loop.period + gj]
-        if (grp) memberOf.set(grp, { loopId: li, iter: it })
-      }
-    }
+  // Stable id per LoopRun. An inner loop has ONE id but possibly N instances
+  // (one per containing outer iter); the (loopId, baseShift) pair identifies
+  // a specific instance for cluster/ghost naming.
+  const loopIds = new Map<LoopRun, number>()
+  const assignIds = (ls: readonly LoopRun[]) => {
+    for (const l of ls) { loopIds.set(l, loopIds.size); assignIds(l.children) }
   }
+  assignIds(loops)
 
   // Truncate long loops: show first 2 + last iteration, with a "…" cluster
   // for the elided middle. Threshold ≥ 4 — 3 iterations are already brief.
-  // Spec stays honest at full T; only the diagram abbreviates.
-  const isHiddenIter = (loopId: number, iter: number): boolean => {
-    const loop = loops[loopId]!
-    return loop.iterations >= 4 && iter >= 2 && iter <= loop.iterations - 2
+  // Spec stays honest at full T; only the diagram abbreviates. Applied per
+  // nesting level independently.
+  const isHiddenIter = (loop: LoopRun, iter: number): boolean =>
+    loop.iterations >= 4 && iter >= 2 && iter <= loop.iterations - 2
+
+  // groupIdx → outermost-hidden ghost-key, or null when visible at every nest
+  // level. Absent for groups outside any loop. "Outermost" (not nearest)
+  // matters because a nearest-hidden redirect could land in an inner ghost
+  // that itself doesn't render (its containing outer iter is hidden).
+  const groupGhost = new Map<number, string | null>()
+  const populate = (ls: readonly LoopRun[], baseShift: number, ancestor: string | null) => {
+    for (const loop of ls) {
+      const lid = loopIds.get(loop)!
+      for (let iter = 0; iter < loop.iterations; iter++) {
+        const iterStart = loop.start + baseShift + iter * loop.period
+        const ghost = ancestor ?? (isHiddenIter(loop, iter) ? `${lid}_${baseShift}` : null)
+        for (let g = iterStart; g < iterStart + loop.period; g++) groupGhost.set(g, ghost)
+        populate(loop.children, baseShift + iter * loop.period, ghost)
+      }
+    }
   }
-  const hiddenTidLoop = new Map<number, number>()  // tid → ghost loopId for hidden-iter tids only
-  for (const node of dag) {
-    if (!node.group) continue
-    const m = memberOf.get(node.group)
-    if (m && isHiddenIter(m.loopId, m.iter)) hiddenTidLoop.set(node.tensorId, m.loopId)
+  populate(loops, 0, null)
+
+  const groupIdx = new Map<Group, number>()
+  for (let i = 0; i < groups.length; i++) groupIdx.set(groups[i]!, i)
+
+  // Split dag nodes three ways: top-level loose (outside any loop), hidden-
+  // in-loop (edge ghost-redirect targets), visible-in-loop (cluster contents).
+  // buildDag emits one dag node per group → dagIdxByGroupIdx single-valued.
+  const looseDagIdxs: number[] = []
+  const dagIdxByGroupIdx = new Map<number, number>()
+  const tidGhost = new Map<number, string>()
+  for (let i = 0; i < dag.length; i++) {
+    const node = dag[i]!
+    const gi = node.group ? groupIdx.get(node.group) : undefined
+    if (gi === undefined || !groupGhost.has(gi)) { looseDagIdxs.push(i); continue }
+    const ghost = groupGhost.get(gi)
+    if (ghost) tidGhost.set(node.tensorId, ghost)
+    else dagIdxByGroupIdx.set(gi, i)
   }
 
   const tidToColor = new Map<number, string>()
   for (const node of dag) tidToColor.set(node.tensorId, nodeColor(node, graph))
 
-  const ghostId = (loopId: number) => `tghost${loopId}`
   const emitCluster = (id: string, label: string, body: () => void) => {
     lines.push(`  subgraph cluster_${id} {`)
     lines.push(`    label="${label}"`)
@@ -481,7 +526,7 @@ function buildDOT(
     lines.push(`  }`)
   }
 
-  const emitNode = (dagIdx: number, indent: string) => {
+  const emitNode = (dagIdx: number) => {
     const node = dag[dagIdx]!
     const tid = node.tensorId
     const wrapped = wrapForLabel(resolveSourceLabel(graph, node, srcCache), 36)
@@ -489,61 +534,63 @@ function buildDOT(
     const color = tidToColor.get(tid)!
     const label = `<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="3" CELLSPACING="0">` +
       `<TR><TD>${wrapped}</TD></TR><TR><TD>${shapeHtml}</TD></TR></TABLE>>`
-    lines.push(`${indent}"t${tid}" [label=${label} color="${color}" class="ti-${tid}"]`)
+    lines.push(`    "t${tid}" [label=${label} color="${color}" class="ti-${tid}"]`)
   }
 
-  // Bucket dag nodes by loop iter. Map insertion order = op-index order so
-  // iter 0's cluster emits before iter 1's. Hidden iters skip bucketing —
-  // they're folded into the ghost cluster.
-  const flatIdxs: number[] = []
-  const buckets = new Map<string, { loopId: number; iter: number; idxs: number[] }>()
-  for (let i = 0; i < dag.length; i++) {
-    const m = dag[i]!.group ? memberOf.get(dag[i]!.group!) : undefined
-    if (!m) flatIdxs.push(i)
-    else if (!isHiddenIter(m.loopId, m.iter)) {
-      const key = `${m.loopId}:${m.iter}`
-      let b = buckets.get(key)
-      if (!b) { b = { loopId: m.loopId, iter: m.iter, idxs: [] }; buckets.set(key, b) }
-      b.idxs.push(i)
+  for (const i of looseDagIdxs) emitNode(i)
+
+  // Within a visible iter, positions covered by a child loop's range are
+  // skipped here — they'll emit inside the child's nested cluster instead.
+  const emitLoopList = (ls: readonly LoopRun[], baseShift: number) => {
+    for (const loop of ls) {
+      const gkStr = `${loopIds.get(loop)!}_${baseShift}`
+      for (let iter = 0; iter < loop.iterations; iter++) {
+        if (isHiddenIter(loop, iter)) continue
+        const iterStart = loop.start + baseShift + iter * loop.period
+        const innerBaseShift = baseShift + iter * loop.period
+        emitCluster(`loop_${gkStr}_iter_${iter}`,
+          `iteration ${iter + 1} of ${loop.iterations}`, () => {
+            for (let gi = iterStart; gi < iterStart + loop.period; gi++) {
+              const inChild = loop.children.some(c => {
+                const cs = c.start + innerBaseShift
+                return gi >= cs && gi < cs + c.period * c.iterations
+              })
+              if (inChild) continue
+              const di = dagIdxByGroupIdx.get(gi)
+              if (di !== undefined) emitNode(di)
+            }
+            emitLoopList(loop.children, innerBaseShift)
+          })
+      }
+      // Ghost lives in the same nesting context as the visible-iter clusters
+      // above, so inner-loop ghosts sit inside their containing outer iter.
+      if (loop.iterations >= 4) {
+        const startIdx = 2, endIdx = loop.iterations - 2
+        emitCluster(`loop_${gkStr}_ghost`,
+          `iterations ${startIdx + 1}..${endIdx + 1} of ${loop.iterations}`, () => {
+            lines.push(`    "tghost_${gkStr}" [label="…" shape=plaintext fontsize=22 fontcolor="#888" class="ti-ghost-${gkStr}"]`)
+          })
+      }
     }
   }
+  emitLoopList(loops, 0)
 
-  for (const i of flatIdxs) emitNode(i, "  ")
-  for (const b of buckets.values()) {
-    const loop = loops[b.loopId]!
-    emitCluster(`loop_${b.loopId}_iter_${b.iter}`, `iteration ${b.iter + 1} of ${loop.iterations}`, () => {
-      for (const i of b.idxs) emitNode(i, "    ")
-    })
-  }
-
-  // One ghost cluster per loop with a hidden middle. The "…" node inside
-  // catches every edge crossing in or out of the hidden range.
-  for (let loopId = 0; loopId < loops.length; loopId++) {
-    const loop = loops[loopId]!
-    if (loop.iterations < 4) continue
-    const start = 2, end = loop.iterations - 2
-    emitCluster(`loop_${loopId}_ghost`, `iterations ${start + 1}..${end + 1} of ${loop.iterations}`, () => {
-      lines.push(`    "${ghostId(loopId)}" [label="…" shape=plaintext fontsize=22 fontcolor="#888" class="ti-ghost-${loopId}"]`)
-    })
-  }
-
-  // Edges: a hidden endpoint redirects to its loop's ghost. Both-hidden
-  // edges drop (internal to elided middle). Ghost-touching edges dedupe by
-  // (src,dst) so many-iter fan-in (e.g. stack consuming every state)
-  // collapses to a single line.
+  // Both endpoints in the same ghost → drop (internal to the elided range).
+  // Ghost-touching edges dedupe by (src,dst) so many-iter fan-in (e.g. a
+  // `stack` consuming every state) collapses to a single line.
   type Endpoint = { id: string; cls: string; hidden: boolean }
   const endpoint = (tid: number): Endpoint => {
-    const loop = hiddenTidLoop.get(tid)
-    return loop !== undefined
-      ? { id: ghostId(loop), cls: `ti-ghost-${loop}`, hidden: true }
-      : { id: `t${tid}`, cls: `ti-${tid}`, hidden: false }
+    const g = tidGhost.get(tid)
+    return g === undefined
+      ? { id: `t${tid}`, cls: `ti-${tid}`, hidden: false }
+      : { id: `tghost_${g}`, cls: `ti-ghost-${g}`, hidden: true }
   }
   const emittedGhostEdges = new Set<string>()
   for (const node of dag) {
     const dst = endpoint(node.tensorId)
     for (const inTid of node.inputs) {
       const src = endpoint(inTid)
-      if (src.hidden && dst.hidden) continue
+      if (src.hidden && dst.hidden && src.id === dst.id) continue
       const color = src.hidden ? "#888" : tidToColor.get(inTid)!
       if (src.hidden || dst.hidden) {
         const key = `${src.id}->${dst.id}`
@@ -977,11 +1024,9 @@ class IRViewer extends Component {
     const dag = buildDag(graph, groups)
     const loops = detectLoops(groups, graph)
 
-    // Visible node count after loop-collapse — mirrors buildDOT's isHiddenIter.
-    let visibleNodes = dag.length
-    for (const loop of loops) {
-      if (loop.iterations >= 4) visibleNodes -= (loop.iterations - 3) * loop.period
-    }
+    // Visible node count after loop-collapse — mirrors buildDOT's isHiddenIter
+    // recursively across nested loops.
+    const visibleNodes = dag.length - countHiddenGroups(loops)
     this.canvasEl.innerHTML = ""
     if (visibleNodes > MAX_DIAGRAM_NODES) {
       const notice = document.createElement("div")
@@ -1351,6 +1396,13 @@ The source MUST end with:
     const posE = pos_emb.fwd(arange(T))                  // [T, D]
     let h = add(tok_emb.fwd(tokens), posE)               // [B, T, D]
 
+**Sinusoidal time/position embedding** — encode a continuous index `t: [B]` (declare `f32`) as concatenated sin+cos of log-spaced frequencies. `arange(half, 'f32')` because i32 won't multiply with the f32 freqs:
+
+    const half = D / 2
+    const freqs = exp(mul(arange(half, 'f32'), -Math.log(10000) / half))   // [half]
+    const angles = mul(reshape(t, [B, 1]), reshape(freqs, [1, half]))      // [B, half]
+    const emb = concat([sin(angles), cos(angles)], -1)                     // [B, D]
+
 **Predict function** — same model forward as the loss uses internally, but without the loss tail. Returns the network's prediction directly (logits, regression output, etc.):
 
     function predictFn(p: MLP, { x }: { x: Tensor }): Tensor {
@@ -1405,7 +1457,7 @@ The source MUST end with:
 **Arithmetic**: `add`, `sub`, `mul`, `div`, `min`, `max` — each takes `(Tensor, Tensor)` or `(Tensor, number)`.
 **Comparison**: `less`, `greater` (same scalar overload as arithmetic), `where(cond, ifTrue, ifFalse)`.
 **Unary math**: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`.
-**Activations**: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`, `leakyRelu(x, alpha?)` (default alpha 0.01).
+**Activations**: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`, `leakyRelu(x, alpha?)` (default alpha 0.01), `softplus` (numerically-stable `log(1 + exp(x))`).
 **Clamping**: `clamp(x, lo, hi)` — `lo` and `hi` are numbers.
 **Reductions**: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax`, `argmin`.
 **Shape**: `reshape(x, [dims])` (one `-1` allowed, inferred from total size — use `reshape(x, [B, -1])` or `reshape(x, [-1])` instead of a `flatten` op; tensorgrad doesn't have one), `permute`, `swapAxes` (= PyTorch `transpose`).
@@ -1432,6 +1484,8 @@ The source MUST end with:
 - **`splitHeads(x, nHeads)`** reshapes one tensor: `[B, T, D] → [B, H, T, D/H]`. For Q/K/V, use three independent `Linear(D, D)` projections and call `splitHeads` on each.
 - **No GQA — use full Q/K/V projections (all `H` heads).** `matmul` batch dims must match exactly (no size-1 broadcasting); matching multi-dim batches like `[B, H, T, D]` work fine — don't flatten to `[B*H, ...]` defensively.
 - **No RoPE — use learned `pos_emb`.** Rotate-half from scratch is fiddly; the diagram shows the same architecture either way.
+- **No hand-rolled fast-GELU — use the `gelu` primitive.** `mul(x, sigmoid(mul(x, 1.702)))` is the approximation; dropping the sigmoid silently collapses the MLP to linear and the trace passes.
+- **Use `new RMSNorm(D)`, don't hand-roll.** Already in the symbols list; a hand-rolled version next to `LayerNorm` reads as architecturally inconsistent.
 - **Use a loop for repeated blocks, not manual unrolling.** `layers = []; for (let i = 0; i < N_LAYERS; i++) layers.push(new Block())` + `for (const layer of m.layers) ...`. Manually-named fields (`layer0`, `layer1`, …) make `N_LAYERS` decorative — editing the const won't change architecture.
 - **Attention scaling**: multiply scores by `1 / Math.sqrt(D_HEAD)` before `softmaxCausal`.
 - **`stack` adds a new axis; `concat` joins an existing one.** `stack([a, b, …], axis)` of N tensors of shape `[B, H]` gives `[B, N, H]` (or wherever `axis` puts it). Don't `reshape(h, [B, 1, H])` and then `stack(outs, 1)` — that double-adds the axis, producing `[B, T, 1, H]` instead of `[B, T, H]`. The bug runs: downstream Linear/reshape silently swallow the extra size-1 dim until something stricter (MSE `sub`, broadcasting) catches it.
@@ -1511,7 +1565,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "submitTitle": "Diagram It"
   },
   "dependencies": {
-    "tensorgrad": "^0.1.5",
+    "tensorgrad": "^0.1.6",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
     "domeleon": "^0.6.0"
