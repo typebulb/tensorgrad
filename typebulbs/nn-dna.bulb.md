@@ -10,7 +10,7 @@ import { App, Component, div as divH, h1, p, a, span, button, h2, textarea, ul, 
 import {
   type Tensor, type Graph, type OpNode, type Shape, type CallSite, type CompiledIR,
   type ForwardFn, type InputDecls, type OptimizerConfig,
-  isWebGPUAvailable, getOpInputs,
+  getOpInputs,
   Module, trace, traceForward, lr, init,
   Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
   crossEntropy, nllLoss,
@@ -58,7 +58,7 @@ interface IRSpec {
 // eval'd spec source, which the bundler can't see. Removing this breaks
 // specs with `ReferenceError: Module is not defined`.
 const _tgKeepalive = {
-  Module, lr, init, isWebGPUAvailable,
+  Module, lr, init,
   Linear, LayerNorm, RMSNorm, Embedding, Conv2d,
   crossEntropy, nllLoss,
   capture, dropout, stopGradient, singleFlight,
@@ -134,6 +134,10 @@ function firstUserFrame(site: CallSite | null): UserFrame | null {
 // ===== Palettes + dim resolver =============================================
 
 const DIM_AUTO_PALETTE = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#aec7e8", "#ffbb78"] as const
+
+// Graphviz layout effectively hangs above ~3000 visible nodes; cap below
+// that to skip rendering rather than freeze the tab.
+const MAX_DIAGRAM_NODES = 1500
 const TENSOR_PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#bcbd22", "#17becf", "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5", "#c49c94"] as const
 // Color keyed on node identity (group signature, or tensor_input name for
 // leaves) rather than tensor id, so corresponding ops share a color across
@@ -581,11 +585,15 @@ function countParams(graph: Graph): number {
   return total
 }
 
-function formatParamCount(n: number): string {
-  if (n < 1000) return `${n}`
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`
-  return `${(n / 1_000_000).toFixed(1)}M`
+// Magnitude-scaled formatter. 1 decimal for K/M, 2 for everything bigger.
+function formatScaled(n: number, units: readonly string[], base = 1000, sep = ''): string {
+  let scaled = n, mag = 0
+  while (scaled >= base && mag < units.length - 1) { scaled /= base; mag++ }
+  if (mag === 0) return `${n}${sep}${units[0]}`
+  return `${scaled.toFixed(mag >= 3 ? 2 : 1)}${sep}${units[mag]}`
 }
+
+const formatParamCount = (n: number) => formatScaled(n, ['', 'K', 'M', 'B', 'T'])
 
 // matmul + conv2d only — everything else is single-digit ops per element,
 // rounding error next to a 2·M·K·N matmul. Includes conv backward kinds;
@@ -615,13 +623,7 @@ function countFlops(graph: Graph, opIds: Iterable<number>): number {
   return total
 }
 
-function formatFlops(n: number): string {
-  if (n < 1_000) return `${n}`
-  if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}K`
-  if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n < 1_000_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}G`
-  return `${(n / 1_000_000_000_000).toFixed(2)}T`
-}
+const formatFlops = (n: number) => formatScaled(n, ['', 'K', 'M', 'G', 'T', 'P', 'E'])
 
 // Bytes of forward intermediate tensors. Excludes params, external inputs,
 // and shape-only ops (reshape/permute are views). Upper bound — the buffer
@@ -638,12 +640,7 @@ function countActivationBytes(graph: Graph, opIds: Iterable<number>): number {
   return total
 }
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
-}
+const formatBytes = (n: number) => formatScaled(n, ['B', 'KB', 'MB', 'GB', 'TB', 'PB'], 1024, ' ')
 
 // ===== Metric definitions ===================================================
 // Four header metrics with definitional hover tooltips.
@@ -702,9 +699,11 @@ function viewOf(ir: CompiledIR): GraphView {
 class IRViewer extends Component {
   // Inference tab is omitted entirely when the spec has no predict function.
   activeTab: "training" | "inference" | "code" | "info" = "training"
-  // `status` is the loading/error string shown when no metrics yet exist.
-  // Once a graph compiles, `metrics` takes over and `status` is ignored.
+  // `status` is the transient loading line. `errorMessage` is the persistent
+  // failure state — rendered differently (constrained width, warning color)
+  // so it doesn't read like a normal status line.
   status = "Loading…"
+  errorMessage: string | null = null
   metrics: MetricData[] = []
   legend: LegendItem[] = []
   dimCollisions: DimCollision[] = []
@@ -751,7 +750,9 @@ class IRViewer extends Component {
                   const chip = span({ class: "metric-chip", "data-tooltip": m.tooltip }, m.display)
                   return i === 0 ? [chip] : [span({ class: "metric-sep" }, "·"), chip]
                 }))
-              : divH({ class: "model-stats" }, this.status),
+              : this.errorMessage
+                ? divH({ class: "model-error" }, this.errorMessage)
+                : divH({ class: "model-stats" }, this.status),
             this.modelDescription ? p({ class: "model-description" }, this.modelDescription) : null,
           ),
           this.legend.length > 0
@@ -793,6 +794,7 @@ class IRViewer extends Component {
             button({ disabled: this.inferring, onClick: () => this.applySpec() }, "Apply"),
             button({ disabled: this.inferring, onClick: () => this.resetSpec() }, "Reset to default"),
           ),
+          this.errorMessage ? divH({ class: "model-error" }, this.errorMessage) : null,
           textarea({
             class: "spec-editor",
             spellCheck: false,
@@ -841,9 +843,14 @@ class IRViewer extends Component {
     if (!this.textareaEl) return
     const source = this.textareaEl.value
     this.specSource = source
-    this.activeTab = "training"
     this.update()
     await this.compileFromSource(source)
+    // Flip to the diagram only on success — if compile failed, the user is
+    // mid-edit on the Code tab and shouldn't be teleported to an error.
+    if (!this.errorMessage) {
+      this.activeTab = "training"
+      this.update()
+    }
   }
 
   private async resetSpec(): Promise<void> {
@@ -862,9 +869,12 @@ class IRViewer extends Component {
       if (result && typeof result.source === "string") {
         this.specSource = result.source
         if (this.textareaEl) this.textareaEl.value = result.source
-        this.activeTab = "training"
         this.update()
         await this.compileFromSource(result.source)
+        if (!this.errorMessage) {
+          this.activeTab = "training"
+          this.update()
+        }
       }
     } catch (e) {
       this.status = `inference error: ${(e as Error)?.message ?? e}`
@@ -876,16 +886,11 @@ class IRViewer extends Component {
   }
 
   private async boot(): Promise<void> {
-    if (!isWebGPUAvailable()) {
-      this.status = "WebGPU not available. Try Chrome 113+ or Safari 17.4+."
-      this.update()
-      return
-    }
     await this.compileFromSource(this.specSource)
   }
 
   private fail(msg: string, e: unknown): void {
-    this.status = msg
+    this.errorMessage = msg
     this.update()
     console.error(e)
   }
@@ -900,6 +905,9 @@ class IRViewer extends Component {
     // If the new spec has no predict, the Inference tab disappears — don't strand the user there.
     if (this.activeTab === "inference") this.activeTab = "training"
 
+    this.modelLabel = ""
+    this.modelDescription = ""
+    this.errorMessage = null
     this.status = "Evaluating spec…"
     this.update()
     let spec: IRSpec
@@ -913,6 +921,11 @@ class IRViewer extends Component {
       return
     }
 
+    // Show the NEW spec's label/description immediately, even if trace fails
+    // below — otherwise an error would display under the previous spec's
+    // metadata, making it look like the old model failed.
+    this.modelLabel = spec.label
+    this.modelDescription = spec.description ?? ""
     this.status = `Tracing "${spec.label}"…`
     this.update()
     try {
@@ -924,9 +937,6 @@ class IRViewer extends Component {
         optimizer: spec.optimizer,
       })
       this.train = viewOf(trainIR)
-
-      this.modelLabel = spec.label
-      this.modelDescription = spec.description ?? ""
 
       const { resolve, legend, collisions } = buildDimResolver(trainIR.graph, spec.dims)
       this.resolveDim = resolve
@@ -970,11 +980,26 @@ class IRViewer extends Component {
     const groups = groupBySourceLine(graph, included)
     const dag = buildDag(graph, groups)
     const loops = detectLoops(groups, graph)
-    const dot = buildDOT(graph, dag, groups, loops, this.resolveDim, this.srcCache)
-    const svg = this.viz.renderSVGElement(dot)
+
+    // Visible node count after loop-collapse — mirrors buildDOT's isHiddenIter.
+    let visibleNodes = dag.length
+    for (const loop of loops) {
+      if (loop.iterations >= 4) visibleNodes -= (loop.iterations - 3) * loop.period
+    }
     this.canvasEl.innerHTML = ""
-    this.canvasEl.appendChild(svg)
-    attachHoverTrace(svg)
+    if (visibleNodes > MAX_DIAGRAM_NODES) {
+      const notice = document.createElement("div")
+      notice.className = "model-error"
+      notice.textContent =
+        `Diagram too large to render (${visibleNodes} visible operations after loop detection). ` +
+        `Metrics above are still available — reduce loop iterations or model depth to see the diagram.`
+      this.canvasEl.appendChild(notice)
+    } else {
+      const dot = buildDOT(graph, dag, groups, loops, this.resolveDim, this.srcCache)
+      const svg = this.viz.renderSVGElement(dot)
+      this.canvasEl.appendChild(svg)
+      attachHoverTrace(svg)
+    }
     // Params always read from train graph (shared); FLOPs cover the full
     // training step or forward-only inference depending on tab.
     const isInference = view === this.infer
@@ -1071,8 +1096,6 @@ body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 
 .ir-viewer .info-panel p { margin: 0 0 0.7rem; max-width: 108ch; }
 .ir-viewer .info-panel p:last-child { margin-bottom: 0; }
 .ir-viewer .info-panel strong { color: var(--text-primary); }
-.ir-viewer .info-panel h2 { font-size: 0.95rem; font-weight: 600; margin: 0.95rem 0 0.4rem; color: var(--text-primary); }
-.ir-viewer .info-panel h2:first-child { margin-top: 0; }
 
 /* `.panel` overflow: hidden gives the textarea its rounded corners — no need to round it directly. */
 .ir-viewer .editor-panel { padding: 0; }
@@ -1146,6 +1169,30 @@ body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 
   gap: 0.15rem 0.45rem;
 }
 .ir-viewer .metric-sep { color: var(--text-muted); user-select: none; }
+
+/* Warm amber rather than alarm red — failures during spec authoring are
+   expected/iterative, not catastrophic. Constrained width so a long stack
+   trace doesn't stretch full-tab. Monospace because errors quote code/paths. */
+.ir-viewer .model-error {
+  max-width: 72ch;
+  margin: 0 auto 0.6rem;
+  padding: 0.55rem 0.85rem;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: #b86a1f;
+  background: rgba(200, 122, 44, 0.08);
+  border: 1px solid rgba(200, 122, 44, 0.3);
+  border-radius: 6px;
+  text-align: left;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+html[data-theme="dark"] .ir-viewer .model-error {
+  color: #e0a86b;
+  background: rgba(224, 168, 107, 0.1);
+  border-color: rgba(224, 168, 107, 0.3);
+}
 
 /* Below the chip, not above: `.panel` has overflow:hidden (textarea
    corners) which would clip anything extending past its top edge. */
@@ -1297,6 +1344,11 @@ The source MUST end with:
       )
     }
 
+**Learned positional embedding** — pair an `Embedding(T, D)` with `arange(T)` for position indices. The `[T, D]` result broadcasts over batch when added to token embeddings:
+
+    const posE = pos_emb.fwd(arange(T))                  // [T, D]
+    let h = add(tok_emb.fwd(tokens), posE)               // [B, T, D]
+
 **Predict function** — same model forward as the loss uses internally, but without the loss tail. Returns the network's prediction directly (logits, regression output, etc.):
 
     function predictFn(p: MLP, { x }: { x: Tensor }): Tensor {
@@ -1356,7 +1408,7 @@ The source MUST end with:
 **Reductions**: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax`, `argmin`.
 **Shape**: `reshape(x, [dims])` (one `-1` allowed, inferred from total size — use `reshape(x, [B, -1])` or `reshape(x, [-1])` instead of a `flatten` op; tensorgrad doesn't have one), `permute`, `swapAxes` (= PyTorch `transpose`).
 **Linear algebra**: `matmul`.
-**Indexing**: `oneHot(idx, depth)`, `arange(n)`, `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (= PyTorch `gather`).
+**Indexing**: `oneHot(idx, depth)`, `arange(n, dtype?)` (default `i32`; pass `'f32'` for float math like sin/cos), `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (= PyTorch `gather`).
 **Const-tensor builders**: `zeros(shape, dtype?)`, `ones(shape, dtype?)` — default `f32`. The full set is `randn` / `arange` / `oneHot` / `zeros` / `ones`; no `full`, `eye`, `linspace`, `tril`, or `like`-variants.
 **Slicing/structural**: `narrow(t, axis, start, len)`, `concat([a, b, ...], axis)`, `stack([a, b, ...], axis)`, `split(t, [size1, size2, ...], axis)`.
 **Fused ML**: `softmax`, `logSoftmax`, `softmaxCausal`, `whereCausal`.
@@ -1376,6 +1428,9 @@ The source MUST end with:
 - **Pass raw logits to `crossEntropy`** — it fuses log-softmax internally. Don't apply `logSoftmax` first.
 - **Loss must be scalar** (rank-0). Use `mean`/`sum` to reduce.
 - **`splitHeads(x, nHeads)`** reshapes one tensor: `[B, T, D] → [B, H, T, D/H]`. For Q/K/V, use three independent `Linear(D, D)` projections and call `splitHeads` on each.
+- **No GQA — use full Q/K/V projections (all `H` heads).** `matmul` batch dims must match exactly (no size-1 broadcasting); matching multi-dim batches like `[B, H, T, D]` work fine — don't flatten to `[B*H, ...]` defensively.
+- **No RoPE — use learned `pos_emb`.** Rotate-half from scratch is fiddly; the diagram shows the same architecture either way.
+- **Use a loop for repeated blocks, not manual unrolling.** `layers = []; for (let i = 0; i < N_LAYERS; i++) layers.push(new Block())` + `for (const layer of m.layers) ...`. Manually-named fields (`layer0`, `layer1`, …) make `N_LAYERS` decorative — editing the const won't change architecture.
 - **Attention scaling**: multiply scores by `1 / Math.sqrt(D_HEAD)` before `softmaxCausal`.
 - **`stack` adds a new axis; `concat` joins an existing one.** `stack([a, b, …], axis)` of N tensors of shape `[B, H]` gives `[B, N, H]` (or wherever `axis` puts it). Don't `reshape(h, [B, 1, H])` and then `stack(outs, 1)` — that double-adds the axis, producing `[B, T, 1, H]` instead of `[B, T, H]`. The bug runs: downstream Linear/reshape silently swallow the extra size-1 dim until something stricter (MSE `sub`, broadcasting) catches it.
 - **No `groups` on Conv2d, no `Conv1d`.** Conv2d is dense conv only.
@@ -1432,7 +1487,7 @@ Use this as a structural template. Substitute the model logic for the user's req
       ],
     }
 
-If the user pastes their own (possibly broken) code, fix it to match these conventions while preserving their intent. If the request is ambiguous, pick reasonable defaults (batch 64–256, hidden 64–128, Adam optimizer at 1e-3 or 5e-3).
+If the user pastes their own (possibly broken) code, fix it to match these conventions while preserving their intent. If the request is ambiguous, default to small (batch 64–256, hidden 64–128, Adam at 1e-3 or 5e-3). For explicit scale requests, match it — the bulb traces without GPU, so GPT-2-scale (D≈1024, 12 layers), Llama/GPT-3-scale (D≈4096+, 32+ layers, B=1), and GPT-4-scale (D≈16K+, 80+ layers) all inspect in seconds; don't shrink toward tutorial defaults.
 ```
 
 **insight.json**
