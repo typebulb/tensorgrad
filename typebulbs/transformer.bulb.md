@@ -1096,7 +1096,10 @@ class AttentionPanel extends Component {
             `Attention weight: query at "${qLabel}" → key at "${kLabel}"`
           ),
           div({ class: styles.body },
-            `Every cell in this heatmap is one attention weight — how much one query position attends to one key position, after softmax. You clicked the cell where the query at "${qLabel}" attends to the key at "${kLabel}". Walk through the stages below in order.`
+            `Attention lets each position selectively read context from earlier positions. Every query (one per position) learns how much to weight each key (one per earlier position), and those weights blend each earlier position's value vector (V — its payload to share) into the query's read.`
+          ),
+          div({ class: [styles.body, 'mt-2'] },
+            `Every cell in this heatmap is one such weight, post-softmax. You clicked the cell where the query at "${qLabel}" attends to the key at "${kLabel}". Walk through the stages below in order.`
           )
         )
       ),
@@ -1192,7 +1195,7 @@ class AttentionPanel extends Component {
     const projectSection = inside && attnW
       ? div({ class: 'mb-3' },
           div({ class: [styles.body, 'mb-1.5 text-center'] },
-            `First, project each position's residual to produce Q (the query), K (the key), and V (the value). The (query, key) pair you selected needs Q at "${qLabel}" and K, V at "${kLabel}". Lines = strongest weights of each projection (green positive, blue negative); residual on top, projected vector below.`
+            `First, project each position's residual to produce Q (the query), K (the key), and V (the value). For your selected (query, key) pair, that means Q at "${qLabel}" and K, V at "${kLabel}". Q and K will combine in Score; V waits until Attend, where it gets blended into the head's output. Lines = strongest weights of each projection (green positive, blue negative); residual on top, projected vector below.`
           ),
           div({ class: [styles.body, 'mb-3 text-center'] },
             `(Q = what each position is looking for; K = what it offers; V = what it would pass forward.)`
@@ -1205,7 +1208,7 @@ class AttentionPanel extends Component {
 
     const scoreSection = div(
       div({ class: [styles.body, 'mb-2 text-center'] },
-        `Next, take Q (at "${qLabel}") and K (at "${kLabel}") from Project. Multiply piece by piece → sum and scale to a raw score → softmax against the row's other scores → attention weights for the query's row. (One of those weights is what colors the heatmap cell you clicked.)`
+        `Next, take Q (at "${qLabel}") and K (at "${kLabel}") from Project. Multiply piece by piece → sum and scale to a raw score → softmax against the row's other scores → attention weights for the query's row. These weights are the recipe Attend uses to blend each key's V into the head's output. (One of those weights colors the heatmap cell you clicked.)`
       ),
       div({ class: [styles.body, 'mb-1.5 text-center'] },
         `The ${D_HEAD} cells below are Q (at "${qLabel}") × K (at "${kLabel}") multiplied piece by piece — one product per dimension. Bright = strong agreement (score up); pale cells contribute little either way.`
@@ -1225,7 +1228,7 @@ class AttentionPanel extends Component {
 
     const outputSection = div(
       div({ class: [styles.body, 'mb-2 text-center'] },
-        `Finally, take the row's attention weights (from Score) and use them to blend the V vectors of every attended key into the head's output, then project the result back into the residual stream.`
+        `Finally, take the row's attention weights (from Score) and the V vectors (built in Project, one per attended key). The weights blend the V vectors into the head's output, then we project the result back into the residual stream.`
       ),
       div({ class: [styles.body, 'mb-1.5 text-center'] },
         `Head output (top row below) is the attention-weighted blend of V vectors across all attended keys — ${D_HEAD} dims. The wires project it back to ${D_MODEL}-dim; that's this head's contribution to the residual at "${qLabel}" (bottom row). Summed with the other ${N_HEADS - 1} heads' contributions, the result is added to the residual stream.`
@@ -1238,7 +1241,7 @@ class AttentionPanel extends Component {
     const tabs: { id: AttnDetailTab; label: string }[] = [
       { id: 'project', label: 'Project →' },
       { id: 'score',   label: 'Score →' },
-      { id: 'output',  label: 'Feed Residual' },
+      { id: 'output',  label: 'Attend' },
     ]
     const tabBar = div({ class: 'flex gap-3 mb-3' },
       tabs.map(t => button({
