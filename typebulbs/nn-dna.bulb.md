@@ -639,7 +639,7 @@ function countActivationBytes(graph: Graph, opIds: Iterable<number>): number {
   return total
 }
 
-const formatBytes = (n: number) => formatScaled(n, ['B', 'KB', 'MB', 'GB', 'TB', 'PB'], 1024, ' ')
+const formatBytes = (n: number) => formatScaled(n, ['bytes', 'KB', 'MB', 'GB', 'TB', 'PB'], 1024, ' ')
 
 // ===== Metric definitions ===================================================
 // Four header metrics with definitional hover tooltips.
