@@ -12,9 +12,4 @@ export default [
     output: { file: 'dist/index.d.ts', format: 'es' },
     plugins: [dts()],
   },
-  {
-    input: 'dist/types-temp/internal.d.ts',
-    output: { file: 'dist/internal.d.ts', format: 'es' },
-    plugins: [dts()],
-  },
 ]

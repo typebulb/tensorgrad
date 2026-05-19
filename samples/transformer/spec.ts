@@ -107,7 +107,7 @@ export const predictInputs = {
   tokens: { shape: [B, T], dtype: 'i32' },
 } as const
 
-export const optimizer = { kind: 'adamw', lr: LR, weightDecay: 0.01 } as const
+export const optimizer = { kind: 'adamw', lr: LR, weightDecay: 0.01, clipGradNorm: 1.0 } as const
 
 const trainingSpec = { model: new Transformer(), loss: lossFn, inputs, optimizer }
 

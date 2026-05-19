@@ -22,7 +22,8 @@ import {
   conv2d, maxPool2d,
   stopGradient,
 } from '../src/index.js'
-import { traceFn, paramInput, tensorInput, appendGrad } from '../src/internal.js'
+import { traceFn, paramInput, tensorInput } from '../src/trace.js'
+import { appendGrad } from '../src/grad.js'
 import { evalGraph } from './_eval.js'
 import { section, ok, fail, done } from './_assert.js'
 import { assertGradMatchesFD } from './_fdgrad.js'

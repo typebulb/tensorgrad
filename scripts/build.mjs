@@ -36,10 +36,7 @@ async function bundleWorker() {
 async function bundleMain(workerSource) {
   const opts = {
     ...sharedEsbuildOpts,
-    // Two entry points: the public barrel and the extension barrel. Both fully
-    // tree-shaken bundles; users pay for what they import. `__WORKER_SOURCE__`
-    // only resolves inside the public bundle (internal doesn't spawn workers).
-    entryPoints: ['src/index.ts', 'src/internal.ts'],
+    entryPoints: ['src/index.ts'],
     outdir: 'dist',
     sourcemap: true,
     define: {
@@ -53,7 +50,7 @@ async function bundleMain(workerSource) {
   if (watch) {
     const ctx = await context(opts)
     await ctx.watch()
-    console.log('build.mjs: watching src/{index,internal}.ts (worker source baked at startup; restart on worker.ts changes)')
+    console.log('build.mjs: watching src/index.ts (worker source baked at startup; restart on worker.ts changes)')
   } else {
     await build(opts)
   }

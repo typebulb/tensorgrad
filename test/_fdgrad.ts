@@ -12,7 +12,8 @@
 // of `(1 - c²)`) fails the FD comparison; the shape-only check passes.
 
 import type { Tensor, Graph } from '../src/index.js'
-import { traceFn, paramInput, appendGrad } from '../src/internal.js'
+import { traceFn, paramInput } from '../src/trace.js'
+import { appendGrad } from '../src/grad.js'
 import { evalGraph, evalOutput } from './_eval.js'
 import { fail, ok } from './_assert.js'
 

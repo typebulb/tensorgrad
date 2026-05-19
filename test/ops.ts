@@ -9,7 +9,7 @@
 // stable shape rules and obvious literal guards were pruned as padding.
 
 import { dropout } from '../src/index.js'
-import { traceFn, tensorInput } from '../src/internal.js'
+import { traceFn, tensorInput } from '../src/trace.js'
 import { section, ok, fail, done } from './_assert.js'
 
 section('dropout — auto-managed per-op salt + shared seed input')

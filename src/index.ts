@@ -1,7 +1,5 @@
 // Public surface — `tensorgrad`. Documented end-user API: ops, layer
 // modules (Linear, LayerNorm, ...), `compile`, runtime helpers.
-// Extension hooks (custom optimizers, IR walks, codegen visualization)
-// live in the sibling `tensorgrad/internal` barrel.
 
 export type { Tensor, Shape, Dtype, OpNode, Graph, CallSite } from './ir.js'
 export { getOpInputs } from './ir.js'

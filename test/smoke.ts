@@ -22,11 +22,10 @@ import {
   logSoftmax,
   type Tensor, type Graph,
 } from '../src/index.js'
-import {
-  traceFn, traceInto, paramInput, tensorInput,
-  appendGrad,
-  planBuffers, emitKernels,
-} from '../src/internal.js'
+import { traceFn, traceInto, paramInput, tensorInput } from '../src/trace.js'
+import { appendGrad } from '../src/grad.js'
+import { planBuffers } from '../src/buffers.js'
+import { emitKernels } from '../src/codegen.js'
 
 // Minimal Node typing — keeps `@types/node` off the dev-dep tree.
 declare const process: { exit(code: number): never }
@@ -325,7 +324,7 @@ console.log('  ✓ capture() inside traceInto is a no-op')
 
 console.log('\nVerifying appendSGD...')
 
-import { appendSGD } from '../src/internal.js'
+import { appendSGD } from '../src/sgd.js'
 
 // Build a trivial training graph: one param p, loss = sum(p * p).
 function buildTrivialTrainingGraph(): { graph: Graph; paramGrads: Record<string, Tensor>; paramTensors: Record<string, Tensor> } {
@@ -403,7 +402,7 @@ try {
 console.log('\nVerifying lr.staircase / lr.multiStep schedules...')
 
 const { lr } = await import('../src/index.js')
-const { resolveLR } = await import('../src/internal.js')
+const { resolveLR } = await import('../src/adam.js')
 
 function approxEq(a: number, b: number, eps = 1e-9): boolean {
   return Math.abs(a - b) < eps

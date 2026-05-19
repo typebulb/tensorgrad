@@ -3,7 +3,7 @@
 A tiny TypeScript-native tensor library with autograd that compiles to WebGPU.
 For training small models in the browser without hand-writing WGSL kernels and
 without dragging in a multi-megabyte ML framework. Zero dependencies. Static
-shapes, `f32` parameters with `i32` indices, Adam / AdamW optimizer, forward +
+shapes, `f32` parameters with `i32` indices, Adam / AdamW / SGD optimizers,
 reverse-mode autograd. Browser-only. All GPU work runs in a library-internal
 Web Worker — every method on a compiled module returns a `Promise`.
 
@@ -69,12 +69,7 @@ for (let step = 0; step < 1000; step++) {
   compiles that share the training graph's params, use
   `train.attach({ forward, inputs })`.
 
-## Porting from PyTorch
-
-If you're translating a PyTorch model or training loop. Assumes the
-**Mental model** above.
-
-### Direct mappings
+## PyTorch translation
 
 | PyTorch | tensorgrad |
 |---|---|
@@ -115,19 +110,27 @@ If you're translating a PyTorch model or training loop. Assumes the
 | `torch.sin(x)` / `torch.cos(x)` | `sin(x)` / `cos(x)` |
 | `torch.gather(input, dim, index)` / `jnp.take_along_axis(arr, idx, axis)` | `takeAlongAxis(input, indices, axis)` — same-rank, NumPy/JAX naming |
 
-### Things that aren't 1-to-1
+## Patterns and pitfalls
 
-**Pass raw logits to the loss, not log-probs.** PyTorch tutorials often
-write `F.log_softmax(logits, dim=-1)` in `forward` and `F.nll_loss(...)`
-in the loss. Tensorgrad's `crossEntropy(logits, targets)` fuses
-log-softmax + NLL into one call. Pass raw logits — don't apply
-log-softmax yourself. Applying it twice silently
-double-log-softmaxes; the model trains but converges to garbage. This
-is the worst class of bug: it runs.
+**Tensorgrad runs in a worker.** Every method on a compiled module is
+async. `step` and `infer.run` return a discriminated result:
 
-If you specifically want the log-probability intermediate visible (e.g.
-to `capture` it for inspection), use `nllLoss(logSoftmax(logits),
-targets)` instead — same numerics, just unfused.
+```ts
+const r = await train.step({ x, y })
+switch (r.kind) {
+  case 'completed': useLoss(r.loss); break        // r.captures also available
+  case 'aborted':   return                        // graph was replaced mid-flight
+  case 'failed':    console.error(r.error); break // execution error (NaN, dispatch, validation, …)
+}
+```
+
+`'aborted'` covers cancellation (graph replaced via `replaceModel`).
+`'failed'` covers anything else that goes wrong inside the worker
+pipeline — NaN loss, kernel dispatch errors, input validation, internal
+IR issues. No try/catch ever needed on `step` or `run`: the
+discriminator is the complete surface. That matters specifically for
+fire-and-forget training loops — an unawaited `runTrainLoop` can't catch
+thrown rejections, so silent loop death was the alternative.
 
 **No `.train()` / `.eval()` mode flag.** Write two forwards: a training
 one (`lossFn`, includes `dropout` etc.) and an inference one
@@ -151,6 +154,29 @@ intermediate, mark it with `capture(name, t)` inside the forward; the
 activation surfaces on the result's `captures` field every call. Graphs
 with no `capture()` sites pay nothing.
 
+**Module internals aren't public.** On a leaf module (`Linear`,
+`LayerNorm`, `Embedding`, `Conv2d`, `RMSNorm`), call `.fwd(x)` — don't
+reach into `module.W` and pass it to a free op. The free
+`embedding(table, indices)` is for the raw `this.param([V, D])` case
+(tied embeddings, codebooks); on an `Embedding` instance use `.fwd(idx)`.
+
+**Pass raw logits to the loss, not log-probs.** PyTorch tutorials often
+write `F.log_softmax(logits, dim=-1)` in `forward` and `F.nll_loss(...)`
+in the loss. Tensorgrad's `crossEntropy(logits, targets)` fuses
+log-softmax + NLL into one call. Pass raw logits — don't apply
+log-softmax yourself. Applying it twice silently
+double-log-softmaxes; the model trains but converges to garbage. This
+is the worst class of bug: it runs.
+
+If you specifically want the log-probability intermediate visible (e.g.
+to `capture` it for inspection), use `nllLoss(logSoftmax(logits),
+targets)` instead — same numerics, just unfused.
+
+**Use the `gelu` primitive, not a hand-rolled approximation.**
+`mul(x, sigmoid(mul(x, 1.702)))` is the fast-GELU shortcut; dropping the
+`sigmoid` silently collapses the MLP to linear and the trace still passes.
+Same goes for `RMSNorm` — use the primitive, not a hand-roll.
+
 **`reshape` doesn't transpose.** It reinterprets the linear memory layout;
 total element count is preserved but axis order in memory is not.
 To reorder axes use `permute` / `swapAxes`:
@@ -171,25 +197,66 @@ const codebook = this.param([N, D])
 const scores = matmul(x, swapAxes(codebook, -1, -2))   // [B, D] · [D, N] → [B, N]
 ```
 
-**Tensorgrad runs in a worker.** Every method on a compiled module is
-async. `step` and `infer.run` return a discriminated result:
+**Sinusoidal positional embedding needs `arange(half, 'f32')`.** `arange`
+defaults to `i32` (it's an index dtype); the sinusoid math needs f32 for
+the exp/freqs path. Without the cast you get a trace-time dtype error:
 
 ```ts
-const r = await train.step({ x, y })
-switch (r.kind) {
-  case 'completed': useLoss(r.loss); break        // r.captures also available
-  case 'aborted':   return                        // graph was replaced mid-flight
-  case 'failed':    console.error(r.error); break // execution error (NaN, dispatch, validation, …)
-}
+const half = D / 2
+const freqs = exp(mul(arange(half, 'f32'), -Math.log(10000) / half))
+const angles = mul(reshape(t, [B, 1]), reshape(freqs, [1, half]))
+const emb = concat([sin(angles), cos(angles)], -1)   // [B, D]
 ```
 
-`'aborted'` covers cancellation (graph replaced via `replaceModel`).
-`'failed'` covers anything else that goes wrong inside the worker
-pipeline — NaN loss, kernel dispatch errors, input validation, internal
-IR issues. No try/catch ever needed on `step` or `run`: the
-discriminator is the complete surface. That matters specifically for
-fire-and-forget training loops — an unawaited `runTrainLoop` can't catch
-thrown rejections, so silent loop death was the alternative.
+**Tied input/output embeddings for transformers.** Use a raw
+`this.param([V, D])` (not `new Embedding`, which is lookup-only) as
+*both* input lookup and output projection. A separate
+`new Linear(D, V)` head grows without bound and NaNs around step
+500-1000; pair with `clipGradNorm` for extra insurance.
+
+```ts
+const tokE   = embedding(m.tok_emb, tokens)              // [B, T, D]
+const logits = matmul(xn, swapAxes(m.tok_emb, -1, -2))   // [B, T, V]
+```
+
+**Transformer attention assembly.** Three independent `Linear(D, D)`
+projections for Q/K/V (not one `Linear(D, 3*D) + split`); call
+`splitHeads` on each. Scale scores by `1 / Math.sqrt(D_HEAD)` *before*
+`softmaxCausal` — forgetting saturates the softmax and silently kills
+the training signal:
+
+```ts
+const q = splitHeads(p.q.fwd(x), nHeads)      // [B, H, T, D/H]
+const k = splitHeads(p.k.fwd(x), nHeads)
+const v = splitHeads(p.v.fwd(x), nHeads)
+const scores = mul(matmul(q, swapAxes(k, -1, -2)), 1 / Math.sqrt(D_HEAD))
+const attn = softmaxCausal(scores)
+```
+
+**Recurrent state in unrolled loops.** Init with `zeros(shape)`, slice
+each timestep with `narrow`, collect outputs, `stack` at the end. Per-step
+state stays `[B, H]`; `stack` adds the T axis (no manual reshape):
+
+```ts
+let h = zeros([B, H])
+const outs: Tensor[] = []
+for (let t = 0; t < T; t++) {
+  const xt = reshape(narrow(x, 1, t, 1), [B, D])
+  h = tanh(add(m.ih.fwd(xt), m.hh.fwd(h)))
+  outs.push(h)
+}
+const seq = stack(outs, 1)   // [B, T, H]
+```
+
+**1D conv via `Conv2d`.** No `Conv1d` primitive. Reshape sequence data
+`[B, C, T]` to `[B, C, 1, T]` and use a `[1, K]` kernel:
+
+```ts
+const conv = new Conv2d(Cin, Cout, [1, K], { padding: [0, K - 1] })
+// in the forward:
+const x4 = reshape(x, [B, Cin, 1, T])
+const y  = reshape(conv.fwd(x4), [B, Cout, Tout])
+```
 
 ## Public API
 
@@ -227,13 +294,33 @@ const infer = await train.attach({
 })
 ```
 
-The training `model` is cloned internally before tracing; the user's
-instance is never mutated. The forward function reads the parent's
-params — every training step is immediately visible through `infer.run()`.
+**Model is a value, not a factory.** Pass a `model: new Model()`
+instance to `compile({ model })`. The compile pipeline clones the module
+tree before tracing, so the same instance can feed both a training compile
+and a subsequent `replaceModel` without surprising mutation.
 
-Training-step updates are immediately visible through `infer.run()` —
-the forward compile binds the training compile's actual param buffers,
-no readback round-trip.
+**Shape declaration forms.** Two canonical shapes:
+
+```ts
+inputs: {
+  x:       [B, 784],                              // tuple → f32 (the common case)
+  tokens:  { shape: [B, T], dtype: 'i32' },       // object → required for non-f32
+}
+```
+
+The tuple shorthand is `f32`-only — i32 / bool indices use the object
+form. Mixing `null` wildcards for parametric dims works in either form.
+
+**Typed inputs.** `step` / `run` are typed against the declared `inputs`
+shape, so each named input expects the right TypedArray: a dtype-`'f32'`
+input (or a tuple shape, which defaults to f32) expects a `Float32Array`;
+a dtype-`'i32'` input expects an `Int32Array`. Passing the wrong array
+type is a compile-time error.
+
+**Wildcard consistency.** Every `null` wildcard across all inputs in a
+single `run()` must resolve to the same value (matches Keras `None` /
+ONNX dynamic-axis convention). Mismatched inferred dims throw at the
+call boundary, not deep in kernel dispatch.
 
 **Parametric batch dim.** When you need the same forward function at
 multiple batch sizes (B=1 for live prediction, B=256 for held-out eval),
@@ -255,6 +342,18 @@ at each new shape pays the trace + codegen cost; the cache is LRU-bounded
 (default 8 shapes, override via `maxCachedShapes`). For latency-sensitive
 paths warm the cache at startup with a dummy `run()` per expected shape.
 
+**Reproducible init.** A deterministic Mulberry32 PRNG seeds compile-time
+init. Pass `seed` to control it; whatever seed was used is exposed as
+`train.seed` so you can replay later:
+
+```ts
+const a = await compile({ ..., seed: 42 })   // pin
+const b = await compile({ ... })             // fresh; b.seed exposes it
+b.reset()                                                  // re-inits with the current seed
+await b.replaceModel(newModel)                             // fresh seed by default
+await b.replaceModel(newModel, { seed: b.seed })           // keep current
+```
+
 **Replacing the model.** If your UI lets the user change the model
 topology (layer count, hidden width, etc.), `replaceModel(newModel)`
 swaps it in place — same handle, same worker. Forward compiles attached
@@ -275,33 +374,6 @@ await train.replaceModel(
 
 For mid-training optimizer changes *without* a topology swap (LR
 schedule update on the existing weights), use `setLR`.
-
-### `singleFlight` (live-preview helper)
-
-A generic concurrency primitive, in the public surface because the async
-worker boundary turns naive UI event handlers into bad behavior (queued
-strokes, stale predictions racing fresh ones). The same `'completed'` /
-`'aborted'` vocabulary used by `step` and `run` composes through it.
-
-For live-preview patterns where stale calls (earlier mouse positions,
-partial drawings) should be dropped in favor of the newest, wrap a
-promise-returning function with `singleFlight`. Matches RxJS `switchMap` /
-p-debounce semantics: at most one in-flight, at most one queued; only
-the most recent call resolves with `'completed'`, displaced callers
-resolve with `'aborted'`.
-
-```ts
-import { singleFlight } from 'tensorgrad'
-
-const predict = singleFlight((tokens: Int32Array) => infer.run({ tokens }))
-
-canvas.addEventListener('pointermove', async () => {
-  const r = await predict(latestTokens())
-  if (r.kind === 'completed') updateUI(r.value)
-})
-```
-
-Generic — works around `run`, `step`, or any single-argument promise function.
 
 ### CompiledTraining methods (all `Promise`-returning)
 
@@ -367,66 +439,10 @@ Module class path. Round-trips directly back through `uploadParams`
 union autocompletes in TS, so `params['l1.W']` is typed access without a
 separate tree variant.
 
-**Typed inputs.** `step` / `run` are typed against the declared `inputs`
-shape, so each named input expects the right TypedArray: a dtype-`'f32'`
-input (or a tuple shape, which defaults to f32) expects a `Float32Array`;
-a dtype-`'i32'` input expects an `Int32Array`. Passing the wrong array
-type is a compile-time error.
-
-**Shape declaration forms.** Two canonical shapes:
-
-```ts
-inputs: {
-  x:       [B, 784],                              // tuple → f32 (the common case)
-  tokens:  { shape: [B, T], dtype: 'i32' },       // object → required for non-f32
-}
-```
-
-The tuple shorthand is `f32`-only — i32 / bool indices use the object
-form. Mixing `null` wildcards for parametric dims works in either form.
-
-**Wildcard consistency.** Every `null` wildcard across all inputs in a
-single `run()` must resolve to the same value (matches Keras `None` /
-ONNX dynamic-axis convention). Mismatched inferred dims throw at the
-call boundary, not deep in kernel dispatch.
-
-**Cancellation as value (and failure too).** If your UI tears down or
-rebuilds the model while a `step` / `run` is in flight (e.g. the user
-picks a new layer size mid-training, triggering `replaceModel`), the
-in-flight call resolves as `'aborted'`. Execution failures inside the
-worker — NaN, dispatch errors, input validation, internal IR — resolve
-as `'failed'` carrying the underlying `Error`. Both surface in the
-discriminator without try/catch:
-
-```ts
-const r = await train.step(batch)
-switch (r.kind) {
-  case 'completed': useLoss(r.loss); break
-  case 'aborted':   return
-  case 'failed':    logAndRetry(r.error); break
-}
-```
-
-`r.captures` lives only on the `'completed'` branch; `r.error` lives
-only on `'failed'`. Type narrowing makes wrong-branch access a compile
-error.
-
-**Model is a value, not a factory.** Pass a `model: new Model()`
-instance to `compile({ model })`. The compile pipeline clones the module
-tree before tracing, so the same instance can feed both a training compile
-and a subsequent `replaceModel` without surprising mutation.
-
-**Reproducible init.** A deterministic Mulberry32 PRNG seeds compile-time
-init. Pass `seed` to control it; whatever seed was used is exposed as
-`train.seed` so you can replay later:
-
-```ts
-const a = await compile({ ..., seed: 42 })   // pin
-const b = await compile({ ... })             // fresh; b.seed exposes it
-b.reset()                                                  // re-inits with the current seed
-await b.replaceModel(newModel)                             // fresh seed by default
-await b.replaceModel(newModel, { seed: b.seed })           // keep current
-```
+**Result type narrowing.** See *Tensorgrad runs in a worker* above for
+the `'completed'` / `'aborted'` / `'failed'` discriminator. `r.captures`
+lives only on the `'completed'` branch; `r.error` lives only on
+`'failed'`. Type narrowing makes wrong-branch access a compile error.
 
 ### Operators
 
@@ -444,9 +460,9 @@ Imported from `'tensorgrad'`:
 - Comparisons / select: `less`, `greater`, `where`
 - Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax(x, axis?)`, `argmin(x, axis?)`
 - Shape: `reshape`, `permute`, `swapAxes` (`permute` is full-axis reorder, like PyTorch's `permute` / JAX's `jnp.transpose`)
-- Attention layout: `splitHeads(x, nHeads)`, `mergeHeads(x)`
-- Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank)
-- Indexing / casting: `oneHot`, `arange`, `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (general per-axis gather; both array/data first to match PyTorch functional, JAX, NumPy)
+- Attention layout: `splitHeads(x, nHeads)` (`[..., T, D] → [..., H, T, D/H]`), `mergeHeads(x)` (inverse)
+- Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank; batch ranks must match exactly when rhs is batched — no size-1 broadcasting)
+- Indexing / casting: `oneHot`, `arange(n, dtype?)` (default `i32` — pass `'f32'` for float math like sinusoidal positions), `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (general per-axis gather; both array/data first to match PyTorch functional, JAX, NumPy)
 - Const-tensor builders: `zeros(shape, dtype?)`, `ones(shape, dtype?)` (default `f32`; non-differentiable; pair with `randn`/`arange` as the complete set — no `full`, `eye`, `linspace`, `tril`, `zerosLike`, or `like`-variants)
 - Slicing / structural: `narrow(t, axis, start, length)` (PyTorch `torch.narrow`), `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal(x, fillValue)` (mask below the diagonal; pairs with `softmaxCausal` when you need a non-softmax causal mask)
@@ -461,11 +477,13 @@ tail is `crossEntropy(logits, targets)` (reduces to scalar mean by
 default).
 
 **Structural ops.** `concat([a, b], axis)` joins along an existing axis;
-`stack([a, b], axis)` joins along a new axis (sugar for
-`reshape` + `concat`). Negative axes index from the end (Python
-convention). Concat over the WebGPU 7-binding cap is auto-chained
-internally — call signature is the same whether you pass 2 or 200
-tensors. `split(t, sizes, axis)` is the inverse, built from `narrow`.
+`stack([a, b], axis)` joins along a new axis (sugar for `reshape` +
+`concat`) — don't `reshape(h, [B, 1, H])` and then `stack(outs, 1)`, that
+double-adds the axis (`[B, T, 1, H]` instead of `[B, T, H]`). Negative
+axes index from the end (Python convention). Concat over the WebGPU
+7-binding cap is auto-chained internally — call signature is the same
+whether you pass 2 or 200 tensors. `split(t, sizes, axis)` is the
+inverse, built from `narrow`.
 
 ### Layer modules and loss helpers
 
@@ -494,12 +512,6 @@ PyTorch's `F.cross_entropy(..., reduction='mean')`). Pass `{ reduction:
 'none' }` for a per-position tensor when you need to mask or weight
 positions yourself before reducing; `'sum'` for an unscaled sum.
 
-Multi-head shape helpers (`splitHeads(x, nHeads)`, `mergeHeads(x)`) are
-pure tensor ops, not modules. The captures-side counterpart is
-`captures.perHead(name)` — a method on the `Captures` instance returned
-by `step()` / `run()`, splits a flat capture into one `Float32Array` per
-head.
-
 ### Optimizers
 
 `compile()` takes an `optimizer` discriminated by
@@ -517,6 +529,9 @@ optimizer: { kind: 'adam', lr: 0.005, clipGradNorm: 1.0 }
 // AdamW — decoupled weight decay (Loshchilov & Hutter)
 optimizer: { kind: 'adamw', lr: 0.005, weightDecay: 0.01 }
 optimizer: { kind: 'adamw', lr: 0.005, weightDecay: 0.01, decayFilter: n => n.endsWith('.W') }
+
+// Transformer recipe — pair with tied embeddings; LR schedule + clip together avoid the late-training NaN cliff
+optimizer: { kind: 'adamw', lr: lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 }), weightDecay: 0.01, clipGradNorm: 1.0 }
 
 // SGD / SGD-with-momentum / Nesterov. Plain SGD when momentum is 0 (default).
 optimizer: { kind: 'sgd', lr: 0.05 }
@@ -551,10 +566,6 @@ await train.setLR(
 )  // non-constant schedules auto-rebase so step 1 = next training step
 ```
 
-Which params receive weight decay is baked at compile time (per-param
-`{ decay: true | false }` metadata). To change `weightDecay`, `beta1`, `beta2`,
-or any other non-LR hyperparameter, recompile via `replaceModel`.
-
 ### Gradient clipping
 
 Global L2-norm clipping matches PyTorch's `clip_grad_norm_` and optax's
@@ -571,10 +582,6 @@ const compiled = await compile({
 The clip is **global** across all params (one shared scale factor),
 applied between backward and the optimizer update. Constant at compile time
 — there's no runtime knob to change `clipGradNorm` after compile.
-
-For custom optimizers, `appendGradClip(graph, paramGrads, maxNorm)` is
-the composable extension hook — call it before whatever optimizer pass
-you append, the same way `appendAdam` does internally.
 
 ### Param init (`init` namespace)
 
@@ -602,7 +609,7 @@ On `LayerNorm`, `decay` toggles *both* gain and bias together; on
 `decay: false`, matching the canonical transformer pattern of excluding
 norm params from weight decay.
 
-### Dropout (no mode flag)
+### Dropout
 
 `dropout(x, p)` is inverted dropout: elements survive with probability
 `1 - p` and are scaled by `1 / (1 - p)`; the rest are zeroed. The mask
@@ -611,11 +618,8 @@ a PCG hash inside the kernel — backward recomputes the same mask, no
 memory cost. The runtime auto-threads the per-step seed; users never
 plumb it.
 
-There is no `.train()/.eval()` mode flag. Instead, follow the
-free-function-forward pattern tensorgrad already encourages: call
-`dropout` inside your *training* forward (`lossFn`), and omit it from
-your *inference* forward (`predictFn`). The two functions compile into
-separate graphs — dropout is literally absent from the inference path.
+Call inside the *training* forward; omit from the *inference* forward
+(see *No `.train()` / `.eval()` mode flag* above):
 
 ```ts
 function lossFn(m: Model, { x, y }: { x: Tensor; y: Tensor }) {
@@ -639,10 +643,10 @@ Wrap any tensor inside a forward to expose its activation post-run:
 ```ts
 import { capture } from 'tensorgrad'
 
+// Inside the forward:
 const attn = capture(`attn.${i}`, softmaxCausal(scores))
-```
 
-```ts
+// After run:
 const r = await infer.run(inputs)
 if (r.kind === 'completed') {
   const attn0 = r.captures.get('attn.0')        // Float32Array
@@ -650,12 +654,37 @@ if (r.kind === 'completed') {
 }
 ```
 
+For multi-head attention captures, `r.captures.perHead(name)` splits the
+flat array into one `Float32Array` per head.
+
 Captures are zero-overhead when the graph has no `capture()` sites.
 When it does, they're read back via a single batched `mapAsync`
 alongside the loss/output — no opt-in flag, the activation is just
 there on the result. A capture site in a *training* forward therefore
 costs a readback on every `train.step()` (megabytes for transformer
 activations); keep them in inference-only forwards.
+
+### `singleFlight` (live-preview helper)
+
+Drops stale calls in favor of the newest — RxJS `switchMap` / p-debounce
+semantics. Resolves to `{ kind: 'completed', value: R }` (latest call won;
+`R` = wrapped function's result) or `{ kind: 'aborted' }` (displaced).
+Generic over any single-argument promise function. When wrapping
+`infer.run` / `train.step`, `r.value` is *their* discriminated result —
+the inner `.kind` still needs checking.
+
+```ts
+import { singleFlight } from 'tensorgrad'
+
+const predict = singleFlight((tokens: Int32Array) => infer.run({ tokens }))
+
+canvas.addEventListener('pointermove', async () => {
+  const r = await predict(latestTokens())
+  if (r.kind === 'completed' && r.value.kind === 'completed') {
+    updateUI(r.value.output)
+  }
+})
+```
 
 ## Constraints
 
@@ -672,46 +701,10 @@ The library is small because of what it doesn't do. Plan accordingly:
   live LR changes; everything else needs `replaceModel({ optimizer })`.
 - **Loss must be a scalar.** A training spec's `loss` returns a rank-0 tensor.
 - **Closures don't cross the worker boundary.** LR schedules and inits are
-  serializable shapes, not functions. Anything per-step you write into a
-  user-defined optimizer (see *Extending* below) follows the same rule.
+  serializable shapes, not functions.
 - **One model per training compile.** Forward specs attach via
   `train.attach(forwardSpec)` to share params; otherwise each `compile()`
   of a training spec spawns its own worker.
-
-## Extending
-
-The IR is open. Adam is built in only because it's the most common starting
-point — other optimizers, custom losses, or extra ops are user code following
-the same pattern as `appendAdam`:
-
-```ts
-import { appendAdam, appendGrad } from 'tensorgrad/internal'
-```
-
-Anything under `tensorgrad/internal` is an extension hook that tracks the
-IR — expect breakage on 0.0.x bumps. The `tensorgrad` (public) surface is
-stable within 0.0.x; `internal` is not.
-
-A custom optimizer is a function that takes the autograd output (graph +
-`paramGrads`) and the materialized param tensors, appends its update ops
-to the graph, and returns writeback declarations the buffer planner uses
-to wire each new value back into its persistent home. SGD, Lion, RMSProp
-all fit this shape; see `src/adam.ts` for the canonical example.
-
-The same applies to ops: anything missing from the built-in set can be
-expressed as a composition of existing ops (GELU, RMSNorm, etc. are a few
-lines), or — if you need a new primitive — added to the IR with a
-forward + backward + WGSL emit.
-
-## Potential future additions
-
-**Activation patching.** The dual of `capture` — a `patch(name, t)`
-marker that exposes any intermediate for *write* at runtime, the way
-`capture` exposes it for read. Sites are declared in the forward;
-whether they're active and what values they carry are per-`run()` /
-`step()` inputs. Covers mech-interp's core ablation toolkit (zero
-ablation, mean ablation, cross-input transplant) without per-experiment
-recompilation. Free when sites are inactive.
 
 ## When not to use this
 
