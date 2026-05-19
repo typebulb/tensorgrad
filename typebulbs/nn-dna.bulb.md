@@ -835,7 +835,7 @@ class IRViewer extends Component {
               disabled: this.inferring,
               onClick: () => this.generateFromDescription(),
             }, this.inferring ? "Asking the AI…" : "Ask the AI"),
-            button({ disabled: this.inferring, onClick: () => this.applySpec() }, "Apply"),
+            button({ disabled: this.inferring, onClick: () => this.compileSpec() }, "Compile"),
             button({ disabled: this.inferring, onClick: () => this.resetSpec() }, "Reset to default"),
           ),
           this.errorMessage ? divH({ class: "model-error code-error" }, this.errorMessage) : null,
@@ -862,10 +862,10 @@ class IRViewer extends Component {
             li("etc."),
           ),
           p("And out comes a diagram of the network."),
-          p("Tensor code can be hard to follow. It shows the ops but not the shapes flowing through them. Each box is a tensor that displays its dimensionality (e.g. [B, H]) and the line of code that produced it; arrows trace dataflow."),
+          p("Tensors have structure that can be invisible when looking at code that transforms them. It shows the ops but not the shapes flowing through them. Each box is a tensor that displays its dimensionality (e.g. [B, H]) and the line of code that produced it; arrows trace dataflow."),
           p("Training and inference have different inputs and outputs because they have different goals. Training takes an input plus the correct answer, and outputs a single number measuring how wrong the model's guess was; that number drives the weight updates. Inference takes only the input and outputs the model's prediction, which is what you wanted in the first place."),
-          p("Only the forward is shown. It's the part specific to the architecture (what makes a transformer different from a CNN). The backprop and optimizer are automatic."),
-          p("Already have tensorgrad code? Click ", em("Ask the AI"), ", paste in your model, and again, out comes the diagram."),
+          p("Only the forward is shown — the computation that produces the model's output. It's the part specific to the architecture (what makes a transformer different from a CNN). The backprop and optimizer are automatic."),
+          p("How does this run? It uses a TypeScript library called tensorgrad that compiles neural networks and runs them on WebGPU. It's designed for small demos and experiments that run in your browser, like ", a({ href: "https://typebulb.com/u/samples/ne-rf/full", target: "_blank" }, "this"), ". The editor in the code tab is the actual API for defining models. In this app, we never actually ", em("run"), " the models, so you can even explore the architecture of enormous 1T-parameter networks."),
         ),
       ),
     )
@@ -883,7 +883,7 @@ class IRViewer extends Component {
     }, label)
   }
 
-  private async applySpec(): Promise<void> {
+  private async compileSpec(): Promise<void> {
     if (!this.textareaEl) return
     const source = this.textareaEl.value
     this.specSource = source
@@ -900,7 +900,7 @@ class IRViewer extends Component {
   private async resetSpec(): Promise<void> {
     if (!this.textareaEl) return
     this.textareaEl.value = this.defaultSource
-    await this.applySpec()
+    await this.compileSpec()
   }
 
   // tb.infer() opens typebulb's inference modal with data.txt as the prompt.
@@ -921,7 +921,7 @@ class IRViewer extends Component {
         }
       }
     } catch (e) {
-      this.status = `inference error: ${(e as Error)?.message ?? e}`
+      this.status = `Ask the AI failed: ${(e as Error)?.message ?? e}`
       console.error(e)
     } finally {
       this.inferring = false
@@ -988,7 +988,7 @@ class IRViewer extends Component {
       this.legend = legend
       this.dimCollisions = collisions
 
-      // Best-effort inference trace — training graph still useful if it fails.
+      // Best-effort — training graph still useful if it fails.
       try {
         const inferIR = await traceForward({
           model: spec.model,
@@ -997,14 +997,14 @@ class IRViewer extends Component {
         })
         this.infer = viewOf(inferIR)
       } catch (e) {
-        console.warn("inference trace failed:", e)
+        console.warn("compile failed:", e)
         this.infer = null
       }
 
       this.update()
       this.rerender()
     } catch (e) {
-      this.fail(`trace error: ${(e as Error)?.message ?? e}`, e)
+      this.fail(`compile error: ${(e as Error)?.message ?? e}`, e)
     }
   }
 
