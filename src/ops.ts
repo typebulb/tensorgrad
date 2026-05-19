@@ -283,6 +283,15 @@ export function leakyRelu(a: Tensor, alpha: number = 0.01): Tensor {
   return max(a, mul(a, alpha))
 }
 
+/** Softplus: smooth, strictly-positive `log(1 + exp(x))`. Composed in the
+ *  numerically-stable form `max(x, 0) + log(1 + exp(-|x|))`, which is finite
+ *  for all f32 inputs; the naive `log(1 + exp(x))` overflows at x > ~88.
+ *  Standard parameterization for strictly-positive outputs: Mamba's per-step
+ *  delta, VAE σ, normalizing-flow scales. */
+export function softplus(a: Tensor): Tensor {
+  return add(max(a, 0), log(add(exp(neg(abs(a))), 1)))
+}
+
 // ---- Reductions ------------------------------------------------------------
 // IR kernels (`mean_last`, `sum_last`, `argmax_last`) are last-axis only.
 // Other axes compose as `permute-axis-to-end` + `*_last` + reshape/back-perm,
