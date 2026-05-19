@@ -17,7 +17,7 @@ import {
   capture, dropout, stopGradient, singleFlight,
   add, sub, mul, div, min, max, less, greater, where,
   sqrt, rsqrt, log, exp, neg, abs, square, sin, cos,
-  relu, tanh, sigmoid, gelu, silu,
+  relu, tanh, sigmoid, gelu, silu, leakyRelu,
   clamp, randn,
   mean, sum, argmax, argmin,
   reshape, permute, swapAxes,
@@ -64,7 +64,7 @@ const _tgKeepalive = {
   capture, dropout, stopGradient, singleFlight,
   add, sub, mul, div, min, max, less, greater, where,
   sqrt, rsqrt, log, exp, neg, abs, square, sin, cos,
-  relu, tanh, sigmoid, gelu, silu,
+  relu, tanh, sigmoid, gelu, silu, leakyRelu,
   clamp, randn,
   mean, sum, argmax, argmin,
   reshape, permute, swapAxes,
@@ -135,8 +135,7 @@ function firstUserFrame(site: CallSite | null): UserFrame | null {
 
 const DIM_AUTO_PALETTE = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#aec7e8", "#ffbb78"] as const
 
-// Graphviz layout effectively hangs above ~3000 visible nodes; cap below
-// that to skip rendering rather than freeze the tab.
+// Graphviz hangs above ~3000 nodes; cap well below.
 const MAX_DIAGRAM_NODES = 1500
 const TENSOR_PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#bcbd22", "#17becf", "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5", "#c49c94"] as const
 // Color keyed on node identity (group signature, or tensor_input name for
@@ -686,8 +685,6 @@ function buildMetrics(args: {
 
 type GraphView = { graph: Graph; kernelCount: number; fwdOps: Set<number> }
 
-// Reduce a CompiledIR to the slim view the bulb actually walks: graph,
-// kernel count, and the forward-reachable op set used to filter the diagram.
 function viewOf(ir: CompiledIR): GraphView {
   return {
     graph: ir.graph,
@@ -794,7 +791,7 @@ class IRViewer extends Component {
             button({ disabled: this.inferring, onClick: () => this.applySpec() }, "Apply"),
             button({ disabled: this.inferring, onClick: () => this.resetSpec() }, "Reset to default"),
           ),
-          this.errorMessage ? divH({ class: "model-error" }, this.errorMessage) : null,
+          this.errorMessage ? divH({ class: "model-error code-error" }, this.errorMessage) : null,
           textarea({
             class: "spec-editor",
             spellCheck: false,
@@ -921,9 +918,8 @@ class IRViewer extends Component {
       return
     }
 
-    // Show the NEW spec's label/description immediately, even if trace fails
-    // below — otherwise an error would display under the previous spec's
-    // metadata, making it look like the old model failed.
+    // Set before trace so a failure displays under the new spec's metadata,
+    // not the previous spec's.
     this.modelLabel = spec.label
     this.modelDescription = spec.description ?? ""
     this.status = `Tracing "${spec.label}"…`
@@ -1193,6 +1189,12 @@ html[data-theme="dark"] .ir-viewer .model-error {
   background: rgba(224, 168, 107, 0.1);
   border-color: rgba(224, 168, 107, 0.3);
 }
+.ir-viewer .code-error {
+  max-width: none;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+}
 
 /* Below the chip, not above: `.panel` has overflow:hidden (textarea
    corners) which would clip anything extending past its top edge. */
@@ -1403,7 +1405,7 @@ The source MUST end with:
 **Arithmetic**: `add`, `sub`, `mul`, `div`, `min`, `max` — each takes `(Tensor, Tensor)` or `(Tensor, number)`.
 **Comparison**: `less`, `greater` (same scalar overload as arithmetic), `where(cond, ifTrue, ifFalse)`.
 **Unary math**: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`.
-**Activations**: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`.
+**Activations**: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`, `leakyRelu(x, alpha?)` (default alpha 0.01).
 **Clamping**: `clamp(x, lo, hi)` — `lo` and `hi` are numbers.
 **Reductions**: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax`, `argmin`.
 **Shape**: `reshape(x, [dims])` (one `-1` allowed, inferred from total size — use `reshape(x, [B, -1])` or `reshape(x, [-1])` instead of a `flatten` op; tensorgrad doesn't have one), `permute`, `swapAxes` (= PyTorch `transpose`).
@@ -1509,7 +1511,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "submitTitle": "Diagram It"
   },
   "dependencies": {
-    "tensorgrad": "^0.1.4",
+    "tensorgrad": "^0.1.5",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
     "domeleon": "^0.6.0"

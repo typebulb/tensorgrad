@@ -437,7 +437,7 @@ Imported from `'tensorgrad'`:
 
 - Arithmetic (binary): `add`, `sub`, `mul`, `div`, `min`, `max`
 - Unary math: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`
-- Activations: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`
+- Activations: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`, `leakyRelu(x, alpha?)`
 - Clamping: `clamp(x, lo, hi)` (scalar bounds)
 - Stochastic: `dropout(x, p)` (inverted dropout, p ∈ [0, 1)), `randn(shape)` (N(0, 1) sampler, zero gradient)
 - Autograd control: `stopGradient(x)` (identity forward, no-op backward — PyTorch's `.detach()`)

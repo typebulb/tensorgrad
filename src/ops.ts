@@ -276,6 +276,13 @@ export function gelu(a: Tensor): Tensor {
   return mul(mul(a, 0.5), add(tanh(inner), 1))
 }
 
+/** Leaky ReLU: `x` for `x > 0`, `alpha · x` otherwise. Composed as
+ *  `max(x, alpha · x)` (assumes `alpha < 1`, which it is for all standard
+ *  uses — PyTorch default 0.01, DCGAN convention 0.2). */
+export function leakyRelu(a: Tensor, alpha: number = 0.01): Tensor {
+  return max(a, mul(a, alpha))
+}
+
 // ---- Reductions ------------------------------------------------------------
 // IR kernels (`mean_last`, `sum_last`, `argmax_last`) are last-axis only.
 // Other axes compose as `permute-axis-to-end` + `*_last` + reshape/back-perm,
