@@ -2065,7 +2065,7 @@ class WiresPanel extends Component {
 }
 
 // ---------- Explainer panel ----------
-type ExplainerTopic = 'training' | 'vectors' | 'streams' | 'takeaways'
+type ExplainerTopic = 'training' | 'architecture' | 'takeaways'
 
 class ExplainerPanel extends Component {
   get root() { return this.ctx.root as any as IRoot }
@@ -2075,8 +2075,7 @@ class ExplainerPanel extends Component {
   view() {
     const topics: { id: ExplainerTopic; label: string }[] = [
       { id: 'training', label: 'Training' },
-      { id: 'vectors', label: '⊕ Vectors' },
-      { id: 'streams', label: 'Streams' },
+      { id: 'architecture', label: 'Architecture' },
       { id: 'takeaways', label: 'Takeaways' }
     ]
     return div({ class: styles.explainerContainer },
@@ -2094,8 +2093,7 @@ class ExplainerPanel extends Component {
   topicView() {
     switch (this.selectedTopic) {
       case 'training': return this.trainingView()
-      case 'vectors': return this.vectorsView()
-      case 'streams': return this.streamsView()
+      case 'architecture': return this.architectureView()
       case 'takeaways': return this.takeawaysView()
     }
   }
@@ -2108,16 +2106,9 @@ class ExplainerPanel extends Component {
     )
   }
 
-  vectorsView() {
+  architectureView() {
     return div(
-      p(`A ${D_MODEL}-dim vector is a single point in ${D_MODEL}-dimensional space, not ${D_MODEL} separate facts. The model uses *directions* in that space to encode information — there might be a direction that means "digit 7", another that means "units slot", another for "this is an operator".`),
-      p(`Now the surprising part: when you add two same-shape vectors, A ⊕ B = C, you get a new vector C of the same shape. This looks lossy — two things squashed into one? In 1 or 2 dimensions it would be. But ${D_MODEL} dimensions is a lot of room. If A points mostly along one direction and B mostly along another (near-orthogonal), C still contains both A's and B's contributions, recoverable downstream by reading along the corresponding directions. Adding isn't averaging or overwriting — it's stacking contributions in a space wide enough that they don't collide. This is sometimes called "superposition".`),
-      p('This is why neural networks can keep using a single fixed-width vector to carry more and more information through a sequence of layers — the ⊕ is doing real work. Anywhere two same-shape vectors are added in this architecture (token + position embedding at layer 0, or residual + each block\'s output through the layers), this mechanism is what\'s happening. Watch for the ⊕ symbol in the diagram below — that\'s the operator at work.')
-    )
-  }
-
-  streamsView() {
-    return div(
+      p(`What flows through every channel in the diagram below is a ${D_MODEL}-dim vector — a single point in ${D_MODEL}-dimensional space, where the model encodes information as *directions*. The ⊕ symbol is element-wise tensor addition: it combines two such vectors number-by-number, and ${D_MODEL} dimensions has enough room that the original contributions stay distinguishable downstream. For the foundations — what a tensor is, what ⊕ is doing here, and how all of this composes into attention — see this `, a({ href: 'https://typebulb.com/u/samples/tensors/full', target: '_blank' }, 'interactive Tensors tutorial'), '.'),
       p(`The residual stream is the vertical channel: at every position, it runs upward through all ${N_LAYERS} layers. Every block in every layer reads from it and writes back into it at ⊕. In the diagram, it's the green vertical line at each position; ⊕ marks where a block writes back.`),
       p('The K/V stream is the horizontal channel: at each layer, K and V at every position are made available to all later positions in that same layer. Only attention reads from it; each position\'s MLP reads only its own residual. In the diagram, the K/V bus is the horizontal line under each layer; each purple K/V circle writes to it, each attention block reads from it. Causal flow runs left-to-right.')
     )
@@ -2615,7 +2606,7 @@ new App({
   "dependencies": {
     "domeleon": "^0.6.0",
     "@unocss/preset-wind3": "^66.5.3",
-    "tensorgrad": "^0.1.6"
+    "tensorgrad": "^0.1.7"
   },
   "description": "Watch a transformer learn 2-digit addition from scratch in your browser. Type two numbers and see it predict the sum digit by digit. Built with tensorgrad (autograd + WebGPU)."
 }
