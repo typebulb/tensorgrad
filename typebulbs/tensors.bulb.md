@@ -21,6 +21,9 @@ const fmt = (x: number, d = 2): string => {
   return x.toFixed(d)
 }
 
+const mono   = (...c: HValues[]) => span({ class: 'mono' }, c)
+const italic = (...c: HValues[]) => span({ class: 'italic' }, c)
+
 // ---------- Number-cell coloring + small row viz (shared across Shapes / Embedding) ----------
 const numClass = (v: number) => v === 0 ? 'num-zero' : v > 0 ? 'num-pos' : 'num-neg'
 
@@ -228,14 +231,14 @@ function specBox(code: string, paragraphs: string[][]) {
     pre({ class: 'spec-code' }, code),
     paragraphs.map(parts =>
       p({ class: 'spec-caption' },
-        parts.map((s, i) => i % 2 === 1 ? span({ class: 'mono' }, s) : s),
+        parts.map((s, i) => i % 2 === 1 ? mono(s) : s),
       ),
     ),
   )
 }
 
 // ---------- TabControl ----------
-type TabDef = { key: string; label: string; content: HValues }
+type TabDef = { key: string; label: string; content: HValues; hideSubBar?: boolean }
 
 class TabControl extends Component {
   selected: string | null = null
@@ -243,6 +246,7 @@ class TabControl extends Component {
   view(props: { tabs: TabDef[]; subBar?: HValues }) {
     const { tabs, subBar } = props
     const sel = this.selected ?? tabs[0]!.key
+    const showSubBar = !tabs.find(t => t.key === sel)?.hideSubBar
     return div({ class: 'tab-control' },
       div({ class: 'tab-bar' },
         tabs.map(t => button({
@@ -254,7 +258,7 @@ class TabControl extends Component {
           },
         }, t.label)),
       ),
-      subBar,
+      showSubBar ? subBar : null,
       tabs.map(t => div({
         class: 'tab-pane',
         style: { display: sel === t.key ? 'block' : 'none' },
@@ -288,13 +292,13 @@ class ShapesSection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         'Neural-network code in PyTorch, JAX, or tensorgrad does not work on individual numbers or vectors; it works on ',
-        span({ class: 'italic' }, 'tensors'),
+        italic('tensors'),
         ': N-dimensional arrays of numbers, with a fixed shape. A scalar is rank 0, a vector is rank 1, a matrix is rank 2, and from rank 3 upward you stack matrices, then stacks of matrices, and so on. Shapes are written as bracketed dim lists: ',
-        span({ class: 'mono' }, '[3]'),
+        mono('[3]'),
         ', ',
-        span({ class: 'mono' }, '[3, 4]'),
+        mono('[3, 4]'),
         ', ',
-        span({ class: 'mono' }, '[B, T, D]'),
+        mono('[B, T, D]'),
         '.',
       ),
 
@@ -321,29 +325,29 @@ class ShapesSection extends ModeSection {
 
       div({ class: 'intro' },
         'A typical transformer tensor is shaped ',
-        span({ class: 'mono' }, '[B, T, D]'),
+        mono('[B, T, D]'),
         ': ',
-        span({ class: 'mono' }, 'B'),
+        mono('B'),
         ' = batch size (independent examples processed together), ',
-        span({ class: 'mono' }, 'T'),
+        mono('T'),
         ' = sequence length (positions in the prompt), ',
-        span({ class: 'mono' }, 'D'),
+        mono('D'),
         ' = model dim (the vector dim every position carries). Think of it as a ',
-        span({ class: 'mono' }, '[B, T]'),
+        mono('[B, T]'),
         ' grid of cells, each holding one ',
-        span({ class: 'mono' }, 'D'),
+        mono('D'),
         '-dim vector. Ops either act elementwise or run along the last axis (the vector), with leading axes as batching — the same computation happens in parallel across every (b, t) cell.',
       ),
 
       div({ class: 'intro' },
         'When two tensors of different ranks meet — for example an ',
-        span({ class: 'mono' }, '[B, T, D]'),
+        mono('[B, T, D]'),
         ' tensor added to a ',
-        span({ class: 'mono' }, '[T, D]'),
+        mono('[T, D]'),
         ' tensor — the shorter shape lines up against the end of the longer one and the missing leading axes get repeated implicitly. ',
-        span({ class: 'mono' }, '[T, D] + [B, T, D]'),
+        mono('[T, D] + [B, T, D]'),
         ' works; the ',
-        span({ class: 'mono' }, '[T, D]'),
+        mono('[T, D]'),
         ' tensor is "broadcast" across the batch dim. This is how the same position-embedding vector applies to every example in a batch without copying.',
       ),
 
@@ -402,13 +406,13 @@ class EmbeddingSection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         'Embedding is a 2D learnable table of shape ',
-        span({ class: 'mono' }, '[VOCAB, D]'),
+        mono('[VOCAB, D]'),
         ' that holds one ',
-        span({ class: 'mono' }, 'D'),
+        mono('D'),
         '-dim row per token (a token is an integer ID, one per position in the input sequence). ',
-        span({ class: 'mono' }, 'embedding(table, idx)'),
+        mono('embedding(table, idx)'),
         ' just fetches the row at position ',
-        span({ class: 'mono' }, 'idx'),
+        mono('idx'),
         '. The table starts random and trains to place related tokens in similar directions.',
       ),
 
@@ -416,16 +420,22 @@ class EmbeddingSection extends ModeSection {
 
       div({ class: 'intro' },
         'Each row in that table is just ',
-        span({ class: 'mono' }, 'D'),
+        mono('D'),
         ' numbers, which makes it a direction in ',
-        span({ class: 'mono' }, 'D'),
+        mono('D'),
         '-dimensional space. There are only ',
-        span({ class: 'mono' }, 'D'),
+        mono('D'),
         ' mutually orthogonal directions, but far more ',
-        span({ class: 'italic' }, 'near-orthogonal'),
+        italic('near-orthogonal'),
         ' ones, and near-orthogonal is enough: two near-orthogonal vectors have a dot product close to zero, so they barely interfere. Pick ',
-        span({ class: 'mono' }, 'D'),
+        mono('D'),
         ' large enough and every token gets its own direction without colliding. The same property lets a single vector carry several independent signals at once. Token identity, position, whatever later operations add: each signal stays readable along its own direction without picking up the others.',
+      ),
+
+      div({ class: 'intro' },
+        'Surprisingly, it\'s even possible to encode more features than there are dimensions — sometimes by an order of magnitude or more. This is called ',
+        italic('superposition'),
+        ', and real LLMs use it heavily: rarely-active features can share directions with minimal interference.',
       ),
 
     )
@@ -440,7 +450,7 @@ class EmbeddingSection extends ModeSection {
 
     return div({ class: 'embed-block' },
       div({ class: 'embed-title' },
-        span({ class: 'mono' }, 'embedding'),
+        mono('embedding'),
         ' — lookup by integer index',
       ),
       div({ class: 'embed-prose' },
@@ -461,7 +471,7 @@ class EmbeddingSection extends ModeSection {
         ),
         div({ class: 'embed-out-col' },
           div({ class: 'embed-out-call' },
-            span({ class: 'mono' }, `embedding(table, ${sel})`),
+            mono(`embedding(table, ${sel})`),
           ),
           div({ class: 'embed-out-arrow' }, '↓'),
           div({ class: 'mat-label' }, `out  [D=${D}]`),
@@ -474,11 +484,11 @@ class EmbeddingSection extends ModeSection {
   tensorgradView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        span({ class: 'mono' }, 'embedding(table, indices)'),
+        mono('embedding(table, indices)'),
         ' is an indexed lookup: every integer in ',
-        span({ class: 'mono' }, 'indices'),
+        mono('indices'),
         ' is replaced by the corresponding row from ',
-        span({ class: 'mono' }, 'table'),
+        mono('table'),
         '. The shape gets promoted from integers to D-dim vectors in one op.',
       ),
 
@@ -527,7 +537,7 @@ class AddSection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         'A vector is a list of numbers — equivalently, an arrow from the origin to a point in space. The first thing you do with two vectors is add them: ',
-        span({ class: 'mono' }, 'A + B = [a₁+b₁, a₂+b₂]'),
+        mono('A + B = [a₁+b₁, a₂+b₂]'),
         ' — component-wise; tip-to-tail in the picture below. Tensorgrad code (and PyTorch, JAX) ultimately works on these and stacks of them.',
       ),
 
@@ -559,7 +569,7 @@ class AddSection extends ModeSection {
   tensorgradView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        span({ class: 'mono' }, 'add(a, b)'),
+        mono('add(a, b)'),
         ' is element-wise addition over two same-shape tensors.',
       ),
       specBox(
@@ -600,21 +610,21 @@ class DotSection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         'Two vectors can be added; they can also be compared. The dot product turns two vectors into a single number measuring how aligned they are. Component-wise: ',
-        span({ class: 'mono' }, 'A · B = a₁b₁ + a₂b₂ + ... + aₙbₙ'),
+        mono('A · B = a₁b₁ + a₂b₂ + ... + aₙbₙ'),
         '. Geometrically: ',
-        span({ class: 'mono' }, 'A · B = |A| |B| cos(θ)'),
+        mono('A · B = |A| |B| cos(θ)'),
         ', where ',
-        span({ class: 'mono' }, '|A|'),
+        mono('|A|'),
         ' is the length of A and ',
-        span({ class: 'mono' }, 'θ'),
+        mono('θ'),
         ' is the angle between A and B.',
       ),
 
       div({ class: 'intro' },
         'The length ',
-        span({ class: 'mono' }, '|A| = √(a₁² + a₂² + ... + aₙ²)'),
+        mono('|A| = √(a₁² + a₂² + ... + aₙ²)'),
         ' is Pythagoras generalized to n dimensions; in 1D it reduces to ordinary absolute value, which is why the bar notation extends. Setting B = A in either form gives the self-case: ',
-        span({ class: 'mono' }, 'A · A = |A|²'),
+        mono('A · A = |A|²'),
         ' — a vector dotted with itself is its squared magnitude.',
       ),
 
@@ -662,38 +672,38 @@ class DotSection extends ModeSection {
     if (θ <= 10) {
       return [
         'A and B are nearly aligned. ',
-        span({ class: 'mono' }, 'A · B'),
+        mono('A · B'),
         ' is near the maximum of ',
-        span({ class: 'mono' }, '|A||B|'),
+        mono('|A||B|'),
         '.',
       ]
     }
     if (θ >= 170) {
       return [
         'A and B are nearly opposite. ',
-        span({ class: 'mono' }, 'A · B'),
+        mono('A · B'),
         ' is near the minimum of ',
-        span({ class: 'mono' }, '−|A||B|'),
+        mono('−|A||B|'),
         '.',
       ]
     }
     if (θ >= 80 && θ <= 100) {
       return [
         'A and B are near-perpendicular. ',
-        span({ class: 'mono' }, 'A · B'),
+        mono('A · B'),
         ' is small (only exactly 0 at 90°) — they share little information along each other\'s direction. In real high-dimensional NN work, this near-zero is what counts: near-orthogonal vectors are effectively independent, and exact 90° is not required.',
       ]
     }
     if (θ < 80) {
       return [
         'A and B partially overlap. ',
-        span({ class: 'mono' }, 'A · B'),
+        mono('A · B'),
         ' is positive — between 0 and |A||B|.',
       ]
     }
     return [
       'A and B partially oppose. ',
-      span({ class: 'mono' }, 'A · B'),
+      mono('A · B'),
       ' is negative — between −|A||B| and 0.',
     ]
   }
@@ -702,7 +712,7 @@ class DotSection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         'tensorgrad does not expose a standalone ',
-        span({ class: 'mono' }, 'dot'),
+        mono('dot'),
         ' op. Element-wise multiply, then sum:',
       ),
       specBox(
@@ -718,15 +728,15 @@ class DotSection extends ModeSection {
       ),
       div({ class: 'intro' },
         'In practice ML almost always wants many dot products at once, and those naturally live inside ',
-        span({ class: 'mono' }, 'matmul'),
+        mono('matmul'),
         ' (explained later). That\'s why tensorgrad doesn\'t bother with a standalone one; just use ',
-        span({ class: 'mono' }, 'sum(mul(a, b))'),
+        mono('sum(mul(a, b))'),
         '. Some frameworks like PyTorch (',
-        span({ class: 'mono' }, 'torch.dot'),
+        mono('torch.dot'),
         ') and JAX/NumPy (',
-        span({ class: 'mono' }, 'jnp.dot'),
+        mono('jnp.dot'),
         ' / ',
-        span({ class: 'mono' }, 'np.dot'),
+        mono('np.dot'),
         ') expose a standalone one, to cross the Ts and · the Is.',
       ),
     )
@@ -784,19 +794,19 @@ class MatmulSection extends ModeSection {
 
       div({ class: 'intro' },
         'The shape rule is ',
-        span({ class: 'mono' }, '[M × K] · [K × N] = [M × N]'),
+        mono('[M × K] · [K × N] = [M × N]'),
         '. The inner K dims must agree — K is the length of every dot product. M and N control how many output cells there are.',
       ),
 
       div({ class: 'intro' },
         'Matmul is the workhorse of neural networks: over 90% of the compute in a typical model. It earns that share by doing two conceptually different jobs, though always as the same operation. The first is the textbook neural-net picture: stacks of neurons connected by wires, every wire a learned weight, all packed into the matrix ',
-        span({ class: 'mono' }, 'W'),
+        mono('W'),
         '. Every output is a weighted sum of the inputs. This is called a ',
-        span({ class: 'italic' }, 'projection'),
+        italic('projection'),
         '; libraries call the building block a ',
-        span({ class: 'mono' }, 'Linear'),
+        mono('Linear'),
         ' layer, and the formula is ',
-        span({ class: 'mono' }, 'matmul(x, W) + b'),
+        mono('matmul(x, W) + b'),
         '. The second use of matmul is reading patterns back out of a vector that has many signals stacked into it — the next tab, Duality, is about exactly this.',
       ),
     )
@@ -853,11 +863,11 @@ class MatmulSection extends ModeSection {
   tensorgradView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        span({ class: 'mono' }, 'matmul(a, b)'),
+        mono('matmul(a, b)'),
         ' is bulk dot product: every row of ',
-        span({ class: 'mono' }, 'a'),
+        mono('a'),
         ' dotted against every column of ',
-        span({ class: 'mono' }, 'b'),
+        mono('b'),
         '.',
       ),
 
@@ -882,11 +892,11 @@ class MatmulSection extends ModeSection {
 
       div({ class: 'intro' },
         'When the data you have is shaped wrong for matmul\'s ',
-        span({ class: 'mono' }, '[M, K] · [K, N]'),
+        mono('[M, K] · [K, N]'),
         ' rule, you rearrange axes first with ',
-        span({ class: 'mono' }, 'swapAxes'),
+        mono('swapAxes'),
         '. Inside attention you will see ',
-        span({ class: 'mono' }, 'matmul(q, swapAxes(k, -1, -2))'),
+        mono('matmul(q, swapAxes(k, -1, -2))'),
         ' — K\'s last two axes get swapped so K\'s rows of features become the columns matmul wants to dot against. Pure shape-rearrangement, no math.',
       ),
     )
@@ -917,7 +927,7 @@ class DualitySection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         'Addition writes contributions into a shared vector. To pull one back out, you dot the shared vector against a ',
-        span({ class: 'italic' }, 'reader'),
+        italic('reader'),
         ' — another vector pointing in the direction of the contribution you want to recover.',
       ),
 
@@ -955,11 +965,11 @@ class DualitySection extends ModeSection {
 
       div({ class: 'intro' },
         'One reader gives you one number. To extract several at once, stack readers side by side into a matrix and apply ',
-        span({ class: 'mono' }, 'matmul'),
+        mono('matmul'),
         ' — each column is one reader direction. The matrix is learned. Write with ',
-        span({ class: 'mono' }, 'add'),
+        mono('add'),
         ', read with ',
-        span({ class: 'mono' }, 'matmul'),
+        mono('matmul'),
         '.',
       ),
 
@@ -974,9 +984,9 @@ class DualitySection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         'Duality is not a primitive — it is the pattern of writing with ',
-        span({ class: 'mono' }, 'add'),
+        mono('add'),
         ' and reading with ',
-        span({ class: 'mono' }, 'matmul'),
+        mono('matmul'),
         '. In isolation:',
       ),
 
@@ -1027,7 +1037,7 @@ class SoftmaxSection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         'Softmax turns a row of arbitrary numbers (logits, for instance the raw scores from a matmul-read) into a probability distribution: every output lands in ',
-        span({ class: 'mono' }, '[0, 1]'),
+        mono('[0, 1]'),
         ', the whole row sums to 1, and the biggest logit becomes the biggest probability. Differences between logits get exponentially amplified into gaps in probability.',
       ),
 
@@ -1042,7 +1052,7 @@ class SoftmaxSection extends ModeSection {
       ),
 
       div({ class: 'caption' },
-        'Softmax is like an inequality increaser: it turns scores into probabilities with most of the mass landing on the biggest one. Cells are tinted green if above the row average, red if below.',
+        'Softmax is an inequality increaser: it turns scores into probabilities with most of the mass landing on the biggest one. Cells are tinted green toward the row max, red toward the row min.',
       ),
 
       div({
@@ -1058,14 +1068,14 @@ class SoftmaxSection extends ModeSection {
 
       div({ class: 'intro' },
         'Differences in logits compound exponentially: a logit 1 unit higher becomes ~2.7× more probable (',
-        span({ class: 'mono' }, 'exp(1) ≈ 2.718'),
+        mono('exp(1) ≈ 2.718'),
         '); 5 units higher, ~148×. softmax is "winner-take-most" by default.',
       ),
 
       div({ class: 'intro' },
         'In language models, softmax is often applied with a ',
-        span({ class: 'italic' }, 'causal mask'),
-        ': future positions in each row are set to −∞ before normalizing, so they become 0 after exp. Why mask at all? A language model generates one token at a time, based on prior ones — that is all it has access to at runtime. But training computes loss for every position in parallel over the whole sequence. If position t could see t+1 during training, it would just copy the answer and the task collapses. Causal masking forces each training position to see only its past, so training and generation see the same information. The same idea applies to any model that generates a sequence one position at a time: audio, code, raster-order images.',
+        italic('causal mask'),
+        ': future positions in each row are set to −∞ before normalizing, so they become 0 after exp. Why mask at all? A language model generates one token at a time, based on prior ones — future tokens haven\'t been generated yet. But training computes loss for every position in parallel over the whole sequence. If position t could see t+1 during training, it would just copy the answer and the task collapses. Causal masking forces each training position to see only its past, so training and generation see the same information. The same idea applies to any model that generates a sequence one position at a time: audio, code, raster-order images.',
       ),
 
     )
@@ -1074,9 +1084,9 @@ class SoftmaxSection extends ModeSection {
   tensorgradView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        span({ class: 'mono' }, 'softmax(x, axis?)'),
+        mono('softmax(x, axis?)'),
         ' applies along one axis (default: last). The formula is ',
-        span({ class: 'mono' }, 'softmax(x)ᵢ = exp(xᵢ) / Σⱼ exp(xⱼ)'),
+        mono('softmax(x)ᵢ = exp(xᵢ) / Σⱼ exp(xⱼ)'),
         ', but exp can overflow for large inputs, so tensorgrad subtracts the row max before exp — the answer is identical because the same constant gets exp\'d into every term and cancels in the divide.',
       ),
       specBox(
@@ -1102,140 +1112,144 @@ class SoftmaxSection extends ModeSection {
 }
 
 // ---------- Composition / capstone section ----------
-class CompositionSection extends ModeSection {
-  conceptualView() {
+class CompositionSection extends Component {
+  view() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'One block of attention — the central operation of a transformer — composes the primitives add, dot, matmul, softmax into five stages.',
+        italic('Attention'),
+        ' is the central operation of a transformer. Given a sequence of positions — each one carrying a vector — it rewrites every position by drawing information from the other positions. Each position computes its own attention weights from its current vector, so the mix differs across positions and adapts to every input.',
       ),
 
       div({ class: 'intro' },
-        'Two shortcuts the stages below silently use. First: ',
-        span({ class: 'mono' }, 'x'),
-        ' in the code below means the residual after a LayerNorm step — the block applies ',
-        span({ class: 'mono' }, 'LayerNorm'),
-        ' to x before stage 1 (each position\'s D-dim vector gets centered and scaled to unit variance, then re-scaled by a learned gain), and we elide that here so the per-stage code stays clean.',
-      ),
-
-      div({ class: 'intro' },
-        'Second: attention runs in parallel across ',
-        span({ class: 'italic' }, 'heads'),
-        ' — each head operates on its own slice of the D-dim vector at each position. In this transformer D = 64 with 4 heads, so each head gets a 16-dim slice (64 ÷ 4). ',
-        span({ class: 'mono' }, 'splitHeads'),
-        ' rearranges shape ',
-        span({ class: 'mono' }, '[B, T, 64]'),
-        ' to ',
-        span({ class: 'mono' }, '[B, 4, T, 16]'),
-        ' — each head\'s slice on its own axis. ',
-        span({ class: 'mono' }, 'mergeHeads'),
-        ' concatenates them back. Neither op does any math; they only rearrange axes.',
+        'The five stages below add up to one attention layer. The input ',
+        mono('x'),
+        ' has shape ',
+        mono('[B, T, D]'),
+        ': T positions in the sequence, each carrying a D-dim vector, for B independent sequences in the batch. ',
+        mono('x'),
+        ' is the residual stream — at the first attention layer, it\'s what Embedding produced; at later layers, the previous layer\'s output. The cast — ',
+        mono('add'),
+        ', ',
+        mono('matmul'),
+        ', ',
+        mono('softmax'),
+        ', and the duality pattern — is the same one you met in the previous tabs.',
       ),
 
       div({ class: 'pipeline' },
-        this.stage(1, 'Project Q, K, V',
-          `const q = splitHeads(matmul(x, W_q), H)\nconst k = splitHeads(matmul(x, W_k), H)\nconst v = splitHeads(matmul(x, W_v), H)`,
-          'Three matmuls — each through its own learned matrix (W_q, W_k, W_v) — turn x into Q, K, V vectors at each position. splitHeads slices each into H heads.',
-          'x [B, T, D]  →  q, k, v  [B, H, T, d]'),
+        this.stage(1, 'Project x into query, key, value', 'x [B, T, D], Wq [D, D] → q [B, T, D]\nx [B, T, D], Wk [D, D] → k [B, T, D]\nx [B, T, D], Wv [D, D] → v [B, T, D]', {
+          code: `const q = matmul(x, p.Wq)\nconst k = matmul(x, p.Wk)\nconst v = matmul(x, p.Wv)`,
+          desc: [
+            'Three learned ',
+            mono('[D, D]'),
+            ' matrices project each D-dim vector in ',
+            mono('x'),
+            ' to a new D-dim vector — so ',
+            mono('q'),
+            ', ',
+            mono('k'),
+            ', ',
+            mono('v'),
+            ' keep ',
+            mono('x'),
+            '\'s shape. The three matrices are learned independently, so each gives a different view of the same ',
+            mono('x'),
+            ': ',
+            mono('q'),
+            ' (query) = what is this position looking for? ',
+            mono('k'),
+            ' (key) = what does this position offer to be matched against? ',
+            mono('v'),
+            ' (value) = what does this position carry to be passed along?',
+          ],
+        }),
         div({ class: 'pipeline-arrow' }, '↓'),
 
-        this.stage(2, 'Score every query against every key',
-          `const scores = mul(matmul(q, swapAxes(k, -1, -2)), 1 / Math.sqrt(d))`,
-          'One matmul produces every (query, key) dot product at once. swapAxes flips K\'s last two axes so the shape rule lines up. The 1/√d scaling keeps the numbers from going extreme before softmax.',
-          'q, k  →  scores  [B, H, T, T]'),
+        this.stage(2, 'Score every query against every key', 'q [B, T, D], k [B, T, D] →\n  scores [B, T, T]', {
+          code: `const scores = mul(matmul(q, swapAxes(k, -1, -2)), 1 / Math.sqrt(D))`,
+          desc: [
+            'For every pair of positions in the sequence, we want one number measuring how relevant they are to each other. The score for a pair is the dot product of one position\'s query with the other\'s key. With T positions, that\'s T × T scores total — which is why the output gained a second T and is now shape ',
+            mono('[B, T, T]'),
+            '. One ',
+            mono('matmul'),
+            ' produces every score in parallel. The ',
+            mono('1/√D'),
+            ' scaling keeps scores from going extreme before ',
+            mono('softmax'),
+            '.',
+          ],
+        }),
         div({ class: 'pipeline-arrow' }, '↓'),
 
-        this.stage(3, 'Turn scores into attention weights',
-          `const attn = softmaxCausal(scores)`,
-          'softmax turns each row of scores into a probability distribution. The "causal" variant masks future positions to −∞ first, so each query attends only to itself and earlier positions.',
-          'scores  →  attn  [B, H, T, T]'),
+        this.stage(3, 'Turn scores into attention weights', 'scores [B, T, T] →\n  attn [B, T, T]', {
+          code: `const attn = softmaxCausal(scores)`,
+          desc: [
+            'Scores are raw numbers; we want each row to be a proportional weighting that sums to 1, so the next stage can take a weighted average. ',
+            mono('softmax'),
+            ' does that. The causal variant zeros out future positions first (see the softmax tab for why).',
+          ],
+        }),
         div({ class: 'pipeline-arrow' }, '↓'),
 
-        this.stage(4, 'Weighted sum of values',
-          `const headOut = matmul(attn, v)`,
-          'Same matmul op as step 2, used differently. Each row of attn weights the V vectors (future positions are zero from the causal mask). matmul produces, for each query, the sum of those V vectors scaled by their attention weights. The duality pattern in action: matmul reading what add wrote.',
-          'attn, v  →  headOut  [B, H, T, d]'),
+        this.stage(4, 'Weighted sum of values', 'attn [B, T, T], v [B, T, D] →\n  mixed [B, T, D]', {
+          code: `const mixed = matmul(attn, v)`,
+          desc: [
+            'Each output position becomes a weighted sum of the value vectors, with the weights coming from ',
+            mono('attn'),
+            ' — so each position pulls in information from the positions it scored highly.',
+          ],
+        }),
         div({ class: 'pipeline-arrow' }, '↓'),
 
-        this.stage(5, 'Merge heads, project, add into residual',
-          `const blockOut = matmul(mergeHeads(headOut), W_o)\nconst newX     = add(x, blockOut)`,
-          'mergeHeads concatenates the per-head outputs back into one D-dim vector per position. One more matmul projects through learned matrix W_o. The result is added to x — this block\'s contribution to the residual stream, visible to every later block.',
-          'headOut  →  blockOut  [B, T, D]   + x  →  newX  [B, T, D]'),
+        this.stage(5, 'Fold the result back into x', 'x [B, T, D], mixed [B, T, D] →\n  newX [B, T, D]', {
+          code: `const newX = add(x, mixed)`,
+          desc: [
+            mono('add'),
+            ' writes ',
+            mono('mixed'),
+            ' into ',
+            mono('x'),
+            '. The result is the new residual — every later layer in the transformer reads it. Because ',
+            mono('x'),
+            ' is itself a summand, whatever attention added sits on top of ',
+            mono('x'),
+            ', not in place of it.',
+          ],
+        }),
       ),
 
       div({ class: 'intro' },
-        'That is one attention block. The transformer stacks several of these (a typical size is anywhere from 6 to 100+ layers). Each block reads the residual ',
-        span({ class: 'mono' }, 'x'),
-        ', computes its contribution from the primitives above, and adds it back. The load-bearing math is matmul, softmax, and add — the other names you will see in attention code (',
-        span({ class: 'mono' }, 'splitHeads'),
-        ', ',
-        span({ class: 'mono' }, 'mergeHeads'),
-        ', ',
-        span({ class: 'mono' }, 'Linear'),
-        ', ',
-        span({ class: 'mono' }, 'LayerNorm'),
-        ') are shape rearrangement and small pre-packaged subroutines layered on top.',
+        'Every primitive from the earlier tabs is doing what it did in isolation. ',
+        mono('matmul'),
+        ' appears as a projection (stage 1) and as a bulk dot product (stages 2 and 4). ',
+        mono('softmax'),
+        ' turns scores into a distribution (stage 3). ',
+        mono('add'),
+        ' writes a contribution into a shared vector (stage 5). The duality pattern wraps the layer: stage 1 reads ',
+        mono('x'),
+        ' with matmul, stage 5 writes back to ',
+        mono('x'),
+        ' with add.',
       ),
 
       div({ class: 'intro' },
-        'After attention each block also runs an MLP and adds its output too. The MLP is ',
-        span({ class: 'mono' }, 'matmul → relu → matmul'),
-        ' — two matmuls with a pointwise nonlinearity between them — then added into the residual.',
+        'Attention layers like this one repeat throughout a transformer (6 to 100+ layers, interleaved with MLP layers). Each layer reads ',
+        mono('x'),
+        ', computes its contribution, and adds it back.',
       ),
     )
   }
 
-  stage(num: number, title: string, code: string, desc: string, shapes: string) {
+  stage(num: number, title: string, shapes: string, opts: { code?: string, desc?: HValues }) {
     return div({ class: 'pipeline-stage' },
-      div({ class: 'pipeline-stage-num' }, String(num)),
-      div({ class: 'pipeline-stage-body' },
-        div({ class: 'pipeline-stage-title' }, title),
-        pre({ class: 'pipeline-stage-code' }, code),
-        div({ class: 'pipeline-stage-desc' }, desc),
-        div({ class: 'pipeline-stage-shapes' }, shapes),
+      div({ class: 'pipeline-stage-head' },
+        span({ class: 'pipeline-stage-num' }, `${num}.`),
+        ' ',
+        title,
       ),
-    )
-  }
-
-  tensorgradView() {
-    return div({ class: 'tab-content-inner' },
-      div({ class: 'intro' },
-        'Here is an attention block, top to bottom. The load-bearing math is the matmul / softmax / add you just learned. The rest — ',
-        span({ class: 'mono' }, 'splitHeads'),
-        ', ',
-        span({ class: 'mono' }, 'mergeHeads'),
-        ', and the ',
-        span({ class: 'mono' }, '.fwd'),
-        ' wrappers on ',
-        span({ class: 'mono' }, 'Linear'),
-        ' and ',
-        span({ class: 'mono' }, 'LayerNorm'),
-        ' — is shape management and module abstraction layered on top.',
-      ),
-
-      specBox(
-        `function attentionFwd(p: Attention, x: Tensor): Tensor {\n  const q = splitHeads(p.q.fwd(x), N_HEADS)\n  const k = splitHeads(p.k.fwd(x), N_HEADS)\n  const v = splitHeads(p.v.fwd(x), N_HEADS)\n  const scores = mul(matmul(q, swapAxes(k, -1, -2)), 1 / Math.sqrt(D_HEAD))\n  const attn = softmaxCausal(scores)\n  return p.o.fwd(mergeHeads(matmul(attn, v)))\n}`,
-        [
-          [
-            'Six lines of body. Three projections produce Q, K, V; one matmul scores; one softmax normalizes; one matmul reads weighted values; one final projection (',
-            'p.o.fwd', ') mixes the heads. The core math is matmul, softmax (causal variant), and add; ',
-            'splitHeads', ' and ', 'mergeHeads', ' are pure shape rearrangement.',
-          ],
-        ],
-      ),
-
-      specBox(
-        `function blockFwd(p: Block, x: Tensor): Tensor {\n  const a = attentionFwd(p.attn, p.ln1.fwd(x))\n  const x1 = add(x, a)\n  return add(x1, mlpFwd(p.mlp, p.ln2.fwd(x1)))\n}`,
-        [
-          [
-            'And the surrounding block. Attention runs over a normalized copy of ',
-            'x', '; the result is added to ',
-            'x', '. MLP runs over a normalized copy of ',
-            'x1', '; its result is added to ',
-            'x1', '. Every transformer block is two additions to the residual stream — one from attention, one from the MLP. Stack ',
-            'N_LAYERS', ' of these and you have the transformer.',
-          ],
-        ],
-      ),
+      div({ class: 'pipeline-stage-shapes' }, shapes),
+      opts.code ? pre({ class: 'pipeline-stage-code' }, opts.code) : null,
+      opts.desc ? div({ class: 'pipeline-stage-desc' }, opts.desc) : null,
     )
   }
 }
@@ -1293,7 +1307,7 @@ class Root extends Component implements IRoot {
             { key: 'matmul',      label: 'matmul',      content: this.matmulSection.view() },
             { key: 'duality',     label: 'Duality',     content: this.dualitySection.view() },
             { key: 'softmax',     label: 'softmax',     content: this.softmaxSection.view() },
-            { key: 'composition', label: 'Altogether now', content: this.compositionSection.view() },
+            { key: 'composition', label: 'Attention',    content: this.compositionSection.view(), hideSubBar: true },
           ],
           subBar: this.viewModeBar(),
         }),
@@ -1392,7 +1406,7 @@ body {
 .subtitle {
   color: var(--text-muted);
   margin: 4px 0 0;
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.6;
   max-width: 720px;
 }
@@ -1418,7 +1432,7 @@ body {
   border-bottom: 2px solid transparent;
   background: transparent;
   font: inherit;
-  font-size: 14.5px;
+  font-size: 16px;
   cursor: pointer;
   color: var(--text-muted);
   border-radius: 0;
@@ -1451,7 +1465,7 @@ body {
   background: var(--bg);
   color: var(--text-muted);
   font: inherit;
-  font-size: 12.5px;
+  font-size: 14px;
   cursor: pointer;
   position: relative;
   border-radius: 0;
@@ -1484,7 +1498,7 @@ body {
 
 .intro {
   color: var(--text);
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.65;
   max-width: 720px;
 }
@@ -1504,7 +1518,8 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
   display: block;
-  flex-shrink: 0;
+  max-width: 100%;
+  height: auto;
 }
 
 .side-panel {
@@ -1520,7 +1535,7 @@ body {
   flex-direction: column;
   gap: 6px;
   font-family: monospace;
-  font-size: 16px;
+  font-size: 17px;
 }
 
 .detail-row {
@@ -1537,7 +1552,7 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  font-size: 12.5px;
+  font-size: 14px;
   color: var(--text-muted);
 }
 
@@ -1553,7 +1568,7 @@ body {
 }
 
 .caption {
-  font-size: 14.5px;
+  font-size: 16px;
   color: var(--text-muted);
   line-height: 1.55;
   font-style: italic;
@@ -1575,7 +1590,7 @@ body {
   border-radius: 6px;
   padding: 12px 14px;
   font-family: monospace;
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.6;
   margin: 0 0 12px;
   overflow-x: auto;
@@ -1585,7 +1600,7 @@ body {
 
 .spec-caption {
   color: var(--text-muted);
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.65;
   margin: 0;
 }
@@ -1606,7 +1621,7 @@ body {
 
 .mat-label {
   font-family: monospace;
-  font-size: 12.5px;
+  font-size: 14px;
   color: var(--text-muted);
   margin-bottom: 6px;
   letter-spacing: 0.02em;
@@ -1629,7 +1644,7 @@ body {
   height: var(--cell-h);
   background: var(--cell-bg);
   font-family: monospace;
-  font-size: 14.5px;
+  font-size: 16px;
   font-weight: 500;
   user-select: none;
   transition: background 120ms, box-shadow 120ms;
@@ -1673,14 +1688,14 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
   font-family: monospace;
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.85;
   color: var(--text);
   overflow-x: auto;
 }
 
 .expr-lhs    { font-weight: 600; }
-.expr-result { font-weight: 700; font-size: 16px; }
+.expr-result { font-weight: 700; font-size: 17px; }
 
 /* Tensors tab */
 .shape-ladder {
@@ -1699,7 +1714,7 @@ body {
 }
 
 .shape-rung-label {
-  font-size: 12.5px;
+  font-size: 14px;
   font-weight: 600;
   color: var(--text);
   letter-spacing: 0.04em;
@@ -1708,7 +1723,7 @@ body {
 
 .shape-rung-notation {
   font-family: monospace;
-  font-size: 12.5px;
+  font-size: 14px;
   color: var(--text-muted);
 }
 
@@ -1725,14 +1740,14 @@ body {
 }
 
 .embed-title {
-  font-size: 14.5px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text);
   margin-bottom: 6px;
 }
 
 .embed-prose {
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.6;
   color: var(--text-muted);
   margin-bottom: 14px;
@@ -1772,7 +1787,7 @@ body {
 
 .embed-idx {
   font-family: monospace;
-  font-size: 14.5px;
+  font-size: 16px;
   color: var(--text-muted);
   min-width: 22px;
   text-align: right;
@@ -1796,7 +1811,7 @@ body {
 
 .embed-out-call {
   font-family: monospace;
-  font-size: 14.5px;
+  font-size: 16px;
   color: var(--text);
   padding: 4px 8px;
   background: var(--bg);
@@ -1819,65 +1834,26 @@ body {
 }
 
 .pipeline-stage {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 14px 18px;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pipeline-stage-head {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text);
 }
 
 .pipeline-stage-num {
   font-family: monospace;
-  font-size: 22px;
-  font-weight: 700;
   color: var(--accent);
-  min-width: 28px;
-  line-height: 1.1;
-}
-
-.pipeline-stage-body {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-
-.pipeline-stage-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.pipeline-stage-title {
-  font-size: 14.5px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.pipeline-stage-ops {
-  display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-}
-
-.pipeline-op-chip {
-  font-family: monospace;
-  font-size: 12.5px;
-  background: var(--code-bg);
-  border: 1px solid var(--code-border);
-  border-radius: 4px;
-  padding: 2px 8px;
-  color: var(--text);
-  white-space: nowrap;
+  margin-right: 2px;
 }
 
 .pipeline-stage-code {
   font-family: monospace;
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.5;
   color: var(--text);
   background: var(--code-bg);
@@ -1890,21 +1866,22 @@ body {
 }
 
 .pipeline-stage-desc {
-  font-size: 14.5px;
+  font-size: 16px;
   color: var(--text-muted);
   line-height: 1.55;
 }
 
 .pipeline-stage-shapes {
   font-family: monospace;
-  font-size: 12.5px;
+  font-size: 16px;
+  line-height: 1.5;
   color: var(--text);
-  padding: 6px 10px;
-  background: var(--bg);
-  border: 1px solid var(--border);
+  padding: 8px 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
   border-radius: 4px;
   overflow-x: auto;
-  white-space: nowrap;
+  white-space: pre;
 }
 
 .pipeline-arrow {
@@ -1941,7 +1918,7 @@ body {
 .sm-step-label {
   padding: 0 14px;
   color: var(--text-muted);
-  font-size: 14.5px;
+  font-size: 16px;
   justify-content: flex-start;
   gap: 8px;
   white-space: nowrap;
@@ -1949,7 +1926,7 @@ body {
 
 .sm-header {
   justify-content: center;
-  font-size: 12.5px;
+  font-size: 14px;
   color: var(--text-muted);
   letter-spacing: 0.04em;
 }
@@ -1957,7 +1934,7 @@ body {
 .sm-header-row { background: var(--cell-bg); }
 
 .sm-aside {
-  font-size: 12.5px;
+  font-size: 14px;
   color: var(--text-muted);
   opacity: 0.85;
 }
