@@ -7,7 +7,7 @@ name: Transformer (tensorgrad)
 
 ```tsx
 import presetWind3 from '@unocss/preset-wind3'
-import { App, Component, div, h1, button, span, p, a, svg, rect, path, line, text, circle, animate, formField, inputRange, type VElement } from 'domeleon'
+import { App, Component, div, h1, button, span, p, a, svg, g, rect, path, line, text, circle, animate, formField, inputRange, type VElement } from 'domeleon'
 import { UnoThemeManager, type ThemeProxy } from 'domeleon/unocss'
 import { inputNumber } from 'domeleon/maskito'
 
@@ -2127,7 +2127,7 @@ class ExplainerPanel extends Component {
   diagramLegendSvg(W: number, H: number): VElement[] {
     const muted = themeMgr.theme.colors.textMuted.css
     const c = themeMgr.theme.colors
-    const y = H - 12
+    const y = H - 10
     const swatchGap = 6, itemGap = 20, charW = 6, fontSize = '11'
 
     type Shape = { width: number; render: (fill: string, x: number) => VElement }
@@ -2180,19 +2180,28 @@ class ExplainerPanel extends Component {
     const tokLabel = (t: number) => (t < 0 || t >= TOKEN_LABELS.length) ? '?' : TOKEN_LABELS[t]
 
     const N_POS = 8
-    const N_ROWS = N_LAYERS + 1
+    const N_ROWS = N_LAYERS + 2   // head + N_LAYERS layers + embed
     const cellW = 80
     const nodeH = 92        // layer-node height; tuned so the K/V→attn stub reads as a distinct segment
-    const embedNodeH = 50   // embedding row is a lookup box, no internal blocks
-    const padL = 80, padR = 20, padT = 50, padB = 76  // padB fits the in-SVG legend
+    const embedNodeH = 50   // embedding row: tok + pos lookups feed ⊕
+    const headNodeH = 50    // head row: lnf + tied unembed projection (residual → vocab)
+    const padL = 80, padR = 20, padT = 14, padB = 32  // stable frame; padB fits the in-SVG legend
+    // Content shift inside the stable frame. Reducing padL would shrink W and
+    // (with `w-full` sizing) make the whole SVG appear zoomed in; instead, we
+    // keep W/H constant and offset content (and the legend, via <g>) here.
+    const shiftX = -8
+    const shiftY = -10
+    const rowHeights = [headNodeH, nodeH, nodeH, nodeH, embedNodeH]
     const W = padL + cellW * N_POS + padR
-    const H = padT + nodeH * N_LAYERS + embedNodeH + padB
-    const xAt = (p: number) => padL + cellW * (p + 0.5)
-    const yTop = (rowFromTop: number) => padT + rowFromTop * nodeH
-    // Embedding at bottom, Layer 3 at top.
+    const H = padT + rowHeights.reduce((s, h) => s + h, 0) + padB
+    const xAt = (p: number) => padL + shiftX + cellW * (p + 0.5)
+    const yTop = (rowFromTop: number) =>
+      padT + shiftY + rowHeights.slice(0, rowFromTop).reduce((s, h) => s + h, 0)
+    // Head at top, embedding at bottom; layers in between.
+    const rowHead = 0
     const rowEmbed = N_ROWS - 1
-    const layerRowsTopDown = [0, 1, 2]
-    const rowLabels = ['Layer 3', 'Layer 2', 'Layer 1', 'Embedding']
+    const layerRowsTopDown = [1, 2, 3]
+    const rowLabels = ['Unembed', 'Layer 3', 'Layer 2', 'Layer 1', 'Embed']
 
     const residualColor = themeMgr.theme.colors.primary.css
     const errorColor = themeMgr.theme.colors.error.css
@@ -2201,6 +2210,7 @@ class ExplainerPanel extends Component {
     const mlpColor = themeMgr.theme.colors.mlp.css
     const mutedCol = themeMgr.theme.colors.textMuted.css
     const textCol = themeMgr.theme.colors.text.css
+    const borderCol = themeMgr.theme.colors.border.css
     const nodeFill = themeMgr.theme.colors.surface.css
     const bgColor = themeMgr.theme.colors.background.css
 
@@ -2268,12 +2278,17 @@ class ExplainerPanel extends Component {
     // ===== Drawing =====
 
     // Residual: drawn bottom-to-top so dashes march upward (flow direction).
+    // Starts at the ⊕ inside the embed row (tok + pos merge); ends inside the
+    // head row entering the unembed box from below (which then displays the
+    // model's prediction at that position).
+    const embedMergeY = 7      // ⊕ y-offset within embed row
+    const headArrowY = 37      // arrowhead tip y-offset within head row (box bottom)
     for (let p = 0; p < N_POS; p++) {
       flowPath(
-        `M ${xAt(p)} ${yTop(rowEmbed) + embedNodeH} L ${xAt(p)} ${yTop(0) - 14}`,
+        `M ${xAt(p)} ${yTop(rowEmbed) + embedMergeY} L ${xAt(p)} ${yTop(rowHead) + headArrowY + 6}`,
         residualColor, 2
       )
-      arrowhead(xAt(p), yTop(0) - 22, 'up', residualColor, 8, 5)
+      arrowhead(xAt(p), yTop(rowHead) + headArrowY, 'up', residualColor, 6, 4)
     }
 
     // Each layer node = attn block (bottom) + MLP block (top), each with a pre-LN
@@ -2349,83 +2364,108 @@ class ExplainerPanel extends Component {
       }
     }
 
+    // Boxes for embed (tok + pos) and unembed: same size, hold actual values.
+    // Stroke is `border` (low-contrast palette tone) so the cell outlines don't
+    // outshine the digits inside — including green digits on correct predictions.
+    const lookupW = 24
+    const lookupH = 22
+    const lookupStroke = borderCol
+    const lookupYHead = 15
+    // Embed boxes shifted down so the arrow's vertical leg equals its
+    // horizontal leg (perfectly square turn into ⊕).
+    const lookupYEmbed = embedMergeY + 10  // boxCx (14) − ⊕ radius (4)
+
+    // Embed row: tok and pos lookups (off-axis) feed ⊕ on the residual line.
+    // The ⊕ is where positional info enters the model. Positions 6/7 hold the
+    // model's prior ones/tens prediction fed back (colored by correctness).
     for (let p = 0; p < N_POS; p++) {
       const nodeY = yTop(rowEmbed)
       const cx = xAt(p)
-      elements.push(rect({
-        x: cx - 14, y: nodeY + 15, width: '28', height: '20',
-        fill: nodeFill, stroke: residualColor, strokeWidth: '1.5', rx: '3'
-      }))
-      elements.push(text({
-        x: cx, y: nodeY + 28,
-        textAnchor: 'middle', fontSize: '8', fontFamily: 'monospace',
-        fill: mutedCol
-      }, 'embed'))
-    }
-
-    for (let i = 0; i < N_ROWS; i++) {
-      elements.push(text({
-        x: padL - 4, y: yTop(i) + (i === rowEmbed ? embedNodeH : nodeH) / 2 + 4,
-        textAnchor: 'end', fontSize: '11', fontFamily: 'monospace',
-        fill: mutedCol
-      }, rowLabels[i]))
-    }
-
-    // Positions 6 and 7 are the model's own ones/tens predictions fed back —
-    // colored green/red to surface the autoregressive error cascade.
-    for (let p = 0; p < N_POS; p++) {
-      const cx = xAt(p)
+      const mergeY = nodeY + embedMergeY
+      const boxY = nodeY + lookupYEmbed
       const tok = inputTok[p]
       const isResultInput = p >= 6
       const resultInputWrong = isResultInput && tok >= 0 && tok !== trueResultDigits[p - 6]
+      const tokColor =
+        !isResultInput ? textCol :
+        tok < 0 ? mutedCol :
+        resultInputWrong ? errorColor :
+        residualColor
+      // tok box (left of center)
+      elements.push(rect({
+        x: cx - 26, y: boxY, width: String(lookupW), height: String(lookupH),
+        fill: nodeFill, stroke: lookupStroke, strokeWidth: '1.5', rx: '2'
+      }))
       elements.push(text({
-        x: cx, y: yTop(rowEmbed) + embedNodeH + 18,
+        x: cx - 14, y: boxY + 16,
         textAnchor: 'middle', fontSize: '15', fontFamily: 'monospace', fontWeight: 'bold',
-        fill: isResultInput ? (resultInputWrong ? errorColor : residualColor) : textCol
+        fill: tokColor
       }, tokLabel(tok)))
+      // pos box (right of center)
+      elements.push(rect({
+        x: cx + 2, y: boxY, width: String(lookupW), height: String(lookupH),
+        fill: nodeFill, stroke: lookupStroke, strokeWidth: '1.5', rx: '2'
+      }))
       elements.push(text({
-        x: cx, y: yTop(rowEmbed) + embedNodeH + 32,
-        textAnchor: 'middle', fontSize: '8', fontFamily: 'monospace',
+        x: cx + 14, y: boxY + 16,
+        textAnchor: 'middle', fontSize: '15', fontFamily: 'monospace',
         fill: mutedCol
-      }, `pos ${p}`))
+      }, String(p)))
+      // Branches up to ⊕. Arrowheads end at the circle edge (r=4).
+      flowPath(`M ${cx - 14} ${boxY} L ${cx - 14} ${mergeY} L ${cx - 4} ${mergeY}`, residualColor)
+      arrowhead(cx - 4, mergeY, 'right', residualColor)
+      flowPath(`M ${cx + 14} ${boxY} L ${cx + 14} ${mergeY} L ${cx + 4} ${mergeY}`, residualColor)
+      arrowhead(cx + 4, mergeY, 'left', residualColor)
+      drawMerge(cx, mergeY)
     }
 
-    // Operand-position "predictions" are muted — the loss never trains those.
+    // Head row: residual is consumed by the unembed projection (matmul with
+    // tok_emb^T, preceded by final LN). Box shows the model's prediction at
+    // each position — positions 5/6/7 are the ones/tens/hundreds result
+    // digits (green/red by correctness); 0–4 are untrained next-operand
+    // guesses, shown muted.
     for (let p = 0; p < N_POS; p++) {
+      const nodeY = yTop(rowHead)
       const cx = xAt(p)
+      const boxY = nodeY + lookupYHead
       let label = '?'
       let isPred = false
       let isWrong = false
       if (p < 5) {
         label = tokLabel(groundTruthNext[p])
       } else {
-        const idx = p - 5  // 0=ones, 1=tens, 2=hundreds
-        const tok = predicted[idx]
-        if (tok !== undefined) {
-          label = tokLabel(tok)
+        const idx = p - 5
+        const t = predicted[idx]
+        if (t !== undefined) {
+          label = tokLabel(t)
           isPred = true
-          isWrong = tok !== trueResultDigits[idx]
+          isWrong = t !== trueResultDigits[idx]
         }
       }
+      const fillColor = isPred ? (isWrong ? errorColor : residualColor) : mutedCol
+      elements.push(rect({
+        x: cx - 12, y: boxY, width: String(lookupW), height: String(lookupH),
+        fill: nodeFill, stroke: lookupStroke, strokeWidth: '1.5', rx: '2'
+      }))
       elements.push(text({
-        x: cx, y: yTop(0) - 30,
-        textAnchor: 'middle', fontSize: '15', fontFamily: 'monospace',
-        fontWeight: isPred ? 'bold' : 'normal',
-        fill: isPred ? (isWrong ? errorColor : residualColor) : mutedCol
+        x: cx, y: boxY + 16,
+        textAnchor: 'middle', fontSize: '15', fontFamily: 'monospace', fontWeight: 'bold',
+        fill: fillColor
       }, label))
     }
-    elements.push(text({
-      x: padL - 4, y: yTop(0) - 30,
-      textAnchor: 'end', fontSize: '10', fontFamily: 'monospace',
-      fill: mutedCol
-    }, 'predicts →'))
-    elements.push(text({
-      x: padL - 4, y: yTop(rowEmbed) + embedNodeH + 18,
-      textAnchor: 'end', fontSize: '10', fontFamily: 'monospace',
-      fill: mutedCol
-    }, 'input →'))
 
-    elements.push(...this.diagramLegendSvg(W, H))
+    for (let i = 0; i < N_ROWS; i++) {
+      // Embed row's boxes are shifted down 2px (square-arrow alignment);
+      // keep the row label tracking with them.
+      const extra = i === rowEmbed ? (lookupYEmbed - lookupYHead) : 0
+      elements.push(text({
+        x: padL + shiftX - 4, y: yTop(i) + rowHeights[i] / 2 + 4 + extra,
+        textAnchor: 'end', fontSize: '11', fontFamily: 'monospace',
+        fill: mutedCol
+      }, rowLabels[i]))
+    }
+
+    elements.push(g({ transform: `translate(${shiftX} ${shiftY})` }, this.diagramLegendSvg(W, H)))
 
     return svg({
       viewBox: `0 0 ${W} ${H}`,
