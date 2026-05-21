@@ -2065,7 +2065,7 @@ class WiresPanel extends Component {
 }
 
 // ---------- Explainer panel ----------
-type ExplainerTopic = 'training' | 'architecture' | 'takeaways'
+type ExplainerTopic = 'training' | 'architecture' | 'notes'
 
 class ExplainerPanel extends Component {
   get root() { return this.ctx.root as any as IRoot }
@@ -2076,7 +2076,7 @@ class ExplainerPanel extends Component {
     const topics: { id: ExplainerTopic; label: string }[] = [
       { id: 'training', label: 'Training' },
       { id: 'architecture', label: 'Architecture' },
-      { id: 'takeaways', label: 'Takeaways' }
+      { id: 'notes', label: 'Notes' }
     ]
     return div({ class: styles.explainerContainer },
       div({ class: 'flex gap-x-3 gap-y-0 mb-3 flex-wrap' },
@@ -2094,7 +2094,7 @@ class ExplainerPanel extends Component {
     switch (this.selectedTopic) {
       case 'training': return this.trainingView()
       case 'architecture': return this.architectureView()
-      case 'takeaways': return this.takeawaysView()
+      case 'notes': return this.notesView()
     }
   }
 
@@ -2108,16 +2108,16 @@ class ExplainerPanel extends Component {
 
   architectureView() {
     return div(
-      p(`What flows through every channel in the diagram below is a ${D_MODEL}-dim vector — a single point in ${D_MODEL}-dimensional space, where the model encodes information as *directions*. The ⊕ nodes in the diagram mark where two such vectors are added element-wise: ${D_MODEL} dimensions has enough room that the original contributions stay distinguishable downstream. For the foundations — what a tensor is, what these additions are doing here, and how all of this composes into attention — see this `, a({ href: 'https://typebulb.com/u/samples/tensors/full', target: '_blank' }, 'interactive Tensors tutorial'), '.'),
-      p(`The residual stream is the vertical channel: at every position, it runs upward through all ${N_LAYERS} layers. Every block in every layer reads from it and writes back into it at ⊕. In the diagram, it's the green vertical line at each position; ⊕ marks where a block writes back.`),
-      p('The K/V stream is the horizontal channel: at each layer, K and V at every position are made available to all later positions in that same layer. Only attention reads from it; each position\'s MLP reads only its own residual. In the diagram, the K/V bus is the horizontal line under each layer; each purple K/V circle writes to it, each attention block reads from it. Causal flow runs left-to-right.')
+      p(`What flows through every channel in the diagram below is a ${D_MODEL}-dim vector — a single point in ${D_MODEL}-dimensional space, where the model encodes information as *directions*. At the bottom, the residual starts where token and position vectors merge at ⊕ (so the model sees order); ${D_MODEL} dimensions has enough room to keep them distinguishable downstream. For the foundations — what a tensor is, what these additions are doing here — see this `, a({ href: 'https://typebulb.com/u/samples/tensors/full', target: '_blank' }, 'interactive Tensors tutorial'), '.'),
+      p(`The residual stream is the vertical channel: at every position, it runs upward through all ${N_LAYERS} layers. Every block in every layer reads from it and writes back into it at ⊕. In the diagram, it's the green vertical line at each position. At the top, the same token-embedding matrix transposed turns the final residual into a prediction.`),
+      p('The K/V stream is the horizontal channel: at each layer, K and V at every position are made available to all later positions in that same layer. Only attention reads from it; each position\'s MLP reads only its own residual. In the diagram, the K/V bus is the horizontal line under each layer; each purple K/V circle writes to it, each attention block reads from it. Causal flow runs left-to-right, but the work is parallel — what RNNs do step by step, transformers do in one pass.')
     )
   }
 
-  takeawaysView() {
+  notesView() {
     return div(
-      p('In this small transformer, MLPs do roughly two-thirds of the FLOPs and most of the non-linearity (softmax inside attention is the other source). Most of the rest is the attention heads, which serve as information routers. (In much larger LLMs with long sequences, attention\'s share grows.)'),
-      p('The precise architecture for this transformer also looks like ', a({ href: 'https://tinyurl.com/44ayrzfp', target: '_blank' }, 'this'), ', diagrammed by nn-dna, a tool that turns plain-English descriptions of neural networks into architecture diagrams.'),
+      p('In small transformers, MLPs do roughly two-thirds of the FLOPs and supply all the element-wise nonlinearity; attention\'s nonlinearity is via softmax. Most of the rest is the attention heads, which serve as information routers. (In much larger LLMs with long sequences, attention\'s share grows.)'),
+      p('See ', a({ href: 'https://tinyurl.com/44ayrzfp', target: '_blank' }, 'this transformer diagrammed by nn-dna'), ', which generates architecture diagrams from plain-English descriptions of neural networks.'),
       p('Co-built with Claude Opus 4.7; inspired by @repligate / j⧉nus\'s "How Information Flows Through Transformers".')
     )
   }
