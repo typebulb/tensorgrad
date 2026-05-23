@@ -1284,9 +1284,15 @@ class CompositionSection extends Component {
         mono('add'),
         ' instead of replace: the original ',
         mono('X'),
-        ' survives. Context layers on top — what attention found is added alongside, not in place of. (Transformers also have a layer normalization step that keeps ',
+        ' survives. Context layers on top — what attention found is added alongside, not in place of.',
+      ),
+
+      div({ class: 'intro' },
+        'Transformers also include a normalization step somewhere in each block — RMSNorm or LayerNorm — that keeps ',
         mono('X'),
-        '\'s magnitudes bounded across many stacked layers.)',
+        '\'s magnitudes bounded across many stacked layers. See this ',
+        a({ href: 'https://tinyurl.com/44ayrzfp', target: '_blank' }, 'transformer architecture diagrammed by nn-dna'),
+        ' for where it sits alongside the attention and MLP sub-layers.',
       ),
 
       div({ class: 'intro' },
