@@ -8,7 +8,7 @@ name: Vectors and Tensors
 ```tsx
 import {
   App, Component, div, h1, p, span, pre, button, input,
-  svg, line, circle, polygon, text, g,
+  svg, line, polygon, text, g, rect,
   type VElement, type HValues,
 } from 'domeleon'
 
@@ -24,20 +24,79 @@ const fmt = (x: number, d = 2): string => {
 const mono   = (...c: HValues[]) => span({ class: 'mono' }, c)
 const italic = (...c: HValues[]) => span({ class: 'italic' }, c)
 
-// ---------- Number-cell coloring + small row viz (shared across Shapes / Embedding) ----------
+// Centered monospace formula, the standard way to surface an equation inside .intro prose.
+const formula = (text: string) => div({ class: 'formula-display' }, mono(text))
+
+// Vector dot product: Σᵢ aᵢ·bᵢ. Works on any number[] (Vec2, Vec5, vec, ...).
+const dotVec = (a: number[], b: number[]) =>
+  a.reduce((s, x, i) => s + x * b[i]!, 0)
+
+// Tri-state color from a signed value (eps avoids floor-noise flicker at zero).
+const signColor = (v: number, eps = 0.01) =>
+  v > eps ? 'var(--positive)' : v < -eps ? 'var(--negative)' : 'var(--zero)'
+
+// CSS color-mix tint: blend `color` at `pct`% with the cell background.
+const tintBg = (color: string, pct: number) =>
+  `color-mix(in srgb, ${color} ${pct}%, var(--cell-bg))`
+
+// ---------- Number-cell coloring + grid helpers (shared across Shapes / Embedding / Matmul) ----------
 const numClass = (v: number) => v === 0 ? 'num-zero' : v > 0 ? 'num-pos' : 'num-neg'
 
-function rowCells(values: number[]) {
-  return div({ class: 'embed-cells' },
-    values.map(v => div({ class: ['mat-cell', numClass(v)] }, String(v))),
-  )
+const numCell = (v: number) => div({ class: ['mat-cell', numClass(v)] }, String(v))
+
+// CSS-grid container of mat-cells with cols equal-width columns. Callers
+// supply the cells, so highlight/selection variants can build their own.
+function matGrid(cols: number, children: HValues) {
+  return div({
+    class: 'mat-grid',
+    style: { gridTemplateColumns: `repeat(${cols}, var(--cell-w))` },
+  }, children)
 }
 
-const SAMPLE_EMBED_TABLE: number[][] = [
-  [ 1,  0, -1,  2],
-  [ 0,  2,  1, -1],
-  [-1,  1,  2,  0],
+// Plain matrix of numbers, sign-colored.
+function numGrid(rows: number[][]) {
+  return matGrid(rows[0]!.length, rows.flatMap(r => r.map(numCell)))
+}
+
+function rowCells(values: number[]) {
+  return div({ class: 'cell-row' }, values.map(numCell))
+}
+
+// 5 tokens × 4 dims. Four named axes used:
+//   dim 0 = pet         (cat, dog)
+//   dim 1 = cat-ness    (cat, catwoman; dog mildly anti)
+//   dim 2 = temperature (hot positive, cold negative — same axis, opposite signs)
+//   dim 3 = sexy        (hot, catwoman)
+// dog's -1 on cat-ness ensures dog·dog > dog·cat: without it, a vector that's
+// a directional subset of another ties its raw self-dot, which reads weird in
+// the widget's diagonal.
+// catwoman bridges two clusters (cat-ness AND sexy) — a polysemous token.
+const NAMED_EMBED_TABLE: { name: string; vec: number[] }[] = [
+  { name: 'cat',       vec: [ 3,  2,  0,  0] },
+  { name: 'dog',       vec: [ 3, -1,  0,  0] },
+  { name: 'hot',       vec: [ 0,  0,  3,  2] },
+  { name: 'cold',      vec: [ 0,  0, -3,  0] },
+  { name: 'catwoman',  vec: [ 0,  3,  0,  2] },
 ]
+
+// Shared worked example for the matmul tab and the Shapes tab's matmul-stack
+// viz. Lives at module scope so both sections reference the same source of
+// truth instead of one section reaching into the other.
+const MATMUL_EXAMPLE = (() => {
+  const A: number[][] = [
+    [1,  2, -1],
+    [0,  1,  1],
+  ]
+  const B: number[][] = [
+    [ 1,  0],
+    [-1,  2],
+    [ 1,  1],
+  ]
+  const C = A.map(rowA => range(B[0]!.length).map(j =>
+    dotVec(rowA, B.map(r => r[j]!)),
+  ))
+  return { A, B, C }
+})()
 
 type Vec2 = [number, number]
 
@@ -78,14 +137,8 @@ function sliderRow(opts: {
 function relMagBg(value: number, rowMin: number, rowMax: number): string | undefined {
   if (rowMax === rowMin) return undefined
   const t = (value - rowMin) / (rowMax - rowMin)
-  if (t > 0.55) {
-    const pct = Math.round((t - 0.5) * 2 * 35)
-    return `color-mix(in srgb, var(--positive) ${pct}%, var(--cell-bg))`
-  }
-  if (t < 0.45) {
-    const pct = Math.round((0.5 - t) * 2 * 35)
-    return `color-mix(in srgb, var(--negative) ${pct}%, var(--cell-bg))`
-  }
+  if (t > 0.55) return tintBg('var(--positive)', Math.round((t - 0.5) * 2 * 35))
+  if (t < 0.45) return tintBg('var(--negative)', Math.round((0.5 - t) * 2 * 35))
   return undefined
 }
 
@@ -105,19 +158,18 @@ function stepRow(label: HValues, values: number[], digits: number, cellClass: st
   ]
 }
 
-// One "label = value" row in a side panel, with optional colors / weight / aside.
+// One "label = value" row in a side panel, with optional colors / weight.
 function detailRow(opts: {
   label: HValues
   value: HValues
   lblColor?: string
   valColor?: string
   valWeight?: string
-  aside?: string
 }) {
   return div({ class: 'detail-row' },
     span({
       class: 'detail-lbl',
-      style: opts.lblColor ? { color: opts.lblColor } : undefined,
+      style: opts.lblColor ? { color: opts.lblColor, fontWeight: '600' } : undefined,
     }, opts.label),
     span('='),
     span({
@@ -126,7 +178,6 @@ function detailRow(opts: {
         ? { color: opts.valColor, fontWeight: opts.valWeight }
         : undefined,
     }, opts.value),
-    opts.aside ? span({ class: 'sm-aside' }, opts.aside) : null,
   )
 }
 
@@ -148,14 +199,14 @@ function axes() {
 
 type ArrowOpts = {
   color: string
-  width?: number
   label?: string
   labelOffset?: { x: number; y: number }
   labelAtMidpoint?: boolean
   labelAnchor?: 'start' | 'middle' | 'end'
   dashed?: boolean
-  headSize?: number
 }
+
+const ARROW_HEAD = 10
 
 function arrow(from: [number, number], to: [number, number], opts: ArrowOpts) {
   const [x1, y1] = plotToScreen(from[0], from[1])
@@ -164,16 +215,15 @@ function arrow(from: [number, number], to: [number, number], opts: ArrowOpts) {
   const len = Math.sqrt(dx * dx + dy * dy)
   const ux = len > 0 ? dx / len : 0
   const uy = len > 0 ? dy / len : 0
-  const headSize = opts.headSize ?? 10
-  const baseX = x2 - ux * headSize
-  const baseY = y2 - uy * headSize
-  const perpX = -uy * (headSize * 0.45)
-  const perpY = ux * (headSize * 0.45)
+  const baseX = x2 - ux * ARROW_HEAD
+  const baseY = y2 - uy * ARROW_HEAD
+  const perpX = -uy * (ARROW_HEAD * 0.45)
+  const perpY = ux * (ARROW_HEAD * 0.45)
   return g(
     line({
       x1, y1, x2: baseX, y2: baseY,
       stroke: opts.color,
-      strokeWidth: opts.width ?? 2.5,
+      strokeWidth: 2.5,
       strokeDashArray: opts.dashed ? '6 4' : undefined,
     }),
     polygon({
@@ -192,27 +242,32 @@ function arrow(from: [number, number], to: [number, number], opts: ArrowOpts) {
   )
 }
 
-// Shared scaffold for the Vectors and Duality vizzes: plot on the left
-// (axes + caller-supplied arrows), side panel on the right (angle slider +
-// caller-supplied detail + optional caption). Both vizzes drive the same
+// Shared scaffold for the Vectors / Dot / Duality vizzes: plot on the left
+// (axes + caller-supplied svg content), side panel on the right (angle slider
+// + caller-supplied detail + optional caption). All three drive the same
 // 0..180° angle parameter.
 function angleViz(opts: {
   angle: number
   setAngle: (a: number) => void
-  arrows: HValues
+  sliderLabel?: string
+  sliderMin?: number
+  sliderMax?: number
+  svgContent: HValues
   detail: HValues
   caption?: HValues
 }) {
   return div({ class: 'viz-row' },
     svg({ class: 'plot', viewBox: `0 0 ${PLOT} ${PLOT}`, width: PLOT, height: PLOT },
       axes(),
-      opts.arrows,
+      opts.svgContent,
     ),
     div({ class: 'side-panel' },
       sliderRow({
-        label: 'angle between A and B',
+        label: opts.sliderLabel ?? 'angle between A and B',
         value: `${opts.angle}°`,
-        min: 0, max: 180, step: 1,
+        min: opts.sliderMin ?? 0,
+        max: opts.sliderMax ?? 180,
+        step: 1,
         current: opts.angle,
         onChange: opts.setAngle,
       }),
@@ -286,14 +341,23 @@ abstract class ModeSection extends Component {
   abstract tensorgradView(): VElement
 }
 
+// Shared by sections whose conceptual view is driven by an angle slider in [0, 180].
+abstract class AngleSection extends ModeSection {
+  abstract angle: number
+  setAngle(a: number) {
+    this.angle = a
+    this.update()
+  }
+}
+
 // ---------- Shapes section ----------
 class ShapesSection extends ModeSection {
   conceptualView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'Neural-network code in PyTorch, JAX, or tensorgrad does not work on individual numbers or vectors; it works on ',
-        italic('tensors'),
-        ': N-dimensional arrays of numbers, with a fixed shape. A scalar is rank 0, a vector is rank 1, a matrix is rank 2, and from rank 3 upward you stack matrices, then stacks of matrices, and so on. Shapes are written as bracketed dim lists: ',
+        'A ',
+        italic('tensor'),
+        ' is an N-dimensional array of numbers with a fixed shape. A scalar is rank 0, a vector is rank 1, a matrix is rank 2, and from rank 3 upward you stack matrices, then stacks of matrices, and so on. Shapes are written as bracketed dim lists: ',
         mono('[3]'),
         ', ',
         mono('[3, 4]'),
@@ -303,54 +367,82 @@ class ShapesSection extends ModeSection {
       ),
 
       div({ class: 'shape-ladder' },
-        this.shapeRung('scalar', 'rank 0',
-          div({ class: 'mat-cell num-pos' }, '5'),
-        ),
-        div({ class: 'shape-arrow' }, '→'),
+        this.shapeRung('scalar', 'rank 0', numCell(5)),
         this.shapeRung('vector', 'rank 1, shape [4]',
           rowCells([1, 4, -2, 3]),
         ),
-        div({ class: 'shape-arrow' }, '→'),
         this.shapeRung('matrix', 'rank 2, shape [3, 4]',
-          div({
-            class: 'mat-grid',
-            style: { gridTemplateColumns: 'repeat(4, var(--cell-w))' },
-          },
-            [[1, 2, -1, 0], [0, 1, 2, -1], [-1, 0, 1, 2]].flatMap(r =>
-              r.map(v => div({ class: ['mat-cell', numClass(v)] }, String(v))),
-            ),
+          numGrid([[1, 2, -1, 0], [0, 1, 2, -1], [-1, 0, 1, 2]]),
+        ),
+        this.shapeRung('3-tensor', 'rank 3, shape [3, 2, 3]',
+          div({ class: 'shape-stack' },
+            [
+              [[ 1, -1,  0], [ 0,  2,  1]],
+              [[ 2,  0, -1], [ 1, -1,  2]],
+              [[-1,  1,  2], [ 0,  1, -1]],
+            ].map(numGrid),
           ),
         ),
       ),
 
+      this.matmulStackViz(),
+
+    )
+  }
+
+  matmulStackViz() {
+    // Reuses the matmul tab's worked example (MATMUL_EXAMPLE). The front
+    // layer is the real matmul; the two blank layers behind each grid stand in
+    // for outer dimensions — the same matmul running at every outer index.
+    const { A, B, C } = MATMUL_EXAMPLE
+
+    const blankGrid = (rows: number, cols: number) =>
+      matGrid(cols, range(rows * cols).map(() => div({ class: 'mat-cell' })))
+
+    const stack = (data: number[][]) => {
+      const rows = data.length, cols = data[0]!.length
+      return div({
+        class: 'mm-stack',
+        style: {
+          width:  `calc(var(--cell-w) * ${cols} + 24px)`,
+          height: `calc(var(--cell-h) * ${rows} + 24px)`,
+        },
+      },
+        numGrid(data),
+        blankGrid(rows, cols),
+        blankGrid(rows, cols),
+      )
+    }
+
+    const item = (name: string, data: number[][]) => div({ class: 'mm-item' },
+      div({ class: 'mm-label' }, mono(`${name}   [${data.length}, ${data[0]!.length}]`)),
+      stack(data),
+    )
+
+    return div({ class: 'mm-viz' },
       div({ class: 'intro' },
-        'A typical transformer tensor is shaped ',
-        mono('[B, T, D]'),
-        ': ',
-        mono('B'),
-        ' = batch size (independent examples processed together), ',
-        mono('T'),
-        ' = sequence length (positions in the prompt), ',
-        mono('D'),
-        ' = model dim (the vector dim every position carries). Think of it as a ',
-        mono('[B, T]'),
-        ' grid of cells, each holding one ',
-        mono('D'),
-        '-dim vector. Ops either act elementwise or run along the last axis (the vector), with leading axes as batching — the same computation happens in parallel across every (b, t) cell.',
+        'Below is a 2D matmul: ',
+        mono('[2, 3] · [3, 2] = [2, 2]'),
+        '. The matmul tab will walk through exactly this example, fully expanded — but only the front layer of each grid, where the math happens.',
       ),
 
       div({ class: 'intro' },
-        'When two tensors of different ranks meet — for example an ',
-        mono('[B, T, D]'),
-        ' tensor added to a ',
-        mono('[T, D]'),
-        ' tensor — the shorter shape lines up against the end of the longer one and the missing leading axes get repeated implicitly. ',
-        mono('[T, D] + [B, T, D]'),
-        ' works; the ',
-        mono('[T, D]'),
-        ' tensor is "broadcast" across the batch dim. This is how the same position-embedding vector applies to every example in a batch without copying.',
+        'The two blank layers behind each grid stand in for the extra outer dimensions you find in real tensor code. The matmul itself is only defined on a pair of 2D matrices; when the inputs have more dimensions, the same matmul runs at every outer index, independently. Most ops follow this rule — the exceptions are ops designed to operate on dimensions themselves, like ',
+        mono('swapAxes'),
+        '.',
       ),
 
+      div({ class: 'mm-row' },
+        item('A', A),
+        div({ class: 'mm-op-glyph' }, '·'),
+        item('B', B),
+        div({ class: 'mm-op-glyph' }, '='),
+        item('C', C),
+      ),
+
+      div({ class: 'intro' },
+        'In practice, the outermost dimension is usually a batch — independent inputs run together. The rule above is what makes batching fast: operations across outer indices are independent, so tensor libraries parallelize them across GPU cores.',
+      ),
     )
   }
 
@@ -405,78 +497,97 @@ class EmbeddingSection extends ModeSection {
   conceptualView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'Embedding is a 2D learnable table of shape ',
-        mono('[VOCAB, D]'),
-        ' that holds one ',
-        mono('D'),
-        '-dim row per token (a token is an integer ID, one per position in the input sequence). ',
-        mono('embedding(table, idx)'),
-        ' just fetches the row at position ',
-        mono('idx'),
-        '. The table starts random and trains to place related tokens in similar directions.',
+        'An embedding is a table of vectors, with one row per item in a vocabulary. In LLMs that\'s tokens, usually word fragments, but for simplicity just think of them as words. Because a vector has many dimensions, it can carry several aspects of a word at once. This allows vectors to encode the relationships between words.',
       ),
 
-      this.embeddingLookup(),
+      this.embeddingExplorer(),
 
       div({ class: 'intro' },
-        'Each row in that table is just ',
-        mono('D'),
-        ' numbers, which makes it a direction in ',
-        mono('D'),
-        '-dimensional space. There are only ',
-        mono('D'),
-        ' mutually orthogonal directions, but far more ',
-        italic('near-orthogonal'),
-        ' ones, and near-orthogonal is enough: two near-orthogonal vectors have a dot product close to zero, so they barely interfere. Pick ',
-        mono('D'),
-        ' large enough and every token gets its own direction without colliding. The same property lets a single vector carry several independent signals at once. Token identity, position, whatever later operations add: each signal stays readable along its own direction without picking up the others.',
+        'Each row is a list of numbers — a direction in 4-dimensional space. The dot products above measure their alignment: related words point in similar directions, unrelated ones land near-perpendicular, opposites point oppositely.',
       ),
 
       div({ class: 'intro' },
-        'Surprisingly, it\'s even possible to encode more features than there are dimensions — sometimes by an order of magnitude or more. This is called ',
+        'Real LLMs go further: they encode more signals than there are dimensions — sometimes by an order of magnitude or more. This works because the signals are sparse: any one input activates only a tiny fraction of them, so two signals that almost never co-occur can share a direction with negligible interference. The phenomenon is called ',
         italic('superposition'),
-        ', and real LLMs use it heavily: rarely-active features can share directions with minimal interference.',
+        '.',
       ),
 
     )
   }
 
-  embeddingLookup() {
-    const TABLE = SAMPLE_EMBED_TABLE
-    const D = TABLE[0]!.length
-    const VOCAB = TABLE.length
+  embeddingExplorer() {
+    const TABLE = NAMED_EMBED_TABLE
     const sel = this.selectedTokenIdx
-    const out = TABLE[sel]!
+    const selRow = TABLE[sel]!
+    const dots = TABLE.map(t => dotVec(t.vec, selRow.vec))
+    // Fixed scale across all possible selections so the same dot value
+    // produces the same bar width when the user clicks between tokens.
+    const allDots = TABLE.flatMap(a => TABLE.map(b => dotVec(a.vec, b.vec)))
+    const maxAbsDot = Math.max(1, ...allDots.map(Math.abs))
+    const otherProds = TABLE.flatMap((t, i) =>
+      i === sel ? [] : t.vec.map((v, j) => selRow.vec[j]! * v),
+    )
+    const maxAbsProd = Math.max(1, ...otherProds.map(Math.abs))
+
+    const productBg = (prod: number) => {
+      if (prod === 0) return undefined
+      const pct = Math.round((Math.abs(prod) / maxAbsProd) * 55)
+      return tintBg(prod > 0 ? 'var(--positive)' : 'var(--negative)', pct)
+    }
 
     return div({ class: 'embed-block' },
-      div({ class: 'embed-title' },
-        mono('embedding'),
-        ' — lookup by integer index',
-      ),
       div({ class: 'embed-prose' },
-        'Click any row of the table to fetch its vector. The output is exactly the row you picked — nothing more, just an indexed read.',
+        'Click a token to look up its row — that\'s the embedding op. Each other row\'s similarity to it is shown on the right; the vector cells tint by how much each dim contributes to that similarity.',
       ),
-      div({ class: 'embed-row-host' },
-        div(
-          div({ class: 'mat-label' }, `table  [VOCAB=${VOCAB} × D=${D}]`),
-          div({ class: 'embed-table' },
-            TABLE.map((row, i) => div({
-              class: ['embed-row', i === sel && 'embed-row-sel'],
-              onClick: () => this.selectToken(i),
-            },
-              div({ class: 'embed-idx' }, String(i)),
-              rowCells(row),
-            )),
+      div({ class: 'embed-grid' },
+        div({ class: 'embed-grid-head' },
+          div(),
+          div(),
+          div({ class: 'embed-sim-head' },
+            'Similarity to ',
+            span({ class: 'embed-h-name' }, selRow.name),
           ),
         ),
-        div({ class: 'embed-out-col' },
-          div({ class: 'embed-out-call' },
-            mono(`embedding(table, ${sel})`),
-          ),
-          div({ class: 'embed-out-arrow' }, '↓'),
-          div({ class: 'mat-label' }, `out  [D=${D}]`),
-          rowCells(out),
-        ),
+        TABLE.map((t, i) => {
+          const isSel = i === sel
+          return div({
+            class: ['embed-grid-row', isSel && 'is-sel'],
+            onClick: () => this.selectToken(i),
+          },
+            div({ class: 'embed-token-name' }, t.name),
+            div({ class: 'cell-row' },
+              t.vec.map((v, j) => {
+                const bg = isSel ? undefined : productBg(selRow.vec[j]! * v)
+                return div({
+                  class: ['mat-cell', numClass(v)],
+                  style: bg ? { background: bg } : undefined,
+                }, String(v))
+              }),
+            ),
+            this.simBar(dots[i]!, maxAbsDot),
+          )
+        }),
+      ),
+    )
+  }
+
+  simBar(dot: number, maxAbs: number) {
+    const t = maxAbs > 0 ? dot / maxAbs : 0
+    const widthPct = Math.abs(t) * 50
+    const offsetPct = dot >= 0 ? 50 : 50 - widthPct
+    const color = signColor(dot)
+    return div({ class: 'embed-sim' },
+      div({ class: 'embed-sim-num', style: { color } }, String(dot)),
+      div({ class: 'embed-sim-track' },
+        div({ class: 'embed-sim-axis' }),
+        widthPct > 0 ? div({
+          class: 'embed-sim-bar',
+          style: {
+            left: `${offsetPct}%`,
+            width: `${widthPct}%`,
+            background: color,
+          },
+        }) : null,
       ),
     )
   }
@@ -519,13 +630,8 @@ class EmbeddingSection extends ModeSection {
 }
 
 // ---------- Add section ----------
-class AddSection extends ModeSection {
+class AddSection extends AngleSection {
   angle: number = 60   // degrees between A and B
-
-  setAngle(a: number) {
-    this.angle = Math.max(0, Math.min(180, a))
-    this.update()
-  }
 
   conceptualView() {
     // A_LEN + B_LEN must fit inside the plot's ~5-unit half-extent — even at
@@ -536,15 +642,15 @@ class AddSection extends ModeSection {
 
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'A vector is a list of numbers — equivalently, an arrow from the origin to a point in space. The first thing you do with two vectors is add them: ',
-        mono('A + B = [a₁+b₁, a₂+b₂]'),
-        ' — component-wise; tip-to-tail in the picture below. Tensorgrad code (and PyTorch, JAX) ultimately works on these and stacks of them.',
+        'A vector is a point in n-dimensional space. You can visualize this as an arrow from the origin, and express it as a list of numbers. Given two vectors of the same size, you can add them component-wise:',
+        formula('A + B = [a₁+b₁, a₂+b₂]'),
+        'Geometrically, this is tip-to-tail addition, as shown in the picture below. Tensorgrad code (and PyTorch, JAX) ultimately works on these, especially stacks of them.',
       ),
 
       angleViz({
         angle: this.angle,
         setAngle: a => this.setAngle(a),
-        arrows: [
+        svgContent: [
           arrow([0, 0], A, { color: 'var(--a-color)', label: 'A' }),
           arrow(A, C, { color: 'var(--b-color)', label: 'B', labelOffset: { x: 8, y: -6 } }),
           arrow([0, 0], C, {
@@ -585,23 +691,18 @@ class AddSection extends ModeSection {
 }
 
 // ---------- Dot section ----------
-class DotSection extends ModeSection {
+class DotSection extends AngleSection {
   angle: number = 45   // degrees
-
-  setAngle(a: number) {
-    this.angle = Math.max(0, Math.min(180, a))
-    this.update()
-  }
 
   conceptualView() {
     const { A, B } = vectorsFromAngle(this.angle, 3, 2.5)
-    const dot = A[0] * B[0] + A[1] * B[1]
-    const Amag = Math.sqrt(A[0] * A[0] + A[1] * A[1])
-    const Bmag = Math.sqrt(B[0] * B[0] + B[1] * B[1])
+    const dot = dotVec(A, B)
+    const Amag = Math.sqrt(dotVec(A, A))
+    const Bmag = Math.sqrt(dotVec(B, B))
     const cosθ = Math.cos(this.angle * Math.PI / 180)
     const projX = B[0]
 
-    const dotColor = dot > 0.01 ? 'var(--positive)' : dot < -0.01 ? 'var(--negative)' : 'var(--zero)'
+    const dotColor = signColor(dot)
 
     const [ox, oy] = plotToScreen(0, 0)
     const [bx, by] = plotToScreen(B[0], B[1])
@@ -609,28 +710,25 @@ class DotSection extends ModeSection {
 
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'Two vectors can be added; they can also be compared. The dot product turns two vectors into a single number measuring how aligned they are. Component-wise: ',
-        mono('A · B = a₁b₁ + a₂b₂ + ... + aₙbₙ'),
-        '. Geometrically: ',
-        mono('A · B = |A| |B| cos(θ)'),
-        ', where ',
+        'We compare the directions of two vectors with a dot product. This produces a single number measuring their alignment. Abstractly, this is relatedness. The same operation has a component-wise definition and a geometric one:',
+        formula('A · B = a₁b₁ + a₂b₂ + ... + aₙbₙ'),
+        formula('A · B = |A| |B| cos(θ)'),
+        'where ',
         mono('|A|'),
         ' is the length of A and ',
         mono('θ'),
-        ' is the angle between A and B.',
-      ),
-
-      div({ class: 'intro' },
-        'The length ',
-        mono('|A| = √(a₁² + a₂² + ... + aₙ²)'),
-        ' is Pythagoras generalized to n dimensions; in 1D it reduces to ordinary absolute value, which is why the bar notation extends. Setting B = A in either form gives the self-case: ',
+        ' is the angle between A and B. The length is Pythagoras generalized to n dimensions:',
+        formula('|A| = √(a₁² + a₂² + ... + aₙ²)'),
+        'In 1D this reduces to ordinary absolute value, which is why the bar notation extends. Setting B = A in either form gives the self-case: ',
         mono('A · A = |A|²'),
         ' — a vector dotted with itself is its squared magnitude.',
       ),
 
-      div({ class: 'viz-row' },
-        svg({ class: 'plot', viewBox: `0 0 ${PLOT} ${PLOT}`, width: PLOT, height: PLOT },
-          axes(),
+      angleViz({
+        angle: this.angle,
+        setAngle: a => this.setAngle(a),
+        sliderLabel: 'angle θ',
+        svgContent: [
           line({
             x1: ox, y1: oy, x2: px, y2: py,
             stroke: 'var(--accent)', strokeWidth: 5, strokeOpacity: 0.35, strokeLineCap: 'round',
@@ -641,27 +739,24 @@ class DotSection extends ModeSection {
           }),
           arrow([0, 0], A, { color: 'var(--a-color)', label: 'A' }),
           arrow([0, 0], B, { color: 'var(--b-color)', label: 'B' }),
+        ],
+        detail: div({ class: 'detail' },
+          detailRow({ label: 'A · B',         value: fmt(dot), valColor: dotColor, valWeight: '700' }),
+          detailRow({ label: '|A|',           value: fmt(Amag) }),
+          detailRow({ label: '|B|',           value: fmt(Bmag) }),
+          detailRow({ label: 'cos θ',         value: fmt(cosθ, 3) }),
+          detailRow({ label: '|A||B| cos θ',  value: fmt(Amag * Bmag * cosθ) }),
         ),
-        div({ class: 'side-panel' },
-          sliderRow({
-            label: 'angle θ',
-            value: `${this.angle}°`,
-            min: 0, max: 180, step: 1,
-            current: this.angle,
-            onChange: v => this.setAngle(v),
-          }),
-          div({ class: 'detail' },
-            detailRow({ label: 'A · B',         value: fmt(dot), valColor: dotColor, valWeight: '700' }),
-            detailRow({ label: '|A|',           value: fmt(Amag) }),
-            detailRow({ label: '|B|',           value: fmt(Bmag) }),
-            detailRow({ label: 'cos θ',         value: fmt(cosθ, 3) }),
-            detailRow({ label: '|A||B| cos θ',  value: fmt(Amag * Bmag * cosθ) }),
-          ),
+        caption: [
           div({ class: 'caption' }, this.stateDescription()),
           div({ class: 'caption' },
             'The faint indigo segment along A is the projection of B onto A\'s direction. Its signed length, scaled by |A|, equals A · B.',
           ),
-        ),
+        ],
+      }),
+
+      div({ class: 'intro' },
+        'Dot product is the math of relatedness: positive for aligned, near-zero for unrelated, negative for opposite. The next tab uses this to give directions meaning.',
       ),
 
     )
@@ -691,7 +786,7 @@ class DotSection extends ModeSection {
       return [
         'A and B are near-perpendicular. ',
         mono('A · B'),
-        ' is small (only exactly 0 at 90°) — they share little information along each other\'s direction. In real high-dimensional NN work, this near-zero is what counts: near-orthogonal vectors are effectively independent, and exact 90° is not required.',
+        ' is small (only exactly 0 at 90°).',
       ]
     }
     if (θ < 80) {
@@ -747,22 +842,6 @@ class DotSection extends ModeSection {
 class MatmulSection extends ModeSection {
   selected: { row: number; col: number } | null = { row: 0, col: 0 }
 
-  // Worked example: 2x3 · 3x2 = 2x2
-  static readonly A: number[][] = [
-    [1,  2, -1],
-    [0,  1,  1],
-  ]
-  static readonly B: number[][] = [
-    [ 1,  0],
-    [-1,  2],
-    [ 1,  1],
-  ]
-  static readonly C: number[][] = MatmulSection.A.map(rowA =>
-    MatmulSection.B[0]!.map((_, j) =>
-      rowA.reduce((s, a, k) => s + a * MatmulSection.B[k]![j]!, 0),
-    ),
-  )
-
   selectCell(row: number, col: number) {
     const s = this.selected
     this.selected = (s && s.row === row && s.col === col) ? null : { row, col }
@@ -770,7 +849,7 @@ class MatmulSection extends ModeSection {
   }
 
   conceptualView() {
-    const { A, B, C } = MatmulSection
+    const { A, B, C } = MATMUL_EXAMPLE
     const M = A.length, K = A[0]!.length, N = B[0]!.length
     const sel = this.selected
 
@@ -793,9 +872,9 @@ class MatmulSection extends ModeSection {
       sel ? this.expand(A, B, C, sel) : null,
 
       div({ class: 'intro' },
-        'The shape rule is ',
-        mono('[M × K] · [K × N] = [M × N]'),
-        '. The inner K dims must agree — K is the length of every dot product. M and N control how many output cells there are.',
+        'The shape rule:',
+        formula('[M × K] · [K × N] = [M × N]'),
+        'The inner K dims must agree — K is the length of every dot product. M and N control how many output cells there are.',
       ),
 
       div({ class: 'intro' },
@@ -816,23 +895,20 @@ class MatmulSection extends ModeSection {
     rowHl?: number; colHl?: number; cellHl?: { row: number; col: number };
     onClick?: (r: number, c: number) => void;
   }) {
-    const cols = data[0]!.length
+    const cells = data.flatMap((row, i) => row.map((v, j) => div({
+      class: [
+        'mat-cell',
+        numClass(v),
+        opts.rowHl === i && 'cell-row-hl',
+        opts.colHl === j && 'cell-col-hl',
+        opts.cellHl?.row === i && opts.cellHl?.col === j && 'cell-sel',
+        opts.onClick && 'cell-clickable',
+      ],
+      onClick: opts.onClick ? () => opts.onClick!(i, j) : undefined,
+    }, String(v))))
     return div({ class: 'mat-col' },
       div({ class: 'mat-label' }, `${name}   [${shape}]`),
-      div({
-        class: 'mat-grid',
-        style: { gridTemplateColumns: `repeat(${cols}, var(--cell-w))` },
-      }, data.flatMap((row, i) => row.map((v, j) => div({
-        class: [
-          'mat-cell',
-          numClass(v),
-          opts.rowHl === i && 'cell-row-hl',
-          opts.colHl === j && 'cell-col-hl',
-          opts.cellHl?.row === i && opts.cellHl?.col === j && 'cell-sel',
-          opts.onClick && 'cell-clickable',
-        ],
-        onClick: opts.onClick ? () => opts.onClick!(i, j) : undefined,
-      }, String(v))))),
+      matGrid(data[0]!.length, cells),
     )
   }
 
@@ -846,17 +922,14 @@ class MatmulSection extends ModeSection {
       return `${w(a)}·${w(b)}`
     }).join('  +  ')
     const lhs = `C[${i},${j}]`
+    const indent = { paddingLeft: `${lhs.length + 2}ch` }
     return div({ class: 'expr' },
       div(
         span({ class: 'expr-lhs' }, lhs),
         '  =  ', indexTerms,
       ),
-      div({ class: 'expr-line', style: { paddingLeft: `${lhs.length + 2}ch` } },
-        '=  ', valueTerms,
-      ),
-      div({ class: 'expr-line', style: { paddingLeft: `${lhs.length + 2}ch` } },
-        '=  ', span({ class: 'expr-result' }, String(C[i]![j]!)),
-      ),
+      div({ style: indent }, '=  ', valueTerms),
+      div({ style: indent }, '=  ', span({ class: 'expr-result' }, String(C[i]![j]!))),
     )
   }
 
@@ -905,37 +978,71 @@ class MatmulSection extends ModeSection {
 
 // ---------- Duality section ----------
 class DualitySection extends ModeSection {
-  angle: number = 90   // degrees between A and B; default to orthogonal (clean recovery)
+  // Reader's angle is the slider variable. Writers A, B are fixed (orthogonal,
+  // for clean recovery at the cardinal directions).
+  readerAngle: number = 0   // degrees, 0 = along x-axis = same direction as A
 
-  setAngle(a: number) {
-    this.angle = Math.max(0, Math.min(180, a))
+  setReaderAngle(a: number) {
+    this.readerAngle = a
     this.update()
   }
 
   conceptualView() {
     const aLen = 2.5, bLen = 2.0
-    const { A, B, C } = vectorsFromAngle(this.angle, aLen, bLen)
-    // Unit-length "readers" aligned with A's and B's directions.
-    const θ = this.angle * Math.PI / 180
-    const rA: Vec2 = [1, 0]
-    const rB: Vec2 = [Math.cos(θ), Math.sin(θ)]
-    const got_A = C[0] * rA[0] + C[1] * rA[1]   // C · r_A
-    const got_B = C[0] * rB[0] + C[1] * rB[1]   // C · r_B
-    const isNearOrth = this.angle >= 80 && this.angle <= 100
-    const readColor = isNearOrth ? 'var(--positive)' : 'var(--negative)'
+    const WRITER_ANGLE = 90  // A and B orthogonal — readers along cardinal directions cleanly recover magnitudes
+    const { A, B, C } = vectorsFromAngle(WRITER_ANGLE, aLen, bLen)
+    const θr = this.readerAngle * Math.PI / 180
+    const r: Vec2 = [Math.cos(θr), Math.sin(θr)]   // unit-length reader (math)
+    const reading = dotVec(C, r)
+
+    // Reader drawn as a long line that always exits the plot — direction only, no magnitude.
+    const rFar: Vec2 = [r[0] * 10, r[1] * 10]
+    const [rOriginX, rOriginY] = plotToScreen(0, 0)
+    const [rFarX, rFarY] = plotToScreen(rFar[0], rFar[1])
+    // Label position: along the line at a visible distance, offset perpendicular for readability.
+    const perpUnit: Vec2 = [-r[1], r[0]]
+    const labelDist = 3.5
+    const lblPlot: Vec2 = [r[0] * labelDist + perpUnit[0] * 0.4, r[1] * labelDist + perpUnit[1] * 0.4]
+    const [rLabelX, rLabelY] = plotToScreen(lblPlot[0], lblPlot[1])
 
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'Addition writes contributions into a shared vector. To pull one back out, you dot the shared vector against a ',
-        italic('reader'),
-        ' — another vector pointing in the direction of the contribution you want to recover.',
+        'Duality is a paired pattern: write with add, read with dot. Vectors carry payloads; ',
+        italic('readers'),
+        ' extract scalars from them. Each reader asks one directional question — "how much of ',
+        italic('this'),
+        ' direction is in here?" — and the dot product is the answer.',
       ),
 
-      angleViz({
-        angle: this.angle,
-        setAngle: a => this.setAngle(a),
-        arrows: [
-          // C first (dashed, drawn under)
+      div({ class: 'intro' },
+        'Writing pairs a direction (address) with a magnitude (value); reading supplies the address and returns the value. Direction is the key; magnitude is the data.',
+      ),
+
+      // Top: slider with angle value to the right, then caption — full-width stack.
+      div({ class: 'duality-top' },
+        div({ class: 'duality-slider-row' },
+          input({
+            type: 'range',
+            min: '0', max: '360', step: '1',
+            value: String(this.readerAngle),
+            class: 'slider',
+            onInput: (e: any) => this.setReaderAngle(Number(e.target.value)),
+          }),
+          div({ class: 'control-value' }, `${this.readerAngle}°`),
+        ),
+        div({ class: 'caption' },
+          'Rotate the reader to ask different directional questions of C. The dot product is the answer.',
+        ),
+      ),
+
+      // Bottom row: cartesian and bar chart side by side.
+      div({ class: 'viz-row' },
+        svg({ class: 'plot', viewBox: `0 0 ${PLOT} ${PLOT}`, width: PLOT, height: PLOT },
+          axes(),
+          // A and B solid — the primary signals we wrote in (matches the bar chart, which has |A|, |B| as targets).
+          arrow([0, 0], A, { color: 'var(--a-color)', label: 'A' }),
+          arrow([0, 0], B, { color: 'var(--b-color)', label: 'B' }),
+          // C dashed — the derived sum / composite (matches the Vectors tab convention).
           arrow([0, 0], C, {
             color: 'var(--c-color)',
             dashed: true,
@@ -943,40 +1050,97 @@ class DualitySection extends ModeSection {
             labelAnchor: 'end',
             labelOffset: { x: 5, y: -25 },
           }),
-          // Readers (unit length, thinner, muted)
-          arrow([0, 0], rA, { color: 'var(--a-color)', width: 1.5, headSize: 7, label: 'r_A', labelOffset: { x: 6, y: 18 } }),
-          this.angle > 0
-            ? arrow([0, 0], rB, { color: 'var(--b-color)', width: 1.5, headSize: 7, label: 'r_B', labelOffset: { x: this.angle < 30 ? 6 : -28, y: this.angle < 30 ? -18 : -8 } })
-            : null,
-          // Primals on top
-          arrow([0, 0], A, { color: 'var(--a-color)', label: 'A' }),
-          arrow([0, 0], B, { color: 'var(--b-color)', label: 'B' }),
-        ],
-        detail: div({ class: 'detail' },
-          detailRow({ label: 'C · r_A', value: fmt(got_A), valColor: readColor, valWeight: '700', aside: `want ${fmt(aLen)}` }),
-          detailRow({ label: 'C · r_B', value: fmt(got_B), valColor: readColor, valWeight: '700', aside: `want ${fmt(bLen)}` }),
+          // Reader: long line through origin that exits the plot — signals direction, not magnitude.
+          line({
+            x1: rOriginX, y1: rOriginY,
+            x2: rFarX, y2: rFarY,
+            stroke: 'var(--accent)', strokeWidth: 2.5,
+          }),
+          text({
+            x: rLabelX, y: rLabelY + 5,
+            textAnchor: 'middle',
+            fill: 'var(--accent)',
+            fontSize: 14, fontWeight: 700,
+            fontFamily: 'monospace',
+          }, 'r'),
         ),
-        caption: div({ class: 'caption' },
-          isNearOrth
-            ? 'A and B are near-orthogonal. Readings have some cross-talk (visible as offsets from the targets) but mostly recover the original magnitudes — and "mostly" is what real high-D NN architectures depend on. Exact 90° is not required.'
-            : 'A and B overlap significantly. Each reading picks up a large share of the other vector\'s contribution — the recovery degrades by the amount of overlap.',
-        ),
-      }),
+        this.verticalBarChart(reading, aLen, bLen),
+      ),
 
       div({ class: 'intro' },
-        'One reader gives you one number. To extract several at once, stack readers side by side into a matrix and apply ',
+        'You\'re choosing the reader\'s direction here. In a real neural network, the readers are ',
+        italic('learned'),
+        '. Gradient descent discovers, simultaneously, which directions to write signals along and which readers to use to extract them. Writers and readers co-evolve — no one designs ahead of time what each direction means.',
+      ),
+
+      div({ class: 'intro' },
+        'One reader gives you one number. For several readings at once, stack readers side by side into a matrix and apply ',
         mono('matmul'),
-        ' — each column is one reader direction. The matrix is learned. Write with ',
-        mono('add'),
-        ', read with ',
-        mono('matmul'),
+        ' — each column is one reader direction. In a transformer, the Q, K, and V projections are three different readers asking three different questions of the same residual stream ',
+        mono('x'),
         '.',
       ),
 
       div({ class: 'intro' },
-        'Why share one vector at all, rather than give each signal its own channel? Separate channels would freeze the signal identities in advance — every slot pre-allocated, no room to discover new ones. The shared vector lets the network grow its own set of signals: new ones emerge along previously-unused directions, and the readers learn which to look at. Transformers do this constantly.',
+        'Why share one vector at all? Separate channels would freeze signal identities in advance. The shared vector lets the network grow its own set of signals — new ones emerge along previously-unused directions, and the readers learn which to look at. Transformers do this constantly.',
       ),
 
+    )
+  }
+
+  verticalBarChart(reading: number, aLen: number, bLen: number) {
+    const width = PLOT     // 360 — same square as the cartesian
+    const height = PLOT
+    const zeroY = height / 2
+    const topPad = 30
+    const botPad = 50
+    // Max possible reading magnitude = |C| = sqrt(|A|² + |B|²) with writers orthogonal.
+    const maxMag = Math.sqrt(aLen * aLen + bLen * bLen) * 1.1
+    const pxPerUnit = Math.min(zeroY - topPad, height - zeroY - botPad) / maxMag
+    const barWidth = 64
+    const positions = [90, 180, 270]
+
+    const bars = [
+      { x: positions[0], value: aLen,    color: 'var(--a-color)', label: '|A|' },
+      { x: positions[1], value: bLen,    color: 'var(--b-color)', label: '|B|' },
+      { x: positions[2], value: reading, color: 'var(--accent)',  label: 'C · r' },
+    ]
+
+    return div({ class: 'bar-chart-wrap' },
+      svg({ class: 'bar-chart', viewBox: `0 0 ${width} ${height}`, width, height },
+        // Zero line: bars extend above (positive) or below (negative).
+        line({
+          x1: 20, y1: zeroY, x2: width - 20, y2: zeroY,
+          stroke: 'var(--axis)', strokeWidth: 1.5,
+        }),
+        bars.map(b => {
+          const barH = Math.abs(b.value) * pxPerUnit
+          const barY = b.value >= 0 ? zeroY - barH : zeroY
+          const valY = b.value >= 0 ? barY - 8 : barY + barH + 18
+          return g(
+            rect({
+              x: b.x - barWidth / 2,
+              y: barY,
+              width: barWidth,
+              height: barH,
+              fill: b.color,
+              opacity: 0.85,
+            }),
+            text({
+              x: b.x, y: valY,
+              textAnchor: 'middle',
+              fontSize: 14, fontWeight: 700, fill: b.color,
+            }, fmt(b.value, 2)),
+            text({
+              x: b.x, y: height - 14,
+              textAnchor: 'middle',
+              fontSize: 13, fontWeight: 600,
+              fill: 'var(--text-muted)',
+              fontFamily: 'monospace',
+            }, b.label),
+          )
+        }),
+      ),
     )
   }
 
@@ -1038,7 +1202,9 @@ class SoftmaxSection extends ModeSection {
       div({ class: 'intro' },
         'Softmax turns a row of arbitrary numbers (logits, for instance the raw scores from a matmul-read) into a probability distribution: every output lands in ',
         mono('[0, 1]'),
-        ', the whole row sums to 1, and the biggest logit becomes the biggest probability. Differences between logits get exponentially amplified into gaps in probability.',
+        ', the whole row sums to 1, and the biggest logit becomes the biggest probability.',
+        formula('softmax(x)ᵢ = exp(xᵢ) / Σⱼ exp(xⱼ)'),
+        'Differences between logits get exponentially amplified into gaps in probability.',
       ),
 
       div({ class: 'softmax-controls' },
@@ -1059,11 +1225,11 @@ class SoftmaxSection extends ModeSection {
         class: 'softmax-steps',
         style: { gridTemplateColumns: `auto repeat(${N}, var(--cell-w))` },
       },
-        div({ class: 'sm-step-label sm-header-row' }, ''),
+        div({ class: 'sm-step-label' }, ''),
         range(N).map(i => div({ class: 'sm-header' }, String(i))),
 
-        stepRow('scores', logits, 2),
-        stepRow('probabilities', probs, 3, ['mat-cell', 'sm-prob-cell']),
+        stepRow([span({ class: 'sm-lbl-full' }, 'scores'),        span({ class: 'sm-lbl-short' }, 's')], logits, 2),
+        stepRow([span({ class: 'sm-lbl-full' }, 'probabilities'), span({ class: 'sm-lbl-short' }, 'p')], probs,  3, ['mat-cell', 'sm-prob-cell']),
       ),
 
       div({ class: 'intro' },
@@ -1085,9 +1251,7 @@ class SoftmaxSection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         mono('softmax(x, axis?)'),
-        ' applies along one axis (default: last). The formula is ',
-        mono('softmax(x)ᵢ = exp(xᵢ) / Σⱼ exp(xⱼ)'),
-        ', but exp can overflow for large inputs, so tensorgrad subtracts the row max before exp — the answer is identical because the same constant gets exp\'d into every term and cancels in the divide.',
+        ' applies along one axis (default: last). For numerical stability, tensorgrad subtracts the row max before exp — the answer is identical because the same constant gets exp\'d into every term and cancels in the divide.',
       ),
       specBox(
         `const logits = ...               // [V]\nconst probs  = softmax(logits)   // [V] — all in [0, 1], summing to 1`,
@@ -1247,8 +1411,8 @@ class CompositionSection extends Component {
         ' ',
         title,
       ),
-      div({ class: 'pipeline-stage-shapes' }, shapes),
-      opts.code ? pre({ class: 'pipeline-stage-code' }, opts.code) : null,
+      div({ class: 'pipeline-code-block' }, shapes),
+      opts.code ? pre({ class: 'pipeline-code-block' }, opts.code) : null,
       opts.desc ? div({ class: 'pipeline-stage-desc' }, opts.desc) : null,
     )
   }
@@ -1302,8 +1466,8 @@ class Root extends Component implements IRoot {
           tabs: [
             { key: 'add',         label: 'Vectors',     content: this.addSection.view() },
             { key: 'dot',         label: 'Dot',         content: this.dotSection.view() },
-            { key: 'shapes',      label: 'Tensors',     content: this.shapesSection.view() },
             { key: 'embedding',   label: 'Embedding',   content: this.embeddingSection.view() },
+            { key: 'shapes',      label: 'Tensors',     content: this.shapesSection.view() },
             { key: 'matmul',      label: 'matmul',      content: this.matmulSection.view() },
             { key: 'duality',     label: 'Duality',     content: this.dualitySection.view() },
             { key: 'softmax',     label: 'softmax',     content: this.softmaxSection.view() },
@@ -1336,14 +1500,15 @@ new App({ root: new Root(), id: 'app' })
   --zero: rgb(140, 140, 140);
   --a-color: rgb(40, 100, 200);
   --b-color: rgb(220, 110, 40);
-  --c-color: rgb(140, 60, 180);
+  --c-color: rgb(0, 120, 0);
   --axis: rgb(200, 200, 200);
   --code-bg: rgb(245, 245, 245);
   --code-border: rgb(220, 220, 220);
   --cell-w: 52px;
   --cell-h: 44px;
+  --content-max-width: 780px;
+  --code-font-size: 14px;
   --row-hl: rgba(50, 130, 255, 0.12);
-  --col-hl: rgba(50, 130, 255, 0.12);
   --selected-bg: rgba(0, 170, 80, 0.20);
   --selected-border: rgb(0, 150, 60);
 }
@@ -1362,12 +1527,11 @@ html[data-theme="dark"] {
   --zero: rgb(130, 130, 135);
   --a-color: rgb(110, 170, 255);
   --b-color: rgb(255, 175, 100);
-  --c-color: rgb(200, 130, 240);
+  --c-color: rgb(110, 220, 110);
   --axis: rgb(70, 70, 75);
   --code-bg: rgb(15, 15, 18);
   --code-border: rgb(50, 50, 55);
   --row-hl: rgba(90, 165, 255, 0.18);
-  --col-hl: rgba(90, 165, 255, 0.18);
   --selected-bg: rgba(40, 210, 110, 0.25);
   --selected-border: rgb(80, 220, 130);
 }
@@ -1403,11 +1567,20 @@ body {
   letter-spacing: -0.01em;
 }
 
-.subtitle {
-  color: var(--text-muted);
-  margin: 4px 0 0;
+/* Muted body text — same role across sections; the per-class rules below
+   only add positional extras (margins, max-widths, italic). */
+.subtitle,
+.caption,
+.spec-caption,
+.pipeline-stage-desc,
+.embed-prose {
   font-size: 16px;
   line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.subtitle {
+  margin: 4px 0 0;
   max-width: 720px;
 }
 
@@ -1493,17 +1666,27 @@ body {
   z-index: 1;
 }
 
-/* Per-tab content shell */
+/* Per-tab content shell — structural width cap. Every direct/indirect child
+   inherits this bound, so individual rules don't need their own max-widths. */
+.tab-content-inner {
+  max-width: var(--content-max-width);
+}
+
 .tab-content-inner > * + * { margin-top: 22px; }
 
 .intro {
   color: var(--text);
   font-size: 16px;
   line-height: 1.65;
-  max-width: 720px;
 }
 
 .italic { font-style: italic; }
+
+/* Display formulas inside .intro paragraphs */
+.formula-display {
+  text-align: center;
+  margin: 14px 0;
+}
 
 /* Plot + side panel row */
 .viz-row {
@@ -1513,7 +1696,44 @@ body {
   align-items: flex-start;
 }
 
+.duality-top {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 22px 0 18px;
+}
+
+.duality-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.duality-slider-row .slider {
+  flex: 1 1 auto;
+}
+
+.duality-slider-row .control-value {
+  flex: 0 0 auto;
+  min-width: 48px;
+  text-align: right;
+}
+
 .plot {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.bar-chart-wrap {
+  display: flex;
+  justify-content: center;
+}
+
+.bar-chart {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1545,7 +1765,7 @@ body {
   flex-wrap: wrap;
 }
 
-.detail-lbl { font-weight: 600; min-width: 80px; }
+.detail-lbl { min-width: 13ch; }
 .detail-val { color: var(--text); }
 
 .control-row {
@@ -1567,12 +1787,7 @@ body {
   accent-color: var(--accent);
 }
 
-.caption {
-  font-size: 16px;
-  color: var(--text-muted);
-  line-height: 1.55;
-  font-style: italic;
-}
+.caption { font-style: italic; }
 
 /* Spec excerpt */
 .spec-anchor {
@@ -1590,7 +1805,7 @@ body {
   border-radius: 6px;
   padding: 12px 14px;
   font-family: monospace;
-  font-size: 16px;
+  font-size: var(--code-font-size);
   line-height: 1.6;
   margin: 0 0 12px;
   overflow-x: auto;
@@ -1598,12 +1813,7 @@ body {
   color: var(--text);
 }
 
-.spec-caption {
-  color: var(--text-muted);
-  font-size: 16px;
-  line-height: 1.65;
-  margin: 0;
-}
+.spec-caption { margin: 0; }
 
 .spec-caption + .spec-caption { margin-top: 10px; }
 
@@ -1658,7 +1868,7 @@ body {
 .cell-clickable:hover:not(.cell-sel) { background: var(--row-hl); }
 
 .cell-row-hl:not(.cell-sel) { background: var(--row-hl); }
-.cell-col-hl:not(.cell-sel) { background: var(--col-hl); }
+.cell-col-hl:not(.cell-sel) { background: var(--row-hl); }
 
 .cell-sel {
   background: var(--selected-bg);
@@ -1683,12 +1893,8 @@ body {
 }
 
 .expr {
-  padding: 16px 20px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
   font-family: monospace;
-  font-size: 16px;
+  font-size: var(--code-font-size);
   line-height: 1.85;
   color: var(--text);
   overflow-x: auto;
@@ -1701,6 +1907,7 @@ body {
 .shape-ladder {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 18px;
   flex-wrap: wrap;
   padding: 12px 0;
@@ -1727,102 +1934,203 @@ body {
   color: var(--text-muted);
 }
 
-.shape-arrow {
-  font-size: 20px;
+/* 3-layer matrix stack — used both for the rank-3 tensor (opaque slices)
+   and the matmul-stack viz (faded ghost layers behind the real matmul). */
+.shape-stack,
+.mm-stack { position: relative; }
+
+.shape-stack { width: calc(var(--cell-w) * 3 + 24px); height: calc(var(--cell-h) * 2 + 24px); }
+
+.shape-stack > .mat-grid,
+.mm-stack > .mat-grid { position: absolute; }
+
+.shape-stack > .mat-grid:nth-child(1),
+.mm-stack    > .mat-grid:nth-child(1) { top: 0;    left: 24px; }
+.shape-stack > .mat-grid:nth-child(2),
+.mm-stack    > .mat-grid:nth-child(2) { top: 12px; left: 12px; }
+.shape-stack > .mat-grid:nth-child(3),
+.mm-stack    > .mat-grid:nth-child(3) { top: 24px; left: 0;    }
+
+.mm-stack > .mat-grid:nth-child(1) { z-index: 3; }
+.mm-stack > .mat-grid:nth-child(2) { z-index: 2; opacity: 0.55; }
+.mm-stack > .mat-grid:nth-child(3) { z-index: 1; opacity: 0.35; }
+
+/* Matmul-stack viz layout. */
+.mm-viz {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.mm-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 8px 0 4px;
+}
+
+.mm-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.mm-label {
+  font-family: monospace;
+  font-size: 14px;
   color: var(--text-muted);
 }
 
-.embed-block {
+.mm-op-glyph {
+  font-family: monospace;
+  font-size: 28px;
+  color: var(--text-muted);
+  align-self: center;
+  padding: 0 4px;
+}
+
+/* Surface-tinted box. Shared with .expr below. */
+.embed-block,
+.expr {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 16px 20px;
 }
 
-.embed-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--text);
-  margin-bottom: 6px;
-}
-
 .embed-prose {
-  font-size: 16px;
-  line-height: 1.6;
-  color: var(--text-muted);
   margin-bottom: 14px;
   max-width: 640px;
 }
 
-.embed-row-host {
-  display: flex;
-  gap: 28px;
-  align-items: flex-start;
-  flex-wrap: wrap;
-}
-
-.embed-table {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.embed-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 3px 6px;
-  border-radius: 4px;
-  cursor: pointer;
-  border: 1px solid transparent;
-  transition: background 120ms, border-color 120ms;
-}
-
-.embed-row:hover:not(.embed-row-sel) { background: var(--row-hl); }
-
-.embed-row-sel {
-  background: var(--selected-bg);
-  border-color: var(--selected-border);
-}
-
-.embed-idx {
-  font-family: monospace;
-  font-size: 16px;
-  color: var(--text-muted);
-  min-width: 22px;
-  text-align: right;
-}
-
-.embed-cells {
-  display: flex;
+/* Inline row of cells (rank-1 vector in the shape ladder; token row in the
+   embedding explorer). */
+.cell-row {
+  display: inline-flex;
   gap: 1px;
   background: var(--cell-border);
   border: 1px solid var(--cell-border);
   border-radius: 4px;
   overflow: hidden;
+  width: fit-content;
 }
 
-.embed-out-col {
+/* Token × vector × similarity explorer */
+.embed-grid {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
+  gap: 2px;
 }
 
-.embed-out-call {
-  font-family: monospace;
-  font-size: 16px;
-  color: var(--text);
-  padding: 4px 8px;
-  background: var(--bg);
-  border: 1px solid var(--border);
+.embed-grid-head,
+.embed-grid-row {
+  display: grid;
+  grid-template-columns: 8ch auto 1fr;
+  gap: 18px;
+  align-items: center;
+  padding: 5px 10px 5px 9px;
+  border-left: 3px solid transparent;
   border-radius: 4px;
 }
 
-.embed-out-arrow {
-  font-size: 20px;
+.embed-grid-head {
+  font-size: 13px;
   color: var(--text-muted);
-  align-self: center;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding-bottom: 4px;
+  cursor: default;
+}
+
+.embed-sim-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.embed-h-name {
+  font-family: monospace;
+  text-transform: none;
+  font-size: 16px;
+  color: var(--text);
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.embed-grid-row {
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+}
+
+.embed-grid-row:hover:not(.is-sel) { background: var(--row-hl); }
+
+.embed-grid-row.is-sel {
+  background: var(--selected-bg);
+  border-left-color: var(--selected-border);
+}
+
+.embed-token-name {
+  font-family: monospace;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.embed-sim {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.embed-sim-num {
+  font-family: monospace;
+  font-size: 16px;
+  font-weight: 600;
+  min-width: 3ch;
+  text-align: right;
+}
+
+.embed-sim-track {
+  position: relative;
+  flex: 1 1 auto;
+  max-width: 160px;
+  height: 10px;
+}
+
+.embed-sim-axis {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--axis);
+}
+
+.embed-sim-bar {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  border-radius: 2px;
+}
+
+/* Mobile: shrink the explorer to fit narrow viewports */
+@media (max-width: 600px) {
+  .embed-block { padding: 12px 14px; }
+  .embed-grid-head,
+  .embed-grid-row {
+    gap: 8px;
+    padding: 4px 6px;
+  }
+  .embed-token-name { font-size: 14px; }
+  .embed-h-name { font-size: 14px; }
+  .embed-grid .mat-cell {
+    width: 28px;
+    height: 32px;
+    font-size: 12px;
+  }
+  .embed-sim-num { font-size: 14px; }
+  .embed-sim-track { display: none; }
 }
 
 /* Composition tab */
@@ -1830,7 +2138,6 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0;
-  max-width: 720px;
 }
 
 .pipeline-stage {
@@ -1851,9 +2158,10 @@ body {
   margin-right: 2px;
 }
 
-.pipeline-stage-code {
+/* Shapes block and code block in pipeline stages — visually identical. */
+.pipeline-code-block {
   font-family: monospace;
-  font-size: 16px;
+  font-size: var(--code-font-size);
   line-height: 1.5;
   color: var(--text);
   background: var(--code-bg);
@@ -1861,25 +2169,6 @@ body {
   border-radius: 4px;
   padding: 8px 12px;
   margin: 0;
-  overflow-x: auto;
-  white-space: pre;
-}
-
-.pipeline-stage-desc {
-  font-size: 16px;
-  color: var(--text-muted);
-  line-height: 1.55;
-}
-
-.pipeline-stage-shapes {
-  font-family: monospace;
-  font-size: 16px;
-  line-height: 1.5;
-  color: var(--text);
-  padding: 8px 12px;
-  background: var(--code-bg);
-  border: 1px solid var(--code-border);
-  border-radius: 4px;
   overflow-x: auto;
   white-space: pre;
 }
@@ -1903,6 +2192,7 @@ body {
   border: 1px solid var(--cell-border);
   border-radius: 6px;
   overflow: hidden;
+  width: fit-content;
 }
 
 .sm-step-label,
@@ -1931,16 +2221,15 @@ body {
   letter-spacing: 0.04em;
 }
 
-.sm-header-row { background: var(--cell-bg); }
-
-.sm-aside {
-  font-size: 14px;
-  color: var(--text-muted);
-  opacity: 0.85;
-}
-
 .sm-prob-cell {
   font-weight: 700;
+}
+
+.sm-lbl-short { display: none; }
+
+@media (max-width: 480px) {
+  .sm-lbl-full { display: none; }
+  .sm-lbl-short { display: inline; }
 }
 ```
 
