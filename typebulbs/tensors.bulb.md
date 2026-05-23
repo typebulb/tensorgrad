@@ -53,6 +53,65 @@ function matGrid(cols: number, children: HValues) {
   }, children)
 }
 
+// Labeled-matrix primitive shared across the Attention X / scores / attn
+// diagrams and the Softmax stepwise grid. Caller supplies pre-rendered value
+// cells; this wraps them in the same bordered .mat-grid used by the other
+// tabs, then places optional col-labels (top), row-labels (left), and
+// per-row annotations (right) in an outer 3-col grid that auto-sizes to
+// align with the cell tracks.
+function labeledMatrix(opts: {
+  rowLabels?: HValues[]
+  colLabels?: HValues[]
+  rowAnnotations?: HValues[]
+  rows: HValues[][]
+}) {
+  const { rowLabels, colLabels, rowAnnotations, rows } = opts
+  const nCols = rows[0]!.length
+  const nRows = rows.length
+  const cellRow = colLabels ? '2' : '1'
+
+  const items: HValues[] = []
+
+  if (colLabels) {
+    items.push(div({
+      class: 'lm-col-labels',
+      style: {
+        gridColumn: '2', gridRow: '1',
+        gridTemplateColumns: `repeat(${nCols}, var(--cell-w))`,
+      },
+    }, colLabels.map(c => div({ class: 'lm-col-label' }, c))))
+  }
+
+  if (rowLabels) {
+    items.push(div({
+      class: 'lm-row-labels',
+      style: {
+        gridColumn: '1', gridRow: cellRow,
+        gridTemplateRows: `repeat(${nRows}, var(--cell-h))`,
+      },
+    }, rowLabels.map(l => div({ class: 'lm-row-label' }, l))))
+  }
+
+  items.push(div({
+    class: 'lm-cells-wrap',
+    style: { gridColumn: '2', gridRow: cellRow },
+  }, matGrid(nCols, rows.flatMap(r => r))))
+
+  if (rowAnnotations) {
+    items.push(div({
+      class: 'lm-row-annotations',
+      style: {
+        gridColumn: '3', gridRow: cellRow,
+        gridTemplateRows: `repeat(${nRows}, var(--cell-h))`,
+      },
+    }, rowAnnotations.map(a => div({ class: 'lm-row-annotation' }, a))))
+  }
+
+  return div({ class: 'labeled-matrix' },
+    div({ class: 'lm-grid' }, items),
+  )
+}
+
 // Plain matrix of numbers, sign-colored.
 function numGrid(rows: number[][]) {
   return matGrid(rows[0]!.length, rows.flatMap(r => r.map(numCell)))
@@ -142,20 +201,18 @@ function relMagBg(value: number, rowMin: number, rowMax: number): string | undef
   return undefined
 }
 
-// One row in the softmax stepwise grid: label cell + a row of value cells.
-function stepRow(label: HValues, values: number[], digits: number, cellClass: string | string[] = 'mat-cell') {
+// A row of value cells, tinted by each value's relative position in the row
+// (green toward max, red toward min). Used by the Softmax stepwise grid.
+function magnitudeCells(values: number[], digits: number, cellClass: string | string[] = 'mat-cell') {
   const rowMin = Math.min(...values)
   const rowMax = Math.max(...values)
-  return [
-    div({ class: 'sm-step-label' }, label),
-    values.map(v => {
-      const bg = relMagBg(v, rowMin, rowMax)
-      return div({
-        class: cellClass,
-        style: bg ? { background: bg } : undefined,
-      }, fmt(v, digits))
-    }),
-  ]
+  return values.map(v => {
+    const bg = relMagBg(v, rowMin, rowMax)
+    return div({
+      class: cellClass,
+      style: bg ? { background: bg } : undefined,
+    }, fmt(v, digits))
+  })
 }
 
 // One "label = value" row in a side panel, with optional colors / weight.
@@ -1012,9 +1069,9 @@ class SoftmaxSection extends ModeSection {
         italic('logits'),
         ' — short for "log-odds." They sit on the log-probability scale, which is why softmax starts by exponentiating: ',
         mono('exp'),
-        ' undoes the log to recover probability-shaped numbers, and the divide normalizes them so the row sums to 1.',
+        ' inverts the log, turning logits into positive numbers.',
         formula('softmax(x)ᵢ = exp(xᵢ) / Σⱼ exp(xⱼ)'),
-        'Differences between logits get exponentially amplified into gaps in probability.',
+        'Small differences between logits become large gaps in probability. Cells below are tinted green toward the row max, red toward the row min.',
       ),
 
       div({ class: 'softmax-controls' },
@@ -1027,20 +1084,17 @@ class SoftmaxSection extends ModeSection {
         }),
       ),
 
-      div({ class: 'caption' },
-        'Softmax is an inequality increaser: it turns scores into probabilities with most of the mass landing on the biggest one. Cells are tinted green toward the row max, red toward the row min.',
-      ),
-
-      div({
-        class: 'softmax-steps',
-        style: { gridTemplateColumns: `auto repeat(${N}, var(--cell-w))` },
-      },
-        div({ class: 'sm-step-label' }, ''),
-        range(N).map(i => div({ class: 'sm-header' }, String(i))),
-
-        stepRow([span({ class: 'sm-lbl-full' }, 'scores'),        span({ class: 'sm-lbl-short' }, 's')], logits, 2),
-        stepRow([span({ class: 'sm-lbl-full' }, 'probabilities'), span({ class: 'sm-lbl-short' }, 'p')], probs,  3, ['mat-cell', 'sm-prob-cell']),
-      ),
+      labeledMatrix({
+        colLabels: range(N).map(i => String(i)),
+        rowLabels: [
+          [span({ class: 'sm-lbl-full' }, 'scores'),        span({ class: 'sm-lbl-short' }, 's')],
+          [span({ class: 'sm-lbl-full' }, 'probabilities'), span({ class: 'sm-lbl-short' }, 'p')],
+        ],
+        rows: [
+          magnitudeCells(logits, 2),
+          magnitudeCells(probs, 3, ['mat-cell', 'sm-prob-cell']),
+        ],
+      }),
 
       div({ class: 'intro' },
         'Differences in logits compound exponentially: a logit 1 unit higher becomes ~2.7× more probable (',
@@ -1095,7 +1149,7 @@ class CompositionSection extends Component {
         'Here\'s a ',
         a({ href: 'https://typebulb.com/u/samples/transformer/full', target: '_blank' },
           'small transformer training live'),
-        ' with animated visualisations. We want to couple the visual intuitions that demo gives with exact math. To do that, we\'ll build an attention head with the tensor primitives we\'ve explained in the previous tabs.',
+        ' with animated visualisations. We want to couple the visual intuitions in that demo with actual transformer code. To do that, we\'ll build an attention head with the tensor primitives we\'ve explained in the previous tabs.',
       ),
 
       // The motivation: why this op exists. Uses dog + hot from the Embedding
@@ -1167,13 +1221,13 @@ class CompositionSection extends Component {
         ' (its query). For example, in ',
         mono('hot dog'),
         ', position ',
-        mono('hot'),
-        ' might be looking for a noun to modify (its Q), while position ',
         mono('dog'),
-        ' offers "I\'m a noun" (its K). The (hot, dog) pair scores high — so ',
+        ' might be looking for a modifier to disambiguate it (its Q), while position ',
         mono('hot'),
+        ' offers "I modify the noun next to me" (its K). The (dog, hot) pair scores high — so ',
+        mono('dog'),
         ' ends up attending to ',
-        mono('dog'),
+        mono('hot'),
         '.',
       ),
 
@@ -1190,6 +1244,8 @@ class CompositionSection extends Component {
       pre({ class: 'pipeline-code-block' },
         `scores = matmul(Q, swapAxes(K, -1, -2))   // [T, T]`,
       ),
+
+      this.scoresDiagram(),
 
       // Softmax: turn raw scores into a per-position weight distribution.
       h3('Softmax each row of scores'),
@@ -1213,6 +1269,8 @@ class CompositionSection extends Component {
         `attn = softmaxCausal(scores)   // [T, T]`,
       ),
 
+      this.attnDiagram(),
+
       // Weighted average of value vectors using attn weights.
       h3('Average values using attention weights'),
       div({ class: 'intro' },
@@ -1235,14 +1293,14 @@ class CompositionSection extends Component {
         ' here, not ',
         mono('K'),
         '. Take ',
-        mono('dog'),
-        ' as the example: ',
-        mono('K[dog]'),
-        ' was just dog\'s match label ("I\'m a noun") that ',
         mono('hot'),
+        ' as the example: ',
+        mono('K[hot]'),
+        ' was just hot\'s match label ("I modify the noun next to me") that ',
+        mono('dog'),
         ' used to find it during scoring. ',
-        mono('V[dog]'),
-        ' is dog\'s actual content (animal, pet, four-legged, etc.) — what flows to anyone who attends to it. ',
+        mono('V[hot]'),
+        ' is hot\'s actual content (heat, temperature, often paired with food) — what flows to anyone who attends to it. ',
         mono('K'),
         ' is how you get found; ',
         mono('V'),
@@ -1251,23 +1309,23 @@ class CompositionSection extends Component {
 
       div({ class: 'intro' },
         'Since ',
-        mono('hot'),
+        mono('dog'),
         ' attended mostly to ',
-        mono('dog'),
-        ' from the scoring step, ',
-        mono('context[hot]'),
-        ' is mostly ',
-        mono('V[dog]'),
-        ' — ',
         mono('hot'),
-        '\'s vector now carries information from ',
+        ' from the scoring step, ',
+        mono('context[dog]'),
+        ' is mostly ',
+        mono('V[hot]'),
+        ' — ',
         mono('dog'),
+        '\'s vector now carries information from ',
+        mono('hot'),
         '. That\'s the payoff of the whole machinery: each position has gathered context from the positions it cared about.',
       ),
 
       // Write: add context back into X (residual update). Closes the
-      // opening hot dog arc — hot's vector now carries dog-info, resolving
-      // the disambiguation problem the tab opened with.
+      // opening hot dog arc — dog's vector now carries hot-info, resolving
+      // the pet/sausage disambiguation the tab opened with.
       h3('Write context back into X'),
       div({ class: 'intro' },
         mono('add(X, context)'),
@@ -1297,13 +1355,47 @@ class CompositionSection extends Component {
 
       div({ class: 'intro' },
         'And the opening puzzle closes. ',
-        mono('hot'),
-        '\'s vector started as just the embedding for "hot" — ambiguous between temperature and food. After this attention head, it also carries information from ',
         mono('dog'),
-        ', so downstream processing can finally tell this is "hot dog" the sausage, not "hot" the temperature. The static lookup we opened with has become context-aware. That\'s one attention head.',
+        '\'s vector started as just the embedding for "dog" — ambiguous between the pet and the food. After this attention head, it also carries information from ',
+        mono('hot'),
+        ', so downstream processing can finally tell this is "hot dog" the sausage, not "dog" the pet. The static lookup we opened with has become context-aware. That\'s one attention head.',
       ),
 
     )
+  }
+
+  // Raw scores matrix (pre-softmax, pre-mask) for the running hot/dog
+  // example. Values are illustrative — chosen so that softmaxCausal of this
+  // matrix produces the attnDiagram numbers (Q[dog] row 2.0 vs 1.15 → 0.7
+  // vs 0.3). Asymmetry of score[i,j] vs score[j,i] is visible by design.
+  scoresDiagram() {
+    const cell = (val: string) => div({ class: ['mat-cell', 'num-pos'] }, val)
+    return labeledMatrix({
+      colLabels: [mono('K[hot]'), mono('K[dog]')],
+      rowLabels: [mono('Q[hot]'), mono('Q[dog]')],
+      rowAnnotations: ['raw scores', 'raw scores'],
+      rows: [
+        [cell('0.3'), cell('1.2')],
+        [cell('2.0'), cell('1.15')],
+      ],
+    })
+  }
+
+  // attn matrix for the running hot/dog example, after softmaxCausal.
+  // Hot at pos 0 sees only itself (future masked); dog at pos 1 sees both
+  // and weights mostly toward hot — the disambiguation flow the tab sets up.
+  attnDiagram() {
+    const cell = (val: string, cls: string) =>
+      div({ class: ['mat-cell', cls] }, val)
+    return labeledMatrix({
+      colLabels: [mono('K[hot]'), mono('K[dog]')],
+      rowLabels: [mono('Q[hot]'), mono('Q[dog]')],
+      rowAnnotations: ['row sums to 1', 'row sums to 1'],
+      rows: [
+        [cell('1.0', 'num-pos'), cell('—', 'lm-masked')],
+        [cell('0.7', 'num-pos'), cell('0.3', 'num-pos')],
+      ],
+    })
   }
 
   // X for the attention example: two rows pulled directly from the Embedding
@@ -1315,12 +1407,12 @@ class CompositionSection extends Component {
       vec: NAMED_EMBED_TABLE.find(t => t.name === name)!.vec,
     }))
     return div({ class: 'x-diagram' },
-      rows.map((row, i) => div(
-        div(row.name),
-        div('→'),
-        div({ class: 'cell-row' }, row.vec.map(numCell)),
-        div(`position ${i}`),
-      )),
+      labeledMatrix({
+        colLabels: rows[0]!.vec.map((_, j) => mono(`d${j}`)),
+        rowLabels: rows.map(r => mono(r.name)),
+        rowAnnotations: rows.map((_, i) => `pos ${i}`),
+        rows: rows.map(r => r.vec.map(numCell)),
+      }),
       p(mono('X'), ' shape ', mono('[T, D] = [2, 4]')),
     )
   }
@@ -1478,7 +1570,6 @@ body {
 .subtitle,
 .caption,
 .spec-caption,
-.pipeline-stage-desc,
 .embed-prose {
   font-size: 16px;
   line-height: 1.6;
@@ -1707,14 +1798,14 @@ body {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  gap: 6px;
 }
 
-.mat-label {
+.mat-label,
+.mm-label {
   font-family: monospace;
   font-size: 14px;
   color: var(--text-muted);
-  margin-bottom: 6px;
-  letter-spacing: 0.02em;
 }
 
 .mat-grid {
@@ -1747,7 +1838,7 @@ body {
 .cell-clickable { cursor: pointer; }
 .cell-clickable:hover:not(.cell-sel) { background: var(--row-hl); }
 
-.cell-row-hl:not(.cell-sel) { background: var(--row-hl); }
+.cell-row-hl:not(.cell-sel),
 .cell-col-hl:not(.cell-sel) { background: var(--row-hl); }
 
 .cell-sel {
@@ -1857,12 +1948,6 @@ body {
   gap: 8px;
 }
 
-.mm-label {
-  font-family: monospace;
-  font-size: 14px;
-  color: var(--text-muted);
-}
-
 .mm-op-glyph {
   font-family: monospace;
   font-size: 28px;
@@ -1897,28 +1982,73 @@ body {
   width: fit-content;
 }
 
-/* Attention tab: X-as-matrix diagram. Rows are direct div children with a
-   fixed grid template (token name | arrow | cells | position label); the
-   trailing <p> is the shape caption. Composes with .cell-row / .mat-cell
-   from the embedding tab so cells visually match. */
+/* Attention tab: X-as-matrix diagram. Wraps a labeledMatrix plus the shape
+   caption (<p>) and centers the whole stack. */
 .x-diagram {
   margin: 12px 0 20px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  font-family: ui-monospace, monospace;
 }
-.x-diagram > div {
-  display: grid;
-  grid-template-columns: 60px 18px auto 90px;
-  align-items: center;
-  gap: 8px;
-}
-.x-diagram > div > :nth-child(1) { text-align: right; font-weight: 600; font-size: 15px; }
-.x-diagram > div > :nth-child(2) { text-align: center; color: var(--text-muted); }
-.x-diagram > div > :nth-child(4) { font-size: 13px; color: var(--text-muted); }
 .x-diagram > p { margin: 4px 0 0; font-size: 14px; color: var(--text-muted); }
+
+/* Labeled-matrix primitive: cells in the middle (rendered as a normal
+   .mat-grid so borders match the embedding/tensors tabs), optional col-labels
+   on top, optional row-labels on the left, optional row-annotations on the
+   right. Outer 3-col grid auto-sizes column 2 to the .mat-grid width and
+   sizes the inner col-labels / row-labels grids to match the cell tracks. */
+.labeled-matrix {
+  display: flex;
+  justify-content: center;
+  margin: 16px 0 4px;
+}
+.lm-grid {
+  display: inline-grid;
+  grid-template-columns: auto auto auto;
+  align-items: center;
+}
+.lm-cells-wrap { display: flex; }
+.lm-col-labels {
+  display: grid;
+  gap: 1px;
+  /* match the 1px outer border of the inner .mat-grid so col labels align
+     with cells in column 2 */
+  border: 1px solid transparent;
+  padding-bottom: 6px;
+  align-self: end;
+}
+.lm-row-labels,
+.lm-row-annotations {
+  display: grid;
+  gap: 1px;
+  border: 1px solid transparent;
+}
+.lm-col-label,
+.lm-row-label,
+.lm-row-annotation {
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+.lm-col-label { justify-content: center; }
+.lm-row-label { justify-content: flex-end; padding-right: 10px; white-space: nowrap; }
+.lm-row-annotation {
+  justify-content: flex-start;
+  padding-left: 10px;
+  font-size: 12px;
+  font-style: italic;
+}
+/* Labels stay in the muted gray of the surrounding chrome — the .mono helper
+   defaults to var(--accent) which would tint them blue. */
+.lm-col-label .mono,
+.lm-row-label .mono,
+.lm-row-annotation .mono { color: inherit; }
+
+.lm-masked {
+  color: var(--text-muted);
+  background: var(--surface);
+}
 
 /* Token × vector × similarity explorer */
 .embed-grid {
@@ -2036,32 +2166,7 @@ body {
   .embed-sim-track { display: none; }
 }
 
-/* Composition tab */
-.pipeline {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-}
-
-.pipeline-stage {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.pipeline-stage-head {
-  font-size: 17px;
-  font-weight: 700;
-  color: var(--text);
-}
-
-.pipeline-stage-num {
-  font-family: monospace;
-  color: var(--accent);
-  margin-right: 2px;
-}
-
-/* Shapes block and code block in pipeline stages — visually identical. */
+/* Code blocks in the Attention tab (one per stage of the attention spine). */
 .pipeline-code-block {
   font-family: monospace;
   font-size: var(--code-font-size);
@@ -2082,52 +2187,11 @@ body {
 .tab-content-inner > .pipeline-code-block,
 .tab-content-inner > .pipeline-code-block + * { margin-top: 14px; }
 
-.pipeline-arrow {
-  text-align: center;
-  font-size: 20px;
-  color: var(--text-muted);
-  padding: 4px 0;
-}
-
 /* softmax tab */
 .softmax-controls {
   max-width: 360px;
-}
-
-.softmax-steps {
-  display: grid;
-  gap: 1px;
-  background: var(--cell-border);
-  border: 1px solid var(--cell-border);
-  border-radius: 6px;
-  overflow: hidden;
-  width: fit-content;
-}
-
-.sm-step-label,
-.sm-header {
-  display: flex;
-  align-items: center;
-  background: var(--cell-bg);
-  height: var(--cell-h);
-  font-family: monospace;
-  color: var(--text);
-}
-
-.sm-step-label {
-  padding: 0 14px;
-  color: var(--text-muted);
-  font-size: 16px;
-  justify-content: flex-start;
-  gap: 8px;
-  white-space: nowrap;
-}
-
-.sm-header {
-  justify-content: center;
-  font-size: 14px;
-  color: var(--text-muted);
-  letter-spacing: 0.04em;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .sm-prob-cell {
