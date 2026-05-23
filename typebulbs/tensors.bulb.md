@@ -7,7 +7,7 @@ name: Vectors and Tensors
 
 ```tsx
 import {
-  App, Component, div, h1, p, span, pre, button, input, a, ul, li,
+  App, Component, div, h1, h3, p, span, pre, button, input, a, ul, li,
   svg, line, polygon, text, g, rect,
   type VElement, type HValues,
 } from 'domeleon'
@@ -242,7 +242,7 @@ function arrow(from: [number, number], to: [number, number], opts: ArrowOpts) {
   )
 }
 
-// Shared scaffold for the Vectors / Dot / Duality vizzes: plot on the left
+// Shared scaffold for the Vectors / Dot vizzes: plot on the left
 // (axes + caller-supplied svg content), side panel on the right (angle slider
 // + caller-supplied detail + optional caption). All three drive the same
 // 0..180° angle parameter.
@@ -896,7 +896,7 @@ class MatmulSection extends ModeSection {
       ),
 
       div({ class: 'intro' },
-        'The second use of matmul is reading patterns back out of a vector that has many signals stacked into it — the next tab, Duality, is about exactly this.',
+        'The second use of matmul is bulk reading — many dot products at once, where each row of one matrix samples a different feature from another. Attention uses this heavily.',
       ),
     )
   }
@@ -981,210 +981,6 @@ class MatmulSection extends ModeSection {
         '. Inside attention you will see ',
         mono('matmul(q, swapAxes(k, -1, -2))'),
         ' — K\'s last two axes get swapped so K\'s rows of features become the columns matmul wants to dot against. Pure shape-rearrangement, no math.',
-      ),
-    )
-  }
-}
-
-// ---------- Duality section ----------
-class DualitySection extends ModeSection {
-  // Reader's angle is the slider variable. Writers A, B are fixed (orthogonal,
-  // for clean recovery at the cardinal directions).
-  readerAngle: number = 0   // degrees, 0 = along x-axis = same direction as A
-
-  setReaderAngle(a: number) {
-    this.readerAngle = a
-    this.update()
-  }
-
-  conceptualView() {
-    const aLen = 2.5, bLen = 2.0
-    const WRITER_ANGLE = 90  // A and B orthogonal — readers along cardinal directions cleanly recover magnitudes
-    const { A, B, C } = vectorsFromAngle(WRITER_ANGLE, aLen, bLen)
-    const θr = this.readerAngle * Math.PI / 180
-    const r: Vec2 = [Math.cos(θr), Math.sin(θr)]   // unit-length reader (math)
-    const reading = dotVec(C, r)
-
-    // Reader drawn as a long line that always exits the plot — direction only, no magnitude.
-    const rFar: Vec2 = [r[0] * 10, r[1] * 10]
-    const [rOriginX, rOriginY] = plotToScreen(0, 0)
-    const [rFarX, rFarY] = plotToScreen(rFar[0], rFar[1])
-    // Label position: along the line at a visible distance, offset perpendicular for readability.
-    const perpUnit: Vec2 = [-r[1], r[0]]
-    const labelDist = 3.5
-    const lblPlot: Vec2 = [r[0] * labelDist + perpUnit[0] * 0.4, r[1] * labelDist + perpUnit[1] * 0.4]
-    const [rLabelX, rLabelY] = plotToScreen(lblPlot[0], lblPlot[1])
-
-    return div({ class: 'tab-content-inner' },
-      div({ class: 'intro' },
-        'Duality is a paired pattern: write with add, read with dot. Vectors carry payloads; ',
-        italic('readers'),
-        ' extract scalars from them. Each reader asks one directional question — "how much of ',
-        italic('this'),
-        ' direction is in here?" — and the dot product is the answer.',
-      ),
-
-      div({ class: 'intro' },
-        'Writing pairs a direction (address) with a magnitude (value); reading supplies the address and returns the value. Direction is the key; magnitude is the data.',
-      ),
-
-      // Top: slider with angle value to the right, then caption — full-width stack.
-      div({ class: 'duality-top' },
-        div({ class: 'duality-slider-row' },
-          input({
-            type: 'range',
-            min: '0', max: '360', step: '1',
-            value: String(this.readerAngle),
-            class: 'slider',
-            onInput: (e: any) => this.setReaderAngle(Number(e.target.value)),
-          }),
-          div({ class: 'control-value' }, `${this.readerAngle}°`),
-        ),
-        div({ class: 'caption' },
-          'Rotate the reader to ask different directional questions of C. The dot product is the answer.',
-        ),
-      ),
-
-      // Bottom row: cartesian and bar chart side by side.
-      div({ class: 'viz-row' },
-        svg({ class: 'plot', viewBox: `0 0 ${PLOT} ${PLOT}`, width: PLOT, height: PLOT },
-          axes(),
-          // A and B solid — the primary signals we wrote in (matches the bar chart, which has |A|, |B| as targets).
-          arrow([0, 0], A, { color: 'var(--a-color)', label: 'A' }),
-          arrow([0, 0], B, { color: 'var(--b-color)', label: 'B' }),
-          // C dashed — the derived sum / composite (matches the Vectors tab convention).
-          arrow([0, 0], C, {
-            color: 'var(--c-color)',
-            dashed: true,
-            label: 'C = A + B',
-            labelAnchor: 'end',
-            labelOffset: { x: 5, y: -25 },
-          }),
-          // Reader: long line through origin that exits the plot — signals direction, not magnitude.
-          line({
-            x1: rOriginX, y1: rOriginY,
-            x2: rFarX, y2: rFarY,
-            stroke: 'var(--accent)', strokeWidth: 2.5,
-          }),
-          text({
-            x: rLabelX, y: rLabelY + 5,
-            textAnchor: 'middle',
-            fill: 'var(--accent)',
-            fontSize: 14, fontWeight: 700,
-            fontFamily: 'monospace',
-          }, 'r'),
-        ),
-        this.verticalBarChart(reading, aLen, bLen),
-      ),
-
-      div({ class: 'intro' },
-        'You\'re choosing the reader\'s direction here. In a real neural network, the readers are ',
-        italic('learned'),
-        '. Gradient descent discovers, simultaneously, which directions to write signals along and which readers to use to extract them. Writers and readers co-evolve — no one designs ahead of time what each direction means.',
-      ),
-
-      div({ class: 'intro' },
-        'One reader gives you one number. For several readings at once, stack readers side by side into a matrix and apply ',
-        mono('matmul'),
-        ' — each column is one reader direction. In a transformer, the Q, K, and V projections are three different readers asking three different questions of the same residual stream ',
-        mono('x'),
-        '.',
-      ),
-
-      div({ class: 'intro' },
-        'Why share one vector at all? Separate channels would freeze signal identities in advance. The shared vector lets the network grow its own set of signals — new ones emerge along previously-unused directions, and the readers learn which to look at. Transformers do this constantly.',
-      ),
-
-    )
-  }
-
-  verticalBarChart(reading: number, aLen: number, bLen: number) {
-    const width = PLOT     // 360 — same square as the cartesian
-    const height = PLOT
-    const zeroY = height / 2
-    const topPad = 30
-    const botPad = 50
-    // Max possible reading magnitude = |C| = sqrt(|A|² + |B|²) with writers orthogonal.
-    const maxMag = Math.sqrt(aLen * aLen + bLen * bLen) * 1.1
-    const pxPerUnit = Math.min(zeroY - topPad, height - zeroY - botPad) / maxMag
-    const barWidth = 64
-    const positions = [90, 180, 270]
-
-    const bars = [
-      { x: positions[0], value: aLen,    color: 'var(--a-color)', label: '|A|' },
-      { x: positions[1], value: bLen,    color: 'var(--b-color)', label: '|B|' },
-      { x: positions[2], value: reading, color: 'var(--accent)',  label: 'C · r' },
-    ]
-
-    return div({ class: 'bar-chart-wrap' },
-      svg({ class: 'bar-chart', viewBox: `0 0 ${width} ${height}`, width, height },
-        // Zero line: bars extend above (positive) or below (negative).
-        line({
-          x1: 20, y1: zeroY, x2: width - 20, y2: zeroY,
-          stroke: 'var(--axis)', strokeWidth: 1.5,
-        }),
-        bars.map(b => {
-          const barH = Math.abs(b.value) * pxPerUnit
-          const barY = b.value >= 0 ? zeroY - barH : zeroY
-          const valY = b.value >= 0 ? barY - 8 : barY + barH + 18
-          return g(
-            rect({
-              x: b.x - barWidth / 2,
-              y: barY,
-              width: barWidth,
-              height: barH,
-              fill: b.color,
-              opacity: 0.85,
-            }),
-            text({
-              x: b.x, y: valY,
-              textAnchor: 'middle',
-              fontSize: 14, fontWeight: 700, fill: b.color,
-            }, fmt(b.value, 2)),
-            text({
-              x: b.x, y: height - 14,
-              textAnchor: 'middle',
-              fontSize: 13, fontWeight: 600,
-              fill: 'var(--text-muted)',
-              fontFamily: 'monospace',
-            }, b.label),
-          )
-        }),
-      ),
-    )
-  }
-
-  tensorgradView() {
-    return div({ class: 'tab-content-inner' },
-      div({ class: 'intro' },
-        'Duality is not a primitive — it is the pattern of writing with ',
-        mono('add'),
-        ' and reading with ',
-        mono('matmul'),
-        '. In isolation:',
-      ),
-
-      specBox(
-        `// Write: stack two contributions into one shared vector\nconst c = add(a, b)              // a, b, c: [D]`,
-        [
-          [
-            'Both contributions are present in ',
-            'c', '. If ',
-            'a', ' and ',
-            'b', ' point in near-orthogonal directions in high-dimensional D, each remains recoverable from the sum.',
-          ],
-        ],
-      ),
-
-      specBox(
-        `// Read: dot the shared vector against learned "reader" vectors\nclass Readers extends Module {\n  W = this.param([D, 3])     // [D × 3] — 3 readers, each a D-dim column\n}\n\n// In a forward function:\nconst reads = matmul(c, p.W)   // reads: [3] — one dot product per reader`,
-        [
-          [
-            'Each column of ',
-            'W', ' is a "reader" from above. Dotting ',
-            'c', ' with each column gives the contribution recovered along that direction. The matmul performs all three reads in one op. The transformer uses this pattern over and over with different W matrices for different downstream jobs.',
-          ],
-        ],
       ),
     )
   }
@@ -1299,7 +1095,7 @@ class CompositionSection extends Component {
         'Here\'s a ',
         a({ href: 'https://typebulb.com/u/samples/transformer/full', target: '_blank' },
           'small transformer training live'),
-        ' with animated visualisations. We want to couple the visual intuitions that demo gives with exact math. To do that, we\'ll build an attention head with the mathematical primitives we\'ve explained in the previous tabs.',
+        ' with animated visualisations. We want to couple the visual intuitions that demo gives with exact math. To do that, we\'ll build an attention head with the tensor primitives we\'ve explained in the previous tabs.',
       ),
 
       // The motivation: why this op exists. Uses dog + hot from the Embedding
@@ -1330,118 +1126,177 @@ class CompositionSection extends Component {
       // Diagram: real embedding values for "hot" and "dog" stacked as X.
       this.xDiagram(),
 
-      // Roadmap: spine is 3 reads + 1 write, the duality pattern at scale.
-      // Names Wq/Wk/Wv upfront as the head's learnable parameters.
+      // Bridge: ground X as the residual stream so the section headings below
+      // have a concrete substrate to operate on. The structure (project →
+      // score → mix → write) shows up in the headings themselves.
       div({ class: 'intro' },
-        'Structurally, an attention head is ',
-        italic('three reads of X followed by one write back into X'),
-        ' — the duality pattern from the Duality tab, applied at scale. The reads use three learnable weight matrices: ',
-        mono('Wq'), ', ',
-        mono('Wk'), ', ',
-        mono('Wv'),
-        ' (each shape ',
-        mono('[D, D]'),
-        ', the head\'s only tunable parameters). The write is a simple ',
-        mono('add'),
-        ' into the residual ',
+        'What follows operates on the residual stream ',
         mono('X'),
         ' — which starts as token embeddings (added to position embeddings) and is updated by each block in the transformer stack.',
       ),
 
-      // Read 1: project X into Q, K, V.
+      // Project: X into Q, K, V via three learned linear projections.
+      h3('Route X into queries, keys, values'),
       div({ class: 'intro' },
-        italic('Read 1: project X into Q, K, V. '),
-        'Each weight matrix acts as a stack of reader-directions (its columns). ',
-        mono('matmul(X, W)'),
-        ' reads each row of ',
+        'Each weight matrix is a learned linear ',
+        italic('routing'),
+        ': it takes each row of ',
         mono('X'),
-        ' along each direction in ',
-        mono('W'),
-        ', producing a matrix of magnitudes. So three reads of ',
-        mono('X'),
-        ' give us the query, key, and value matrices — ',
+        ' and re-expresses it as another vector, tuned for what the projection will be used for downstream. Apply this three times with three different weight matrices to get ',
         mono('Q'), ', ',
         mono('K'), ', ',
         mono('V'),
-        ' — each shape ',
-        mono('[T, D]'),
-        ', each row holding one position\'s magnitudes.',
+        ' — same shape as ',
+        mono('X'),
+        ', each row holding one position\'s projected view.',
       ),
 
       pre({ class: 'pipeline-code-block' },
         `Q = matmul(X, Wq)   // [T, D]\nK = matmul(X, Wk)   // [T, D]\nV = matmul(X, Wv)   // [T, D]`,
       ),
 
-      // Read 2: Q reads K → scores → softmax → attn.
+      // Score: pairwise dot products of Q rows with K rows. Matchmaking
+      // metaphor + concrete hot/dog example anchors the asymmetric Q-vs-K
+      // roles.
+      h3('Score every (Q, K) pair'),
       div({ class: 'intro' },
-        italic('Read 2: Q reads K. '),
-        'Now ',
-        mono('Q'),
-        '\'s rows act as the reader-directions — each is one position\'s query. Read each query against each key for a relevance score:',
+        'Think of this step as pairwise matchmaking: every position pitches what it ',
+        italic('offers'),
+        ' (its key) and scans the others for what it ',
+        italic('wants'),
+        ' (its query). For example, in ',
+        mono('hot dog'),
+        ', position ',
+        mono('hot'),
+        ' might be looking for a noun to modify (its Q), while position ',
+        mono('dog'),
+        ' offers "I\'m a noun" (its K). The (hot, dog) pair scores high — so ',
+        mono('hot'),
+        ' ends up attending to ',
+        mono('dog'),
+        '.',
+      ),
+
+      div({ class: 'intro' },
+        'That\'s exactly what the dot product from the Dot tab does — for any pair (i, j):',
         formula('score(i, j) = q[i] · k[j]'),
         'One matmul produces all ',
         mono('T × T'),
-        ' scores at once (',
+        ' of them at once (',
         mono('swapAxes'),
-        ' transposes K so the inner dim lines up). Softmax over each row turns scores into ',
-        mono('attn'),
-        ', a per-position weight distribution over all positions. In a language model, future positions are masked to −∞ first (see the softmax tab).',
+        ' transposes K so the shapes line up).',
       ),
 
       pre({ class: 'pipeline-code-block' },
-        `scores = matmul(Q, swapAxes(K, -1, -2)) // [T, T]\nattn   = softmaxCausal(scores)          // [T, T]`,
+        `scores = matmul(Q, swapAxes(K, -1, -2))   // [T, T]`,
       ),
 
-      // Read 3: attn reads V → context.
+      // Softmax: turn raw scores into a per-position weight distribution.
+      h3('Softmax each row of scores'),
       div({ class: 'intro' },
-        italic('Read 3: attn reads V. '),
-        'Now ',
+        'Softmax over each row of ',
+        mono('scores'),
+        ' turns it into ',
         mono('attn'),
-        '\'s rows act as the reader-directions — each is one position\'s weight vector over all positions. ',
-        mono('matmul(attn, V)'),
-        ' produces ',
+        ': a per-position distribution where each row sums to 1 (covered in the softmax tab).',
+      ),
+
+      div({ class: 'intro' },
+        'We need these to act as weights in the next step (Average), and raw scores wouldn\'t work — they could be negative, unbounded, or near-identical. Softmax fixes that: non-negative outputs that sum to 1 per row, giving each position a fixed attention budget to spread across the others. And because softmax is winner-take-most, each position can focus that budget on the few keys that best matched its query.',
+      ),
+
+      div({ class: 'intro' },
+        'When the data has causal or temporal structure (language, audio, time series, video), future positions are masked to −∞ first to keep them from influencing earlier ones (see the softmax tab).',
+      ),
+
+      pre({ class: 'pipeline-code-block' },
+        `attn = softmaxCausal(scores)   // [T, T]`,
+      ),
+
+      // Weighted average of value vectors using attn weights.
+      h3('Average values using attention weights'),
+      div({ class: 'intro' },
+        'For each position, take a weighted average of all the value vectors, with the weights coming from that position\'s row of ',
+        mono('attn'),
+        '. One matmul does this for every position at once, producing ',
         mono('context'),
         ' (shape ',
         mono('[T, D]'),
-        '); each row is a weighted average of the value vectors.',
+        ').',
       ),
 
       pre({ class: 'pipeline-code-block' },
         `context = matmul(attn, V)   // [T, D]`,
       ),
 
-      // Write: add context back into X.
       div({ class: 'intro' },
-        italic('Write: fold context back into X. '),
+        'Notice we\'re using ',
+        mono('V'),
+        ' here, not ',
+        mono('K'),
+        '. Take ',
+        mono('dog'),
+        ' as the example: ',
+        mono('K[dog]'),
+        ' was just dog\'s match label ("I\'m a noun") that ',
+        mono('hot'),
+        ' used to find it during scoring. ',
+        mono('V[dog]'),
+        ' is dog\'s actual content (animal, pet, four-legged, etc.) — what flows to anyone who attends to it. ',
+        mono('K'),
+        ' is how you get found; ',
+        mono('V'),
+        ' is what you give.',
+      ),
+
+      div({ class: 'intro' },
+        'Since ',
+        mono('hot'),
+        ' attended mostly to ',
+        mono('dog'),
+        ' from the scoring step, ',
+        mono('context[hot]'),
+        ' is mostly ',
+        mono('V[dog]'),
+        ' — ',
+        mono('hot'),
+        '\'s vector now carries information from ',
+        mono('dog'),
+        '. That\'s the payoff of the whole machinery: each position has gathered context from the positions it cared about.',
+      ),
+
+      // Write: add context back into X (residual update). Closes the
+      // opening hot dog arc — hot's vector now carries dog-info, resolving
+      // the disambiguation problem the tab opened with.
+      h3('Write context back into X'),
+      div({ class: 'intro' },
         mono('add(X, context)'),
         ' adds each position\'s context onto its original ',
         mono('X'),
-        ' row. Every position now carries its original vector plus its context-aware contribution. That\'s one attention head.',
+        ' row. Every position now carries its original vector plus its context-aware contribution.',
       ),
 
       pre({ class: 'pipeline-code-block' },
         `X = add(X, context)   // [T, D]`,
       ),
 
-      // Adaptive twist: only the first read uses fixed reader-directions.
       div({ class: 'intro' },
-        'Notice the asymmetry: only the first read uses ',
-        italic('fixed'),
-        ' reader-directions (the learned columns of ',
-        mono('Wq'), ', ',
-        mono('Wk'), ', ',
-        mono('Wv'),
-        '). The other two use directions ',
-        italic('computed from'),
-        ' ',
+        mono('add'),
+        ' instead of replace: the original ',
         mono('X'),
-        ' itself — that\'s what makes attention adaptive: what each position pays attention to depends on its current content.',
+        ' survives. Context layers on top — what attention found is added alongside, not in place of. (Transformers also have a layer normalization step that keeps ',
+        mono('X'),
+        '\'s magnitudes bounded across many stacked layers.)',
       ),
 
-      // Tail: heads stack into layers; layers stack into a transformer.
       div({ class: 'intro' },
-        'Attention layers — each with multiple heads like the one above — repeat 1 to 100+ times in a transformer, interleaved with MLP layers.',
+        'And the opening puzzle closes. ',
+        mono('hot'),
+        '\'s vector started as just the embedding for "hot" — ambiguous between temperature and food. After this attention head, it also carries information from ',
+        mono('dog'),
+        ', so downstream processing can finally tell this is "hot dog" the sausage, not "hot" the temperature. The static lookup we opened with has become context-aware. That\'s one attention head.',
       ),
+
     )
   }
 
@@ -1475,7 +1330,6 @@ class Root extends Component implements IRoot {
   addSection         = new AddSection()
   dotSection         = new DotSection()
   matmulSection      = new MatmulSection()
-  dualitySection     = new DualitySection()
   softmaxSection     = new SoftmaxSection()
   compositionSection = new CompositionSection()
 
@@ -1516,7 +1370,6 @@ class Root extends Component implements IRoot {
             { key: 'embedding',   label: 'Embedding',   content: this.embeddingSection.view() },
             { key: 'shapes',      label: 'Tensors',     content: this.shapesSection.view() },
             { key: 'matmul',      label: 'matmul',      content: this.matmulSection.view() },
-            { key: 'duality',     label: 'Duality',     content: this.dualitySection.view() },
             { key: 'softmax',     label: 'softmax',     content: this.softmaxSection.view() },
             { key: 'composition', label: 'Attention',    content: this.compositionSection.view(), hideSubBar: true },
           ],
@@ -1727,6 +1580,17 @@ body {
   line-height: 1.65;
 }
 
+/* Section headings inside tab content (e.g. the project/score/mix/write
+   spine in the Attention tab). Generous top margin marks the section break;
+   tighter gap below keeps the heading attached to its paragraph. */
+.tab-content-inner h3 {
+  font-size: 21px;
+  font-weight: 600;
+  margin: 36px 0 0;
+  color: var(--text);
+}
+.tab-content-inner h3 + * { margin-top: 10px; }
+
 .italic { font-style: italic; }
 
 /* Display formulas inside .intro paragraphs */
@@ -1743,44 +1607,7 @@ body {
   align-items: flex-start;
 }
 
-.duality-top {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin: 22px 0 18px;
-}
-
-.duality-slider-row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.duality-slider-row .slider {
-  flex: 1 1 auto;
-}
-
-.duality-slider-row .control-value {
-  flex: 0 0 auto;
-  min-width: 48px;
-  text-align: right;
-}
-
 .plot {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  display: block;
-  max-width: 100%;
-  height: auto;
-}
-
-.bar-chart-wrap {
-  display: flex;
-  justify-content: center;
-}
-
-.bar-chart {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
