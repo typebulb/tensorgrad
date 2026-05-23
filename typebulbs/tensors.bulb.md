@@ -7,7 +7,7 @@ name: Vectors and Tensors
 
 ```tsx
 import {
-  App, Component, div, h1, p, span, pre, button, input,
+  App, Component, div, h1, p, span, pre, button, input, a, ul, li,
   svg, line, polygon, text, g, rect,
   type VElement, type HValues,
 } from 'domeleon'
@@ -88,9 +88,9 @@ const MATMUL_EXAMPLE = (() => {
     [0,  1,  1],
   ]
   const B: number[][] = [
-    [ 1,  0],
-    [-1,  2],
-    [ 1,  1],
+    [ 1,  0,  2, -1],
+    [-1,  2,  0,  1],
+    [ 1,  1, -1,  0],
   ]
   const C = A.map(rowA => range(B[0]!.length).map(j =>
     dotVec(rowA, B.map(r => r[j]!)),
@@ -422,7 +422,7 @@ class ShapesSection extends ModeSection {
     return div({ class: 'mm-viz' },
       div({ class: 'intro' },
         'Below is a 2D matmul: ',
-        mono('[2, 3] · [3, 2] = [2, 2]'),
+        mono('[2, 3] · [3, 4] = [2, 4]'),
         '. The matmul tab will walk through exactly this example, fully expanded — but only the front layer of each grid, where the math happens.',
       ),
 
@@ -886,7 +886,17 @@ class MatmulSection extends ModeSection {
         mono('Linear'),
         ' layer, and the formula is ',
         mono('matmul(x, W) + b'),
-        '. The second use of matmul is reading patterns back out of a vector that has many signals stacked into it — the next tab, Duality, is about exactly this.',
+        ', where ',
+        mono('x'),
+        ' is the input vector (a single-row matrix, in matmul\'s shape rule), ',
+        mono('W'),
+        ' is the weight matrix, and ',
+        mono('b'),
+        ' is a learned bias added to each output.',
+      ),
+
+      div({ class: 'intro' },
+        'The second use of matmul is reading patterns back out of a vector that has many signals stacked into it — the next tab, Duality, is about exactly this.',
       ),
     )
   }
@@ -1200,9 +1210,13 @@ class SoftmaxSection extends ModeSection {
 
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'Softmax turns a row of arbitrary numbers (logits, for instance the raw scores from a matmul-read) into a probability distribution: every output lands in ',
+        'Softmax turns a row of arbitrary numbers into a probability distribution: every output lands in ',
         mono('[0, 1]'),
-        ', the whole row sums to 1, and the biggest logit becomes the biggest probability.',
+        ', the whole row sums to 1, and the biggest input becomes the biggest output. The raw numbers going in are called ',
+        italic('logits'),
+        ' — short for "log-odds." They sit on the log-probability scale, which is why softmax starts by exponentiating: ',
+        mono('exp'),
+        ' undoes the log to recover probability-shaped numbers, and the divide normalizes them so the row sums to 1.',
         formula('softmax(x)ᵢ = exp(xᵢ) / Σⱼ exp(xⱼ)'),
         'Differences between logits get exponentially amplified into gaps in probability.',
       ),
@@ -1279,141 +1293,174 @@ class SoftmaxSection extends ModeSection {
 class CompositionSection extends Component {
   view() {
     return div({ class: 'tab-content-inner' },
+      // Hook: linked bulb has the animated visualisations; this tab does the
+      // primitive-by-primitive math for one head.
       div({ class: 'intro' },
-        italic('Attention'),
-        ' is the central operation of a transformer. Given a sequence of positions — each one carrying a vector — it rewrites every position by drawing information from the other positions. Each position computes its own attention weights from its current vector, so the mix differs across positions and adapts to every input.',
+        'Here\'s a ',
+        a({ href: 'https://typebulb.com/u/samples/transformer/full', target: '_blank' },
+          'small transformer training live'),
+        ' with animated visualisations. We want to couple the visual intuitions that demo gives with exact math. To do that, we\'ll build an attention head with the mathematical primitives we\'ve explained in the previous tabs.',
       ),
 
+      // The motivation: why this op exists. Uses dog + hot from the Embedding
+      // tab's vocabulary rather than introducing fresh words (bank, river).
       div({ class: 'intro' },
-        'The five stages below add up to one attention layer. The input ',
-        mono('x'),
-        ' has shape ',
-        mono('[B, T, D]'),
-        ': T positions in the sequence, each carrying a D-dim vector, for B independent sequences in the batch. ',
-        mono('x'),
-        ' is the residual stream — at the first attention layer, it\'s what Embedding produced; at later layers, the previous layer\'s output. The cast — ',
+        'Embedding gives "dog" a single fixed vector. But "hot dog" is a sausage, not a warm pet — meaning depends on context, and a static lookup can\'t carry that. Attention is the operation that lets each token\'s vector update based on the other tokens around it.',
+      ),
+
+      // The missing concept: a sequence of token vectors stacked as a matrix.
+      // Uses the hot dog example continuously: same two words, real embedding
+      // values from the table, now arranged as X.
+      div({ class: 'intro' },
+        'Take that ',
+        mono('hot dog'),
+        ' example: 2 tokens. Embedding turns each one into a vector; stacked in order they form a matrix ',
+        mono('X'),
+        ' of shape ',
+        mono('[T, D]'),
+        '. ',
+        mono('T'),
+        ' is the number of tokens (here, 2). ',
+        mono('D'),
+        ' is the embedding dimension — the length of each row\'s vector (here, 4, matching the Embedding tab). Each row is one ',
+        italic('position'),
+        ' in the sequence. That\'s the input to attention.',
+      ),
+
+      // Diagram: real embedding values for "hot" and "dog" stacked as X.
+      this.xDiagram(),
+
+      // Roadmap: spine is 3 reads + 1 write, the duality pattern at scale.
+      // Names Wq/Wk/Wv upfront as the head's learnable parameters.
+      div({ class: 'intro' },
+        'Structurally, an attention head is ',
+        italic('three reads of X followed by one write back into X'),
+        ' — the duality pattern from the Duality tab, applied at scale. The reads use three learnable weight matrices: ',
+        mono('Wq'), ', ',
+        mono('Wk'), ', ',
+        mono('Wv'),
+        ' (each shape ',
+        mono('[D, D]'),
+        ', the head\'s only tunable parameters). The write is a simple ',
         mono('add'),
-        ', ',
-        mono('matmul'),
-        ', ',
-        mono('softmax'),
-        ', and the duality pattern — is the same one you met in the previous tabs.',
+        ' into the residual ',
+        mono('X'),
+        ' — which starts as token embeddings (added to position embeddings) and is updated by each block in the transformer stack.',
       ),
 
-      div({ class: 'pipeline' },
-        this.stage(1, 'Project x into query, key, value', 'x [B, T, D], Wq [D, D] → q [B, T, D]\nx [B, T, D], Wk [D, D] → k [B, T, D]\nx [B, T, D], Wv [D, D] → v [B, T, D]', {
-          code: `const q = matmul(x, p.Wq)\nconst k = matmul(x, p.Wk)\nconst v = matmul(x, p.Wv)`,
-          desc: [
-            'Three learned ',
-            mono('[D, D]'),
-            ' matrices project each D-dim vector in ',
-            mono('x'),
-            ' to a new D-dim vector — so ',
-            mono('q'),
-            ', ',
-            mono('k'),
-            ', ',
-            mono('v'),
-            ' keep ',
-            mono('x'),
-            '\'s shape. The three matrices are learned independently, so each gives a different view of the same ',
-            mono('x'),
-            ': ',
-            mono('q'),
-            ' (query) = what is this position looking for? ',
-            mono('k'),
-            ' (key) = what does this position offer to be matched against? ',
-            mono('v'),
-            ' (value) = what does this position carry to be passed along?',
-          ],
-        }),
-        div({ class: 'pipeline-arrow' }, '↓'),
-
-        this.stage(2, 'Score every query against every key', 'q [B, T, D], k [B, T, D] →\n  scores [B, T, T]', {
-          code: `const scores = mul(matmul(q, swapAxes(k, -1, -2)), 1 / Math.sqrt(D))`,
-          desc: [
-            'For every pair of positions in the sequence, we want one number measuring how relevant they are to each other. The score for a pair is the dot product of one position\'s query with the other\'s key. With T positions, that\'s T × T scores total — which is why the output gained a second T and is now shape ',
-            mono('[B, T, T]'),
-            '. One ',
-            mono('matmul'),
-            ' produces every score in parallel. The ',
-            mono('1/√D'),
-            ' scaling keeps scores from going extreme before ',
-            mono('softmax'),
-            '.',
-          ],
-        }),
-        div({ class: 'pipeline-arrow' }, '↓'),
-
-        this.stage(3, 'Turn scores into attention weights', 'scores [B, T, T] →\n  attn [B, T, T]', {
-          code: `const attn = softmaxCausal(scores)`,
-          desc: [
-            'Scores are raw numbers; we want each row to be a proportional weighting that sums to 1, so the next stage can take a weighted average. ',
-            mono('softmax'),
-            ' does that. The causal variant zeros out future positions first (see the softmax tab for why).',
-          ],
-        }),
-        div({ class: 'pipeline-arrow' }, '↓'),
-
-        this.stage(4, 'Weighted sum of values', 'attn [B, T, T], v [B, T, D] →\n  mixed [B, T, D]', {
-          code: `const mixed = matmul(attn, v)`,
-          desc: [
-            'Each output position becomes a weighted sum of the value vectors, with the weights coming from ',
-            mono('attn'),
-            ' — so each position pulls in information from the positions it scored highly.',
-          ],
-        }),
-        div({ class: 'pipeline-arrow' }, '↓'),
-
-        this.stage(5, 'Fold the result back into x', 'x [B, T, D], mixed [B, T, D] →\n  newX [B, T, D]', {
-          code: `const newX = add(x, mixed)`,
-          desc: [
-            mono('add'),
-            ' writes ',
-            mono('mixed'),
-            ' into ',
-            mono('x'),
-            '. The result is the new residual — every later layer in the transformer reads it. Because ',
-            mono('x'),
-            ' is itself a summand, whatever attention added sits on top of ',
-            mono('x'),
-            ', not in place of it.',
-          ],
-        }),
-      ),
-
+      // Read 1: project X into Q, K, V.
       div({ class: 'intro' },
-        'Every primitive from the earlier tabs is doing what it did in isolation. ',
-        mono('matmul'),
-        ' appears as a projection (stage 1) and as a bulk dot product (stages 2 and 4). ',
-        mono('softmax'),
-        ' turns scores into a distribution (stage 3). ',
-        mono('add'),
-        ' writes a contribution into a shared vector (stage 5). The duality pattern wraps the layer: stage 1 reads ',
-        mono('x'),
-        ' with matmul, stage 5 writes back to ',
-        mono('x'),
-        ' with add.',
+        italic('Read 1: project X into Q, K, V. '),
+        'Each weight matrix acts as a stack of reader-directions (its columns). ',
+        mono('matmul(X, W)'),
+        ' reads each row of ',
+        mono('X'),
+        ' along each direction in ',
+        mono('W'),
+        ', producing a matrix of magnitudes. So three reads of ',
+        mono('X'),
+        ' give us the query, key, and value matrices — ',
+        mono('Q'), ', ',
+        mono('K'), ', ',
+        mono('V'),
+        ' — each shape ',
+        mono('[T, D]'),
+        ', each row holding one position\'s magnitudes.',
       ),
 
+      pre({ class: 'pipeline-code-block' },
+        `Q = matmul(X, Wq)   // [T, D]\nK = matmul(X, Wk)   // [T, D]\nV = matmul(X, Wv)   // [T, D]`,
+      ),
+
+      // Read 2: Q reads K → scores → softmax → attn.
       div({ class: 'intro' },
-        'Attention layers like this one repeat throughout a transformer (6 to 100+ layers, interleaved with MLP layers). Each layer reads ',
-        mono('x'),
-        ', computes its contribution, and adds it back.',
+        italic('Read 2: Q reads K. '),
+        'Now ',
+        mono('Q'),
+        '\'s rows act as the reader-directions — each is one position\'s query. Read each query against each key for a relevance score:',
+        formula('score(i, j) = q[i] · k[j]'),
+        'One matmul produces all ',
+        mono('T × T'),
+        ' scores at once (',
+        mono('swapAxes'),
+        ' transposes K so the inner dim lines up). Softmax over each row turns scores into ',
+        mono('attn'),
+        ', a per-position weight distribution over all positions. In a language model, future positions are masked to −∞ first (see the softmax tab).',
+      ),
+
+      pre({ class: 'pipeline-code-block' },
+        `scores = matmul(Q, swapAxes(K, -1, -2)) // [T, T]\nattn   = softmaxCausal(scores)          // [T, T]`,
+      ),
+
+      // Read 3: attn reads V → context.
+      div({ class: 'intro' },
+        italic('Read 3: attn reads V. '),
+        'Now ',
+        mono('attn'),
+        '\'s rows act as the reader-directions — each is one position\'s weight vector over all positions. ',
+        mono('matmul(attn, V)'),
+        ' produces ',
+        mono('context'),
+        ' (shape ',
+        mono('[T, D]'),
+        '); each row is a weighted average of the value vectors.',
+      ),
+
+      pre({ class: 'pipeline-code-block' },
+        `context = matmul(attn, V)   // [T, D]`,
+      ),
+
+      // Write: add context back into X.
+      div({ class: 'intro' },
+        italic('Write: fold context back into X. '),
+        mono('add(X, context)'),
+        ' adds each position\'s context onto its original ',
+        mono('X'),
+        ' row. Every position now carries its original vector plus its context-aware contribution. That\'s one attention head.',
+      ),
+
+      pre({ class: 'pipeline-code-block' },
+        `X = add(X, context)   // [T, D]`,
+      ),
+
+      // Adaptive twist: only the first read uses fixed reader-directions.
+      div({ class: 'intro' },
+        'Notice the asymmetry: only the first read uses ',
+        italic('fixed'),
+        ' reader-directions (the learned columns of ',
+        mono('Wq'), ', ',
+        mono('Wk'), ', ',
+        mono('Wv'),
+        '). The other two use directions ',
+        italic('computed from'),
+        ' ',
+        mono('X'),
+        ' itself — that\'s what makes attention adaptive: what each position pays attention to depends on its current content.',
+      ),
+
+      // Tail: heads stack into layers; layers stack into a transformer.
+      div({ class: 'intro' },
+        'Attention layers — each with multiple heads like the one above — repeat 1 to 100+ times in a transformer, interleaved with MLP layers.',
       ),
     )
   }
 
-  stage(num: number, title: string, shapes: string, opts: { code?: string, desc?: HValues }) {
-    return div({ class: 'pipeline-stage' },
-      div({ class: 'pipeline-stage-head' },
-        span({ class: 'pipeline-stage-num' }, `${num}.`),
-        ' ',
-        title,
-      ),
-      div({ class: 'pipeline-code-block' }, shapes),
-      opts.code ? pre({ class: 'pipeline-code-block' }, opts.code) : null,
-      opts.desc ? div({ class: 'pipeline-stage-desc' }, opts.desc) : null,
+  // X for the attention example: two rows pulled directly from the Embedding
+  // table — "hot" and "dog" — making the continuity from the motivating
+  // paragraph above to the matrix shape below literal rather than implied.
+  xDiagram() {
+    const rows = ['hot', 'dog'].map(name => ({
+      name,
+      vec: NAMED_EMBED_TABLE.find(t => t.name === name)!.vec,
+    }))
+    return div({ class: 'x-diagram' },
+      rows.map((row, i) => div(
+        div(row.name),
+        div('→'),
+        div({ class: 'cell-row' }, row.vec.map(numCell)),
+        div(`position ${i}`),
+      )),
+      p(mono('X'), ' shape ', mono('[T, D] = [2, 4]')),
     )
   }
 }
@@ -2017,6 +2064,29 @@ body {
   width: fit-content;
 }
 
+/* Attention tab: X-as-matrix diagram. Rows are direct div children with a
+   fixed grid template (token name | arrow | cells | position label); the
+   trailing <p> is the shape caption. Composes with .cell-row / .mat-cell
+   from the embedding tab so cells visually match. */
+.x-diagram {
+  margin: 12px 0 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  font-family: ui-monospace, monospace;
+}
+.x-diagram > div {
+  display: grid;
+  grid-template-columns: 60px 18px auto 90px;
+  align-items: center;
+  gap: 8px;
+}
+.x-diagram > div > :nth-child(1) { text-align: right; font-weight: 600; font-size: 15px; }
+.x-diagram > div > :nth-child(2) { text-align: center; color: var(--text-muted); }
+.x-diagram > div > :nth-child(4) { font-size: 13px; color: var(--text-muted); }
+.x-diagram > p { margin: 4px 0 0; font-size: 14px; color: var(--text-muted); }
+
 /* Token × vector × similarity explorer */
 .embed-grid {
   display: flex;
@@ -2172,6 +2242,12 @@ body {
   overflow-x: auto;
   white-space: pre;
 }
+
+/* Code blocks sit closer to surrounding prose than the default
+   intro-to-intro gap — symmetric 14px above and below, replacing the
+   .tab-content-inner > * + * 22px rule for this case. */
+.tab-content-inner > .pipeline-code-block,
+.tab-content-inner > .pipeline-code-block + * { margin-top: 14px; }
 
 .pipeline-arrow {
   text-align: center;
