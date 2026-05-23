@@ -2102,7 +2102,10 @@ class ExplainerPanel extends Component {
     return div(
       p('A small transformer is being trained from scratch in your browser to add 2-digit numbers. The vocabulary is just digits 0-9, "+", and "=". Each training example is one addition: "27+45=270". (The answer 72 is padded to 3 digits and reversed — the model generates the result one digit at a time, units first, so carries flow naturally left-to-right.)'),
       p('We hold out 20% of (a, b) pairs from training. Held-out accuracy measures real generalization: can the model add numbers it has never seen?'),
-      p('At each training step, the model predicts the result digits for a mini-batch of additions, cross-entropy measures how wrong it was, and AdamW (Adam with decoupled weight decay, a widely-used optimizer) updates the parameters to be a bit less wrong next time. Loss is masked to the result-digit positions only — the model is graded on getting the answer right, not on predicting the operands.')
+      p('At each training step, the model predicts the result digits for a mini-batch of additions, cross-entropy measures how wrong it was, and AdamW (Adam with decoupled weight decay, a widely-used optimizer) updates the parameters to be a bit less wrong next time. Loss is masked to the result-digit positions only — the model is graded on getting the answer right, not on predicting the operands.'),
+      p('What backprop and the optimizer step actually do, up close: ',
+        a({ href: 'https://typebulb.com/u/samples/xor-x-ray/full', target: '_blank' }, 'XOR X-ray'),
+        ' — a 2-2-1 network where you click through forward, chain-rule backward, and the parameter update one phase at a time.')
     )
   }
 
