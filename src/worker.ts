@@ -125,7 +125,9 @@ function createOptimizerState(cfg: WireOptimizerConfig | null): OptimizerState |
 }
 
 function graphUsesPrng(graph: WireIR['graph']): boolean {
-  for (const op of graph.ops) if (op.kind === 'dropout' || op.kind === 'randn') return true
+  for (const op of graph.ops) {
+    if (op.kind === 'dropout' || op.kind === 'randn' || op.kind === 'categorical_last') return true
+  }
   return false
 }
 

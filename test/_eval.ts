@@ -581,6 +581,36 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       }
       return out
     }
+    case 'categorical_last': {
+      // Mirrors codegen.ts's Gumbel-max kernel: per row, argmax over
+      // (logit_j + g_j) where g_j = -log(-log(u_j)) with u from the same PCG
+      // hash as dropout/randn.
+      const a = v(op.a) as Float32Array
+      const seedBuf = v(op.seed) as Int32Array
+      const seed = seedBuf[0]! >>> 0
+      const saltConst = (op.salt * 0x9E3779B1) >>> 0
+      const aShape = graph.tensors[op.a]!.shape
+      const D = aShape[aShape.length - 1]!
+      const outerSize = a.length / D
+      const out = new Int32Array(outerSize)
+      for (let i = 0; i < outerSize; i++) {
+        let bestVal = -Infinity
+        let bestIdx = 0
+        const base = i * D
+        for (let j = 0; j < D; j++) {
+          let h = ((seed ^ saltConst ^ (i * D + j)) >>> 0)
+          h = ((h * 747796405 + 2891336453) >>> 0)
+          h = ((((h ^ (h >>> ((h >>> 28) + 4))) >>> 0) * 277803737) >>> 0)
+          h = (h ^ (h >>> 22)) >>> 0
+          const u = Math.max(1e-10, h / 4294967296)
+          const g = -Math.log(-Math.log(u))
+          const val = a[base + j]! + g
+          if (val > bestVal) { bestVal = val; bestIdx = j }
+        }
+        out[i] = bestIdx
+      }
+      return out
+    }
 
     // ---- Adam-fused ops (optimizer internals; eval is provided for       )
     //      completeness but the test suite doesn't usually run them).      )
