@@ -141,6 +141,13 @@ export type OpNode =
   // Pre-softmax causal mask. Upper-triangle (i < j) entries become `fillValue`
   // (typically a large negative); lower triangle passes through.
   | { kind: 'where_causal'; out: number; a: number; fillValue: number }
+  // Sample one categorical index per leading position from logits along the
+  // last axis. Output is i32, one rank less than input. Non-differentiable
+  // (sampling is discrete). Implemented via Gumbel-max + PCG; salt + shared
+  // PRNG seed plumbing match dropout / randn. Named `categorical` (not
+  // `multinomial`) because we sample one index per row, not N with
+  // replacement; matches `jax.random.categorical`.
+  | { kind: 'categorical_last'; out: number; a: number; seed: number; salt: number }
 
   // ---- Comparisons + selection -------------------------------------------
   // Bool result (lowered to u32 in storage). Trailing-axis broadcast.
@@ -342,6 +349,7 @@ export function getOpInputs(op: OpNode): readonly number[] {
     case 'broadcast_to': case 'sum_to_shape':
       return [op.a]
     case 'dropout': return [op.a, op.seed]
+    case 'categorical_last': return [op.a, op.seed]
     case 'one_hot': return [op.indices]
     case 'where': return [op.cond, op.a, op.b]
     case 'concat': return op.inputs

@@ -22,7 +22,8 @@ export {
   type ReduceOptions,
   // Shape
   reshape, permute, swapAxes,
-  splitHeads, mergeHeads,
+  splitHeads, mergeHeads, rope,
+  type RopeOptions,
   // Linear algebra
   matmul,
   // Indexing / casting
@@ -30,7 +31,7 @@ export {
   // Const-tensor builders
   zeros, ones,
   // ML primitives
-  softmaxCausal, logSoftmax, softmax, whereCausal,
+  softmaxCausal, logSoftmax, softmax, whereCausal, categorical,
   // 2D conv + pool (NCHW)
   conv2d, maxPool2d, nearestUpsample2d,
   type Conv2dOptions, type MaxPool2dOptions,

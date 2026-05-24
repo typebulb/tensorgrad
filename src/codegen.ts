@@ -363,6 +363,44 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: outerSize, workgroupSize: WG_SIZE }
     }
 
+    case 'categorical_last': {
+      // Gumbel-max sampling: sample ~ argmax_j (logit_j + g_j) where
+      // g_j = -log(-log(u_j)) and u_j ~ Uniform(0,1). Mathematically
+      // equivalent to sampling from softmax(logits) but skips the
+      // normalization pass — one fused kernel, no separate softmax.
+      const a = tof(op.a)
+      const D = a.shape[a.shape.length - 1]!
+      const outerSize = shapeSize(a.shape) / D
+      const saltConst = ((op.salt * 0x9E3779B1) >>> 0).toString(10) + 'u'
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read> seed : array<i32>;
+@group(0) @binding(2) var<storage, read_write> out : array<i32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${outerSize}u) { return; }
+  let base = i * ${D}u;
+  var bestVal : f32 = -1.0e30;
+  var bestIdx : i32 = 0;
+  for (var j : u32 = 0u; j < ${D}u; j = j + 1u) {
+    // PCG hash of (seed, salt, row*D + j) → uniform u in (0,1]. The
+    // max() clamp keeps log(u) finite; small u yields large positive
+    // Gumbel noise, which is the desired tail behavior.
+    var h : u32 = u32(seed[0]) ^ ${saltConst} ^ (i * ${D}u + j);
+    h = h * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h = (h >> 22u) ^ h;
+    let u : f32 = max(1.0e-10, f32(h) / 4294967296.0);
+    let g : f32 = -log(-log(u));
+    let v : f32 = a[base + j] + g;
+    if (v > bestVal) { bestVal = v; bestIdx = i32(j); }
+  }
+  out[i] = bestIdx;
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.seed), buf(op.out)], threads: outerSize, workgroupSize: WG_SIZE }
+    }
+
     // ---- Shape / detach ----------------------------------------------------
     // Both ops are byte-identical memcpy; reshape relabels the shape, while
     // stop_gradient detaches from the autograd graph. Aliasing the buffers

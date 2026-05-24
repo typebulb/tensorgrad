@@ -9,7 +9,7 @@
 // (26 letters + '.' as BOS/EOS/pad). Loss = mean cross-entropy on next-char
 // prediction; pad positions train the model to keep emitting '.' after EOS,
 // which is exactly what we want at sampling time. Sampling is autoregressive
-// with multinomial temperature-1 sampling, stops on '.' or SEQ_LEN.
+// with categorical temperature-1 sampling, stops on '.' or SEQ_LEN.
 //
 // File layout: ML + training above, UI below. The ML section exposes a small
 // set of entry points (startTraining, stopTraining) and emits updates via the

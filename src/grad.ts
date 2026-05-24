@@ -388,6 +388,7 @@ function runAdjointRule(
       return
 
     case 'argmax_last':
+    case 'categorical_last':
       // Non-differentiable: index output is discrete.
       return
 

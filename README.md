@@ -92,6 +92,7 @@ for (let step = 0; step < 1000; step++) {
 | `x.mean(dim=k, keepdim=True)` | `mean(x, k, { keepDims: true })` |
 | `F.softmax(x, dim=k)` / `F.log_softmax(x, dim=k)` | `softmax(x, k)` / `logSoftmax(x, k)` — both default to last axis |
 | Causal-masked softmax (`tril` + `masked_fill` + `softmax`) | `softmaxCausal(scores)` (fused; preferred over composing the mask yourself) |
+| `torch.multinomial(F.softmax(logits, -1), 1)` | `categorical(logits)` (takes raw logits via Gumbel-max; pass logits, not probs) |
 | `x.argmax(dim=k)` / `x.argmin(dim=k)` | `argmax(x, k)` / `argmin(x, k)` (negative axes count from the end; flat over the whole tensor when no axis is given — returns a 0-d scalar i32, matching `np.argmax` / `torch.argmax` without `dim`) |
 | `x.transpose(a, b)` | `swapAxes(x, a, b)` (NumPy/JAX call this `swapaxes`; tensorgrad matches them — PyTorch's `transpose` is the cross-library outlier) |
 | `x.permute(*dims)` | `permute(x, [...])` (NumPy/JAX semantics: full-axis reorder) |
@@ -455,12 +456,12 @@ Imported from `'tensorgrad'`:
 - Unary math: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`
 - Activations: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`, `leakyRelu(x, alpha?)`, `softplus`
 - Clamping: `clamp(x, lo, hi)` (scalar bounds)
-- Stochastic: `dropout(x, p)` (inverted dropout, p ∈ [0, 1)), `randn(shape)` (N(0, 1) sampler, zero gradient)
+- Stochastic: `dropout(x, p)` (inverted dropout, p ∈ [0, 1)), `randn(shape)` (N(0, 1) sampler, zero gradient), `categorical(logits, axis?)` (samples from logits via Gumbel-max, i32, non-diff)
 - Autograd control: `stopGradient(x)` (identity forward, no-op backward — PyTorch's `.detach()`)
 - Comparisons / select: `less`, `greater`, `where`
 - Reductions: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax(x, axis?)`, `argmin(x, axis?)`
 - Shape: `reshape`, `permute`, `swapAxes` (`permute` is full-axis reorder, like PyTorch's `permute` / JAX's `jnp.transpose`)
-- Attention layout: `splitHeads(x, nHeads)` (`[..., T, D] → [..., H, T, D/H]`), `mergeHeads(x)` (inverse)
+- Attention layout: `splitHeads(x, nHeads)` (`[..., T, D] → [..., H, T, D/H]`), `mergeHeads(x)` (inverse), `rope(q, k, { base? })` (rotary position embedding on the Q/K pair; returns the pair rotated)
 - Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank; batch ranks must match exactly when rhs is batched — no size-1 broadcasting)
 - Indexing / casting: `oneHot`, `arange(n, dtype?)` (default `i32` — pass `'f32'` for float math like sinusoidal positions), `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (general per-axis gather; both array/data first to match PyTorch functional, JAX, NumPy)
 - Const-tensor builders: `zeros(shape, dtype?)`, `ones(shape, dtype?)` (default `f32`; non-differentiable; pair with `randn`/`arange` as the complete set — no `full`, `eye`, `linspace`, `tril`, `zerosLike`, or `like`-variants)

@@ -918,9 +918,8 @@ class MatmulSection extends ModeSection {
       sel ? this.expand(A, B, C, sel) : null,
 
       div({ class: 'intro' },
-        'The shape rule:',
+        'Matmul follows a shape rule: the inner K dims must agree — K is the length of every dot product, and M and N control how many output cells there are.',
         formula('[M × K] · [K × N] = [M × N]'),
-        'The inner K dims must agree — K is the length of every dot product. M and N control how many output cells there are.',
       ),
 
       div({ class: 'intro' },

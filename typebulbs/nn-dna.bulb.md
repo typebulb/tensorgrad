@@ -21,12 +21,12 @@ import {
   clamp, randn,
   mean, sum, argmax, argmin,
   reshape, permute, swapAxes,
-  splitHeads, mergeHeads,
+  splitHeads, mergeHeads, rope,
   matmul,
   oneHot, arange, embedding, takeAlongAxis,
   zeros, ones,
   narrow, concat, stack, split,
-  softmax, logSoftmax, softmaxCausal, whereCausal,
+  softmax, logSoftmax, softmaxCausal, whereCausal, categorical,
   conv2d, maxPool2d, nearestUpsample2d
 } from "tensorgrad"
 import { instance } from "@viz-js/viz"
@@ -68,12 +68,12 @@ const _tgKeepalive = {
   clamp, randn,
   mean, sum, argmax, argmin,
   reshape, permute, swapAxes,
-  splitHeads, mergeHeads,
+  splitHeads, mergeHeads, rope,
   matmul,
   oneHot, arange, embedding, takeAlongAxis,
   zeros, ones,
   narrow, concat, stack, split,
-  softmax, logSoftmax, softmaxCausal, whereCausal,
+  softmax, logSoftmax, softmaxCausal, whereCausal, categorical,
   conv2d, maxPool2d, nearestUpsample2d,
 }
 ;(globalThis as any).__tg_keepalive = _tgKeepalive
@@ -115,21 +115,27 @@ type UserFrame = { url: string; line: number }
 
 // Spec lives inside eval, so V8 reports its frames as `<anonymous>:LINE:COL`
 // (sometimes wrapped: `eval at outer (url:N:C), <anonymous>:M:K`). Every
-// other frame is bundled library/runtime — skip. Strategy: walk frames
-// top-down, take the first containing an `<anonymous>:LINE:COL` token, and
-// within that line take the LAST match (innermost position for nested eval).
-function firstUserFrame(site: CallSite | null): UserFrame | null {
-  if (!site) return null
+// other frame is bundled library/runtime — skip. Within each anonymous line
+// the LAST match is the innermost position (nested eval).
+//
+// Returned chain is outermost-first: index 0 is the entry frame (the spec's
+// top-level forward), increasing index is deeper user code. Library frames
+// between user frames are filtered out — only frames in the eval'd spec source
+// appear in the chain.
+function userFrameChain(site: CallSite | null): UserFrame[] {
+  if (!site) return []
+  const innermostFirst: UserFrame[] = []
   for (const raw of site.stack.split("\n").slice(1)) {
     const line = raw.trim()
     if (!line) continue
     const matches = [...line.matchAll(/<anonymous>:(\d+):\d+/g)]
     if (matches.length > 0) {
-      return { url: "__spec__", line: parseInt(matches[matches.length - 1]![1]!, 10) }
+      innermostFirst.push({ url: "__spec__", line: parseInt(matches[matches.length - 1]![1]!, 10) })
     }
   }
-  return null
+  return innermostFirst.reverse()
 }
+
 
 // ===== Palettes + dim resolver =============================================
 
@@ -138,13 +144,14 @@ const DIM_AUTO_PALETTE = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b",
 // Graphviz hangs above ~3000 nodes; cap well below.
 const MAX_DIAGRAM_NODES = 1500
 const TENSOR_PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#bcbd22", "#17becf", "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5", "#c49c94"] as const
-// Color keyed on node identity (group signature, or tensor_input name for
-// leaves) rather than tensor id, so corresponding ops share a color across
-// loop iterations and across training/inference views.
+// Color keyed on (source line, op kinds) for leaves and on input name for
+// data sources — so corresponding ops share a color across loop iterations
+// and between training/inference views.
 function nodeColor(node: DagNode, graph: Graph): string {
   let key: string
-  if (node.group) {
-    key = groupSignature(node.group, graph)
+  if (node.leaf) {
+    const opKinds = node.leaf.ops.map(i => graph.ops[i]!.kind).join(",")
+    key = `${node.leaf.frame.url}#${node.leaf.frame.line}:${opKinds}`
   } else {
     const t = graph.tensors[node.tensorId]!
     const op = t.source !== null ? graph.ops[t.source]! : null
@@ -245,69 +252,185 @@ function describeLibraryOp(op: OpNode): string {
   return op.kind
 }
 
-// ===== Grouping + DAG =======================================================
+// ===== Grouping (tree) ======================================================
+//
+// Each op's user-frame chain is walked into a tree where each interior node
+// is a CallCluster (the call site of a sub-call) and each leaf is a run of
+// consecutive ops sharing the same source line. Clusters are pure visual
+// wrappers — they render as labeled rectangles around their contents but
+// don't appear as nodes in the DAG.
 
-type Group = { ops: number[]; frame: UserFrame | null; output: number }
-type DagNode = { tensorId: number; shape: Shape; group: Group | null; inputs: number[] }
+type LeafGroup = {
+  kind: 'leaf'
+  frame: UserFrame
+  ops: number[]
+  output: number             // tid of the leaf's last op (= node tid in the diagram)
+  internalTids: Set<number>  // tids produced by ops in this leaf
+}
 
-// Leaf-like op kinds get a unique key per op so they each show up as a
-// distinct node, even when they share a null source frame. Without this
-// the source-line grouping silently absorbs every param / input / scalar
-// into one big '<none>' group.
+type CallCluster = {
+  kind: 'cluster'
+  frame: UserFrame           // the call-site source line in the parent frame
+  children: TreeNode[]       // leaves and nested clusters in trace order
+}
+
+type TreeNode = LeafGroup | CallCluster
+
+// Leaf-like op kinds get a unique leaf each (no merging with siblings on the
+// same source line). Without this every param / input / scalar collapses
+// into one giant "<none>" leaf at the top of the diagram.
 const NEVER_MERGE_KINDS = new Set<string>([
   "param_input",
   "tensor_input",
   "const_scalar",
 ])
 
-function groupBySourceLine(graph: Graph, included: Set<number>): Group[] {
-  const groups: Group[] = []
-  let curKey = ""
-  let cur: Group | null = null
-  for (let i = 0; i < graph.ops.length; i++) {
-    if (!included.has(i)) continue
-    const op = graph.ops[i]!
-    const frame = firstUserFrame(graph.tensors[op.out]!.site)
-    const key = NEVER_MERGE_KINDS.has(op.kind)
-      ? `${op.kind}#${i}`
-      : frame ? `${frame.url}#${frame.line}` : "<none>"
-    if (cur && key === curKey) { cur.ops.push(i); cur.output = op.out }
-    else { cur = { ops: [i], frame, output: op.out }; groups.push(cur); curKey = key }
+// Walks ops in trace order, building the cluster tree. Sub-call invocation
+// boundaries use a first-seen-deviated heuristic: within a parent cluster,
+// when a sub-call's call-site line returns after other lines have been
+// visited, treat as a new invocation. Multi-line sub-call bodies hit this
+// correctly; single-line bodies (rare) merge consecutive invocations
+// together — acceptable trade.
+function buildGroupTree(graph: Graph, included: Set<number>): CallCluster {
+  const root: CallCluster = {
+    kind: 'cluster',
+    frame: { url: '__spec__', line: 0 },
+    children: [],
   }
-  return groups
+  const stack: CallCluster[] = [root]
+  // Per-parent tracker: which sub-call line was first seen since this parent
+  // became active, and whether we've since drifted to a different line.
+  const tracker = new Map<CallCluster, { firstChildLine: number | undefined; deviated: boolean }>()
+  tracker.set(root, { firstChildLine: undefined, deviated: false })
+
+  for (let opIdx = 0; opIdx < graph.ops.length; opIdx++) {
+    if (!included.has(opIdx)) continue
+    const op = graph.ops[opIdx]!
+    const chain = userFrameChain(graph.tensors[op.out]!.site)
+    // Chain layout: chain[0..length-2] are call-site frames (one per nested
+    // cluster); chain[length-1] is the leaf line where the op was issued.
+    const clusterFrameCount = Math.max(0, chain.length - 1)
+
+    let matchDepth = 0
+    while (matchDepth < clusterFrameCount && matchDepth + 1 < stack.length) {
+      const existing = stack[matchDepth + 1]!
+      if (existing.frame.line !== chain[matchDepth]!.line) break
+      const parent = stack[matchDepth]!
+      const t = tracker.get(parent)!
+      if (t.firstChildLine === chain[matchDepth]!.line && t.deviated) {
+        // First-seen sub-call line returned after deviation → new invocation.
+        break
+      }
+      matchDepth++
+    }
+
+    while (stack.length > matchDepth + 1) {
+      const popped = stack.pop()!
+      tracker.delete(popped)
+    }
+
+    while (stack.length - 1 < clusterFrameCount) {
+      const depth = stack.length - 1
+      const parent = stack[depth]!
+      const frame = chain[depth]!
+      const t = tracker.get(parent)!
+      if (t.firstChildLine === undefined) {
+        t.firstChildLine = frame.line
+      } else if (t.firstChildLine !== frame.line) {
+        t.deviated = true
+      } else if (t.deviated) {
+        // firstChildLine returned after deviation → fresh invocation under parent.
+        t.firstChildLine = frame.line
+        t.deviated = false
+      }
+      const cluster: CallCluster = {
+        kind: 'cluster',
+        frame,
+        children: [],
+      }
+      parent.children.push(cluster)
+      stack.push(cluster)
+      tracker.set(cluster, { firstChildLine: undefined, deviated: false })
+    }
+
+    // Add op as a leaf, merging with previous leaf if same source line.
+    const inner = stack[stack.length - 1]!
+    const leafFrame = chain[chain.length - 1] ?? inner.frame
+    const isMergeable = !NEVER_MERGE_KINDS.has(op.kind)
+    const lastChild = inner.children[inner.children.length - 1]
+    if (
+      isMergeable && lastChild && lastChild.kind === 'leaf' &&
+      lastChild.frame.line === leafFrame.line &&
+      !NEVER_MERGE_KINDS.has(graph.ops[lastChild.ops[lastChild.ops.length - 1]!]!.kind)
+    ) {
+      lastChild.ops.push(opIdx)
+      lastChild.output = op.out
+      lastChild.internalTids.add(op.out)
+    } else {
+      inner.children.push({
+        kind: 'leaf',
+        frame: leafFrame,
+        ops: [opIdx],
+        output: op.out,
+        internalTids: new Set([op.out]),
+      })
+    }
+  }
+
+  return root
 }
 
-function buildDag(graph: Graph, groups: Group[]): DagNode[] {
-  // Tids referenced as inputs by any included op — gates which tensor_inputs become nodes.
+// In-order list of every leaf in the tree. Each leaf is one visible node in
+// the diagram; clusters are pure visual wrappers (subgraph rectangles) that
+// don't themselves appear as nodes in the DAG.
+function collectLeaves(tree: CallCluster): LeafGroup[] {
+  const out: LeafGroup[] = []
+  const walk = (node: TreeNode) => {
+    if (node.kind === 'leaf') out.push(node)
+    else for (const c of node.children) walk(c)
+  }
+  for (const c of tree.children) walk(c)
+  return out
+}
+
+type DagNode = {
+  tensorId: number
+  shape: Shape
+  leaf: LeafGroup | null
+  inputs: number[]
+}
+
+function buildDag(graph: Graph, leaves: readonly LeafGroup[]): DagNode[] {
+  // Tids referenced as inputs by any leaf's ops — gates which tensor_inputs become nodes.
   const consumedTids = new Set<number>()
-  for (const g of groups) {
-    for (const opIdx of g.ops) {
+  for (const l of leaves) {
+    for (const opIdx of l.ops) {
       for (const tid of getOpInputs(graph.ops[opIdx]!)) consumedTids.add(tid)
     }
   }
-  // Tensor_inputs first (in op order) so they appear at the top of the DAG, then group outputs.
   const nodes: DagNode[] = []
   const builtTids = new Set<number>()
-  const pushNode = (tid: number, group: Group | null) => {
-    nodes.push({ tensorId: tid, shape: graph.tensors[tid]!.shape, group, inputs: [] })
-    builtTids.add(tid)
-  }
+  // tensor_input leaves render before any user-op leaf (they're the data
+  // sources). They appear as nodes with `leaf: null` and no source frame.
   for (const op of graph.ops) {
-    if (op.kind === "tensor_input" && consumedTids.has(op.out)) pushNode(op.out, null)
+    if (op.kind === "tensor_input" && consumedTids.has(op.out)) {
+      nodes.push({ tensorId: op.out, shape: graph.tensors[op.out]!.shape, leaf: null, inputs: [] })
+      builtTids.add(op.out)
+    }
   }
-  for (const g of groups) pushNode(g.output, g)
-
-  // Wire inputs: tids consumed by the group but produced outside it.
+  for (const l of leaves) {
+    nodes.push({ tensorId: l.output, shape: graph.tensors[l.output]!.shape, leaf: l, inputs: [] })
+    builtTids.add(l.output)
+  }
+  // Wire inputs: external tids consumed by a leaf's ops (not produced inside).
   for (const node of nodes) {
-    if (!node.group) continue
-    const inGroupOps = new Set(node.group.ops)
+    if (!node.leaf) continue
     const seen = new Set<number>()
-    for (const opIdx of node.group.ops) {
+    for (const opIdx of node.leaf.ops) {
       for (const tid of getOpInputs(graph.ops[opIdx]!)) {
         if (seen.has(tid)) continue
         seen.add(tid)
-        const src = graph.tensors[tid]!.source
-        if (src !== null && inGroupOps.has(src)) continue
+        if (node.leaf.internalTids.has(tid)) continue
         if (!builtTids.has(tid)) continue
         node.inputs.push(tid)
       }
@@ -317,32 +440,34 @@ function buildDag(graph: Graph, groups: Group[]): DagNode[] {
 }
 
 // ===== Loop detection =======================================================
-// Iterations of a for-loop body produce groups with matching signatures in
-// the same sequence, so loops are period-k repetition in the signature array.
-// const_scalars/tensor_inputs are keyed by value/name (not source line) so
-// they match across iterations even though their op indices differ. Greedy
-// by coverage k*n; ties favor SMALLER k — tightest period = the natural body
-// the user wrote. A 3-group × 8-iter loop has the same coverage as 6×4 and
-// 12×2 super-periods; we want the 3×8 view, not "2 iterations" of a body
-// that's actually 4 real iterations smushed together. Recurses into iter-0's
-// body of each detected run; matching outer signatures guarantee identical
-// inner structure across all iterations.
+// Iterations of a for-loop body produce TreeNodes (clusters or leaves) with
+// matching signatures in the same sequence. Loops are period-k repetition in
+// the signature array. Greedy by coverage k*n; ties favor SMALLER k — the
+// tightest period is the natural body the user wrote. Each cluster's children
+// array is analyzed independently; matching outer-cluster signatures guarantee
+// identical inner structure across iterations.
 
 type LoopRun = { start: number; period: number; iterations: number; children: LoopRun[] }
 
-function groupSignature(group: Group, graph: Graph): string {
-  if (group.ops.length === 1) {
-    const op = graph.ops[group.ops[0]!]!
-    if (op.kind === "const_scalar") return `const_scalar:${(op as { value: number }).value}`
-    if (op.kind === "tensor_input") return `tensor_input:${(op as { name: string }).name}`
+function nodeSignature(node: TreeNode, graph: Graph): string {
+  if (node.kind === 'leaf') {
+    if (node.ops.length === 1) {
+      const op = graph.ops[node.ops[0]!]!
+      if (op.kind === "const_scalar") return `const_scalar:${(op as { value: number }).value}`
+      if (op.kind === "tensor_input") return `tensor_input:${(op as { name: string }).name}`
+    }
+    const frameKey = `${node.frame.url}#${node.frame.line}`
+    const opKinds = node.ops.map(i => graph.ops[i]!.kind).join(",")
+    return `leaf:${frameKey}:${opKinds}`
   }
-  const frameKey = group.frame ? `${group.frame.url}#${group.frame.line}` : "<none>"
-  const opKinds = group.ops.map(i => graph.ops[i]!.kind).join(",")
-  return `${frameKey}:${opKinds}`
+  // Sibling clusters with same call site AND structurally-identical bodies
+  // produce matching signatures, which is what loop detection matches on.
+  const childSigs = node.children.map(c => nodeSignature(c, graph)).join("|")
+  return `cluster:${node.frame.url}#${node.frame.line}:[${childSigs}]`
 }
 
-function detectLoops(groups: readonly Group[], graph: Graph): LoopRun[] {
-  const signatures = groups.map(g => groupSignature(g, graph))
+function detectLoops(children: readonly TreeNode[], graph: Graph): LoopRun[] {
+  const signatures = children.map(n => nodeSignature(n, graph))
   return detectLoopsInRange(signatures, 0, signatures.length)
 }
 
@@ -352,8 +477,8 @@ function detectLoopsInRange(signatures: readonly string[], lo: number, hi: numbe
   while (i < hi) {
     let bestK = 0
     let bestN = 0
-    // Period >= 2: single-line iteration bodies merge into one group via
-    // groupBySourceLine, so legit period-1 loops can't exist; any period-1
+    // Period >= 2: single-line iteration bodies merge into one leaf via
+    // tree building, so legit period-1 loops can't exist; any period-1
     // match is coincidence.
     for (let k = 2; k <= Math.floor((hi - i) / 2); k++) {
       let n = 1
@@ -381,19 +506,6 @@ function detectLoopsInRange(signatures: readonly string[], lo: number, hi: numbe
     }
   }
   return loops
-}
-
-// Each visible outer iter contains a fresh inner-loop instance with its own
-// truncation, so inner savings multiply by visibleIters.
-function countHiddenGroups(loops: readonly LoopRun[]): number {
-  let total = 0
-  for (const loop of loops) {
-    const hiddenIters = loop.iterations >= 4 ? loop.iterations - 3 : 0
-    const visibleIters = loop.iterations - hiddenIters
-    total += hiddenIters * loop.period
-    total += visibleIters * countHiddenGroups(loop.children)
-  }
-  return total
 }
 
 // ===== DOT generation =======================================================
@@ -428,18 +540,9 @@ function shapeHtmlLabel(shape: Shape, resolveDim: (size: number, pos: number, ra
   }).join(", ") + "]"
 }
 
-function resolveSourceLabel(graph: Graph, node: DagNode, srcCache: Map<string, string[]>): string {
-  const t = graph.tensors[node.tensorId]!
-  const leafOp = t.source !== null ? graph.ops[t.source]! : null
-  if (leafOp && (leafOp.kind === "tensor_input" || leafOp.kind === "param_input")) {
-    return describeLibraryOp(leafOp)
-  }
-  const frame = node.group?.frame
-  if (frame) {
-    const src = srcCache.get(frame.url)?.[frame.line - 1]
-    return src ? src.trim() : `<spec>:${frame.line}`
-  }
-  return "(unattributed)"
+function frameSourceText(frame: UserFrame, srcCache: Map<string, string[]>): string {
+  const src = srcCache.get(frame.url)?.[frame.line - 1]
+  return src ? src.trim() : `<spec>:${frame.line}`
 }
 
 // Strip a trailing "// [B, T, V]" comment when its dims match the node's
@@ -459,15 +562,15 @@ function stripRedundantShapeComment(src: string, shapeNames: readonly string[]):
 
 function buildDOT(
   graph: Graph,
+  tree: CallCluster,
   dag: DagNode[],
-  groups: readonly Group[],
-  loops: readonly LoopRun[],
   resolveDim: (size: number, pos: number, rank: number) => ResolvedDim,
   srcCache: Map<string, string[]>,
 ): string {
   const lines: string[] = [
     "digraph G {",
     "  rankdir=TB",
+    "  compound=true",
     '  bgcolor="transparent"',
     "  pad=0.05",
     '  node [shape=box style=filled fillcolor=white fontname="Courier" fontsize=11 margin="0.18,0.09" penwidth=1.4]',
@@ -476,125 +579,132 @@ function buildDOT(
     "  ranksep=0.3",
   ]
 
-  // Stable id per LoopRun. An inner loop has ONE id but possibly N instances
-  // (one per containing outer iter); the (loopId, baseShift) pair identifies
-  // a specific instance for cluster/ghost naming.
-  const loopIds = new Map<LoopRun, number>()
-  const assignIds = (ls: readonly LoopRun[]) => {
-    for (const l of ls) { loopIds.set(l, loopIds.size); assignIds(l.children) }
-  }
-  assignIds(loops)
-
-  // Truncate long loops: show first 2 + last iteration, with a "…" cluster
-  // for the elided middle. Threshold ≥ 4 — 3 iterations are already brief.
-  // Spec stays honest at full T; only the diagram abbreviates. Applied per
-  // nesting level independently.
-  const isHiddenIter = (loop: LoopRun, iter: number): boolean =>
-    loop.iterations >= 4 && iter >= 2 && iter <= loop.iterations - 2
-
-  // groupIdx → outermost-hidden ghost-key, or null when visible at every nest
-  // level. Absent for groups outside any loop. "Outermost" (not nearest)
-  // matters because a nearest-hidden redirect could land in an inner ghost
-  // that itself doesn't render (its containing outer iter is hidden).
-  const groupGhost = new Map<number, string | null>()
-  const populate = (ls: readonly LoopRun[], baseShift: number, ancestor: string | null) => {
-    for (const loop of ls) {
-      const lid = loopIds.get(loop)!
-      for (let iter = 0; iter < loop.iterations; iter++) {
-        const iterStart = loop.start + baseShift + iter * loop.period
-        const ghost = ancestor ?? (isHiddenIter(loop, iter) ? `${lid}_${baseShift}` : null)
-        for (let g = iterStart; g < iterStart + loop.period; g++) groupGhost.set(g, ghost)
-        populate(loop.children, baseShift + iter * loop.period, ghost)
-      }
-    }
-  }
-  populate(loops, 0, null)
-
-  const groupIdx = new Map<Group, number>()
-  for (let i = 0; i < groups.length; i++) groupIdx.set(groups[i]!, i)
-
-  // Split dag nodes three ways: top-level loose (outside any loop), hidden-
-  // in-loop (edge ghost-redirect targets), visible-in-loop (cluster contents).
-  // buildDag emits one dag node per group → dagIdxByGroupIdx single-valued.
-  const looseDagIdxs: number[] = []
-  const dagIdxByGroupIdx = new Map<number, number>()
-  const tidGhost = new Map<number, string>()
-  for (let i = 0; i < dag.length; i++) {
-    const node = dag[i]!
-    const gi = node.group ? groupIdx.get(node.group) : undefined
-    if (gi === undefined || !groupGhost.has(gi)) { looseDagIdxs.push(i); continue }
-    const ghost = groupGhost.get(gi)
-    if (ghost) tidGhost.set(node.tensorId, ghost)
-    else dagIdxByGroupIdx.set(gi, i)
-  }
-
   const tidToColor = new Map<number, string>()
   for (const node of dag) tidToColor.set(node.tensorId, nodeColor(node, graph))
 
-  const emitCluster = (id: string, label: string, body: () => void) => {
-    lines.push(`  subgraph cluster_${id} {`)
-    lines.push(`    label="${label}"`)
-    for (const a of [`style="dashed"`, `color="#888"`, `fontcolor="#888"`, `fontsize=10`, `fontname="sans-serif"`, `labelloc=t`, `labeljust=l`]) {
-      lines.push(`    ${a}`)
+  // Truncate long loops: show first 2 + last iteration, with a "…" cluster
+  // for the elided middle. Threshold ≥ 4 — 3 iterations are already brief.
+  // Applied per nesting level independently.
+  const isHiddenIter = (loop: LoopRun, iter: number): boolean =>
+    loop.iterations >= 4 && iter >= 2 && iter <= loop.iterations - 2
+
+  // Walk the tree to populate ghost-tid map (tid → ghost cluster ID for leaf
+  // tids inside hidden iterations at any level). Computed before emission so
+  // edges can redirect through ghosts.
+  const tidGhost = new Map<number, string>()
+  const markGhostLeafTids = (node: TreeNode, ghostKey: string) => {
+    if (node.kind === 'leaf') tidGhost.set(node.output, ghostKey)
+    else for (const child of node.children) markGhostLeafTids(child, ghostKey)
+  }
+  const populateGhosts = (children: readonly TreeNode[], idPath: string) => {
+    const loops = detectLoops(children, graph)
+    for (let li = 0; li < loops.length; li++) {
+      const loop = loops[li]!
+      const ghostKey = `${idPath}_l${li}`
+      for (let iter = 0; iter < loop.iterations; iter++) {
+        const iterStart = loop.start + iter * loop.period
+        if (isHiddenIter(loop, iter)) {
+          for (let k = iterStart; k < iterStart + loop.period; k++) {
+            markGhostLeafTids(children[k]!, ghostKey)
+          }
+        } else {
+          populateGhosts(children.slice(iterStart, iterStart + loop.period), `${idPath}_l${li}i${iter}`)
+        }
+      }
     }
+    const loopCovers = new Set<number>()
+    for (const loop of loops) {
+      for (let k = loop.start; k < loop.start + loop.period * loop.iterations; k++) loopCovers.add(k)
+    }
+    for (let k = 0; k < children.length; k++) {
+      if (loopCovers.has(k)) continue
+      const c = children[k]!
+      if (c.kind === 'cluster') populateGhosts(c.children, `${idPath}_n${k}`)
+    }
+  }
+  populateGhosts(tree.children, "r")
+
+  const LOOP_ITER_ATTRS = [`style="dashed"`, `color="#888"`, `fontcolor="#888"`, `fontsize=10`, `fontname="sans-serif"`, `labelloc=t`, `labeljust=l`]
+  // User-cluster style: subtle background tint (no outline) so cluster
+  // boundaries can't be confused with edge connectors. Tint stacks ~8% alpha
+  // per nesting level.
+  const USER_CLUSTER_ATTRS = [`style="filled,rounded"`, `fillcolor="#80808014"`, `color="transparent"`, `fontcolor="#888"`, `fontsize=10`, `fontname="Courier"`, `labelloc=t`, `labeljust=l`, `penwidth=0`, `margin=10`]
+
+  const emitCluster = (id: string, label: string, attrs: readonly string[], body: () => void) => {
+    lines.push(`  subgraph cluster_${id} {`)
+    lines.push(`    label="${label.replace(/"/g, '\\"')}"`)
+    for (const a of attrs) lines.push(`    ${a}`)
     body()
     lines.push(`  }`)
   }
 
-  const emitNode = (dagIdx: number) => {
-    const node = dag[dagIdx]!
-    const tid = node.tensorId
-    const shapeNames = node.shape.map((d, i) => resolveDim(d, i, node.shape.length).name)
-    const rawLabel = resolveSourceLabel(graph, node, srcCache)
+  const emitGhostNode = (ghostKey: string) => {
+    emitCluster(`ghost_${ghostKey}`, "…hidden iterations…", LOOP_ITER_ATTRS, () => {
+      lines.push(`    "tghost_${ghostKey}" [label="…" shape=plaintext fontsize=22 fontcolor="#888" class="ti-ghost-${ghostKey}"]`)
+    })
+  }
+
+  // stripRedundantShapeComment is safe on any label — the regex doesn't match
+  // for input labels (`input: name`), so the call is a no-op in that case.
+  const emitNodeBox = (tid: number, rawLabel: string) => {
+    const shape = graph.tensors[tid]!.shape
+    const shapeNames = shape.map((d, i) => resolveDim(d, i, shape.length).name)
     const wrapped = wrapForLabel(stripRedundantShapeComment(rawLabel, shapeNames), 36)
-    const shapeHtml = shapeHtmlLabel(node.shape, resolveDim)
+    const shapeHtml = shapeHtmlLabel(shape, resolveDim)
     const color = tidToColor.get(tid)!
     const label = `<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="3" CELLSPACING="0">` +
       `<TR><TD>${wrapped}</TD></TR><TR><TD>${shapeHtml}</TD></TR></TABLE>>`
     lines.push(`    "t${tid}" [label=${label} color="${color}" class="ti-${tid}"]`)
   }
 
-  for (const i of looseDagIdxs) emitNode(i)
+  // Inputs render at the top of the diagram, outside any cluster.
+  for (const dn of dag) {
+    if (dn.leaf !== null) continue
+    const op = graph.ops[graph.tensors[dn.tensorId]!.source!]!
+    emitNodeBox(dn.tensorId, describeLibraryOp(op))
+  }
 
-  // Within a visible iter, positions covered by a child loop's range are
-  // skipped here — they'll emit inside the child's nested cluster instead.
-  const emitLoopList = (ls: readonly LoopRun[], baseShift: number) => {
-    for (const loop of ls) {
-      const gkStr = `${loopIds.get(loop)!}_${baseShift}`
-      for (let iter = 0; iter < loop.iterations; iter++) {
-        if (isHiddenIter(loop, iter)) continue
-        const iterStart = loop.start + baseShift + iter * loop.period
-        const innerBaseShift = baseShift + iter * loop.period
-        emitCluster(`loop_${gkStr}_iter_${iter}`,
-          `iteration ${iter + 1} of ${loop.iterations}`, () => {
-            for (let gi = iterStart; gi < iterStart + loop.period; gi++) {
-              const inChild = loop.children.some(c => {
-                const cs = c.start + innerBaseShift
-                return gi >= cs && gi < cs + c.period * c.iterations
-              })
-              if (inChild) continue
-              const di = dagIdxByGroupIdx.get(gi)
-              if (di !== undefined) emitNode(di)
-            }
-            emitLoopList(loop.children, innerBaseShift)
+  // Recursive walk: leaves emit as nodes; user clusters emit as labeled
+  // subgraph rectangles; loop runs emit as per-iter clusters with a ghost
+  // for hidden iterations.
+  const emitChildren = (children: readonly TreeNode[], idPath: string) => {
+    const loops = detectLoops(children, graph)
+    const loopByStart = new Map<number, { loop: LoopRun; index: number }>()
+    for (let li = 0; li < loops.length; li++) loopByStart.set(loops[li]!.start, { loop: loops[li]!, index: li })
+
+    let i = 0
+    while (i < children.length) {
+      const entry = loopByStart.get(i)
+      if (entry) {
+        const { loop, index } = entry
+        for (let iter = 0; iter < loop.iterations; iter++) {
+          if (isHiddenIter(loop, iter)) continue
+          const iterStart = loop.start + iter * loop.period
+          emitCluster(`${idPath}_l${index}_iter${iter}`,
+            `iteration ${iter + 1} of ${loop.iterations}`, LOOP_ITER_ATTRS, () => {
+              emitChildren(children.slice(iterStart, iterStart + loop.period), `${idPath}_l${index}i${iter}`)
+            })
+        }
+        if (loop.iterations >= 4) emitGhostNode(`${idPath}_l${index}`)
+        i = loop.start + loop.period * loop.iterations
+      } else {
+        const child = children[i]!
+        if (child.kind === 'leaf') {
+          if (!tidGhost.has(child.output)) emitNodeBox(child.output, frameSourceText(child.frame, srcCache))
+        } else {
+          emitCluster(`${idPath}_n${i}`, frameSourceText(child.frame, srcCache), USER_CLUSTER_ATTRS, () => {
+            emitChildren(child.children, `${idPath}_n${i}`)
           })
-      }
-      // Ghost lives in the same nesting context as the visible-iter clusters
-      // above, so inner-loop ghosts sit inside their containing outer iter.
-      if (loop.iterations >= 4) {
-        const startIdx = 2, endIdx = loop.iterations - 2
-        emitCluster(`loop_${gkStr}_ghost`,
-          `iterations ${startIdx + 1}..${endIdx + 1} of ${loop.iterations}`, () => {
-            lines.push(`    "tghost_${gkStr}" [label="…" shape=plaintext fontsize=22 fontcolor="#888" class="ti-ghost-${gkStr}"]`)
-          })
+        }
+        i++
       }
     }
   }
-  emitLoopList(loops, 0)
+  emitChildren(tree.children, "r")
 
-  // Both endpoints in the same ghost → drop (internal to the elided range).
-  // Ghost-touching edges dedupe by (src,dst) so many-iter fan-in (e.g. a
-  // `stack` consuming every state) collapses to a single line.
+  // Edges. For each consumer→producer pair, redirect through ghosts when one
+  // side sits inside a hidden iteration. Dedupe ghost-touching edges so a
+  // many-iter fan-in collapses to one line.
   type Endpoint = { id: string; cls: string; hidden: boolean }
   const endpoint = (tid: number): Endpoint => {
     const g = tidGhost.get(tid)
@@ -743,6 +853,38 @@ function buildMetrics(args: {
       tooltip: "Compiled GPU programs the model dispatches each step.",
     },
   ]
+}
+
+// Mirrors buildDOT's loop-hiding rules so MAX_DIAGRAM_NODES matches reality.
+// Leaves count as 1; clusters are pure visual wrappers and contribute their
+// children's count. Hidden iters contribute 0; each loop with hidden iters
+// contributes 1 for its ghost.
+function countVisibleLeaves(tree: CallCluster, graph: Graph): number {
+  const isHiddenIter = (loop: LoopRun, iter: number): boolean =>
+    loop.iterations >= 4 && iter >= 2 && iter <= loop.iterations - 2
+  const countChildren = (children: readonly TreeNode[]): number => {
+    const loops = detectLoops(children, graph)
+    const loopCovers = new Set<number>()
+    for (const loop of loops) {
+      for (let k = loop.start; k < loop.start + loop.period * loop.iterations; k++) loopCovers.add(k)
+    }
+    let total = 0
+    for (const loop of loops) {
+      for (let iter = 0; iter < loop.iterations; iter++) {
+        if (isHiddenIter(loop, iter)) continue
+        const iterStart = loop.start + iter * loop.period
+        total += countChildren(children.slice(iterStart, iterStart + loop.period))
+      }
+      if (loop.iterations >= 4) total += 1  // ghost node
+    }
+    for (let k = 0; k < children.length; k++) {
+      if (loopCovers.has(k)) continue
+      const c = children[k]!
+      total += c.kind === 'leaf' ? 1 : countChildren(c.children)
+    }
+    return total
+  }
+  return countChildren(tree.children)
 }
 
 // ===== Component ============================================================
@@ -1030,20 +1172,22 @@ class IRViewer extends Component {
     if (!this.viz || !view || !this.resolveDim || !this.canvasEl) return
     const { graph, fwdOps, kernelCount } = view
     // Forward-only graph: backward and optimizer are universal training
-    // machinery, not architecture. Param_input leaves hidden too — Linear/
+    // machinery, not architecture. Param_input leaves hidden — Linear /
     // LayerNorm boxes already imply "has weights"; param count is in the
-    // header. How-it-works tab covers what's not shown.
+    // header. Tensor_input leaves excluded from the tree because buildDag
+    // renders them separately as data-source nodes at the top of the graph,
+    // labeled via describeLibraryOp ("input: clean" / "input: noisy") rather
+    // than the call-site lookup that runs on tree leaves.
     const included = new Set<number>()
     for (const i of fwdOps) {
-      if (graph.ops[i]!.kind !== "param_input") included.add(i)
+      const kind = graph.ops[i]!.kind
+      if (kind !== "param_input" && kind !== "tensor_input") included.add(i)
     }
-    const groups = groupBySourceLine(graph, included)
-    const dag = buildDag(graph, groups)
-    const loops = detectLoops(groups, graph)
+    const tree = buildGroupTree(graph, included)
+    const leaves = collectLeaves(tree)
+    const dag = buildDag(graph, leaves)
 
-    // Visible node count after loop-collapse — mirrors buildDOT's isHiddenIter
-    // recursively across nested loops.
-    const visibleNodes = dag.length - countHiddenGroups(loops)
+    const visibleNodes = countVisibleLeaves(tree, graph)
     this.canvasEl.innerHTML = ""
     if (visibleNodes > MAX_DIAGRAM_NODES) {
       const notice = document.createElement("div")
@@ -1053,7 +1197,7 @@ class IRViewer extends Component {
         `Metrics above are still available — reduce loop iterations or model depth to see the diagram.`
       this.canvasEl.appendChild(notice)
     } else {
-      const dot = buildDOT(graph, dag, groups, loops, this.resolveDim, this.srcCache)
+      const dot = buildDOT(graph, tree, dag, this.resolveDim, this.srcCache)
       const svg = this.viz.renderSVGElement(dot)
       this.canvasEl.appendChild(svg)
       attachHoverTrace(svg)
@@ -1068,6 +1212,7 @@ class IRViewer extends Component {
     })
     this.update()
   }
+
 }
 
 new App({ root: new IRViewer(), id: "app" })
@@ -1305,6 +1450,11 @@ html[data-theme="dark"] .ir-viewer .metric-chip::after {
 .ir-viewer .canvas svg [class*="ti-"] { transition: filter 0.1s ease; }
 .ir-viewer .hi-highlight { filter: drop-shadow(0 0 4px #f5a623); }
 
+/* Cluster header labels (both user-function and loop-iter clusters) — route
+   through theme tokens for proper light/dark contrast. Graphviz emits the
+   color inline, which doesn't theme-switch. */
+.ir-viewer .canvas svg g.cluster > text { fill: var(--text-primary); }
+
 /* SVG content theme — Graphviz hard-codes the node fill as the DOT's
    `fillcolor=white` (emitted as `fill="#ffffff"` on the box `<polygon>`
    for `shape=box`, sometimes on a `<path>` for other shapes) and the
@@ -1413,6 +1563,11 @@ The source MUST end with:
     const posE = pos_emb.fwd(arange(T))                  // [T, D]
     let h = add(tok_emb.fwd(tokens), posE)               // [B, T, D]
 
+**RoPE (rotary position embedding)** — apply `rope` to the Q/K pair after `splitHeads`, before attention scores. Returns the pair rotated:
+
+    const [q, k] = rope(splitHeads(p.q.fwd(x), H), splitHeads(p.k.fwd(x), H))
+    const v = splitHeads(p.v.fwd(x), H)                  // [B, H, T, D/H]
+
 **Tied input/output embeddings** — declare `tok_emb` as a raw `this.param([VOCAB, D])` (not `new Embedding`, which is lookup-only). Use `embedding(tok_emb, tokens)` for the input side and `matmul(h, swapAxes(tok_emb, -1, -2))` for the output tail:
 
     tok_emb = this.param([VOCAB, D])
@@ -1488,9 +1643,9 @@ The source MUST end with:
 **Const-tensor builders**: `zeros(shape, dtype?)`, `ones(shape, dtype?)` — default `f32`. The full set is `randn` / `arange` / `oneHot` / `zeros` / `ones`; no `full`, `eye`, `linspace`, `tril`, or `like`-variants.
 **Slicing/structural**: `narrow(t, axis, start, len)`, `concat([a, b, ...], axis)`, `stack([a, b, ...], axis)`, `split(t, [size1, size2, ...], axis)`.
 **Fused ML**: `softmax`, `logSoftmax`, `softmaxCausal`, `whereCausal`.
-**Attention layout**: `splitHeads(x, nHeads)`, `mergeHeads(x)`.
+**Attention layout**: `splitHeads(x, nHeads)`, `mergeHeads(x)`, `rope(q, k, { base? })` (rotary position embedding on the Q/K pair; returns the pair rotated).
 **Conv/pool**: `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`.
-**Stochastic/grad**: `dropout(x, p)`, `randn(shape)`, `stopGradient(x)` (= PyTorch `.detach`), `capture(name, t)`.
+**Stochastic/grad**: `dropout(x, p)`, `randn(shape)`, `categorical(logits, axis?)` (samples from logits via Gumbel-max; i32, non-diff), `stopGradient(x)` (= PyTorch `.detach`), `capture(name, t)`.
 
 ## Gotchas
 
@@ -1505,7 +1660,6 @@ The source MUST end with:
 - **Loss must be scalar** (rank-0). Use `mean`/`sum` to reduce.
 - **`splitHeads(x, nHeads)`** reshapes one tensor: `[B, T, D] → [B, H, T, D/H]`. For Q/K/V, use three independent `Linear(D, D)` projections and call `splitHeads` on each.
 - **No GQA — use full Q/K/V projections (all `H` heads).** `matmul` batch dims must match exactly (no size-1 broadcasting); matching multi-dim batches like `[B, H, T, D]` work fine — don't flatten to `[B*H, ...]` defensively.
-- **No RoPE — use learned `pos_emb`.** Rotate-half from scratch is fiddly; the diagram shows the same architecture either way.
 - **No hand-rolled fast-GELU — use the `gelu` primitive.** `mul(x, sigmoid(mul(x, 1.702)))` is the approximation; dropping the sigmoid silently collapses the MLP to linear and the trace passes.
 - **Use `new RMSNorm(D)`, don't hand-roll.** Already in the symbols list; a hand-rolled version next to `LayerNorm` reads as architecturally inconsistent.
 - **Use a loop for repeated blocks, not manual unrolling.** `layers = []; for (let i = 0; i < N_LAYERS; i++) layers.push(new Block())` + `for (const layer of m.layers) ...`. Manually-named fields (`layer0`, `layer1`, …) make `N_LAYERS` decorative — editing the const won't change architecture.
@@ -1587,7 +1741,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "submitTitle": "Diagram It"
   },
   "dependencies": {
-    "tensorgrad": "^0.1.6",
+    "tensorgrad": "^0.1.8",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
     "domeleon": "^0.6.0"

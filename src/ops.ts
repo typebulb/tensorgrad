@@ -259,12 +259,47 @@ function findOrCreatePrngSeed(g: Graph): Tensor {
   return tensorInput(PRNG_SEED_INPUT, [], 'i32')
 }
 
-// Counts every stochastic op in the graph so each new dropout / randn site
-// receives a unique salt and an independent PCG stream.
+// Counts every stochastic op in the graph so each new dropout / randn /
+// categorical site receives a unique salt and an independent PCG stream.
 function countStochasticOps(g: Graph): number {
   let n = 0
-  for (const op of g.ops) if (op.kind === 'dropout' || op.kind === 'randn') n++
+  for (const op of g.ops) {
+    if (op.kind === 'dropout' || op.kind === 'randn' || op.kind === 'categorical_last') n++
+  }
   return n
+}
+
+function categoricalLastIR(a: Tensor): Tensor {
+  const site = captureSite('categorical')
+  if (a.dtype !== 'f32') throw new ShapeError(`categorical: requires f32 logits, got ${a.dtype}`, site)
+  const outShape = inferSumLast('categorical', a.shape, site)
+  const g = currentGraph()
+  const seed = findOrCreatePrngSeed(g)
+  const salt = countStochasticOps(g)
+  return addOp(g, 'categorical_last', outShape, 'i32', site, { a: a.id, seed: seed.id, salt })
+}
+
+/** Sample one categorical index per leading position from `logits` along an
+ *  axis (default `-1`). Returns `i32`, one rank less than input. Pass raw
+ *  logits — softmax is applied implicitly via the Gumbel-max trick, so
+ *  pre-softmaxing is unnecessary. Applying softmax yourself first samples
+ *  from softmax(softmax(logits)) silently (a flatter distribution) — same
+ *  footgun shape as crossEntropy + pre-log-softmax.
+ *
+ *  Reuses the shared per-step PRNG seed — each `step()` / `run()` advances
+ *  the seed so each call sees a fresh draw. Salt assignment follows the same
+ *  rules as `dropout` / `randn` (sequence position in the graph) — adding or
+ *  removing an earlier stochastic op shifts the random stream of every later
+ *  call. Non-differentiable; gradients do not flow back through the sampled
+ *  index. Standard use: LLM next-token sampling. Temperature is
+ *  `categorical(div(logits, T))` — the Gumbel-max trick handles it
+ *  correctly.
+ *
+ *  Named for the sampled distribution (one categorical draw per row), not
+ *  for the multinomial-with-replacement op of the same name in PyTorch.
+ *  Matches `jax.random.categorical`. */
+export function categorical(logits: Tensor, axis: number = -1): Tensor {
+  return axisReducing(logits, axis, 'categorical', categoricalLastIR)
 }
 
 /** GELU using the GPT-2 tanh approximation:
@@ -332,14 +367,7 @@ function argmaxLastIR(a: Tensor): Tensor {
  *  Non-differentiable: gradients do not flow back through this op. */
 export function argmax(a: Tensor, axis?: number): Tensor {
   if (axis === undefined) return argmaxLastIR(reshape(a, [-1]))
-  const r = a.shape.length
-  const k = axis < 0 ? r + axis : axis
-  if (k < 0 || k >= r) {
-    throw new ShapeError(`argmax: axis ${axis} out of range for shape [${a.shape.join(',')}]`, captureSite('argmax'))
-  }
-  if (k === r - 1) return argmaxLastIR(a)
-  const perm = [...Array(r).keys()].filter(i => i !== k).concat(k)
-  return argmaxLastIR(permute(a, perm))
+  return axisReducing(a, axis, 'argmax', argmaxLastIR)
 }
 
 /** Index of the minimum value along an axis. Mirrors `argmax` exactly;
@@ -685,6 +713,25 @@ function axisPreserving(
   return permute(applyLast(permute(a, perm)), backPerm(k, r))
 }
 
+// Apply a last-axis-reducing IR op (output drops the last axis) along an
+// arbitrary axis by permuting before the kernel call. No back-permute — the
+// axis is gone from the output. Used by argmax / categorical.
+function axisReducing(
+  a: Tensor, axisArg: number, opName: string,
+  applyLast: (t: Tensor) => Tensor,
+): Tensor {
+  const r = a.shape.length
+  if (r === 0) {
+    throw new ShapeError(`${opName}: cannot reduce a 0-d tensor`, captureSite(opName))
+  }
+  const k = axisArg < 0 ? r + axisArg : axisArg
+  if (k < 0 || k >= r) {
+    throw new ShapeError(`${opName}: axis ${axisArg} out of range for shape [${a.shape.join(',')}]`, captureSite(opName))
+  }
+  if (k === r - 1) return applyLast(a)
+  return applyLast(permute(a, [...Array(r).keys()].filter(i => i !== k).concat(k)))
+}
+
 /** Pre-softmax causal mask. Sets cells where `i < j` on the last two axes
  *  to `fillValue` (typically `-1e30`); lower-triangle entries pass through.
  *  Use when you want the masked scores explicitly (e.g. to `capture` them);
@@ -791,6 +838,68 @@ export function mergeHeads(x: Tensor): Tensor {
   const lead = x.shape.slice(0, r - 3)
   const swapped = swapAxes(x, r - 3, r - 2)
   return reshape(swapped, [...lead, T, H * d])
+}
+
+export interface RopeOptions {
+  /** Base for the rotary frequency schedule: `θ_i = base^(-2i/D)`. Default
+   *  10000 (RoFormer / Llama standard). Long-context models often raise this
+   *  to 500_000+ (NTK-aware schedules). */
+  base?: number
+}
+
+/** Rotary position embedding applied to a query/key pair. Both inputs have
+ *  shape `[..., T, D]`: T is the sequence axis (positions `0..T-1`), D is the
+ *  rotation axis and must be even. T and D must match between q and k;
+ *  leading axes can differ. Returns `[q_rotated, k_rotated]`.
+ *
+ *  Takes Q and K together (not single-tensor) because rope is always applied
+ *  to the Q/K pair and never to V — the pair API makes that structural
+ *  rather than relying on the user remembering. Bonus: the cos/sin schedule
+ *  is computed once and shared, rather than duplicated across two calls.
+ *
+ *  Uses the rotate-half convention (Llama / RoFormer): pairs `(x_i, x_{i+D/2})`
+ *  rotate by angle `pos · base^(-2i/D)`. */
+export function rope(q: Tensor, k: Tensor, opts: RopeOptions = {}): [Tensor, Tensor] {
+  const site = captureSite('rope')
+  if (q.dtype !== 'f32') throw new ShapeError(`rope: q must be f32, got ${q.dtype}`, site)
+  if (k.dtype !== 'f32') throw new ShapeError(`rope: k must be f32, got ${k.dtype}`, site)
+  if (q.shape.length < 2) {
+    throw new ShapeError(`rope: q requires rank >= 2 (sequence axis at -2, rotation axis at -1), got rank ${q.shape.length}`, site)
+  }
+  if (k.shape.length < 2) {
+    throw new ShapeError(`rope: k requires rank >= 2, got rank ${k.shape.length}`, site)
+  }
+  const T = q.shape[q.shape.length - 2]!
+  const D = q.shape[q.shape.length - 1]!
+  if (k.shape[k.shape.length - 2] !== T || k.shape[k.shape.length - 1] !== D) {
+    throw new ShapeError(`rope: q and k must share sequence and feature dims, got q=[${q.shape.join(',')}] k=[${k.shape.join(',')}]`, site)
+  }
+  if (D % 2 !== 0) {
+    throw new ShapeError(`rope: rotation dim must be even (rotates pairs), got ${D}`, site)
+  }
+  const half = D / 2
+  const base = opts.base ?? 10000
+
+  // Schedule (computed once, applied to both q and k):
+  // freqs[i] = base^(-2i/D) for i in [0, D/2); angles[t, i] = t * freqs[i].
+  const idx = arange(half, 'f32')
+  const freqs = exp(mul(idx, -Math.log(base) / half))              // [D/2]
+  const positions = arange(T, 'f32')
+  const angles = mul(reshape(positions, [T, 1]), reshape(freqs, [1, half]))  // [T, D/2]
+  // Duplicate halves so cos/sin broadcast across both pair members.
+  const cosHalf = cos(angles)
+  const sinHalf = sin(angles)
+  const cosFull = concat([cosHalf, cosHalf], -1)                   // [T, D]
+  const sinFull = concat([sinHalf, sinHalf], -1)                   // [T, D]
+
+  // rotate_half(x) = concat([-x[..., D/2:], x[..., :D/2]], -1).
+  // [T, D] broadcasts as a suffix over the leading axes of x.
+  const applyRot = (x: Tensor): Tensor => {
+    const [x1, x2] = split(x, [half, half], -1)
+    const rotated = concat([neg(x2!), x1!], -1)                    // [..., T, D]
+    return add(mul(x, cosFull), mul(rotated, sinFull))
+  }
+  return [applyRot(q), applyRot(k)]
 }
 
 /** Inverse of `concat`: split into pieces along `axis` with the given
