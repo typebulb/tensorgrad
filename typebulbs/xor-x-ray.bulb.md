@@ -727,7 +727,7 @@ class Root extends Component implements IRoot {
 
   tabBtn(key: "demo" | "code", label: string) {
     return button({
-      class: ["tab-btn", this.activeTab === key && "active"],
+      class: ["tab-btn", this.activeTab === key ? "active" : ""],
       onClick: () => {
         if (this.activeTab === key) return
         this.activeTab = key
@@ -741,7 +741,7 @@ class Root extends Component implements IRoot {
       div({ class: "toggle-label" }, label),
       choices.map(c => button({
         onClick: () => onSelect(c.value),
-        class: ["toggle", current === c.value && "active"],
+        class: ["toggle", current === c.value ? "active" : ""],
       }, c.label)),
     )
   }
@@ -935,7 +935,7 @@ class Root extends Component implements IRoot {
           const f = forward(d.p, ex.x, ex.y, d.hiddenAct)
           const correct = Math.abs(f.y - ex.y) < 0.3
           const isCurrent = i === d.exIdx
-          return div({ class: ["pred-row", correct ? "correct" : "incorrect", isCurrent && "current"] },
+          return div({ class: ["pred-row", correct ? "correct" : "incorrect", isCurrent ? "current" : ""] },
             span({ class: "ex-dot", style: { background: `var(--ex-color-${i})` } }),
             span({ class: "pred-in"    }, `(${ex.x[0]}, ${ex.x[1]})`),
             span({ class: "pred-arrow" }, "→"),

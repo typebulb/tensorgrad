@@ -1516,7 +1516,7 @@ class InsidePanel extends Component implements IInsidePanel {
               colorClass = step.inputTokens[pos] === trueResultDigits[idx] ? styles.successHigh : styles.successLow
             }
             return div({
-              class: ['text-center text-[11px] font-mono', isPredInput && 'font-bold', colorClass],
+              class: ['text-center text-[11px] font-mono', isPredInput ? 'font-bold' : '', colorClass],
               style: { width: cellW + 'px' }
             }, `${pos}\n` + TOKEN_LABELS[step.inputTokens[pos]])
           })
@@ -1571,7 +1571,7 @@ class InsidePanel extends Component implements IInsidePanel {
       ? splitResultDigits(this.root.inputPanel.operandA + this.root.inputPanel.operandB)[pos - (T - N_RESULT_DIGITS)]
       : step.inputTokens[pos + 1]
 
-    const subTabs: { id: typeof this.cellDetailTab; label: string }[] = [
+    const subTabs: { id: 'stages' | 'wires' | 'vocab'; label: string }[] = [
       { id: 'stages', label: 'Residual' },
       { id: 'wires', label: 'MLP' },
       { id: 'vocab', label: 'Projection' }
@@ -1607,7 +1607,7 @@ class InsidePanel extends Component implements IInsidePanel {
         const isSel = sIdx === layerIdx
         return div({ class: styles.stripRow },
           div({
-            class: [styles.stripRowLabel, isSel ? styles.successHigh : styles.mutedText, isSel && 'font-bold'],
+            class: [styles.stripRowLabel, isSel ? styles.successHigh : styles.mutedText, isSel ? 'font-bold' : ''],
             style: { width: stripLabelW + 'px' }
           }, `${stageNames[sIdx]}  max=${stageMaxes[sIdx].toFixed(2)}`),
           div({
@@ -2588,7 +2588,7 @@ class Root extends Component implements IRoot {
   }
 
   tabsPanel() {
-    const tabs: { id: typeof this.activeTab; label: string }[] = [
+    const tabs: { id: 'explainer' | 'attention' | 'inside' | 'embeddings'; label: string }[] = [
       { id: 'explainer', label: 'Explainer' },
       { id: 'attention', label: 'Attention' },
       { id: 'inside', label: 'Blocks' },
@@ -2649,7 +2649,7 @@ new App({
   "dependencies": {
     "domeleon": "^0.6.0",
     "@unocss/preset-wind3": "^66.5.3",
-    "tensorgrad": "^0.1.7"
+    "tensorgrad": "^0.1.8"
   },
   "description": "Watch a transformer learn 2-digit addition from scratch in your browser. Type two numbers and see it predict the sum digit by digit. Built with tensorgrad (autograd + WebGPU)."
 }

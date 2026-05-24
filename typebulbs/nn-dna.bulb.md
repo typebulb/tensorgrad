@@ -624,7 +624,10 @@ function buildDOT(
   }
   populateGhosts(tree.children, "r")
 
-  const LOOP_ITER_ATTRS = [`style="dashed"`, `color="#888"`, `fontcolor="#888"`, `fontsize=10`, `fontname="sans-serif"`, `labelloc=t`, `labeljust=l`]
+  // Heavier penwidth + explicit margin so the dashed border has breathing
+  // room from the inner user-cluster's tint; without these, the default thin
+  // gray dashes get visually absorbed by the tint.
+  const LOOP_ITER_ATTRS = [`style="dashed"`, `color="#666"`, `fontcolor="#888"`, `fontsize=10`, `fontname="sans-serif"`, `labelloc=t`, `labeljust=l`, `penwidth=1.4`, `margin=14`]
   // User-cluster style: subtle background tint (no outline) so cluster
   // boundaries can't be confused with edge connectors. Tint stacks ~8% alpha
   // per nesting level.
@@ -1032,7 +1035,7 @@ class IRViewer extends Component {
 
   private tabBtn(key: typeof this.activeTab, label: string) {
     return button({
-      class: ["tab-btn", this.activeTab === key && "active"],
+      class: ["tab-btn", this.activeTab === key ? "active" : ""],
       onClick: () => {
         if (this.activeTab === key) return
         this.activeTab = key

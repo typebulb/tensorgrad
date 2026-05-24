@@ -347,7 +347,7 @@ class TabControl extends Component {
     return div({ class: 'tab-control' },
       div({ class: 'tab-bar' },
         tabs.map(t => button({
-          class: ['tab-btn', sel === t.key && 'active'],
+          class: ['tab-btn', sel === t.key ? 'active' : ''],
           onClick: () => {
             if (this.selected === t.key) return
             this.selected = t.key
@@ -593,7 +593,7 @@ class EmbeddingSection extends ModeSection {
         TABLE.map((t, i) => {
           const isSel = i === sel
           return div({
-            class: ['embed-grid-row', isSel && 'is-sel'],
+            class: ['embed-grid-row', isSel ? 'is-sel' : ''],
             onClick: () => this.selectToken(i),
           },
             div({ class: 'embed-token-name' }, t.name),
@@ -954,10 +954,10 @@ class MatmulSection extends ModeSection {
       class: [
         'mat-cell',
         numClass(v),
-        opts.rowHl === i && 'cell-row-hl',
-        opts.colHl === j && 'cell-col-hl',
-        opts.cellHl?.row === i && opts.cellHl?.col === j && 'cell-sel',
-        opts.onClick && 'cell-clickable',
+        opts.rowHl === i ? 'cell-row-hl' : '',
+        opts.colHl === j ? 'cell-col-hl' : '',
+        opts.cellHl?.row === i && opts.cellHl?.col === j ? 'cell-sel' : '',
+        opts.onClick ? 'cell-clickable' : '',
       ],
       onClick: opts.onClick ? () => opts.onClick!(i, j) : undefined,
     }, String(v))))
@@ -1427,7 +1427,7 @@ class Root extends Component implements IRoot {
 
   viewModeBar() {
     const mk = (key: ViewMode, label: string) => button({
-      class: ['view-mode-btn', this.viewMode === key && 'active'],
+      class: ['view-mode-btn', this.viewMode === key ? 'active' : ''],
       onClick: () => this.setViewMode(key),
     }, label)
     return div({ class: 'view-mode-bar' },
