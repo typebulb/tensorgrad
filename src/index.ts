@@ -41,7 +41,7 @@ export {
 
 export { lr, type AdamConfig, type AdamWConfig, type LR } from './adam.js'
 export { type SGDConfig } from './sgd.js'
-export { Captures } from './runtime.js'
+export { Captures, type OutputArray, type DtypeArray } from './runtime.js'
 export {
   compile, trace, traceForward, isWebGPUAvailable,
   type TrainingSpec, type ForwardSpec, type CompiledIR, type ForwardFn,

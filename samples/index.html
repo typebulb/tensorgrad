@@ -57,6 +57,10 @@
       <p>Same transformer architecture as the addition demo, retargeted to Karpathy's makemore task: train on ~32K real first names, sample novel plausible names. The genuine ML payoff — outputs are defined by the data distribution, not by any specifiable algorithm.</p>
     </li>
     <li>
+      <a href="/pokeformer/">Pokéformer (Llama-style, in-graph categorical)</a>
+      <p>Tiny Llama-style decoder (RMSNorm + RoPE + tied embeddings) invents Pokémon names from the PokéAPI corpus. The inference forward bakes <code>categorical</code> sampling into the graph with a runtime temperature input, so <code>infer.run</code> returns sampled token ids directly (<code>r.output</code> is <code>Int32Array</code>) — exercises the in-graph stochastic + i32-readback paths end-to-end.</p>
+    </li>
+    <li>
       <a href="/mlp-sin/">MLP fits sin(x)</a>
       <p>Tiny 2-layer MLP regressor. Demonstrates the same library on a much smaller model — lets you see autograd, Adam, and the Module abstraction work in a different shape of problem.</p>
     </li>

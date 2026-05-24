@@ -218,7 +218,7 @@ function injectPrngSeed(slot: GraphSlot, inputs: Record<string, Int32Array | Flo
 async function handleStep(payload: {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
-}): Promise<{ loss: number; captures: Record<string, Float32Array> | null }> {
+}): Promise<{ loss: number; captures: Record<string, Float32Array | Int32Array> | null }> {
   const slot = mustGet(payload.graphId)
   const merged = injectPrngSeed(slot, injectOptimizerScalars(slot, payload.inputs))
   const hasCaptures = Object.keys(slot.captureShapes).length > 0
@@ -240,7 +240,7 @@ async function handleStep(payload: {
 async function handleRun(payload: {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
-}): Promise<{ output: Float32Array; captures: Record<string, Float32Array> | null }> {
+}): Promise<{ output: Float32Array | Int32Array; captures: Record<string, Float32Array | Int32Array> | null }> {
   const slot = mustGet(payload.graphId)
   const merged = injectPrngSeed(slot, payload.inputs)
   const hasCaptures = Object.keys(slot.captureShapes).length > 0
@@ -262,13 +262,14 @@ function abortErr(msg: string): Error {
   return e
 }
 
-/** Captures class instance → plain Record so we can transfer Float32Arrays
- *  back without serializing the class. */
+/** Captures class instance → plain Record so we can transfer typed arrays
+ *  back without serializing the class. Per-entry array type matches the
+ *  captured tensor's dtype (Float32Array for f32, Int32Array for i32). */
 function capturesToRecord(
-  captures: { get(name: string): Float32Array; has(name: string): boolean; names(): string[] },
+  captures: { get(name: string): Float32Array | Int32Array; has(name: string): boolean; names(): string[] },
   shapes: Record<string, number[]>,
-): Record<string, Float32Array> {
-  const out: Record<string, Float32Array> = {}
+): Record<string, Float32Array | Int32Array> {
+  const out: Record<string, Float32Array | Int32Array> = {}
   for (const name of Object.keys(shapes)) {
     if (captures.has(name)) out[name] = captures.get(name)
   }
@@ -363,7 +364,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
   }
 }
 
-function collectTransfers(rec: Record<string, Float32Array> | null | undefined): ArrayBuffer[] {
+function collectTransfers(rec: Record<string, Float32Array | Int32Array> | null | undefined): ArrayBuffer[] {
   if (!rec) return []
   const out: ArrayBuffer[] = []
   for (const v of Object.values(rec)) out.push(v.buffer as ArrayBuffer)

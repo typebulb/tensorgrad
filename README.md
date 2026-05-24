@@ -398,6 +398,10 @@ reads/writes are visible there too.
 infer.run(inputs)                            // → { kind: 'completed', output, captures } | { kind: 'aborted' }
 ```
 
+`r.output` defaults to `Float32Array`. For forwards ending in `categorical`
+/ `argmax` / `argmin`, pass `output: 'i32'` on the attach spec and
+`r.output` types as `Int32Array` (validated at compile).
+
 **Concurrent `step` / `run` auto-serialize.** A `run()` issued while a
 `step()` is in flight is queued automatically — same worker, same single
 output staging buffer; the runtime chains the second call so the two
@@ -650,13 +654,14 @@ const attn = capture(`attn.${i}`, softmaxCausal(scores))
 // After run:
 const r = await infer.run(inputs)
 if (r.kind === 'completed') {
-  const attn0 = r.captures.get('attn.0')        // Float32Array
+  const attn0 = r.captures.get('attn.0')        // Float32Array | Int32Array (matches the captured tensor's dtype)
   r.captures.shape('attn.0')                    // readonly number[]
 }
 ```
 
 For multi-head attention captures, `r.captures.perHead(name)` splits the
-flat array into one `Float32Array` per head.
+flat array into one `Float32Array` per head; throws if the named capture
+is i32 (per-head is for attention activations, always f32).
 
 Captures are zero-overhead when the graph has no `capture()` sites.
 When it does, they're read back via a single batched `mapAsync`
@@ -694,7 +699,7 @@ The library is small because of what it doesn't do. Plan accordingly:
 - **WebGPU only.** No Wasm, WebGL, or native fallback.
 - **Static shapes.** Every shape is fixed at compile time. Changing a batch
   size means recompiling.
-- **`f32` only.** No mixed precision. Inputs may be `i32` for indices.
+- **`f32` for math, `i32` for indices.** Params and differentiable tensors are f32; index tensors (`categorical`, `argmax`, `argmin`, `arange`, embedding lookups) are i32. No mixed precision.
 - **One transformation: `grad`.** No `vmap`, `pmap`, `jvp`, `custom_vjp`.
   Batch your data explicitly.
 - **Only `lr` is hot-mutable.** `weightDecay`, `beta1`, `beta2`, `clipGradNorm`,

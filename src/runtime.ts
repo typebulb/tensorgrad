@@ -6,6 +6,17 @@ import type { KernelSpec } from './codegen.js'
 // lib.dom declares the WebGPU types but not this runtime constant.
 declare const GPUMapMode: { readonly READ: number; readonly WRITE: number }
 
+/** Maps an output dtype tag (`'f32'` or `'i32'`) to its host-side
+ *  TypedArray. Used to give `r.output` the right concrete type per the
+ *  declared output dtype on the forward spec. */
+export type DtypeArray<D extends 'f32' | 'i32'> = D extends 'i32' ? Int32Array : Float32Array
+
+/** Union of all output-shaped TypedArrays. Used internally by the runtime
+ *  and by `Captures.get` (where per-capture dtype isn't separately declared
+ *  in the spec). User code typing `r.output` should prefer `DtypeArray<O>`
+ *  via the `output` field on the forward spec. */
+export type OutputArray = Float32Array | Int32Array
+
 /**
  * Activation readbacks for one `step()`/`run()` call. Keyed by the names
  * passed to `capture(name, t)` during the trace. `get(name)` throws if the
@@ -15,9 +26,9 @@ declare const GPUMapMode: { readonly READ: number; readonly WRITE: number }
 export class Captures {
   constructor(
     private readonly shapes: Record<string, readonly number[]>,
-    private readonly data: Map<string, Float32Array>,
+    private readonly data: Map<string, OutputArray>,
   ) {}
-  get(name: string): Float32Array {
+  get(name: string): OutputArray {
     const d = this.data.get(name)
     if (!d) {
       const known = [...this.data.keys()].sort().join(', ') || '(none registered)'
@@ -40,9 +51,13 @@ export class Captures {
    *  the static shape registered at compile time. The leading axis is treated
    *  as heads (matching `splitHeads` layout at B=1); a leading singleton batch
    *  is stripped if present so callers can pass capture names directly.
-   *  Throws if the capture isn't registered. */
+   *  Throws if the capture isn't registered, or if the capture's dtype is
+   *  i32 — per-head viz is for attention activations (always f32). */
   perHead(name: string): Float32Array[] {
     const flat = this.get(name)
+    if (!(flat instanceof Float32Array)) {
+      throw new TypeError(`Captures.perHead: '${name}' is i32; perHead() supports f32 captures only`)
+    }
     const shape = this.shape(name)
     if (shape.length < 2) {
       throw new Error(`Captures.perHead: '${name}' shape needs >= 2 dims, got [${shape.join(', ')}]`)
@@ -59,11 +74,12 @@ export class Captures {
   }
 }
 
-/** Result of `run(inputs)`: the output tensor as a flat `Float32Array`
- *  plus a `Captures` instance. When the traced graph has no `capture(...)`
- *  sites, `captures` is empty (calling `.get` on any name throws). */
+/** Result of `run(inputs)`: the output tensor as a flat typed array plus a
+ *  `Captures` instance. The output is `Float32Array` for f32 graph outputs,
+ *  `Int32Array` for i32 outputs (`categorical`, `argmax`, `argmin`). When
+ *  the traced graph has no `capture(...)` sites, `captures` is empty. */
 export interface RunCompletion {
-  output: Float32Array
+  output: OutputArray
   captures: Captures
 }
 
@@ -244,7 +260,7 @@ export async function createRuntime(
   // step({ withCaptures: true }) call.
   type CaptureLayout = {
     buffer: GPUBuffer
-    slices: { name: string; bufId: number; offset: number; byteSize: number }[]
+    slices: { name: string; bufId: number; offset: number; byteSize: number; dtype: 'f32' | 'i32' }[]
   }
   let captureStaging: CaptureLayout | null = null
   function ensureCaptureStaging(): CaptureLayout {
@@ -255,12 +271,18 @@ export async function createRuntime(
       const spec = plan.buffers[bufId]!
       // copyBufferToBuffer offsets must be 4-aligned. byteSizes are always
       // shape-product × 4 (every dtype is 4 bytes), so offsets stay aligned.
-      slices.push({ name, bufId, offset: totalBytes, byteSize: spec.byteSize })
+      slices.push({ name, bufId, offset: totalBytes, byteSize: spec.byteSize, dtype: spec.dtype as 'f32' | 'i32' })
       totalBytes += spec.byteSize
     }
     const buffer = device.createBuffer({ size: totalBytes, usage: READBACK, label: 'captures-staging' })
     captureStaging = { buffer, slices }
     return captureStaging
+  }
+
+  /** Wrap a readback ArrayBuffer as the dtype-correct typed array. Single
+   *  source of truth so output and capture paths can't diverge. */
+  function wrapReadback(buffer: ArrayBuffer, dtype: 'f32' | 'i32'): OutputArray {
+    return dtype === 'i32' ? new Int32Array(buffer) : new Float32Array(buffer)
   }
 
   // Shared core for step() and run(): upload inputs, dispatch every kernel
@@ -273,7 +295,7 @@ export async function createRuntime(
   // async paths (e.g. training loop + aux `refreshPrediction`) run in turn.
   let pending: Promise<unknown> = Promise.resolve()
   type DispatchOpts = { wantCaptures: boolean }
-  type DispatchResult = { output: Float32Array; captures: Map<string, Float32Array> }
+  type DispatchResult = { output: OutputArray; captures: Map<string, OutputArray> }
   async function dispatch(
     inputs: Record<string, Int32Array | Float32Array>,
     opts: DispatchOpts,
@@ -336,16 +358,20 @@ export async function createRuntime(
     queue.submit([encoder.finish()])
 
     await outputReadback.mapAsync(GPUMapMode.READ)
-    const output = new Float32Array(outputReadback.getMappedRange().slice(0))
+    const output = wrapReadback(
+      outputReadback.getMappedRange().slice(0) as ArrayBuffer,
+      outputSpec.dtype as 'f32' | 'i32',
+    )
     outputReadback.unmap()
 
-    const captures = new Map<string, Float32Array>()
+    const captures = new Map<string, OutputArray>()
     if (layout) {
       await layout.buffer.mapAsync(GPUMapMode.READ)
       const range = layout.buffer.getMappedRange()
       for (const s of layout.slices) {
         // .slice() copies before unmap — the ArrayBuffer detaches on unmap.
-        captures.set(s.name, new Float32Array(range, s.offset, s.byteSize / 4).slice())
+        const copy = range.slice(s.offset, s.offset + s.byteSize) as ArrayBuffer
+        captures.set(s.name, wrapReadback(copy, s.dtype))
       }
       layout.buffer.unmap()
     }

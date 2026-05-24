@@ -133,13 +133,17 @@ export interface CompileResult {
 
 export interface StepResultWire {
   loss: number
-  /** Null when the graph registered no captures. */
-  captures: Record<string, Float32Array> | null
+  /** Null when the graph registered no captures. Per-capture array type
+   *  matches the captured tensor's dtype: `Float32Array` for f32,
+   *  `Int32Array` for i32. */
+  captures: Record<string, Float32Array | Int32Array> | null
 }
 
 export interface RunResultWire {
-  output: Float32Array
-  captures: Record<string, Float32Array> | null
+  /** `Float32Array` for f32 graph outputs, `Int32Array` for i32 outputs
+   *  (`categorical`, `argmax`, `argmin`). */
+  output: Float32Array | Int32Array
+  captures: Record<string, Float32Array | Int32Array> | null
 }
 
 export interface DownloadParamsResult {
