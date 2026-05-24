@@ -7,8 +7,8 @@ name: Vectors and Tensors
 
 ```tsx
 import {
-  App, Component, div, h1, h3, p, span, pre, button, input, a, ul, li,
-  svg, line, polygon, text, g, rect,
+  App, Component, div, h1, h3, p, span, pre, button, input, a,
+  svg, line, polygon, text, g,
   type VElement, type HValues,
 } from 'domeleon'
 
@@ -68,42 +68,29 @@ function labeledMatrix(opts: {
   const { rowLabels, colLabels, rowAnnotations, rows } = opts
   const nCols = rows[0]!.length
   const nRows = rows.length
-  const cellRow = colLabels ? '2' : '1'
 
   const items: HValues[] = []
 
   if (colLabels) {
     items.push(div({
       class: 'lm-col-labels',
-      style: {
-        gridColumn: '2', gridRow: '1',
-        gridTemplateColumns: `repeat(${nCols}, var(--cell-w))`,
-      },
+      style: { gridTemplateColumns: `repeat(${nCols}, var(--cell-w))` },
     }, colLabels.map(c => div({ class: 'lm-col-label' }, c))))
   }
 
   if (rowLabels) {
     items.push(div({
       class: 'lm-row-labels',
-      style: {
-        gridColumn: '1', gridRow: cellRow,
-        gridTemplateRows: `repeat(${nRows}, var(--cell-h))`,
-      },
+      style: { gridTemplateRows: `repeat(${nRows}, var(--cell-h))` },
     }, rowLabels.map(l => div({ class: 'lm-row-label' }, l))))
   }
 
-  items.push(div({
-    class: 'lm-cells-wrap',
-    style: { gridColumn: '2', gridRow: cellRow },
-  }, matGrid(nCols, rows.flatMap(r => r))))
+  items.push(div({ class: 'lm-cells-wrap' }, matGrid(nCols, rows.flatMap(r => r))))
 
   if (rowAnnotations) {
     items.push(div({
       class: 'lm-row-annotations',
-      style: {
-        gridColumn: '3', gridRow: cellRow,
-        gridTemplateRows: `repeat(${nRows}, var(--cell-h))`,
-      },
+      style: { gridTemplateRows: `repeat(${nRows}, var(--cell-h))` },
     }, rowAnnotations.map(a => div({ class: 'lm-row-annotation' }, a))))
   }
 
@@ -258,12 +245,15 @@ type ArrowOpts = {
   color: string
   label?: string
   labelOffset?: { x: number; y: number }
-  labelAtMidpoint?: boolean
   labelAnchor?: 'start' | 'middle' | 'end'
   dashed?: boolean
 }
 
 const ARROW_HEAD = 10
+
+// Shared label config for the A/B arrows in the Vectors and Dot tabs: label
+// centered above the arrow tip.
+const VECTOR_LABEL = { labelOffset: { x: 0, y: -10 }, labelAnchor: 'middle' as const }
 
 function arrow(from: [number, number], to: [number, number], opts: ArrowOpts) {
   const [x1, y1] = plotToScreen(from[0], from[1])
@@ -288,8 +278,8 @@ function arrow(from: [number, number], to: [number, number], opts: ArrowOpts) {
       fill: opts.color,
     }),
     opts.label ? text({
-      x: (opts.labelAtMidpoint ? (x1 + x2) / 2 : x2) + (opts.labelOffset?.x ?? 8),
-      y: (opts.labelAtMidpoint ? (y1 + y2) / 2 : y2) + (opts.labelOffset?.y ?? -8),
+      x: x2 + (opts.labelOffset?.x ?? 8),
+      y: y2 + (opts.labelOffset?.y ?? -8),
       textAnchor: opts.labelAnchor,
       fill: opts.color,
       fontSize: 14,
@@ -301,14 +291,11 @@ function arrow(from: [number, number], to: [number, number], opts: ArrowOpts) {
 
 // Shared scaffold for the Vectors / Dot vizzes: plot on the left
 // (axes + caller-supplied svg content), side panel on the right (angle slider
-// + caller-supplied detail + optional caption). All three drive the same
-// 0..180° angle parameter.
+// + caller-supplied detail + optional caption). Angle is always 0..180°.
 function angleViz(opts: {
   angle: number
   setAngle: (a: number) => void
   sliderLabel?: string
-  sliderMin?: number
-  sliderMax?: number
   svgContent: HValues
   detail: HValues
   caption?: HValues
@@ -322,9 +309,7 @@ function angleViz(opts: {
       sliderRow({
         label: opts.sliderLabel ?? 'angle between A and B',
         value: `${opts.angle}°`,
-        min: opts.sliderMin ?? 0,
-        max: opts.sliderMax ?? 180,
-        step: 1,
+        min: 0, max: 180, step: 1,
         current: opts.angle,
         onChange: opts.setAngle,
       }),
@@ -339,14 +324,14 @@ function angleViz(opts: {
 // plain prose; 1,3,5 are wrapped in <span class="mono">. Lets us write inline code
 // references without nesting span() calls everywhere.
 function specBox(code: string, paragraphs: string[][]) {
-  return div({ class: 'spec-anchor' },
-    pre({ class: 'spec-code' }, code),
-    paragraphs.map(parts =>
-      p({ class: 'spec-caption' },
+  return [
+    pre({ class: 'code-block' }, code),
+    ...paragraphs.map(parts =>
+      p({ class: 'code-caption' },
         parts.map((s, i) => i % 2 === 1 ? mono(s) : s),
       ),
     ),
-  )
+  ]
 }
 
 // ---------- TabControl ----------
@@ -691,10 +676,14 @@ class AddSection extends AngleSection {
   angle: number = 60   // degrees between A and B
 
   conceptualView() {
-    // A_LEN + B_LEN must fit inside the plot's ~5-unit half-extent — even at
-    // θ=0° where B is colinear with A and the sum lands at A_LEN + B_LEN on
-    // the x-axis. 2.5 + 2.0 = 4.5, comfortably inside.
-    const { A, B, C } = vectorsFromAngle(this.angle, 2.5, 2.0)
+    // |A|=4, |B|=3 logically (shown in detail panel) — at θ=90° these form
+    // the 3-4-5 right triangle: A=[4,0], B=[0,3], A+B=[4,3], |A+B|=5.
+    // PLOT_SCALE shrinks for drawing: max colinear sum (4+3=7 at θ=0°)
+    // becomes 4.55, comfortably inside the plot's ~5-unit half-extent.
+    const PLOT_SCALE = 0.65
+    const { A, B, C } = vectorsFromAngle(this.angle, 4, 3)
+    const scaled = (v: Vec2): Vec2 => [v[0] * PLOT_SCALE, v[1] * PLOT_SCALE]
+    const A_draw = scaled(A), C_draw = scaled(C)
     const fmtV = (v: Vec2) => `[${fmt(v[0])}, ${fmt(v[1])}]`
 
     return div({ class: 'tab-content-inner' },
@@ -708,15 +697,11 @@ class AddSection extends AngleSection {
         angle: this.angle,
         setAngle: a => this.setAngle(a),
         svgContent: [
-          arrow([0, 0], A, { color: 'var(--a-color)', label: 'A' }),
-          arrow(A, C, { color: 'var(--b-color)', label: 'B', labelOffset: { x: 8, y: -6 } }),
-          arrow([0, 0], C, {
+          arrow([0, 0], A_draw, { color: 'var(--a-color)', label: 'A', ...VECTOR_LABEL }),
+          arrow(A_draw, C_draw, { color: 'var(--b-color)', label: 'B', ...VECTOR_LABEL }),
+          arrow([0, 0], C_draw, {
             color: 'var(--c-color)',
             dashed: true,
-            label: 'A + B',
-            labelAtMidpoint: true,
-            labelAnchor: 'middle',
-            labelOffset: { x: 0, y: 24 },
           }),
         ],
         detail: div({ class: 'detail' },
@@ -725,6 +710,10 @@ class AddSection extends AngleSection {
           detailRow({ label: 'A + B', value: fmtV(C), lblColor: 'var(--c-color)' }),
         ),
       }),
+
+      div({ class: 'intro' },
+        'Two dimensions oversell how destructive addition is. In high-dimensional space, two random directions land near-perpendicular, so adding B onto A leaves each one recoverable from the sum. It\'s why deep networks can keep adding to a vector layer after layer without each addition erasing what came before. The next tab introduces the operation that measures how aligned two directions are: the dot product.',
+      ),
 
     )
   }
@@ -752,7 +741,7 @@ class DotSection extends AngleSection {
   angle: number = 45   // degrees
 
   conceptualView() {
-    const { A, B } = vectorsFromAngle(this.angle, 3, 2.5)
+    const { A, B } = vectorsFromAngle(this.angle, 4, 3)
     const dot = dotVec(A, B)
     const Amag = Math.sqrt(dotVec(A, A))
     const Bmag = Math.sqrt(dotVec(B, B))
@@ -767,7 +756,7 @@ class DotSection extends AngleSection {
 
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'We compare the directions of two vectors with a dot product. This produces a single number measuring their alignment. Abstractly, this is relatedness. The same operation has a component-wise definition and a geometric one:',
+        'We compare the directions of two vectors with a dot product. This produces a single number measuring their alignment. The same operation has a component-wise definition and a geometric one:',
         formula('A · B = a₁b₁ + a₂b₂ + ... + aₙbₙ'),
         formula('A · B = |A| |B| cos(θ)'),
         'where ',
@@ -788,14 +777,14 @@ class DotSection extends AngleSection {
         svgContent: [
           line({
             x1: ox, y1: oy, x2: px, y2: py,
-            stroke: 'var(--accent)', strokeWidth: 5, strokeOpacity: 0.35, strokeLineCap: 'round',
+            stroke: 'var(--accent)', strokeWidth: 12, strokeOpacity: 0.35, strokeLineCap: 'butt',
           }),
           line({
             x1: bx, y1: by, x2: px, y2: py,
             stroke: 'var(--axis)', strokeWidth: 1, strokeDashArray: '4 3',
           }),
-          arrow([0, 0], A, { color: 'var(--a-color)', label: 'A' }),
-          arrow([0, 0], B, { color: 'var(--b-color)', label: 'B' }),
+          arrow([0, 0], A, { color: 'var(--a-color)', label: 'A', ...VECTOR_LABEL }),
+          arrow([0, 0], B, { color: 'var(--b-color)', label: 'B', ...VECTOR_LABEL }),
         ],
         detail: div({ class: 'detail' },
           detailRow({ label: 'A · B',         value: fmt(dot), valColor: dotColor, valWeight: '700' }),
@@ -813,7 +802,7 @@ class DotSection extends AngleSection {
       }),
 
       div({ class: 'intro' },
-        'Dot product is the math of relatedness: positive for aligned, near-zero for unrelated, negative for opposite. The next tab uses this to give directions meaning.',
+        'Dot product is the math of similarity. Geometric alignment is one face of it; the same number measures similarity between vectors that encode any kind of information, not just positions in space. Positive for aligned, near-zero for unrelated, negative for opposite. For people who say hate isn\'t the opposite of love, indifference is: vector math disagrees. Hate is the opposite of love (same axis flipped, negative). Indifference is orthogonal (zero on that axis). The next tab uses this to give directions meaning.',
       ),
 
     )
@@ -1205,7 +1194,7 @@ class CompositionSection extends Component {
         ', each row holding one position\'s projected view.',
       ),
 
-      pre({ class: 'pipeline-code-block' },
+      pre({ class: 'code-block' },
         `Q = matmul(X, Wq)   // [T, D]\nK = matmul(X, Wk)   // [T, D]\nV = matmul(X, Wv)   // [T, D]`,
       ),
 
@@ -1241,7 +1230,7 @@ class CompositionSection extends Component {
         ' transposes K so the shapes line up).',
       ),
 
-      pre({ class: 'pipeline-code-block' },
+      pre({ class: 'code-block' },
         `scores = matmul(Q, swapAxes(K, -1, -2))   // [T, T]`,
       ),
 
@@ -1265,7 +1254,7 @@ class CompositionSection extends Component {
         'When the data has causal or temporal structure (language, audio, time series, video), future positions are masked to −∞ first to keep them from influencing earlier ones (see the softmax tab).',
       ),
 
-      pre({ class: 'pipeline-code-block' },
+      pre({ class: 'code-block' },
         `attn = softmaxCausal(scores)   // [T, T]`,
       ),
 
@@ -1283,7 +1272,7 @@ class CompositionSection extends Component {
         ').',
       ),
 
-      pre({ class: 'pipeline-code-block' },
+      pre({ class: 'code-block' },
         `context = matmul(attn, V)   // [T, D]`,
       ),
 
@@ -1334,7 +1323,7 @@ class CompositionSection extends Component {
         ' row. Every position now carries its original vector plus its context-aware contribution.',
       ),
 
-      pre({ class: 'pipeline-code-block' },
+      pre({ class: 'code-block' },
         `X = add(X, context)   // [T, D]`,
       ),
 
@@ -1464,7 +1453,7 @@ class Root extends Component implements IRoot {
         this.tabs.view({
           tabs: [
             { key: 'add',         label: 'Vectors',     content: this.addSection.view() },
-            { key: 'dot',         label: 'Dot',         content: this.dotSection.view() },
+            { key: 'dot',         label: 'Dot Product', content: this.dotSection.view() },
             { key: 'embedding',   label: 'Embedding',   content: this.embeddingSection.view() },
             { key: 'shapes',      label: 'Tensors',     content: this.shapesSection.view() },
             { key: 'matmul',      label: 'matmul',      content: this.matmulSection.view() },
@@ -1569,7 +1558,7 @@ body {
    only add positional extras (margins, max-widths, italic). */
 .subtitle,
 .caption,
-.spec-caption,
+.code-caption,
 .embed-prose {
   font-size: 16px;
   line-height: 1.6;
@@ -1760,33 +1749,26 @@ body {
 
 .caption { font-style: italic; }
 
-/* Spec excerpt */
-.spec-anchor {
+/* Code blocks (used in tensorgrad sub-tabs and the Attention tab spine). */
+.code-block {
   background: var(--code-bg);
   border: 1px solid var(--code-border);
-  border-radius: 8px;
-  padding: 16px 18px;
-}
-
-.spec-anchor + .spec-anchor { margin-top: 14px; }
-
-.spec-code {
-  background: var(--bg);
-  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 12px 14px;
   font-family: monospace;
   font-size: var(--code-font-size);
-  line-height: 1.6;
-  margin: 0 0 12px;
+  line-height: 1.5;
+  margin: 12px 0;
   overflow-x: auto;
   white-space: pre;
   color: var(--text);
 }
 
-.spec-caption { margin: 0; }
+.code-block + * { margin-top: 12px; }
 
-.spec-caption + .spec-caption { margin-top: 10px; }
+.code-caption { margin: 0; }
+
+.code-caption + .code-caption { margin-top: 10px; }
 
 .mono {
   font-family: monospace;
@@ -2007,7 +1989,7 @@ body {
   grid-template-columns: auto auto auto;
   align-items: center;
 }
-.lm-cells-wrap { display: flex; }
+.lm-cells-wrap { display: flex; grid-column: 2; grid-row: 2; }
 .lm-col-labels {
   display: grid;
   gap: 1px;
@@ -2016,13 +1998,18 @@ body {
   border: 1px solid transparent;
   padding-bottom: 6px;
   align-self: end;
+  grid-column: 2;
+  grid-row: 1;
 }
 .lm-row-labels,
 .lm-row-annotations {
   display: grid;
   gap: 1px;
   border: 1px solid transparent;
+  grid-row: 2;
 }
+.lm-row-labels      { grid-column: 1; }
+.lm-row-annotations { grid-column: 3; }
 .lm-col-label,
 .lm-row-label,
 .lm-row-annotation {
@@ -2165,27 +2152,6 @@ body {
   .embed-sim-num { font-size: 14px; }
   .embed-sim-track { display: none; }
 }
-
-/* Code blocks in the Attention tab (one per stage of the attention spine). */
-.pipeline-code-block {
-  font-family: monospace;
-  font-size: var(--code-font-size);
-  line-height: 1.5;
-  color: var(--text);
-  background: var(--code-bg);
-  border: 1px solid var(--code-border);
-  border-radius: 4px;
-  padding: 8px 12px;
-  margin: 0;
-  overflow-x: auto;
-  white-space: pre;
-}
-
-/* Code blocks sit closer to surrounding prose than the default
-   intro-to-intro gap — symmetric 14px above and below, replacing the
-   .tab-content-inner > * + * 22px rule for this case. */
-.tab-content-inner > .pipeline-code-block,
-.tab-content-inner > .pipeline-code-block + * { margin-top: 14px; }
 
 /* softmax tab */
 .softmax-controls {
