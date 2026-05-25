@@ -182,15 +182,6 @@ export function inferWhereCausal(opName: string, aShape: Shape, site: CallSite |
   return aShape
 }
 
-export function inferSliceLastRange(opName: string, aShape: Shape, start: number, end: number, site: CallSite | null): Shape {
-  if (aShape.length === 0) fail(`${opName}: cannot slice 0-d tensor`, site)
-  const last = aShape[aShape.length - 1]!
-  if (start < 0 || end > last || start >= end) {
-    fail(`${opName}: invalid range [${start}, ${end}) for last axis of size ${last}`, site)
-  }
-  return [...aShape.slice(0, -1), end - start]
-}
-
 /** General-axis slice. `axis` is non-negative; callers must normalize any
  *  negative-axis input before calling. */
 export function inferSliceRange(opName: string, aShape: Shape, axis: number, start: number, end: number, site: CallSite | null): Shape {

@@ -12,9 +12,9 @@ import type { Tensor, Graph } from './ir.js'
 import type { WritebackDecl } from './buffers.js'
 import { traceInto, stateInput, tensorInput } from './trace.js'
 import { add, sub, mul, mulScalar, broadcastTo } from './ops.js'
-import { appendGradClip } from './adam.js'
-import type { LR } from './adam.js'
-import { isLRDynamic, resolveLR } from './adam.js'
+import { appendGradClip } from './grad.js'
+import { type LR, isLRDynamic } from './lr.js'
+import type { WireSGDConfig } from './worker-protocol.js'
 
 /** SGD hyperparameters. Pass via `compile({ ..., optimizer:
  *  { kind: 'sgd', ... } })`. Only `lr` is required. With `momentum: 0`
@@ -69,6 +69,21 @@ export interface SGDResult {
   /** Resolved hyperparameters (defaults applied; `lr` left as the schedule
    *  shape so the runtime can compute per-step values). */
   config: SGDResolvedConfig
+}
+
+/** Project an `appendSGD` result into the serializable config the worker
+ *  reconstructs SGD state from. Lives here so a config-field change touches
+ *  only `sgd.ts` (the type + its wire projection together). */
+export function wireSGDConfig(r: SGDResult): WireSGDConfig {
+  const c: SGDResolvedConfig = r.config
+  return {
+    lr: c.lr,
+    momentum: c.momentum,
+    nesterov: c.nesterov,
+    weightDecay: c.weightDecay,
+    lrIsScheduled: c.lrIsScheduled,
+    lrInputName: r.lrInputName,
+  }
 }
 
 /**
@@ -147,10 +162,4 @@ export function appendSGD(
 
     return { writebacks, lrInputName, config: fullConfig }
   })
-}
-
-/** Resolve the per-step lr (scalar) for SGD. Trivial wrapper around
- *  `resolveLR` for symmetry with how the worker invokes Adam's update path. */
-export function resolveSGDLr(config: SGDResolvedConfig, step: number): number {
-  return resolveLR(config.lr, step)
 }

@@ -181,8 +181,6 @@ export type OpNode =
     }
 
   // ---- Slicing / broadcasting / autograd infrastructure -------------------
-  // Slice [start, end) along the last axis.
-  | { kind: 'slice_last_range'; out: number; a: number; start: number; end: number }
   // General-axis slice. `axis` is non-negative (ops.ts normalizes negatives).
   | { kind: 'slice_range'; out: number; a: number; axis: number; start: number; end: number }
   // Adjoint of slice_range: scatter `a` into `[start, end)` along `axis` of
@@ -345,7 +343,7 @@ export function getOpInputs(op: OpNode): readonly number[] {
     case 'reshape': case 'permute':
     case 'softmax_causal_last': case 'log_softmax_last':
     case 'where_causal': case 'stop_gradient':
-    case 'slice_last_range': case 'slice_range': case 'scatter_axis':
+    case 'slice_range': case 'scatter_axis':
     case 'broadcast_to': case 'sum_to_shape':
       return [op.a]
     case 'dropout': return [op.a, op.seed]

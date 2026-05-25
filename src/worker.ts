@@ -2,7 +2,8 @@
 // see specs/WorkerArchitecture.md for the rationale.
 
 import { createRuntime, type CompiledRuntime, type RuntimeOpts } from './runtime.js'
-import { resolveLR, rebaseLR, type LR } from './adam.js'
+import { resolveLR, rebaseLR, type LR } from './lr.js'
+import { adamStepScalars } from './adam.js'
 import { PRNG_SEED_INPUT } from './ops.js'
 import type { Req, Res, WireIR, WireAdamConfig, WireSGDConfig, WireOptimizerConfig, WireError } from './worker-protocol.js'
 import { wireError } from './worker-protocol.js'
@@ -61,11 +62,14 @@ async function ensureDevice(): Promise<GPUDevice> {
   // requestAdapter() resolves with null (not throws) when the GPU process
   // is transiently unhealthy — recent crash, power-state transition, sandboxed
   // iframe+blob worker quirk, etc. Retry with backoff before giving up.
+  // `high-performance` selects the discrete GPU on dual-GPU laptops (the
+  // default often picks the integrated one). No-op on single-GPU machines;
+  // correct default for a training workload.
   let adapter: GPUAdapter | null = null
   const delays = [0, 100, 400]
   for (const ms of delays) {
     if (ms > 0) await new Promise(r => setTimeout(r, ms))
-    adapter = await navigator.gpu.requestAdapter()
+    adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
     if (adapter) break
   }
   if (!adapter) throw new Error('tensorgrad worker: no WebGPU adapter')
@@ -93,17 +97,12 @@ async function handleCreateRuntime(payload: {
     runtime.uploadParams(payload.initialParams)
   }
 
-  const captureShapes: Record<string, number[]> = {}
-  for (const [name, bufId] of plan.capturesByName) {
-    captureShapes[name] = [...plan.buffers[bufId]!.shape]
-  }
-
   const slot: GraphSlot = {
     runtime,
     paramNames: [...plan.paramsByName.keys()],
     outputShape: [...runtime.outputShape],
     kernelCount: kernels.filter(k => k.wgsl).length,
-    captureShapes,
+    captureShapes: runtime.captureShapes,
     optimizer: createOptimizerState(payload.optimizer),
     parentGraphId: null,
     prng: graphUsesPrng(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
@@ -124,11 +123,14 @@ function createOptimizerState(cfg: WireOptimizerConfig | null): OptimizerState |
   return { kind: 'sgd', state: createSGDState(cfg.config) }
 }
 
+// A graph needs per-step PRNG seeding iff it contains the shared seed input,
+// which every stochastic op (dropout / randn / categorical) creates via
+// `findOrCreatePrngSeed`. Deriving it from graph structure — rather than
+// matching a hardcoded list of stochastic op kinds — means a new stochastic op
+// is detected automatically (the missing-categorical PRNG bug in 0.1.8 was
+// exactly that list drifting out of sync with the ops).
 function graphUsesPrng(graph: WireIR['graph']): boolean {
-  for (const op of graph.ops) {
-    if (op.kind === 'dropout' || op.kind === 'randn' || op.kind === 'categorical_last') return true
-  }
-  return false
+  return graph.ops.some(op => op.kind === 'tensor_input' && op.name === PRNG_SEED_INPUT)
 }
 
 async function handleCompileForward(payload: {
@@ -146,17 +148,12 @@ async function handleCompileForward(payload: {
   const opts: RuntimeOpts = { device: dev, sharedParams: parent.runtime.params }
   const runtime = await createRuntime(plan, kernels, outputBufferId, opts)
 
-  const captureShapes: Record<string, number[]> = {}
-  for (const [name, bufId] of plan.capturesByName) {
-    captureShapes[name] = [...plan.buffers[bufId]!.shape]
-  }
-
   const slot: GraphSlot = {
     runtime,
     paramNames: [...plan.paramsByName.keys()],
     outputShape: [...runtime.outputShape],
     kernelCount: kernels.filter(k => k.wgsl).length,
-    captureShapes,
+    captureShapes: runtime.captureShapes,
     optimizer: null,
     parentGraphId: payload.parentGraphId,
     prng: graphUsesPrng(graph) ? { counter: 0, seedBuf: new Int32Array(1) } : null,
@@ -192,11 +189,11 @@ function injectOptimizerScalars(slot: GraphSlot, inputs: Record<string, Int32Arr
   if (o.kind === 'adam') {
     const a = o.state
     a.t++
-    const lrNow = resolveLR(a.config.lr, a.t)
-    a.lrtBuf[0] = lrNow * Math.sqrt(1 - Math.pow(a.config.beta2, a.t)) / (1 - Math.pow(a.config.beta1, a.t))
+    const { lrt, decayShrink } = adamStepScalars(a.config, a.t)
+    a.lrtBuf[0] = lrt
     const merged: Record<string, Int32Array | Float32Array> = { ...inputs, [a.config.lrtInputName]: a.lrtBuf }
     if (a.decayShrinkBuf && a.config.decayShrinkInputName) {
-      a.decayShrinkBuf[0] = 1 - lrNow * a.config.weightDecay
+      a.decayShrinkBuf[0] = decayShrink
       merged[a.config.decayShrinkInputName] = a.decayShrinkBuf
     }
     return merged

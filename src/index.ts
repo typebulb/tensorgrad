@@ -39,7 +39,8 @@ export {
   narrow, concat, stack, split,
 } from './ops.js'
 
-export { lr, type AdamConfig, type AdamWConfig, type LR } from './adam.js'
+export { lr, type LR } from './lr.js'
+export { type AdamConfig, type AdamWConfig } from './adam.js'
 export { type SGDConfig } from './sgd.js'
 export { Captures, type OutputArray, type DtypeArray } from './runtime.js'
 export {

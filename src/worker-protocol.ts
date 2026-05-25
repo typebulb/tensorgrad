@@ -6,7 +6,7 @@
 import type { Graph } from './ir.js'
 import type { BufferPlan } from './buffers.js'
 import type { KernelSpec } from './codegen.js'
-import type { LR } from './adam.js'
+import type { LR } from './lr.js'
 
 // Per-param decay flags are baked into the IR by appendAdam/appendSGD before
 // it ships to the worker, so `decayFilter` isn't part of the wire types.

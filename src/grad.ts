@@ -1,15 +1,17 @@
-// Reverse-mode autograd. Walks a traced Graph in reverse and appends backward
-// ops in-place via traceInto. Each adjoint rule expresses its contribution as
-// regular forward-op calls (e.g. mul(a, b)→c gives da += dc*b, db += dc*a),
-// which append to the current graph since we run inside a trace context.
-// Cotangents are accumulated as they arrive, so by the time we reach a
-// tensor's producer the cotangent sum is complete.
+// Reverse-mode autograd + gradient transforms. `appendGrad` walks a traced
+// Graph in reverse and appends backward ops in-place via traceInto; each
+// adjoint rule expresses its contribution as regular forward-op calls (e.g.
+// mul(a, b)→c gives da += dc*b, db += dc*a), which append to the current graph
+// since we run inside a trace context. Cotangents are accumulated as they
+// arrive, so by the time we reach a tensor's producer the sum is complete.
+// `appendGradClip` is the post-grad transform optimizers share (clip the
+// computed gradients before the update consumes them).
 
 import type { Graph, OpNode, Tensor, Shape } from './ir.js'
 import {
   add, sub, mul, div, mulScalar,
   matmul, permute, swapAxes, reshape,
-  exp, sin, cos,
+  exp, sin, cos, sqrt, min,
   broadcastTo, sumToShape,
   constScalar, reluGrad,
   sum, where, less, greater,
@@ -87,6 +89,43 @@ export function appendGrad(graph: Graph): GradResult {
     }
 
     return { graph, paramGrads, loss: lossTensor }
+  })
+}
+
+/**
+ * Append global L2-norm gradient clipping to `graph`. Reads every gradient
+ * in `paramGrads`, computes the total norm across all of them, and emits a
+ * fresh `paramGrads` record where each tensor has been scaled by
+ * `min(1, maxNorm / (totalNorm + 1e-6))`.
+ *
+ * Matches PyTorch's `clip_grad_norm_` semantics and optax's
+ * `clip_by_global_norm`. The scale is global — every gradient shares one
+ * scaling factor — not per-parameter. A post-grad transform, shared by the
+ * optimizers: `appendAdam` / `appendSGD` call it when `clipGradNorm` is set,
+ * and it's usable directly when composing clipping with a custom optimizer.
+ *
+ * Cross-parameter reduction is a chained add — fine at browser-scale param
+ * counts (tens to low hundreds). Each add is a rank-0 dispatch.
+ */
+export function appendGradClip(
+  graph: Graph,
+  paramGrads: Record<string, Tensor>,
+  maxNorm: number,
+): Record<string, Tensor> {
+  return traceInto(graph, () => {
+    const entries = Object.entries(paramGrads)
+    if (entries.length === 0) return paramGrads
+    // sum_p sum(grad_p²) — chained adds across params; each summand is rank-0.
+    let sumSq: Tensor = sum(mul(entries[0]![1], entries[0]![1]))
+    for (let i = 1; i < entries.length; i++) {
+      sumSq = add(sumSq, sum(mul(entries[i]![1], entries[i]![1])))
+    }
+    const scale = min(div(constScalar(maxNorm, 'f32'), add(sqrt(sumSq), 1e-6)), 1)
+    const clipped: Record<string, Tensor> = {}
+    for (const [name, g] of entries) {
+      clipped[name] = mul(g, broadcastTo(scale, g.shape))
+    }
+    return clipped
   })
 }
 
@@ -338,14 +377,6 @@ function runAdjointRule(
     // ---- Indexing / casting (no gradient through integer indices) --------
     case 'one_hot':
       return
-
-    // ---- Slicing ---------------------------------------------------------
-    case 'slice_last_range': {
-      const a = tensorOf(op.a)
-      const axis = a.shape.length - 1
-      accumulate(cotangents, op.a, scatterAxis(outCotan, a.shape, axis, op.start, op.end))
-      return
-    }
 
     // ---- Broadcast / un-broadcast (autograd infrastructure) ---------------
     case 'broadcast_to': {

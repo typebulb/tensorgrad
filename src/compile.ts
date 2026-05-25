@@ -17,10 +17,11 @@ import type { Tensor, Shape, Dtype } from './ir.js'
 import { traceFn, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
 import {
-  appendAdam, resolveLR,
-  type AdamConfig, type AdamWConfig, type AdamResult, type AdamResolvedConfig, type LR,
+  appendAdam, wireAdamConfig,
+  type AdamConfig, type AdamWConfig, type AdamResult,
 } from './adam.js'
-import { appendSGD, type SGDConfig, type SGDResult, type SGDResolvedConfig } from './sgd.js'
+import { resolveLR, type LR } from './lr.js'
+import { appendSGD, wireSGDConfig, type SGDConfig, type SGDResult } from './sgd.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
 import { Captures, type OutputArray, type DtypeArray } from './runtime.js'
@@ -28,7 +29,7 @@ import { Module, materializeParams, cloneModule, mulberry32, type MaterializedPa
 import { WorkerProxy } from './worker-proxy.js'
 import {
   transferablesOfRecord,
-  type Req, type WireIR, type WireAdamConfig, type WireSGDConfig, type WireOptimizerConfig,
+  type Req, type WireIR, type WireOptimizerConfig,
   type CompileResult,
   type StepResultWire, type RunResultWire, type DownloadParamsResult,
 } from './worker-protocol.js'
@@ -527,29 +528,21 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
    *  re-trace against the latest topology. */
   currentModel(): M { return this.opts.model }
 
-  async step(inputs: LooseInputs): Promise<StepResult> {
-    try {
+  step(inputs: LooseInputs): Promise<StepResult> {
+    return guarded(async () => {
       const r = await this.proxy.request<StepResultWire>(
         { kind: 'step', payload: { graphId: this.graphId, inputs } },
       )
-      return { kind: 'completed', loss: r.loss, captures: makeCaptures(r.captures, this.meta.captureShapes) }
-    } catch (e) {
-      if ((e as { name?: string })?.name === 'AbortError') return { kind: 'aborted' }
-      return { kind: 'failed', error: e instanceof Error ? e : new Error(String(e)) }
-    }
+      return { kind: 'completed' as const, loss: r.loss, captures: makeCaptures(r.captures, this.meta.captureShapes) }
+    })
   }
 
   uploadParams(params: Record<string, Float32Array>): Promise<void> {
-    return this.proxy.request<null>(
-      { kind: 'uploadParams', payload: { graphId: this.graphId, params } },
-    ).then(() => undefined)
+    return uploadParamsTo(this.proxy, this.graphId, params)
   }
 
-  async downloadParams(): Promise<Record<string, Float32Array>> {
-    const r = await this.proxy.request<DownloadParamsResult>(
-      { kind: 'downloadParams', payload: { graphId: this.graphId } },
-    )
-    return r.params
+  downloadParams(): Promise<Record<string, Float32Array>> {
+    return downloadParamsFrom(this.proxy, this.graphId)
   }
 
   async reset(opts: { params?: boolean; optimizer?: boolean } = {}): Promise<void> {
@@ -705,8 +698,8 @@ class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i3
     return sib
   }
 
-  async run(inputs: LooseInputs): Promise<RunResult<O>> {
-    try {
+  run(inputs: LooseInputs): Promise<RunResult<O>> {
+    return guarded(async () => {
       const sib = await this.siblingFor(inputs)
       const r = await this.proxy.request<RunResultWire>(
         { kind: 'run', payload: { graphId: sib.graphId, inputs } },
@@ -714,29 +707,21 @@ class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i3
       // r.output's concrete TypedArray class matches the declared output
       // dtype (validated above + runtime returns the right class via
       // wrapReadback). Cast to the typed array the generic O resolves to.
-      return { kind: 'completed', output: r.output as DtypeArray<O>, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
-    } catch (e) {
-      if ((e as { name?: string })?.name === 'AbortError') return { kind: 'aborted' }
-      return { kind: 'failed', error: e instanceof Error ? e : new Error(String(e)) }
-    }
+      return { kind: 'completed' as const, output: r.output as DtypeArray<O>, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
+    })
   }
 
   async graphFor(inputs: LooseInputs): Promise<CompiledIR> {
     return (await this.siblingFor(inputs)).ir
   }
 
-  async uploadParams(params: Record<string, Float32Array>): Promise<void> {
+  uploadParams(params: Record<string, Float32Array>): Promise<void> {
     // Params live on the parent (shared with all siblings).
-    await this.proxy.request<null>(
-      { kind: 'uploadParams', payload: { graphId: this.parent.graphId, params } },
-    )
+    return uploadParamsTo(this.proxy, this.parent.graphId, params)
   }
 
-  async downloadParams(): Promise<Record<string, Float32Array>> {
-    const r = await this.proxy.request<DownloadParamsResult>(
-      { kind: 'downloadParams', payload: { graphId: this.parent.graphId } },
-    )
-    return r.params
+  downloadParams(): Promise<Record<string, Float32Array>> {
+    return downloadParamsFrom(this.proxy, this.parent.graphId)
   }
 
   destroy(): void {
@@ -937,32 +922,6 @@ function buildInitialParams(
   return out
 }
 
-function wireAdamConfig(r: AdamResult): WireAdamConfig {
-  const c: AdamResolvedConfig = r.config
-  return {
-    lr: c.lr,
-    beta1: c.beta1,
-    beta2: c.beta2,
-    eps: c.eps,
-    weightDecay: c.weightDecay,
-    lrIsScheduled: c.lrIsScheduled,
-    lrtInputName: r.lrtInputName,
-    decayShrinkInputName: r.decayShrinkInputName,
-  }
-}
-
-function wireSGDConfig(r: SGDResult): WireSGDConfig {
-  const c: SGDResolvedConfig = r.config
-  return {
-    lr: c.lr,
-    momentum: c.momentum,
-    nesterov: c.nesterov,
-    weightDecay: c.weightDecay,
-    lrIsScheduled: c.lrIsScheduled,
-    lrInputName: r.lrInputName,
-  }
-}
-
 function makeCaptures(
   captures: Record<string, OutputArray> | null,
   captureShapes: Record<string, number[]>,
@@ -970,5 +929,28 @@ function makeCaptures(
   const data = new Map<string, OutputArray>()
   if (captures) for (const [name, arr] of Object.entries(captures)) data.set(name, arr)
   return new Captures(captureShapes, data)
+}
+
+/** Run a worker call and translate its exceptions into the `'aborted'` /
+ *  `'failed'` result discriminator. The single source of that contract —
+ *  `step` and `run` supply only the `'completed'` branch. */
+async function guarded<C>(body: () => Promise<C>): Promise<C | { kind: 'aborted' } | { kind: 'failed'; error: Error }> {
+  try {
+    return await body()
+  } catch (e) {
+    if ((e as { name?: string })?.name === 'AbortError') return { kind: 'aborted' }
+    return { kind: 'failed', error: e instanceof Error ? e : new Error(String(e)) }
+  }
+}
+
+/** Param upload/download over the worker protocol. The only thing that varies
+ *  between the two proxies is whose `graphId` owns the params (a training
+ *  graph, or the parent a forward sibling shares with). */
+function uploadParamsTo(proxy: WorkerProxy, graphId: number, params: Record<string, Float32Array>): Promise<void> {
+  return proxy.request<null>({ kind: 'uploadParams', payload: { graphId, params } }).then(() => undefined)
+}
+
+function downloadParamsFrom(proxy: WorkerProxy, graphId: number): Promise<Record<string, Float32Array>> {
+  return proxy.request<DownloadParamsResult>({ kind: 'downloadParams', payload: { graphId } }).then(r => r.params)
 }
 

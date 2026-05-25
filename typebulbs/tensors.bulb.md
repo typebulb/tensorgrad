@@ -545,7 +545,7 @@ class EmbeddingSection extends ModeSection {
       this.embeddingExplorer(),
 
       div({ class: 'intro' },
-        'Each row is a list of numbers — a direction in 4-dimensional space. The dot products above measure their alignment: related words point in similar directions, unrelated ones land near-perpendicular, opposites point oppositely.',
+        'Each row is a list of numbers — a direction in 4-dimensional space (12,288 in GPT-3). The dot products above measure their alignment: related words point in similar directions, unrelated ones land near-perpendicular, opposites point oppositely.',
       ),
 
       div({ class: 'intro' },
@@ -923,13 +923,17 @@ class MatmulSection extends ModeSection {
       ),
 
       div({ class: 'intro' },
-        'Matmul is the workhorse of neural networks: over 90% of the compute in a typical model. It earns that share by doing two conceptually different jobs, though always as the same operation. The first is the textbook neural-net picture: stacks of neurons connected by wires, every wire a learned weight, all packed into the matrix ',
+        'Matmul is the workhorse of neural networks: over 90% of the compute in a typical model.',
+      ),
+
+      div({ class: 'intro' },
+        'In the most common case, one of the two matrices is a stack of learned weights. This is the textbook neural-net picture — neurons connected by wires, every wire a weight, all packed into the matrix ',
         mono('W'),
-        '. Every output is a weighted sum of the inputs. This is called a ',
+        ' — so every output is a weighted sum of the inputs. This is called a ',
         italic('projection'),
         '; libraries call the building block a ',
         mono('Linear'),
-        ' layer, and the formula is ',
+        ' layer: ',
         mono('matmul(x, W) + b'),
         ', where ',
         mono('x'),
@@ -941,7 +945,7 @@ class MatmulSection extends ModeSection {
       ),
 
       div({ class: 'intro' },
-        'The second use of matmul is bulk reading — many dot products at once, where each row of one matrix samples a different feature from another. Attention uses this heavily.',
+        'Attention uses matmul exactly this way — projecting inputs through learned weights — and in other ways the attention tab will cover.',
       ),
     )
   }

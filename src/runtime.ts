@@ -101,6 +101,9 @@ export interface CompiledBase {
   /** Shape of the graph's output (loss scalar `[]` for training; the user's
    *  returned tensor for forward-only compiles). */
   outputShape: readonly number[]
+  /** Static shape per `capture(name)` site, keyed by name. Built once from the
+   *  buffer plan so callers (the worker's wire meta) don't recompute it. */
+  captureShapes: Record<string, number[]>
   /** Upload parameter Float32Arrays to their GPU buffers. Partial by default:
    *  missing keys leave the existing GPU values unchanged. Unknown keys throw
    *  — that's always a typo. */
@@ -133,15 +136,10 @@ export interface CompiledRuntime extends CompiledBase {
   resetOptimizerState(): void
 }
 
-/** Forward-only compiled runtime — produced by `compileForward`. No optimizer,
- *  no backward. Returns the output tensor (not just a scalar) per `run()` call. */
-export interface CompiledForward extends CompiledBase {
-  run: RunFn
-}
-
 export interface RuntimeOpts {
-  /** Pre-acquired GPUDevice. If omitted, runtime requests its own. */
-  device?: GPUDevice
+  /** The GPUDevice to bind to. The worker owns one shared device and injects
+   *  it here (the sole acquisition site is the worker's `ensureDevice`). */
+  device: GPUDevice
   /** External param buffers to bind in place of allocating fresh ones, keyed
    *  by param name. Used to share params between a training compile and a
    *  sibling forward-only compile (e.g., a B=1 inference graph). When a name
@@ -160,9 +158,9 @@ export async function createRuntime(
   plan: BufferPlan,
   kernels: KernelSpec[],
   lossBufferId: number,
-  opts: RuntimeOpts = {},
+  opts: RuntimeOpts,
 ): Promise<CompiledRuntime> {
-  const device = opts.device ?? await acquireDevice()
+  const device = opts.device
   const queue = device.queue
 
   // Allocate one GPUBuffer per BufferSpec. State buffers are filled with
@@ -473,6 +471,7 @@ export async function createRuntime(
     device,
     params,
     outputShape,
+    captureShapes,
     uploadParams,
     downloadParams: () => downloadFromMap(plan.paramsByName),
     step,
@@ -482,24 +481,3 @@ export async function createRuntime(
   }
 }
 
-/** Same machinery as `createRuntime`, narrower public type: a forward-only
- *  graph exposes `run()` instead of `step()` (no optimizer state, no scalar-
- *  loss readback). The full runtime object is built once and projected by
- *  `compileForward` to the public shape. */
-export async function createForwardRuntime(
-  plan: BufferPlan,
-  kernels: KernelSpec[],
-  outputBufferId: number,
-  opts: RuntimeOpts = {},
-): Promise<CompiledForward> {
-  return await createRuntime(plan, kernels, outputBufferId, opts)
-}
-
-async function acquireDevice(): Promise<GPUDevice> {
-  if (typeof navigator === 'undefined' || !navigator.gpu) {
-    throw new Error('tensorgrad: WebGPU not available in this environment')
-  }
-  const adapter = await navigator.gpu.requestAdapter()
-  if (!adapter) throw new Error('tensorgrad: no WebGPU adapter')
-  return await adapter.requestDevice()
-}

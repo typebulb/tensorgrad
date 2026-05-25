@@ -412,20 +412,6 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
     }
 
     // ---- Slicing / structural -------------------------------------------
-    case 'slice_last_range': {
-      const a = v(op.a) as Float32Array
-      const aShape = graph.tensors[op.a]!.shape
-      const D_in = aShape[aShape.length - 1]!
-      const D_out = op.end - op.start
-      const outer = shapeSize(aShape) / D_in
-      const out = new Float32Array(outer * D_out)
-      for (let i = 0; i < outer; i++) {
-        for (let j = 0; j < D_out; j++) {
-          out[i * D_out + j] = a[i * D_in + op.start + j]!
-        }
-      }
-      return out
-    }
     case 'slice_range': {
       const a = v(op.a) as Float32Array
       const aShape = graph.tensors[op.a]!.shape

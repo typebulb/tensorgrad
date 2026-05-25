@@ -402,7 +402,7 @@ try {
 console.log('\nVerifying lr.staircase / lr.multiStep schedules...')
 
 const { lr } = await import('../src/index.js')
-const { resolveLR } = await import('../src/adam.js')
+const { resolveLR } = await import('../src/lr.js')
 
 function approxEq(a: number, b: number, eps = 1e-9): boolean {
   return Math.abs(a - b) < eps

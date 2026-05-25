@@ -625,26 +625,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
 
     // ---- Slicing -----------------------------------------------------------
-    case 'slice_last_range': {
-      const out = tof(op.out)
-      const a = tof(op.a)
-      const D_in = a.shape[a.shape.length - 1]!
-      const D_out = op.end - op.start
-      const total = shapeSize(out.shape)
-      const wgsl = `
-@group(0) @binding(0) var<storage, read> a : array<${wgslDtype(a.dtype)}>;
-@group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
-@compute @workgroup_size(${WG_SIZE})
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  ${GID_LINE}
-  if (i >= ${total}u) { return; }
-  let outer = i / ${D_out}u;
-  let inner = i % ${D_out}u;
-  out[i] = a[outer * ${D_in}u + ${op.start}u + inner];
-}`.trim()
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
-    }
-
     case 'slice_range': {
       // Decompose i into (outer, axisIdx, inner); shift axisIdx by `start`
       // and use the input's axis stride.
