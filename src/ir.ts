@@ -61,10 +61,11 @@ export interface CallSite {
  * op-specific scalar parameters baked at trace time.
  *
  * Adding a new op means:
- *   1. add a variant here,
+ *   1. add a variant here, plus a `getOpInputs` case below,
  *   2. add a shape rule in `src/shape.ts`,
  *   3. add an adjoint rule in `src/grad.ts`,
- *   4. add a kernel template in `src/codegen.ts`.
+ *   4. add a kernel template in `src/codegen.ts`,
+ *   5. add a reference case in `test/_eval.ts` so the grad/smoke tests run it.
  *
  * The kinds intentionally match the surface API in `src/ops.ts` one-to-one
  * (with the exception of autograd-internal kinds like `*_grad`, `broadcast_to`,
@@ -106,10 +107,10 @@ export type OpNode =
   // the same (seed, salt) so masks line up. `seed` is the id of the shared
   // i32 scalar tensor_input (`__prngSeed`) the runtime updates per step.
   | { kind: 'dropout'; out: number; a: number; seed: number; p: number; salt: number }
-  // Standard-normal sampler. Shares dropout's per-step seed; `salt` is unique
-  // per call (counted across both dropout and randn). Each thread does two
-  // PCG draws + Box-Muller to emit one N(0, 1) value. Output shape is baked
-  // into the op (no input tensor — randn synthesizes its values).
+  // Standard-normal sampler. Shares the per-step seed; `salt` is unique per
+  // call (counted across all stochastic ops). Each thread does two PCG draws
+  // + Box-Muller to emit one N(0, 1) value. Output shape is baked into the op
+  // (no input tensor — randn synthesizes its values).
   | { kind: 'randn'; out: number; seed: number; salt: number; shape: Shape }
   // Identity-copy forward, no-op backward. Used to detach a tensor from the
   // autograd graph so gradient stops flowing through it (PyTorch's `.detach()`,

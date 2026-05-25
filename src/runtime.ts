@@ -452,7 +452,6 @@ export async function createRuntime(
   for (const [name, bufId] of plan.paramsByName) {
     params.set(name, buffers.get(bufId)!)
   }
-  // Static shape per capture, surfaced so callers don't recompute strides.
   const captureShapes: Record<string, number[]> = {}
   for (const [name, bufId] of plan.capturesByName) {
     captureShapes[name] = [...plan.buffers[bufId]!.shape]

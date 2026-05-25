@@ -72,8 +72,7 @@ export interface SGDResult {
 }
 
 /** Project an `appendSGD` result into the serializable config the worker
- *  reconstructs SGD state from. Lives here so a config-field change touches
- *  only `sgd.ts` (the type + its wire projection together). */
+ *  reconstructs SGD state from. */
 export function wireSGDConfig(r: SGDResult): WireSGDConfig {
   const c: SGDResolvedConfig = r.config
   return {

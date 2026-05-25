@@ -499,27 +499,42 @@ class ShapesSection extends ModeSection {
   tensorgradView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'In tensorgrad, every parameter declares its shape. Shapes are part of the type — downstream ops are checked against them when the model is compiled to a GPU kernel.',
+        'In tensorgrad, a ',
+        italic('tensor'),
+        ' is a multi-dimensional array of numbers with a fixed shape — and that shape is part of its runtime type, checked against every op when the model compiles to a GPU kernel. You create tensors with helpers like ',
+        mono('zeros'),
+        ' and ',
+        mono('ones'),
+        ':',
       ),
 
       specBox(
-        `class MyModel extends Module {\n  W = this.param([3, 4])   // a learnable 2D tensor: 3 rows of 4 numbers\n}`,
-        [
-          [
-            '',
-            'this.param([...])', ' declares a learnable tensor inside a Module subclass. Training fills in the values via gradient descent. The shape is fixed at compile time.',
-          ],
-        ],
-      ),
-
-      specBox(
-        `const x = ones([3, 4])    // shape [3, 4]\nconst y = ones([4])       // shape [4]\nconst z = add(x, y)       // shape [3, 4]; the [4] vector is reused across all 3 rows`,
+        `const x = zeros([3, 4])   // shape [3, 4]\nconst y = ones([4])       // shape [4]\nconst z = add(x, y)       // shape [3, 4]; the [4] vector is reused across all 3 rows`,
         [
           [
             'When two tensors of different ranks meet, the shorter shape lines up against the end of the longer one, and the missing leading axes are repeated implicitly. The shorter tensor is said to ',
             'broadcast', ' across those axes. Here ',
             'y', ' broadcasts across the leading axis of ',
             'x', '.',
+          ],
+        ],
+      ),
+
+      div({ class: 'intro' },
+        'Learnable tensors — the parameters trained by gradient descent — live inside a ',
+        mono('Module'),
+        '. A ',
+        mono('Linear'),
+        ' layer is a learned weight matrix:',
+      ),
+
+      specBox(
+        `const D = 64   // model dimension\nclass Attention extends Module {\n  q = new Linear(D, D)\n  k = new Linear(D, D)\n  v = new Linear(D, D)\n  o = new Linear(D, D)\n}`,
+        [
+          [
+            'Each ',
+            'Linear(D, D)', ' holds a learned ',
+            '[D, D]', ' weight matrix — a rank-2 tensor.',
           ],
         ],
       ),
@@ -637,35 +652,38 @@ class EmbeddingSection extends ModeSection {
   tensorgradView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        mono('embedding(table, indices)'),
-        ' is an indexed lookup: every integer in ',
-        mono('indices'),
-        ' is replaced by the corresponding row from ',
-        mono('table'),
-        '. The shape gets promoted from integers to D-dim vectors in one op.',
+        'An embedding table is a learnable parameter on the model. A transformer declares one for tokens and one for positions:',
       ),
 
       specBox(
-        `class Embed extends Module {\n  table = this.param([12, 64])     // 12 learnable rows, each a 64-dim vector\n}\n\n// In a forward function, given ids as an i32 Tensor of shape [3]:\nconst out = embedding(p.table, ids)   // shape [3, 64] — the three fetched rows`,
+        `const D = 64   // model dimension\nconst VOCAB = 12\nconst SEQ_LEN = 9\n\nclass Transformer extends Module {\n  tokenEmbedding    = this.param([VOCAB, D])\n  positionEmbedding = this.param([SEQ_LEN, D])\n  ...\n}`,
         [
           [
-            'Each integer in ',
-            'ids', ' becomes the corresponding row of ',
-            'table', '. The output shape is the input shape with one extra trailing axis equal to ',
-            'D', '.',
+            '',
+            'this.param', ' declares a raw learnable tensor, filled in by training.',
           ],
         ],
       ),
 
+      div({ class: 'intro' },
+        'A forward pass runs a model from its inputs through to its outputs. Here it begins with the embedding lookup: each integer in ',
+        mono('ids'),
+        ' — the input token indices, say ',
+        mono('[5, 0, 9]'),
+        ' — is replaced by its row in the table, so the output gains a trailing axis of size D:',
+      ),
+
       specBox(
-        `// indices can have any leading shape — e.g., a batch of token sequences:\n// ids: i32 Tensor of shape [B, T]\nconst out = embedding(p.table, ids)   // shape [B, T, 64]`,
-        [
-          [
-            'The same op vectorizes across any leading shape. A ',
-            '[B, T]', ' tensor of integers becomes a ',
-            '[B, T, 64]', ' tensor of vectors — exactly what a transformer needs to feed a batch of token sequences into the rest of the model.',
-          ],
-        ],
+        `function forward(model: Transformer, ids: Tensor) {\n  const tokenVecs = embedding(model.tokenEmbedding, ids)   // ids: [3]  →  [3, 64]\n  ...\n}`,
+        [],
+      ),
+
+      div({ class: 'intro' },
+        'Indices can carry any leading shape: a ',
+        mono('[B, T]'),
+        ' batch of token sequences becomes ',
+        mono('[B, T, 64]'),
+        ' — what a transformer feeds into the rest of the model.',
       ),
     )
   }
@@ -722,13 +740,17 @@ class AddSection extends AngleSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         mono('add(a, b)'),
-        ' is element-wise addition over two same-shape tensors.',
+        ' is element-wise addition over two same-shape tensors. As we will see, a tensor allows addition to be defined abstractly. It could add just two scalar values, or two huge cubes of scalar values.',
       ),
       specBox(
-        `const c = add(a, b)   // a: [64], b: [64]  →  c: [64]\n                      // c[i] = a[i] + b[i] for every i`,
+        `const c = add(a, b)`,
         [
           [
-            'Each output element is the sum of corresponding inputs. The shape is preserved.',
+            'Each output element is the sum of the corresponding inputs: ',
+            'c[i] = a[i] + b[i]', '. The shape is preserved, and the same element-wise pattern covers ',
+            'sub', ', ',
+            'mul', ', and ',
+            'div', '.',
           ],
         ],
       ),
@@ -802,7 +824,7 @@ class DotSection extends AngleSection {
       }),
 
       div({ class: 'intro' },
-        'Dot product is the math of similarity. Geometric alignment is one face of it; the same number measures similarity between vectors that encode any kind of information, not just positions in space. Positive for aligned, near-zero for unrelated, negative for opposite. For people who say hate isn\'t the opposite of love, indifference is: vector math disagrees. Hate is the opposite of love (same axis flipped, negative). Indifference is orthogonal (zero on that axis). The next tab uses this to give directions meaning.',
+        'Dot product is the math of similarity. Geometric alignment is one face of it; the same number measures similarity between vectors that encode any kind of information, not just positions in space. Positive for aligned, near-zero for unrelated, negative for opposite. For people who say hate isn\'t the opposite of love, indifference is: vector math disagrees. Hate is the opposite of love (same axis flipped, negative). Indifference is orthogonal (zero on that axis).',
       ),
 
     )
@@ -852,33 +874,24 @@ class DotSection extends AngleSection {
   tensorgradView() {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
-        'tensorgrad does not expose a standalone ',
-        mono('dot'),
-        ' op. Element-wise multiply, then sum:',
+        'A dot op can be expressed by composing two primitive ops, like this:',
       ),
       specBox(
-        `const d = sum(mul(a, b))   // a: [N], b: [N]  →  d: scalar\n                           // d = a[0]*b[0] + a[1]*b[1] + ... + a[N-1]*b[N-1]`,
-        [
-          [
-            '',
-            'mul', ' multiplies element-wise (',
-            'mul(a, b)[i] = a[i] * b[i]', '); ',
-            'sum', ' collapses the result to a single number. Together: the dot product.',
-          ],
-        ],
+        `const d = sum(mul(a, b))`,
+        [],
       ),
       div({ class: 'intro' },
-        'In practice ML almost always wants many dot products at once, and those naturally live inside ',
+        'This works, whether ',
+        mono('a'),
+        ' and ',
+        mono('b'),
+        ' are scalars, or multi-dimensional tensors. ',
         mono('matmul'),
-        ' (explained later). That\'s why tensorgrad doesn\'t bother with a standalone one; just use ',
-        mono('sum(mul(a, b))'),
-        '. Some frameworks like PyTorch (',
-        mono('torch.dot'),
-        ') and JAX/NumPy (',
-        mono('jnp.dot'),
-        ' / ',
-        mono('np.dot'),
-        ') expose a standalone one, to cross the Ts and · the Is.',
+        ' is a ',
+        italic('bulk dot op'),
+        ' — it implicitly multiplies and sums. Since the multi-dimensional case is far more common, there\'s little need for a standalone dot op. We explain ',
+        mono('matmul'),
+        ' in detail in a separate tab.',
       ),
     )
   }
@@ -993,33 +1006,28 @@ class MatmulSection extends ModeSection {
   }
 
   tensorgradView() {
+    const dim = (letter: string, color: string) =>
+      span({ style: { color, fontWeight: '700' } }, letter)
+    const T = () => dim('T', 'var(--a-color)')
+    const D = () => dim('D', 'var(--b-color)')
+    const V = () => dim('V', 'var(--c-color)')
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
+        'In tensorgrad, ',
         mono('matmul(a, b)'),
-        ' is bulk dot product: every row of ',
-        mono('a'),
-        ' dotted against every column of ',
-        mono('b'),
-        '.',
+        ' multiplies two tensors:',
       ),
 
       specBox(
-        `const c = matmul(a, b)   // a: [3, 4], b: [4, 5]  →  c: [3, 5]\n                         // c[i, j] = sum(mul(a[i, :], b[:, j]))`,
-        [
-          [
-            'Shape rule: ',
-            '[M, K] · [K, N] = [M, N]', '. The inner K must agree — it is the length of every dot product.',
-          ],
-        ],
+        `const c = matmul(a, b)`,
+        [],
       ),
 
-      specBox(
-        `const c = matmul(a, b)   // a: [B, T, D], b: [D, V]  →  c: [B, T, V]\n                         // any leading axes (here, B) carry through unchanged;\n                         // the [T, D] · [D, V] matmul runs across each B slot`,
-        [
-          [
-            'matmul works the same whether the input is a single matrix or a stack of them. The shape rule applies to the trailing two axes; anything earlier is along for the ride.',
-          ],
-        ],
+      div({ class: 'intro' },
+        'matmul handles stacks too: any leading axes — like the batch B — ride along unchanged:',
+      ),
+      div({ class: 'formula-display', style: { fontFamily: 'monospace' } },
+        '[B, ', T(), ', ', D(), '] · [', D(), ', ', V(), ']  →  [B, ', T(), ', ', V(), ']',
       ),
 
       div({ class: 'intro' },
@@ -1107,25 +1115,26 @@ class SoftmaxSection extends ModeSection {
     return div({ class: 'tab-content-inner' },
       div({ class: 'intro' },
         mono('softmax(x, axis?)'),
-        ' applies along one axis (default: last). For numerical stability, tensorgrad subtracts the row max before exp — the answer is identical because the same constant gets exp\'d into every term and cancels in the divide.',
+        ' outputs values that are non-negative and sum to 1 across that axis.',
       ),
       specBox(
         `const logits = ...               // [V]\nconst probs  = softmax(logits)   // [V] — all in [0, 1], summing to 1`,
-        [
-          [
-            '',
-            'softmax', ' acts on the last axis by default. The output values are non-negative and sum to 1 across that axis.',
-          ],
-        ],
+        [],
+      ),
+      div({ class: 'intro' },
+        'It applies along one axis, defaulting to the last — the same trailing-axis convention as broadcasting.',
+      ),
+      div({ class: 'intro' },
+        'The causal variant, as explained in the conceptual tab, is just:',
       ),
       specBox(
-        `// Causal variant\nconst attn = softmaxCausal(scores)   // future positions masked to −∞ before softmax`,
-        [
-          [
-            '',
-            'softmaxCausal', ' is softmax with the causal mask fused in. See the conceptual view for why.',
-          ],
-        ],
+        `const attn = softmaxCausal(scores)   // future positions masked to −∞ before softmax`,
+        [],
+      ),
+      div({ class: 'intro' },
+        'For numerical stability, tensorgrad subtracts each row\'s max before exponentiating. The result is identical: subtracting the same constant from every value scales each exponential by the same factor, and that factor cancels in the division. The payoff is safety — the largest exponent is now 0, so ',
+        mono('exp'),
+        ' can\'t overflow.',
       ),
     )
   }
@@ -1457,8 +1466,8 @@ class Root extends Component implements IRoot {
           tabs: [
             { key: 'add',         label: 'Vectors',     content: this.addSection.view() },
             { key: 'dot',         label: 'Dot Product', content: this.dotSection.view() },
-            { key: 'embedding',   label: 'Embedding',   content: this.embeddingSection.view() },
             { key: 'shapes',      label: 'Tensors',     content: this.shapesSection.view() },
+            { key: 'embedding',   label: 'Embedding',   content: this.embeddingSection.view() },
             { key: 'matmul',      label: 'matmul',      content: this.matmulSection.view() },
             { key: 'softmax',     label: 'softmax',     content: this.softmaxSection.view() },
             { key: 'composition', label: 'Attention',    content: this.compositionSection.view(), hideSubBar: true },
@@ -1557,18 +1566,11 @@ body {
   letter-spacing: -0.01em;
 }
 
-/* Muted body text — same role across sections; the per-class rules below
-   only add positional extras (margins, max-widths, italic). */
-.subtitle,
-.caption,
-.code-caption,
-.embed-prose {
+/* Page tagline under the H1 — the one genuinely secondary line of prose. */
+.subtitle {
   font-size: 16px;
   line-height: 1.6;
   color: var(--text-muted);
-}
-
-.subtitle {
   margin: 4px 0 0;
   max-width: 720px;
 }
@@ -1663,7 +1665,10 @@ body {
 
 .tab-content-inner > * + * { margin-top: 22px; }
 
-.intro {
+.intro,
+.caption,
+.code-caption,
+.embed-prose {
   color: var(--text);
   font-size: 16px;
   line-height: 1.65;
@@ -1749,8 +1754,6 @@ body {
   width: 100%;
   accent-color: var(--accent);
 }
-
-.caption { font-style: italic; }
 
 /* Code blocks (used in tensorgrad sub-tabs and the Attention tab spine). */
 .code-block {

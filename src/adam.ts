@@ -101,8 +101,7 @@ export interface AdamResult {
 }
 
 /** Project an `appendAdam` result into the serializable config the worker
- *  reconstructs Adam state from. Lives here so a config-field change touches
- *  only `adam.ts` (the type + its wire projection together). */
+ *  reconstructs Adam state from. */
 export function wireAdamConfig(r: AdamResult): WireAdamConfig {
   const c: AdamResolvedConfig = r.config
   return {
@@ -120,8 +119,7 @@ export function wireAdamConfig(r: AdamResult): WireAdamConfig {
 /** The two per-step scalars the runtime feeds Adam's update kernel: the
  *  bias-corrected effective LR `lrt = lr·√(1−β2ᵗ)/(1−β1ᵗ)`, and AdamW's
  *  `decayShrink = 1 − lr·weightDecay` (folds out to 1 for non-decayed params,
- *  unused when weightDecay is 0). Lives here, with the rest of Adam's math,
- *  rather than in the worker that merely plumbs the values per step. */
+ *  unused when weightDecay is 0). */
 export function adamStepScalars(
   c: { lr: LR; beta1: number; beta2: number; weightDecay: number },
   t: number,

@@ -123,12 +123,9 @@ function createOptimizerState(cfg: WireOptimizerConfig | null): OptimizerState |
   return { kind: 'sgd', state: createSGDState(cfg.config) }
 }
 
-// A graph needs per-step PRNG seeding iff it contains the shared seed input,
-// which every stochastic op (dropout / randn / categorical) creates via
-// `findOrCreatePrngSeed`. Deriving it from graph structure — rather than
-// matching a hardcoded list of stochastic op kinds — means a new stochastic op
-// is detected automatically (the missing-categorical PRNG bug in 0.1.8 was
-// exactly that list drifting out of sync with the ops).
+// A graph needs per-step PRNG seeding iff it has the shared seed input, which
+// every stochastic op creates via `findOrCreatePrngSeed`. Derived from graph
+// structure so new stochastic ops are picked up without editing a kind list.
 function graphUsesPrng(graph: WireIR['graph']): boolean {
   return graph.ops.some(op => op.kind === 'tensor_input' && op.name === PRNG_SEED_INPUT)
 }

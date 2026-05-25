@@ -177,11 +177,11 @@ export function silu(a: Tensor): Tensor {
   return mul(a, sigmoid(a))
 }
 
-/** Hidden tensor_input name for the per-step PRNG seed shared by `dropout`
- *  and `randn`. The runtime auto-injects this scalar before each
- *  `step()`/`run()` when the compiled graph contains any stochastic op;
- *  users do not pass it. Exposed as a named constant so worker + proxy
- *  agree on the convention. */
+/** Hidden tensor_input name for the per-step PRNG seed shared by the
+ *  stochastic ops (`dropout`, `randn`, `categorical`). The runtime
+ *  auto-injects this scalar before each `step()`/`run()` when the compiled
+ *  graph contains any stochastic op; users do not pass it. Exposed as a named
+ *  constant so worker + proxy agree on the convention. */
 export const PRNG_SEED_INPUT = '__prngSeed'
 
 /** Inverted dropout: with probability `p`, zero an element; otherwise scale
@@ -197,7 +197,8 @@ export const PRNG_SEED_INPUT = '__prngSeed'
  *  and a forward spec attached via `train.attach(forwardSpec)`.
  *
  *  **Salt ordering.** Salts are assigned by graph-construction order across
- *  `dropout` and `randn` calls combined. Adding or removing a stochastic op
+ *  all stochastic-op calls (`dropout` / `randn` / `categorical`) combined.
+ *  Adding or removing a stochastic op
  *  upstream shifts the salts (and therefore the random streams) of every
  *  later stochastic call. The forward / backward pair of a single dropout
  *  always shares its salt, so masks line up correctly. Refactor-induced
@@ -210,9 +211,9 @@ export function dropout(x: Tensor, p: number): Tensor {
   if (x.dtype !== 'f32') throw new ShapeError(`dropout: requires f32, got ${x.dtype}`, site)
   const g = currentGraph()
   const seed = findOrCreatePrngSeed(g)
-  // Salt counts both dropout and randn ops so independent stochastic sites
-  // get independent PCG streams. Forward/backward of a single dropout share
-  // their salt; see `dropoutWithSalt`.
+  // salt = position among stochastic ops (see countStochasticOps) so each site
+  // gets an independent PCG stream. A dropout's forward/backward share their
+  // salt — see `dropoutWithSalt`.
   const salt = countStochasticOps(g)
   return addOp(g, 'dropout', inferUnary('dropout', x.shape, site), 'f32', site, { a: x.id, seed: seed.id, p, salt })
 }
@@ -225,10 +226,10 @@ export function dropout(x: Tensor, p: number): Tensor {
  *  stochastic regularization beyond dropout.
  *
  *  **Salt ordering.** Salts are assigned by graph-construction order across
- *  `randn` and `dropout` combined. Adding or removing a stochastic op
- *  upstream shifts the random streams of every later stochastic call — not
- *  a correctness issue, but a reproducibility-across-refactors gotcha to
- *  know about. */
+ *  all stochastic ops (`dropout` / `randn` / `categorical`) combined. Adding
+ *  or removing a stochastic op upstream shifts the random streams of every
+ *  later stochastic call — not a correctness issue, but a
+ *  reproducibility-across-refactors gotcha to know about. */
 export function randn(shape: Shape): Tensor {
   const site = captureSite('randn')
   for (const d of shape) {
