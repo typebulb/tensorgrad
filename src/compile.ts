@@ -171,6 +171,24 @@ export interface ForwardSpec<M extends Module, I extends InputDecls = InputDecls
   maxCachedShapes?: number
 }
 
+/** Spec passed to `compileForward({ ... })` — a standalone forward executor
+ *  that owns its *own* param buffers (no parent training compile, no loss, no
+ *  optimizer). Same as `ForwardSpec` plus the `model` instance and an optional
+ *  init `seed`. The returned `CompiledForward` exposes
+ *  `run`/`uploadParams`/`downloadParams`/`destroy`/`paramNames` — load weights
+ *  in via `uploadParams` (e.g. from `loadSafetensors`) before running. */
+export interface ForwardExecutorSpec<M extends Module, I extends InputDecls = InputDecls, O extends 'f32' | 'i32' = 'f32'>
+  extends ForwardSpec<M, I, O>
+{
+  /** A model instance — `new Model()`. Cloned internally before tracing,
+   *  exactly like `compile({ model })`. */
+  model: M
+  /** 32-bit integer seed for param init. Params are typically overwritten by
+   *  `uploadParams` (imported weights), so this matters only for the values of
+   *  any params you never upload. Defaults to a fresh random seed. */
+  seed?: number
+}
+
 
 /** Returned by `compile(opts)`. Proxies all GPU work to an internal
  *  worker; every method returns a Promise. Generic over the declared
@@ -384,7 +402,60 @@ export async function trace<M extends Module, I extends InputDecls>(
 export async function traceForward<M extends Module, I extends InputDecls>(
   opts: { model: M; forward: ForwardFn<M, I>; inputs: I },
 ): Promise<CompiledIR> {
-  return buildForwardIR(opts.model, opts.forward as unknown as ForwardFn<M, InputDecls>, opts.inputs)
+  return (await buildForwardIR(opts.model, opts.forward as unknown as ForwardFn<M, InputDecls>, opts.inputs)).ir
+}
+
+/**
+ * Compile a *standalone forward-only* graph to a worker-backed runtime — spawns
+ * its own worker and owns its *own* param buffers. The third executor path
+ * alongside `compile()` (needs a loss + optimizer) and `train.attach()` (needs
+ * a parent training compile and *shares* its params): `compileForward` runs a
+ * model that has neither a training counterpart nor a parent.
+ *
+ * The headline use is running an imported pretrained backbone: load weights via
+ * `uploadParams` (e.g. from `loadSafetensors`), then `run` to extract features.
+ *
+ * ```ts
+ * const backbone = await compileForward({ model: new Backbone(), forward, inputs })
+ * await backbone.uploadParams(loadSafetensors(buf).tensors)
+ * const { output } = await backbone.run({ x })
+ * ```
+ *
+ * Polymorphic over `null`-wildcard input dims like `train.attach`: the owner
+ * graph (which owns the params) is compiled at the first resolved shape, and
+ * each additional shape is cached as a sibling that shares the owner's params.
+ * With fully concrete input shapes the owner is created eagerly, so
+ * `uploadParams` / `downloadParams` work before the first `run()`.
+ */
+export async function compileForward<M extends Module, I extends InputDecls, O extends 'f32' | 'i32' = 'f32'>(
+  spec: ForwardExecutorSpec<M, I, O>,
+): Promise<CompiledForward<M, I, O>> {
+  const proxy = new WorkerProxy(__WORKER_SOURCE__)
+  try {
+    const decls = normalizeDecls(spec.inputs)
+    const seed = spec.seed ?? randomSeed()
+    const concrete = declsAreConcrete(decls)
+    // Eager metadata trace: enumerate the model's params (names + init fns) and
+    // surface any trace-time error up front. When the declared shape is fully
+    // concrete this same IR is promoted to the live owner (no second trace);
+    // for a parametric shape it's metadata-only (wildcards substituted with 1,
+    // which is shape-independent for params) and the owner traces fresh at the
+    // first run()'s actual shape.
+    const metaShape = ownerMetaShape(decls)
+    const { ir, materialized } = await buildForwardIR(
+      spec.model, spec.forward as unknown as ForwardFn<M, InputDecls>, metaShape,
+    )
+    const executor = new ForwardExecutorProxy<M, I, O>(
+      proxy, spec.model, spec.forward, decls, spec.output ?? 'f32',
+      spec.maxCachedShapes ?? DEFAULT_MAX_CACHED_SHAPES, seed,
+      materialized.initFns, [...ir.plan.paramsByName.keys()],
+    )
+    if (concrete) await executor._initOwnerEager(metaShape, ir)
+    return executor
+  } catch (e) {
+    proxy.terminate()
+    throw e
+  }
 }
 
 /** Yields a macrotask via setTimeout(0) so the browser can paint between
@@ -429,18 +500,20 @@ async function buildTrainingIR<M extends Module, I extends InputDecls>(
 }
 
 /** Pure-JS portion of a forward-only graph build. Shared by `traceForward()`
- *  (public inspection) and `compileSibling()` (per-shape lazy compile). */
+ *  (public inspection), `compileSibling()` (per-shape lazy compile against a
+ *  parent), and `compileForward()` (standalone executor — needs `materialized`
+ *  to build its own initial params, since it owns its buffers). */
 async function buildForwardIR<M extends Module>(
   model: M,
   forward: ForwardFn<M, InputDecls>,
   decls: InputDecls,
-): Promise<CompiledIR> {
-  const { graph } = traceModule(model, forward, decls)
+): Promise<{ ir: CompiledIR; materialized: MaterializedParams }> {
+  const { graph, materialized } = traceModule(model, forward, decls)
   await yieldToUI()
   const outputTensor = graph.tensors[graph.outputs[0]!]!
   const plan = planBuffers(graph, {})
   const kernels = emitKernels(graph, plan)
-  return { graph, paramGrads: {}, loss: outputTensor, plan, kernels }
+  return { ir: { graph, paramGrads: {}, loss: outputTensor, plan, kernels }, materialized }
 }
 
 interface BuiltTrainingGraph {
@@ -762,13 +835,184 @@ async function compileSibling<M extends Module, I extends InputDecls>(
   decls: ResolvedDecls,
   nextGraphId: { v: number },
 ): Promise<ForwardSiblingMeta> {
-  const ir = await buildForwardIR(model, forward as unknown as ForwardFn<M, InputDecls>, decls)
+  const { ir } = await buildForwardIR(model, forward as unknown as ForwardFn<M, InputDecls>, decls)
   const childGraphId = nextGraphId.v++
   const wireIR: WireIR = { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
   const meta = await proxy.request<CompileResult>(
     { kind: 'compileForward', payload: { graphId: childGraphId, parentGraphId, ir: wireIR } },
   )
   return { graphId: childGraphId, ir, meta }
+}
+
+/** Standalone forward executor proxy (returned by `compileForward`). Owns its
+ *  own worker + param buffers — no parent training compile. The owner graph
+ *  (graphId 0) is created via `createRuntime` with `optimizer: null` and holds
+ *  the params; additional resolved shapes reuse the existing sibling mechanism
+ *  (a `compileForward` payload pointed at the owner), so polymorphism falls out
+ *  of composing the two shipping worker paths — no worker change.
+ *
+ *  The owner is held separately from the LRU sibling cache so it's never
+ *  evicted: evicting it would free the param buffers every sibling shares. */
+class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i32' = 'f32'>
+  implements CompiledForward<M, I, O>
+{
+  /** Owner graph (graphId 0). Null until created — eagerly for concrete input
+   *  shapes (see `compileForward`), else on the first `run()`. */
+  private ownerMeta: ForwardSiblingMeta | null = null
+  private ownerKey: string | null = null
+  /** Sibling shapes only (the owner is `ownerMeta`). LRU: Map preserves
+   *  insertion order, so the first key is the oldest. */
+  private readonly cache = new Map<string, ForwardSiblingMeta>()
+  private readonly nextGraphId = { v: 1 }
+  /** `uploadParams` calls issued before the owner exists (parametric spec, no
+   *  run yet) accumulate here and flush right after the owner is created.
+   *  Partial-by-default merge — later keys win, matching `uploadParams`. */
+  private pendingUpload: Record<string, Float32Array> | null = null
+
+  constructor(
+    private readonly proxy: WorkerProxy,
+    private readonly model: M,
+    private readonly forward: ForwardFn<M, I>,
+    private readonly decls: NormalizedDecls,
+    private readonly declaredOutput: 'f32' | 'i32',
+    private readonly maxCachedShapes: number,
+    private readonly seed: number,
+    private readonly initFns: Record<string, InitFn>,
+    private _paramNames: readonly string[],
+  ) {}
+
+  get paramNames(): readonly string[] { return this._paramNames }
+
+  /** Create the owner graph eagerly from a prebuilt IR (concrete-shape path,
+   *  called once from `compileForward`). Same effect as the lazy owner-create
+   *  inside `siblingFor`, but reuses the trace already done for metadata. */
+  async _initOwnerEager(resolved: ResolvedDecls, prebuilt: CompiledIR): Promise<void> {
+    await this.createOwner(resolved, prebuilt)
+  }
+
+  private async createOwner(resolved: ResolvedDecls, prebuilt?: CompiledIR): Promise<ForwardSiblingMeta> {
+    const ir = prebuilt ?? (await buildForwardIR(
+      this.model, this.forward as unknown as ForwardFn<M, InputDecls>, resolved,
+    )).ir
+    const initialParams = buildInitialParams(ir.plan, this.initFns, mulberry32(this.seed))
+    const wireIR: WireIR = { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
+    const meta = await this.proxy.request<CompileResult>(
+      { kind: 'createRuntime', payload: { graphId: 0, ir: wireIR, initialParams, optimizer: null } },
+      transferablesOfRecord(initialParams),
+    )
+    this.validateOutputDtype(ir)
+    this.ownerMeta = { graphId: 0, ir, meta }
+    this.ownerKey = shapeKey(resolved)
+    this._paramNames = meta.paramNames
+    if (this.pendingUpload) {
+      await uploadParamsTo(this.proxy, 0, this.pendingUpload)
+      this.pendingUpload = null
+    }
+    return this.ownerMeta
+  }
+
+  /** Validate the declared output dtype against the graph's actual output. Same
+   *  guard as `ForwardProxy.siblingFor` — a wrong `output: 'i32'`/`'f32'` would
+   *  otherwise produce wrong-class TypedArray reads at every call site. */
+  private validateOutputDtype(ir: CompiledIR): void {
+    const actual = ir.graph.tensors[ir.graph.outputs[0]!]!.dtype
+    if (actual !== this.declaredOutput) {
+      throw new Error(
+        `compileForward: forward declares output: '${this.declaredOutput}' but the traced graph's output tensor is '${actual}'. ` +
+        `Use \`output: '${actual}'\` in the spec (or default by omitting the field for f32).`,
+      )
+    }
+  }
+
+  private async siblingFor(inputs: LooseInputs): Promise<ForwardSiblingMeta> {
+    const resolved = resolveDecls(this.decls, inputs)
+    const key = shapeKey(resolved)
+    if (!this.ownerMeta) return this.createOwner(resolved)
+    if (key === this.ownerKey) return this.ownerMeta
+    const hit = this.cache.get(key)
+    if (hit) {
+      // Bump to most-recently-used.
+      this.cache.delete(key)
+      this.cache.set(key, hit)
+      return hit
+    }
+    const sib = await compileSibling<M, I>(
+      this.proxy, this.ownerMeta.graphId, this.model, this.forward, resolved, this.nextGraphId,
+    )
+    this.validateOutputDtype(sib.ir)
+    // Evict the least-recently-used sibling (owner is never in this cache).
+    if (this.cache.size >= this.maxCachedShapes) {
+      const oldestKey = this.cache.keys().next().value
+      if (oldestKey !== undefined) {
+        const oldest = this.cache.get(oldestKey)!
+        this.proxy.send({ kind: 'destroy', payload: { graphId: oldest.graphId } })
+        this.cache.delete(oldestKey)
+      }
+    }
+    this.cache.set(key, sib)
+    return sib
+  }
+
+  run(inputs: LooseInputs): Promise<RunResult<O>> {
+    return guarded(async () => {
+      const sib = await this.siblingFor(inputs)
+      const r = await this.proxy.request<RunResultWire>(
+        { kind: 'run', payload: { graphId: sib.graphId, inputs } },
+      )
+      return { kind: 'completed' as const, output: r.output as DtypeArray<O>, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
+    })
+  }
+
+  async graphFor(inputs: LooseInputs): Promise<CompiledIR> {
+    return (await this.siblingFor(inputs)).ir
+  }
+
+  uploadParams(params: Record<string, Float32Array>): Promise<void> {
+    // Before the owner exists (parametric spec, no run yet) there are no GPU
+    // buffers to write — buffer the upload and flush it after owner creation.
+    if (!this.ownerMeta) {
+      this.pendingUpload = { ...(this.pendingUpload ?? {}), ...params }
+      return Promise.resolve()
+    }
+    return uploadParamsTo(this.proxy, this.ownerMeta.graphId, params)
+  }
+
+  downloadParams(): Promise<Record<string, Float32Array>> {
+    if (!this.ownerMeta) {
+      return Promise.reject(new Error(
+        'compileForward: downloadParams() before any params exist on the GPU. With a parametric ' +
+        '(null-wildcard) input shape the param buffers are allocated on the first run(); call ' +
+        'run() once (or declare fully concrete input shapes) before downloadParams().',
+      ))
+    }
+    return downloadParamsFrom(this.proxy, this.ownerMeta.graphId)
+  }
+
+  destroy(): void {
+    // Destroying the owner (graphId 0) cascades to every sibling sharing its
+    // params (worker handleDestroy walks parentGraphId), then we tear down the
+    // worker. Nothing to destroy if the owner was never created.
+    if (this.ownerMeta) this.proxy.send({ kind: 'destroy', payload: { graphId: this.ownerMeta.graphId } })
+    this.proxy.terminate()
+  }
+}
+
+/** True when no declared input shape contains a `null` wildcard — the owner
+ *  graph can then be created eagerly at `compileForward` time. */
+function declsAreConcrete(decls: NormalizedDecls): boolean {
+  return Object.values(decls).every(d => d.shape.every(x => x !== null))
+}
+
+/** Shape to trace for the eager metadata pass: concrete dims as-is, `null`
+ *  wildcards substituted with 1. Param shapes are batch-independent, so this is
+ *  exact for enumerating params; for a concrete spec it equals the declared
+ *  shape and the resulting IR is promoted to the live owner. */
+function ownerMetaShape(decls: NormalizedDecls): ResolvedDecls {
+  const out: ResolvedDecls = {}
+  for (const [name, d] of Object.entries(decls)) {
+    out[name] = { shape: d.shape.map(x => (x === null ? 1 : x)) as number[], dtype: d.dtype }
+  }
+  return out
 }
 
 type Graph = ReturnType<typeof traceFn>

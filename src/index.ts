@@ -44,12 +44,13 @@ export { type AdamConfig, type AdamWConfig } from './adam.js'
 export { type SGDConfig } from './sgd.js'
 export { Captures, type OutputArray, type DtypeArray } from './runtime.js'
 export {
-  compile, trace, traceForward, isWebGPUAvailable,
-  type TrainingSpec, type ForwardSpec, type CompiledIR, type ForwardFn,
+  compile, compileForward, trace, traceForward, isWebGPUAvailable,
+  type TrainingSpec, type ForwardSpec, type ForwardExecutorSpec, type CompiledIR, type ForwardFn,
   type CompiledTraining, type CompiledForward, type OptimizerConfig,
   type StepResult, type RunResult,
   type InputDecl, type InputDecls, type TypedInputs,
 } from './compile.js'
+export { loadSafetensors, type SafetensorsData } from './safetensors.js'
 export { Module, init, type InitSpec, type ParamOptions } from './module.js'
 export { singleFlight, type SingleFlightResult } from './single-flight.js'
 export {

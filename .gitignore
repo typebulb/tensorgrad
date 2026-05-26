@@ -9,6 +9,10 @@ build-artifacts/
 .env
 .env.local
 
+# Local pretrained-weight cache (bulb downloads checkpoints here on first run;
+# never committed — see the transfer-learning spec's hosting note).
+/weights/
+
 # Excluded from publication. Specs are working design notes; .claude/.github
 # are local config.
 /typebulbs-tentative

@@ -259,12 +259,42 @@ const x4 = reshape(x, [B, Cin, 1, T])
 const y  = reshape(conv.fwd(x4), [B, Cout, Tout])
 ```
 
+**Transfer learning is two-stage: frozen features, then a trained head.**
+There's no param-freeze flag — instead run a frozen backbone with
+`compileForward`, cache its feature vectors in JS, then train a small head
+on those features with the ordinary `compile` training API. The backbone
+is a `Module` *you* define and load weights into (via `loadSafetensors` →
+`uploadParams`); tensorgrad ships no pretrained backbones, and matching a
+checkpoint requires the exact same graph (per-tensor shapes must match;
+only naming + storage layout — e.g. PyTorch's `[out, in]` Linear weights vs
+tensorgrad's `[in, out]` — are reconcilable, transpose on import). Weights
+are f32-only, so convert non-f32 checkpoints offline before hosting.
+
+```ts
+// 1. Run the frozen backbone (its own params, no training counterpart).
+const backbone = await compileForward({ model: new Backbone(), forward, inputs })
+await backbone.uploadParams(loadSafetensors(await (await fetch(url)).arrayBuffer()).tensors)
+
+// 2. Extract features once, cache in JS.
+const feats: Float32Array[] = []
+for (const batch of examples) feats.push((await backbone.run(batch)).output)
+
+// 3. Train a head with the ordinary training API — features are a plain input.
+const head = await compile({
+  model: new Head(FEAT, nClasses),
+  loss: (m, { f, y }) => crossEntropy(m.fc.fwd(f), y),
+  inputs: { f: [B, FEAT], y: { shape: [B], dtype: 'i32' } },
+  optimizer: { kind: 'adam', lr: 0.01 },
+})
+```
+
 ## Public API
 
 ### Compile entry points
 
 ```ts
 compile(trainingSpec): Promise<CompiledTraining>
+compileForward(forwardSpec): Promise<CompiledForward>    // standalone forward — owns its own params
 train.attach(forwardSpec): Promise<CompiledForward>      // shares worker + param buffers
 train.replaceModel(newModel, { seed?, optimizer? }): Promise<void>
 trace(trainingSpec): Promise<CompiledIR>                 // IR only — no worker, no GPU
@@ -274,7 +304,15 @@ isWebGPUAvailable(): boolean                             // friendly pre-flight 
 
 `compile()` is the worker-spawning executor; `train.attach()` adds a
 sibling forward graph that shares the training compile's worker and
-param buffers. Both take plain options objects — types are inferred
+param buffers. `compileForward()` is the third path: a worker-spawning,
+forward-only executor for a model with its *own* params and no training
+counterpart — same `CompiledForward` surface as `attach`
+(`run`/`uploadParams`/`downloadParams`/`destroy`/`paramNames`), minus the
+parent. Load weights in via `uploadParams` (e.g. from `loadSafetensors`),
+then `run`. This is *not* a general pretrained-inference offering (that's
+still ORT — see *When not to use this*); it runs a model you've defined as
+a `Module` and supplied weights for. Both take plain options objects —
+types are inferred
 from the model + forward function, so you rarely need to import them
 (but `CompiledTraining<M, I>` / `CompiledForward<M, I>` are exported
 for class fields, `useRef`, and other storage that breaks inference):
@@ -690,6 +728,23 @@ canvas.addEventListener('pointermove', async () => {
     updateUI(r.value.output)
   }
 })
+```
+
+### `loadSafetensors` (weight import)
+
+Parses a safetensors `ArrayBuffer` into the flat record `uploadParams`
+consumes, plus a shape map for verifying a port layer by layer. Pure TS,
+no deps. f32 params load; integer/bool tensors (e.g. BatchNorm's
+`num_batches_tracked` counters) are skipped and reported in `skipped`;
+other float dtypes (f16/bf16) throw — convert to f32 offline first.
+
+```ts
+import { loadSafetensors } from 'tensorgrad'
+
+const { tensors, shapes, skipped } = loadSafetensors(await (await fetch(url)).arrayBuffer())
+// tensors: Record<string, Float32Array>   shapes: Record<string, number[]>
+// skipped: Record<string, string>  (name -> dtype of non-f32 tensors left out)
+await backbone.uploadParams(tensors)   // after any key remap / layout transpose
 ```
 
 ## Constraints

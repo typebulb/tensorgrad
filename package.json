@@ -45,7 +45,7 @@
     "build": "npm run build:js && npm run build:types",
     "clean": "rimraf dist build-artifacts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json && tsc -p samples/tsconfig.json",
-    "test": "tsx test/ops.ts && tsx test/grad.ts && tsx test/smoke.ts",
+    "test": "tsx test/ops.ts && tsx test/grad.ts && tsx test/smoke.ts && tsx test/safetensors.ts",
     "prepublishOnly": "npm run clean && npm run build"
   },
   "devDependencies": {
