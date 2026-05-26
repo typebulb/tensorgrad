@@ -219,8 +219,8 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
   step(inputs: TypedInputs<I>): Promise<StepResult>
 
   /** Upload params from a flat record (the shape `downloadParams` returns).
-   *  Partial by default — missing keys leave existing GPU values unchanged.
-   *  Unknown keys throw (typo guard). */
+   *  Strict — the record must cover every param; missing and unknown keys both
+   *  throw. Update a subset via `downloadParams()` + overlay. */
   uploadParams(params: Record<string, Float32Array>): Promise<void>
   /** Read params back as a flat `{ 'layers.0.W': Float32Array, ... }`
    *  record. Round-trips directly through `uploadParams`. */
@@ -305,9 +305,9 @@ export interface CompiledForward<M extends Module = Module, I extends InputDecls
    *  shape you're running. */
   graphFor(inputs: TypedInputs<I>): Promise<CompiledIR>
 
-  /** Upload params. Partial by default — missing keys leave existing values
-   *  unchanged. Reads/writes go to the parent training compile's buffers
-   *  (shared, so updates are immediately visible there too). */
+  /** Upload params. Strict — the record must cover every param; missing and
+   *  unknown keys both throw. Reads/writes go to the parent training compile's
+   *  buffers (shared, so updates are immediately visible there too). */
   uploadParams(params: Record<string, Float32Array>): Promise<void>
   /** Flat `{ 'layers.0.W': Float32Array, ... }` record of the shared param
    *  state — identical to the parent training graph's `downloadParams()`
@@ -890,8 +890,8 @@ class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f3
   private readonly cache: ShapeCache
   private readonly nextGraphId = { v: 1 }
   /** `uploadParams` calls issued before the owner exists (parametric spec, no
-   *  run yet) accumulate here and flush right after the owner is created.
-   *  Partial-by-default merge — later keys win, matching `uploadParams`. */
+   *  run yet) accumulate here and flush right after the owner is created. Merged
+   *  (later keys win); the merged union is strict-checked at flush. */
   private pendingUpload: Record<string, Float32Array> | null = null
 
   constructor(

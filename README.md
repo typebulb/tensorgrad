@@ -1,8 +1,9 @@
 # tensorgrad
 
 A tiny TypeScript-native tensor library with autograd that compiles to WebGPU.
-For training small models in the browser without hand-writing WGSL kernels and
-without dragging in a multi-megabyte ML framework. Zero dependencies. Static
+For training small models in the browser without hand-writing WGSL kernels or
+dragging in a multi-megabyte ML framework, or running a pretrained one frozen
+for transfer learning. Zero dependencies. Static
 shapes, `f32` parameters with `i32` indices, Adam / AdamW / SGD optimizers,
 reverse-mode autograd. Browser-only. All GPU work runs in a library-internal
 Web Worker — every method on a compiled module returns a `Promise`.
@@ -276,7 +277,10 @@ are f32-only, so convert non-f32 checkpoints offline before hosting.
 ```ts
 // 1. Run the frozen backbone (its own params, no training counterpart).
 const backbone = await compileForward({ model: new Backbone(), forward, inputs })
-await backbone.uploadParams(loadSafetensors(await (await fetch(url)).arrayBuffer()).tensors)
+const { tensors } = loadSafetensors(await (await fetch(url)).arrayBuffer())
+// Remap checkpoint keys to your Module's param names (and transpose each
+// Linear); uploadParams is strict, so the result must cover every param.
+await backbone.uploadParams(toModuleParams(tensors))
 
 // 2. Extract features once, cache in JS.
 const feats: Float32Array[] = []
@@ -312,9 +316,8 @@ forward-only executor for a model with its *own* params and no training
 counterpart — same `CompiledForward` surface as `attach`
 (`run`/`uploadParams`/`downloadParams`/`destroy`/`paramNames`), minus the
 parent. Load weights in via `uploadParams` (e.g. from `loadSafetensors`),
-then `run`. This is *not* a general pretrained-inference offering (that's
-still ORT — see *When not to use this*); it runs a model you've defined as
-a `Module` and supplied weights for. Both take plain options objects —
+then `run`. This is *not* a general pretrained-inference offering; it runs
+a model you've defined as a `Module` and supplied weights for. Both take plain options objects —
 types are inferred
 from the model + forward function, so you rarely need to import them
 (but `CompiledTraining<M, I>` / `CompiledForward<M, I>` are exported
@@ -421,7 +424,7 @@ schedule update on the existing weights), use `setLR`.
 
 ```ts
 train.step(inputs)                           // → { kind: 'completed', loss, captures } | { kind: 'aborted' }
-train.uploadParams(record)                   // partial by default; missing keys keep current values
+train.uploadParams(record)                   // strict: record must cover every param (missing & unknown both throw)
 train.downloadParams()                       // → Record<'layers.0.W' | …, Float32Array> (round-trips through uploadParams)
 train.attach(forwardSpec)                    // → CompiledForward; sibling that shares params + worker
 train.reset({ params?, optimizer? })         // defaults to both; pass false to skip either
@@ -769,12 +772,6 @@ The library is small because of what it doesn't do. Plan accordingly:
 - **One model per training compile.** Forward specs attach via
   `train.attach(forwardSpec)` to share params; otherwise each `compile()`
   of a training spec spawns its own worker.
-
-## When not to use this
-
-- **Inference of pretrained models** → use ONNX Runtime Web or
-  transformers.js.
-- **Server-side training** → use PyTorch or JAX.
 
 ## License
 

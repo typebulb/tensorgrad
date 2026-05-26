@@ -104,9 +104,9 @@ export interface CompiledBase {
   /** Static shape per `capture(name)` site, keyed by name. Built once from the
    *  buffer plan so callers (the worker's wire meta) don't recompute it. */
   captureShapes: Record<string, number[]>
-  /** Upload parameter Float32Arrays to their GPU buffers. Partial by default:
-   *  missing keys leave the existing GPU values unchanged. Unknown keys throw
-   *  — that's always a typo. */
+  /** Upload parameter Float32Arrays to their GPU buffers. Strict: the record
+   *  must cover every param — missing keys and unknown keys both throw. Update
+   *  a subset via downloadParams() + overlay. */
   uploadParams(params: Record<string, Float32Array>): void
   /** Read all parameters back as Float32Arrays — used for UI panels. */
   downloadParams(): Promise<Record<string, Float32Array>>
@@ -392,6 +392,7 @@ export async function createRuntime(
 
   // ---- uploadParams ---------------------------------------------------------
   function uploadParams(params: Record<string, Float32Array>) {
+    // Unknown keys are always a typo.
     for (const name of Object.keys(params)) {
       if (!plan.paramsByName.has(name)) {
         throw new Error(
@@ -400,9 +401,16 @@ export async function createRuntime(
         )
       }
     }
+    // Strict: the record must cover every param. A missing key would otherwise
+    // silently leave that param at its random init — the worst import bug (the
+    // model runs, the output is garbage). Update a subset via downloadParams() +
+    // overlay. Checked before any write so a rejected upload leaves no half-state.
+    const missing = [...plan.paramsByName.keys()].filter(name => params[name] === undefined)
+    if (missing.length > 0) {
+      throw new Error(`uploadParams: missing ${missing.length} param(s): ${missing.sort().join(', ')}`)
+    }
     for (const [name, bufId] of plan.paramsByName) {
-      const data = params[name]
-      if (!data) continue
+      const data = params[name]!
       const expected = plan.buffers[bufId]!.byteSize / 4
       if (data.length !== expected) {
         throw new Error(`uploadParams: '${name}' has ${data.length} elements, expected ${expected}`)
