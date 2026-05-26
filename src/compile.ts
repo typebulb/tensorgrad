@@ -531,14 +531,13 @@ async function buildTrainingGraph<M extends Module, I extends InputDecls>(
 ): Promise<BuiltTrainingGraph> {
   const { ir, materialized, adamResult, sgdResult } = await buildTrainingIR(opts)
   const initialParams = buildInitialParams(ir.plan, materialized.initFns, mulberry32(opts.seed))
-  const wireIR: WireIR = { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
   const wireOptimizer: WireOptimizerConfig | null =
     adamResult ? { kind: 'adam', config: wireAdamConfig(adamResult) }
     : sgdResult ? { kind: 'sgd', config: wireSGDConfig(sgdResult) }
     : null
   const transfers = transferablesOfRecord(initialParams)
   const meta = await proxy.request<CompileResult>(
-    { kind: 'createRuntime', payload: { graphId, ir: wireIR, initialParams, optimizer: wireOptimizer } },
+    { kind: 'createRuntime', payload: { graphId, ir: toWireIR(ir), initialParams, optimizer: wireOptimizer } },
     transfers,
   )
   return { ir, meta, initFns: materialized.initFns }
@@ -714,9 +713,8 @@ const DEFAULT_MAX_CACHED_SHAPES = 8
 class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i32' = 'f32'>
   implements CompiledForward<M, I, O>, ChildProxy
 {
-  // LRU cache. Map preserves insertion order, so we evict the first key
-  // when over capacity. On hit we re-insert to bump to most-recent.
-  private readonly cache = new Map<string, ForwardSiblingMeta>()
+  /** Per-shape sibling cache (LRU; see `ShapeCache`). */
+  private readonly cache: ShapeCache
 
   constructor(
     private readonly proxy: WorkerProxy,
@@ -725,9 +723,11 @@ class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i3
     private readonly decls: NormalizedDecls,
     private readonly declaredOutput: 'f32' | 'i32',
     private readonly nextGraphId: { v: number },
-    private readonly maxCachedShapes: number,
+    maxCachedShapes: number,
     private readonly onDestroy: () => void,
-  ) {}
+  ) {
+    this.cache = new ShapeCache(proxy, maxCachedShapes)
+  }
 
   get paramNames(): readonly string[] { return this.parent.paramNames }
 
@@ -735,38 +735,12 @@ class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i3
     const resolved = resolveDecls(this.decls, inputs)
     const key = shapeKey(resolved)
     const hit = this.cache.get(key)
-    if (hit) {
-      // Bump to most-recently-used.
-      this.cache.delete(key)
-      this.cache.set(key, hit)
-      return hit
-    }
+    if (hit) return hit
     const sib = await compileSibling<M, I>(
       this.proxy, this.parent.graphId, this.parent.currentModel(), this.forward,
       resolved, this.nextGraphId,
     )
-    // Validate the declared output dtype matches the graph's actual output
-    // dtype. Throws if the user wrote `output: 'i32'` but the forward
-    // returns f32 (or vice versa) — silent type-mismatch would otherwise
-    // give wrong-class TypedArray reads at every call site.
-    const actualDtype = sib.ir.graph.tensors[sib.ir.graph.outputs[0]!]!.dtype
-    if (actualDtype !== this.declaredOutput) {
-      throw new Error(
-        `attach: forward declares output: '${this.declaredOutput}' but the traced graph's output tensor is '${actualDtype}'. ` +
-        `Use \`output: '${actualDtype}'\` in the forward spec (or default by omitting the field for f32).`,
-      )
-    }
-    // Evict the least-recently-used before inserting (Map preserves insertion
-    // order — first key is oldest). Destroy the evicted graph in the worker
-    // so its kernels free their GPU buffers.
-    if (this.cache.size >= this.maxCachedShapes) {
-      const oldestKey = this.cache.keys().next().value
-      if (oldestKey !== undefined) {
-        const oldest = this.cache.get(oldestKey)!
-        this.proxy.send({ kind: 'destroy', payload: { graphId: oldest.graphId } })
-        this.cache.delete(oldestKey)
-      }
-    }
+    assertOutputDtype(sib.ir, this.declaredOutput, 'attach')
     this.cache.set(key, sib)
     return sib
   }
@@ -811,9 +785,6 @@ class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i3
   // Drop per-shape kernel caches after a parent topology swap. The proxy
   // object stays alive; next run() recompiles against the new model.
   _invalidateForReplace(): void {
-    for (const sib of this.cache.values()) {
-      this.proxy.send({ kind: 'destroy', payload: { graphId: sib.graphId } })
-    }
     this.cache.clear()
   }
 }
@@ -839,9 +810,63 @@ async function compileSibling<M extends Module, I extends InputDecls>(
   const childGraphId = nextGraphId.v++
   const wireIR: WireIR = { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
   const meta = await proxy.request<CompileResult>(
-    { kind: 'compileForward', payload: { graphId: childGraphId, parentGraphId, ir: wireIR } },
+    { kind: 'compileForward', payload: { graphId: childGraphId, parentGraphId, ir: toWireIR(ir) } },
   )
   return { graphId: childGraphId, ir, meta }
+}
+
+/** The fields of a `CompiledIR` that cross the wire to the worker. */
+function toWireIR(ir: CompiledIR): WireIR {
+  return { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
+}
+
+/** Validate a forward graph's actual output dtype against the spec's declared
+ *  `output`. A mismatch (e.g. `output: 'i32'` on an f32-returning forward)
+ *  would otherwise produce wrong-class TypedArray reads at every call site, so
+ *  fail loudly at compile. `label` names the entry point in the message. */
+function assertOutputDtype(ir: CompiledIR, declared: 'f32' | 'i32', label: 'attach' | 'compileForward'): void {
+  const actual = ir.graph.tensors[ir.graph.outputs[0]!]!.dtype
+  if (actual !== declared) {
+    throw new Error(
+      `${label}: forward declares output: '${declared}' but the traced graph's output tensor is '${actual}'. ` +
+      `Use \`output: '${actual}'\` in the forward spec (or default by omitting the field for f32).`,
+    )
+  }
+}
+
+/** LRU cache of per-shape compiled siblings, keyed by resolved-shape string.
+ *  Map insertion order = recency: a hit bumps to most-recent, and inserting
+ *  past capacity evicts the oldest — sending the worker a `destroy` so its
+ *  kernels free their GPU buffers. Shared by both forward proxies; the
+ *  proxy-specific owner / parent logic stays in their `siblingFor`. */
+class ShapeCache {
+  private readonly map = new Map<string, ForwardSiblingMeta>()
+  constructor(private readonly proxy: WorkerProxy, private readonly max: number) {}
+
+  get(key: string): ForwardSiblingMeta | undefined {
+    const hit = this.map.get(key)
+    if (!hit) return undefined
+    this.map.delete(key); this.map.set(key, hit)   // bump to most-recently-used
+    return hit
+  }
+
+  set(key: string, sib: ForwardSiblingMeta): void {
+    if (this.map.size >= this.max) {
+      const oldest = this.map.keys().next().value
+      if (oldest !== undefined) { this.destroyGraph(this.map.get(oldest)!); this.map.delete(oldest) }
+    }
+    this.map.set(key, sib)
+  }
+
+  /** Destroy every cached graph in the worker and empty the cache. */
+  clear(): void {
+    for (const sib of this.map.values()) this.destroyGraph(sib)
+    this.map.clear()
+  }
+
+  private destroyGraph(sib: ForwardSiblingMeta): void {
+    this.proxy.send({ kind: 'destroy', payload: { graphId: sib.graphId } })
+  }
 }
 
 /** Standalone forward executor proxy (returned by `compileForward`). Owns its
@@ -860,9 +885,9 @@ class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f3
    *  shapes (see `compileForward`), else on the first `run()`. */
   private ownerMeta: ForwardSiblingMeta | null = null
   private ownerKey: string | null = null
-  /** Sibling shapes only (the owner is `ownerMeta`). LRU: Map preserves
-   *  insertion order, so the first key is the oldest. */
-  private readonly cache = new Map<string, ForwardSiblingMeta>()
+  /** Sibling shapes only — the owner is held in `ownerMeta` so it's never
+   *  evicted (freeing it would drop the shared param buffers). LRU; see `ShapeCache`. */
+  private readonly cache: ShapeCache
   private readonly nextGraphId = { v: 1 }
   /** `uploadParams` calls issued before the owner exists (parametric spec, no
    *  run yet) accumulate here and flush right after the owner is created.
@@ -875,11 +900,13 @@ class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f3
     private readonly forward: ForwardFn<M, I>,
     private readonly decls: NormalizedDecls,
     private readonly declaredOutput: 'f32' | 'i32',
-    private readonly maxCachedShapes: number,
+    maxCachedShapes: number,
     private readonly seed: number,
     private readonly initFns: Record<string, InitFn>,
     private _paramNames: readonly string[],
-  ) {}
+  ) {
+    this.cache = new ShapeCache(proxy, maxCachedShapes)
+  }
 
   get paramNames(): readonly string[] { return this._paramNames }
 
@@ -895,12 +922,11 @@ class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f3
       this.model, this.forward as unknown as ForwardFn<M, InputDecls>, resolved,
     )).ir
     const initialParams = buildInitialParams(ir.plan, this.initFns, mulberry32(this.seed))
-    const wireIR: WireIR = { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
     const meta = await this.proxy.request<CompileResult>(
-      { kind: 'createRuntime', payload: { graphId: 0, ir: wireIR, initialParams, optimizer: null } },
+      { kind: 'createRuntime', payload: { graphId: 0, ir: toWireIR(ir), initialParams, optimizer: null } },
       transferablesOfRecord(initialParams),
     )
-    this.validateOutputDtype(ir)
+    assertOutputDtype(ir, this.declaredOutput, 'compileForward')
     this.ownerMeta = { graphId: 0, ir, meta }
     this.ownerKey = shapeKey(resolved)
     this._paramNames = meta.paramNames
@@ -911,44 +937,17 @@ class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f3
     return this.ownerMeta
   }
 
-  /** Validate the declared output dtype against the graph's actual output. Same
-   *  guard as `ForwardProxy.siblingFor` — a wrong `output: 'i32'`/`'f32'` would
-   *  otherwise produce wrong-class TypedArray reads at every call site. */
-  private validateOutputDtype(ir: CompiledIR): void {
-    const actual = ir.graph.tensors[ir.graph.outputs[0]!]!.dtype
-    if (actual !== this.declaredOutput) {
-      throw new Error(
-        `compileForward: forward declares output: '${this.declaredOutput}' but the traced graph's output tensor is '${actual}'. ` +
-        `Use \`output: '${actual}'\` in the spec (or default by omitting the field for f32).`,
-      )
-    }
-  }
-
   private async siblingFor(inputs: LooseInputs): Promise<ForwardSiblingMeta> {
     const resolved = resolveDecls(this.decls, inputs)
     const key = shapeKey(resolved)
     if (!this.ownerMeta) return this.createOwner(resolved)
     if (key === this.ownerKey) return this.ownerMeta
     const hit = this.cache.get(key)
-    if (hit) {
-      // Bump to most-recently-used.
-      this.cache.delete(key)
-      this.cache.set(key, hit)
-      return hit
-    }
+    if (hit) return hit
     const sib = await compileSibling<M, I>(
       this.proxy, this.ownerMeta.graphId, this.model, this.forward, resolved, this.nextGraphId,
     )
-    this.validateOutputDtype(sib.ir)
-    // Evict the least-recently-used sibling (owner is never in this cache).
-    if (this.cache.size >= this.maxCachedShapes) {
-      const oldestKey = this.cache.keys().next().value
-      if (oldestKey !== undefined) {
-        const oldest = this.cache.get(oldestKey)!
-        this.proxy.send({ kind: 'destroy', payload: { graphId: oldest.graphId } })
-        this.cache.delete(oldestKey)
-      }
-    }
+    assertOutputDtype(sib.ir, this.declaredOutput, 'compileForward')
     this.cache.set(key, sib)
     return sib
   }
