@@ -99,6 +99,7 @@ export type OpNode =
   | { kind: 'abs'; out: number; a: number }
   | { kind: 'tanh'; out: number; a: number }
   | { kind: 'sigmoid'; out: number; a: number }
+  | { kind: 'erf'; out: number; a: number }
   | { kind: 'sin'; out: number; a: number }
   | { kind: 'cos'; out: number; a: number }
   // Inverted dropout. Same kernel runs forward (a = x) and backward (a = dy):
@@ -339,7 +340,7 @@ export function getOpInputs(op: OpNode): readonly number[] {
       return [op.a, op.b]
     case 'mul_scalar': case 'add_scalar':
     case 'sqrt': case 'rsqrt': case 'log': case 'exp': case 'relu':
-    case 'neg': case 'abs': case 'tanh': case 'sigmoid': case 'sin': case 'cos':
+    case 'neg': case 'abs': case 'tanh': case 'sigmoid': case 'erf': case 'sin': case 'cos':
     case 'mean_last': case 'sum_last': case 'argmax_last':
     case 'reshape': case 'permute':
     case 'softmax_causal_last': case 'log_softmax_last':

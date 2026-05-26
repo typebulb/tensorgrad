@@ -164,6 +164,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     case 'abs':
     case 'tanh':
     case 'sigmoid':
+    case 'erf':
     case 'sin':
     case 'cos': {
       const out = tof(op.out)
@@ -180,9 +181,21 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         op.kind === 'tanh'    ? 'tanh(x)' :
         op.kind === 'sin'     ? 'sin(x)' :
         op.kind === 'cos'     ? 'cos(x)' :
+        op.kind === 'erf'     ? 'erf_approx(x)' :
         // tanh identity for numerical stability: sigmoid(x) = 0.5 + 0.5 * tanh(0.5x)
         /* sigmoid */           '0.5 + 0.5 * tanh(0.5 * x)'
-      const wgsl = `
+      // WGSL has no erf intrinsic — emit the A&S 7.1.26 rational-poly approx
+      // (max abs error ~1.5e-7) as a helper. Empty for every other unary.
+      const preamble = op.kind === 'erf' ? `
+fn erf_approx(x : f32) -> f32 {
+  let s = sign(x);
+  let ax = abs(x);
+  let t = 1.0 / (1.0 + 0.3275911 * ax);
+  let p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+  return s * (1.0 - p * exp(-ax * ax));
+}
+` : ''
+      const wgsl = `${preamble}
 @group(0) @binding(0) var<storage, read> a : array<${wgslDtype(a.dtype)}>;
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
 @compute @workgroup_size(${WG_SIZE})

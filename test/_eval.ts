@@ -173,6 +173,7 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
     case 'abs':
     case 'tanh':
     case 'sigmoid':
+    case 'erf':
     case 'sin':
     case 'cos': {
       const a = v(op.a) as Float32Array
@@ -188,6 +189,13 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
         op.kind === 'tanh'    ? Math.tanh :
         op.kind === 'sin'     ? Math.sin :
         op.kind === 'cos'     ? Math.cos :
+        // erf via A&S 7.1.26 — matches the WGSL kernel exactly.
+        op.kind === 'erf'     ? (x: number) => {
+          const s = Math.sign(x), ax = Math.abs(x)
+          const t = 1 / (1 + 0.3275911 * ax)
+          const p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+          return s * (1 - p * Math.exp(-ax * ax))
+        } :
         /* sigmoid via tanh identity — matches the WGSL kernel exactly */
                                 (x: number) => 0.5 + 0.5 * Math.tanh(0.5 * x)
       for (let i = 0; i < a.length; i++) out[i] = fn(a[i]!)

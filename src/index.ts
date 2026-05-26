@@ -9,7 +9,7 @@ export {
   // Element-wise arithmetic (binops accept Tensor or JS number)
   add, sub, mul, div, min, max, clamp,
   // Unary
-  sqrt, rsqrt, log, exp, relu, neg, abs, tanh, sigmoid, sin, cos, gelu, silu, leakyRelu, softplus,
+  sqrt, rsqrt, log, exp, relu, neg, abs, tanh, sigmoid, erf, sin, cos, gelu, silu, leakyRelu, softplus,
   square,
   // Stochastic regularization
   dropout, randn,

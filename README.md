@@ -495,7 +495,7 @@ lives only on the `'completed'` branch; `r.error` lives only on
 Imported from `'tensorgrad'`:
 
 - Arithmetic (binary): `add`, `sub`, `mul`, `div`, `min`, `max`
-- Unary math: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`
+- Unary math: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`, `erf`
 - Activations: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`, `leakyRelu(x, alpha?)`, `softplus`
 - Clamping: `clamp(x, lo, hi)` (scalar bounds)
 - Stochastic: `dropout(x, p)` (inverted dropout, p ∈ [0, 1)), `randn(shape)` (N(0, 1) sampler, zero gradient), `categorical(logits, axis?)` (samples from logits via Gumbel-max, i32, non-diff)

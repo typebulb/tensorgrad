@@ -264,6 +264,13 @@ function runAdjointRule(
       accumulate(cotangents, op.a, mul(outCotan, cMinusCSq))
       return
     }
+    case 'erf': {
+      // dc/da = 2/√π · e^(−a²).
+      const a = tensorOf(op.a)
+      const d = mulScalar(exp(mulScalar(mul(a, a), -1)), 2 / Math.sqrt(Math.PI))
+      accumulate(cotangents, op.a, mul(outCotan, d))
+      return
+    }
     case 'sin': {
       // dc/da = cos(a).
       const a = tensorOf(op.a)

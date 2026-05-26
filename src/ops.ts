@@ -118,7 +118,7 @@ export function addScalar(a: Tensor, scalar: number): Tensor {
 // Unary ops.
 // ----------------------------------------------------------------------------
 
-type UnaryKind = 'sqrt' | 'rsqrt' | 'log' | 'exp' | 'relu' | 'neg' | 'abs' | 'tanh' | 'sigmoid' | 'sin' | 'cos'
+type UnaryKind = 'sqrt' | 'rsqrt' | 'log' | 'exp' | 'relu' | 'neg' | 'abs' | 'tanh' | 'sigmoid' | 'erf' | 'sin' | 'cos'
 
 function unary(name: UnaryKind, a: Tensor): Tensor {
   const site = captureSite(name)
@@ -146,6 +146,12 @@ export const abs     = (a: Tensor): Tensor => unary('abs',     a)
 export const tanh    = (a: Tensor): Tensor => unary('tanh',    a)
 /** Element-wise logistic sigmoid (`1 / (1 + e^-x)`). Requires `f32`. */
 export const sigmoid = (a: Tensor): Tensor => unary('sigmoid', a)
+/** Element-wise Gauss error function. Requires `f32`. Evaluated via the
+ *  Abramowitz & Stegun 7.1.26 approximation (max abs error ~1.5e-7 — far
+ *  inside f32 noise, i.e. effectively exact). The point of having it is
+ *  *exact* GELU: `0.5·x·(1 + erf(x/√2))`, which the reference `nn.GELU()`
+ *  computes but tensorgrad's `gelu` (GPT-2 tanh approximation) does not. */
+export const erf     = (a: Tensor): Tensor => unary('erf',     a)
 /** Element-wise sine. Requires `f32`. */
 export const sin     = (a: Tensor): Tensor => unary('sin',     a)
 /** Element-wise cosine. Requires `f32`. */

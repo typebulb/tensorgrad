@@ -18,7 +18,7 @@ import {
   concat,
   narrow, split,
   softmaxCausal, whereCausal,
-  gelu,
+  gelu, erf,
   conv2d, maxPool2d,
   stopGradient,
 } from '../src/index.js'
@@ -75,6 +75,12 @@ assertGradMatchesFD('concat (variadic, gradient via narrow)', [3, 4], p => {
 //    (mul → add → mul → tanh → add → mul). Catches any layer-of-the-stack
 //    bug in chain-rule composition.
 assertGradMatchesFD('gelu (composed: chain rule through tanh approx)', [4], p => mean(gelu(p)))
+
+// 8b. erf primitive: analytic grad 2/√π·e^(−x²) vs finite-diff of the A&S
+//     forward. Also covers exact GELU, which composes from erf.
+assertGradMatchesFD('erf (analytic 2/√π·e^(−x²))', [5], p => mean(erf(p)))
+assertGradMatchesFD('gelu-exact (composed from erf)', [5],
+  p => mean(mul(mul(p, 0.5), add(erf(mul(p, 1 / Math.sqrt(2))), 1))))
 
 // 9. Conv2d (input gradient, two-input op with stride+padding). The param
 //    is the input image; the weight is a fixed tensor_input. Tests the
