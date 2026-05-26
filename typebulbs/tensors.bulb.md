@@ -1815,7 +1815,7 @@ body {
   font-family: monospace;
   font-size: 16px;
   font-weight: 500;
-  user-select: none;
+  user-select: text;
   transition: background 120ms, box-shadow 120ms;
 }
 
@@ -1824,6 +1824,10 @@ body {
 .num-zero { color: var(--zero); }
 
 .cell-clickable { cursor: pointer; }
+
+/* clickable grids pick a cell/row on drag — keep those unselectable */
+.cell-clickable,
+.embed-grid-row .mat-cell { user-select: none; }
 .cell-clickable:hover:not(.cell-sel) { background: var(--row-hl); }
 
 .cell-row-hl:not(.cell-sel),

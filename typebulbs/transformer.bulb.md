@@ -186,7 +186,7 @@ function makeBatch(): { tokens: Int32Array; targets: Int32Array } {
 const HIDDEN = 4 * D_MODEL
 
 // Stable softmax over a slice of a flat array.
-function softmaxNumeric(arr: Float32Array, offset = 0, len = arr.length - offset): number[] {
+function softmaxNumeric(arr: ArrayLike<number>, offset = 0, len = arr.length - offset): number[] {
   let mx = -Infinity
   for (let i = 0; i < len; i++) if (arr[offset + i]! > mx) mx = arr[offset + i]!
   const probs = new Array<number>(len)
@@ -2101,11 +2101,10 @@ class ExplainerPanel extends Component {
   trainingView() {
     return div(
       p('A small transformer is being trained from scratch in your browser to add 2-digit numbers. The vocabulary is just digits 0-9, "+", and "=". Each training example is one addition: "27+45=270". (The answer 72 is padded to 3 digits and reversed — the model generates the result one digit at a time, units first, so carries flow naturally left-to-right.)'),
-      p('We hold out 20% of (a, b) pairs from training. Held-out accuracy measures real generalization: can the model add numbers it has never seen?'),
-      p('At each training step, the model predicts the result digits for a mini-batch of additions, cross-entropy measures how wrong it was, and AdamW (Adam with decoupled weight decay, a widely-used optimizer) updates the parameters to be a bit less wrong next time. Loss is masked to the result-digit positions only — the model is graded on getting the answer right, not on predicting the operands.'),
-      p('What backprop and the optimizer step actually do, up close: ',
+      p('At each training step, the model tries to predict the sum. How wrong those predictions are is the signal that drives every adjustment the model makes. If you\'re new to backprop and optimization, watch this ',
         a({ href: 'https://typebulb.com/u/samples/xor-x-ray/full', target: '_blank' }, 'XOR X-ray'),
-        ' — a 2-2-1 network where you click through forward, chain-rule backward, and the parameter update one phase at a time.')
+        ' demo, which has a simple neural network that you can see learn in real-time.'),
+      p('In our model, we use cross-entropy to measure wrongness, and AdamW for the optimizer. The loss is masked to the result-digit positions only — the model is graded on getting the answer right, not on predicting the operands. We hold out 20% of (a, b) pairs from training. Held-out accuracy measures real generalization: can the model add numbers it has never seen?')
     )
   }
 
@@ -2113,13 +2112,14 @@ class ExplainerPanel extends Component {
     return div(
       p(`What flows through every channel in the diagram below is a ${D_MODEL}-dim vector — a single point in ${D_MODEL}-dimensional space, where the model encodes information as *directions*. At the bottom, the residual starts where token and position vectors merge at ⊕ (so the model sees order); ${D_MODEL} dimensions has enough room to keep them distinguishable downstream. For the foundations — what a tensor is, what these additions are doing here — see this `, a({ href: 'https://typebulb.com/u/samples/tensors/full', target: '_blank' }, 'interactive Tensors tutorial'), '.'),
       p(`The residual stream is the vertical channel: at every position, it runs upward through all ${N_LAYERS} layers. Every block in every layer reads from it and writes back into it at ⊕. In the diagram, it's the green vertical line at each position. At the top, the same token-embedding matrix transposed turns the final residual into a prediction.`),
-      p('The K/V stream is the horizontal channel: at each layer, K and V at every position are made available to all later positions in that same layer. Only attention reads from it; each position\'s MLP reads only its own residual. In the diagram, the K/V bus is the horizontal line under each layer; each purple K/V circle writes to it, each attention block reads from it. Causal flow runs left-to-right, but the work is parallel — what RNNs do step by step, transformers do in one pass.')
+      p('The K/V stream is the horizontal channel: at each layer, K and V at every position are made available to all later positions in that same layer. Attention reads from it; each position\'s MLP reads only its own residual. In the diagram, the K/V bus is the horizontal line under each layer; each purple K/V circle writes to it, each attention block reads from it. Causal flow runs left-to-right, but the work is parallel — what RNNs do step by step, transformers do in one pass.')
     )
   }
 
   notesView() {
     return div(
-      p('In small transformers, MLPs do roughly two-thirds of the FLOPs and supply all the element-wise nonlinearity; attention\'s nonlinearity is via softmax. Most of the rest is the attention heads, which serve as information routers. (In much larger LLMs with long sequences, attention\'s share grows.)'),
+      p('Even the most sophisticated transformers follow this basic model. They do, however, have many refinements. For example, token positions are usually fed into the attention heads as rotations to pairs of K and Q projections (RoPE). In this example, we keep it simple, and positions are simply embedded with tokens at the start of each residual stream.'),
+      p('Attention is almost all linear algebra, aside from softmax. The bulk of the nonlinearity in the model lives in the MLPs.'),
       p('See ', a({ href: 'https://tinyurl.com/44ayrzfp', target: '_blank' }, 'this transformer diagrammed by nn-dna'), ', which generates architecture diagrams from plain-English descriptions of neural networks.'),
       p('Co-built with Claude Opus 4.7; inspired by @repligate / j⧉nus\'s "How Information Flows Through Transformers".')
     )

@@ -628,10 +628,12 @@ function buildDOT(
   // room from the inner user-cluster's tint; without these, the default thin
   // gray dashes get visually absorbed by the tint.
   const LOOP_ITER_ATTRS = [`style="dashed"`, `color="#666"`, `fontcolor="#888"`, `fontsize=10`, `fontname="sans-serif"`, `labelloc=t`, `labeljust=l`, `penwidth=1.4`, `margin=14`]
-  // User-cluster style: subtle background tint (no outline) so cluster
-  // boundaries can't be confused with edge connectors. Tint stacks ~8% alpha
-  // per nesting level.
-  const USER_CLUSTER_ATTRS = [`style="filled,rounded"`, `fillcolor="#80808014"`, `color="transparent"`, `fontcolor="#888"`, `fontsize=10`, `fontname="Courier"`, `labelloc=t`, `labeljust=l`, `penwidth=0`, `margin=10`]
+  // User-cluster style: subtle background tint plus a faint hairline border,
+  // both the same semi-transparent gray. Tint stacks ~8% alpha per nesting
+  // level; the border is drawn over that accumulated bg, so it always sits a
+  // fixed step darker than its own level — definition without an outline that
+  // could read as an edge connector (solid + thin, vs. the loops' dashed gray).
+  const USER_CLUSTER_ATTRS = [`style="filled,rounded"`, `fillcolor="#80808014"`, `color="#80808030"`, `fontcolor="#888"`, `fontsize=10`, `fontname="Courier"`, `labelloc=t`, `labeljust=l`, `penwidth=1`, `margin=10`]
 
   const emitCluster = (id: string, label: string, attrs: readonly string[], body: () => void) => {
     lines.push(`  subgraph cluster_${id} {`)
