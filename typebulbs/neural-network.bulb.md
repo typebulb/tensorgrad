@@ -217,19 +217,30 @@ class Model extends Component implements IModel {
   }
 
   async loadData() {
-    const prefix = "https://s3.eu-west-2.amazonaws.com/solenya-media/"
+    const prefix = "https://assets.typebulb.com/mnist/"   // MNIST shards on Cloudflare R2 (custom domain), cached in-browser
+
+    const cachedBytes = async (url: string) => {   // first load fetches; reloads/revisits hit the in-browser CacheStorage (generic browser API, no platform support needed)
+      const cache = await caches.open('tensorgrad-assets')
+      let res = await cache.match(url)
+      if (!res) {
+        res = await fetch(url)
+        // cache only successful responses, and best-effort: an interrupted download or a 206 shouldn't break the load
+        if (res.ok) { try { await cache.put(url, res.clone()) } catch { /* caching is an optimization, not a requirement */ } }
+      }
+      if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`)
+      return new Uint8Array(await res.arrayBuffer())
+    }
 
     const loadSet = async (imgFile: string, lblFile: string, name: string) => {
       this.status = `Fetching ${name}...`
       this.update()
 
-      const [imgRes, lblRes] = await Promise.all([
-        fetch(prefix + imgFile),
-        fetch(prefix + lblFile)
+      const [imgGz, lblGz] = await Promise.all([
+        cachedBytes(prefix + imgFile),
+        cachedBytes(prefix + lblFile)
       ])
-
-      const imgBytes = inflate(new Uint8Array(await imgRes.arrayBuffer()))
-      const lblBytes = inflate(new Uint8Array(await lblRes.arrayBuffer()))
+      const imgBytes = inflate(imgGz)
+      const lblBytes = inflate(lblGz)
       const view = new DataView(imgBytes.buffer, imgBytes.byteOffset)
 
       const count = view.getUint32(4)

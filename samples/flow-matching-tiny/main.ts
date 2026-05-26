@@ -28,7 +28,7 @@ import {
 
 // ========== MODEL / TRAINING ==========
 
-const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
+const MNIST_PREFIX = 'https://assets.typebulb.com/mnist/'
 const SAMPLE_STEPS = 25          // Euler steps at generation time
 
 // ---------------------------------------------------------------------------

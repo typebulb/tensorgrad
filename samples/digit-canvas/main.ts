@@ -26,7 +26,7 @@
 //     (or after a reset). One persistence slot per hidden-size topology so
 //     a 64-unit save doesn't clash with a 128-unit save.
 //
-// MNIST data is served from solenya-media S3 — same URLs the in-repo bulbs
+// MNIST data is served from Cloudflare R2 — same URLs the in-repo bulbs
 // use. ~11 MB on first load; cached after that.
 //
 // File layout: model + training above, UI below. The ML section exposes a
@@ -45,7 +45,7 @@ import {
 
 // ========== MODEL / TRAINING ==========
 
-const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
+const MNIST_PREFIX = 'https://assets.typebulb.com/mnist/'
 
 // ---------------------------------------------------------------------------
 // MNIST loading. The files are the standard 60k-train / 10k-test idx-ubyte

@@ -29,7 +29,7 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
+const MNIST_PREFIX = 'https://assets.typebulb.com/mnist/'
 
 // UI-supplied sink; assigned in the UI section so the ML side has zero DOM
 // dependencies. Default no-op lets this section behave in isolation.

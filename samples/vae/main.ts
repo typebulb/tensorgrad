@@ -27,7 +27,7 @@ import {
 
 // ========== MODEL / TRAINING ==========
 
-const MNIST_PREFIX = 'https://s3.eu-west-2.amazonaws.com/solenya-media/'
+const MNIST_PREFIX = 'https://assets.typebulb.com/mnist/'
 const N_SAMPLES = 9                   // 3×3 grid
 
 // ---------------------------------------------------------------------------
