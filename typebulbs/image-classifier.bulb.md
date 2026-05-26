@@ -1,6 +1,6 @@
 ---
 format: typebulb/v1
-name: Teach an image classifier — frozen ViT + trained head
+name: Image Classifier
 ---
 
 **code.tsx**
@@ -285,6 +285,7 @@ class Model extends Component {
     this.setStatus('Training the head…')
     await this.retrain()
     await this.preselect()
+    tb.server.log('Ready.')
   }
 
   async embOf(image: HTMLImageElement): Promise<Float32Array> {
@@ -454,8 +455,8 @@ class Root extends Component {
   }
 
   view() {
-    return div({ class: 'classifier' },
-      h1('Teach an image classifier'),
+    return div(
+      h1('Image Classifier'),
       this.stage(),
       this.chartSection(),
       this.trainingSet(),
@@ -649,11 +650,9 @@ class Root extends Component {
   }
 
   about() {
-    return p({ class: 'about' },
-      'A pretrained ViT-tiny runs frozen on WebGPU and turns each image into a 192-dimensional feature vector. ',
-      'On top of those features we train a one-layer head: the loss falls in a fraction of a second, you classify any image, ',
-      'then correct it — or invent a new class — and it retrains instantly on the cached features. ',
-      'The backbone never changes; only the head learns.',
+    return div({ class: 'about' },
+      p('This is a pretrained image model running in your browser with tensorgrad. Drop in a photo and it tells you what it sees; when it’s wrong, correct it or add a class of your own, and it learns from that one example right away.'),
+      p('Under the hood the pretrained model is a frozen ViT-tiny that turns each image into a 192-dimensional feature vector. tensorgrad trains a one-layer head on top of those features, so the backbone never changes and only the head learns.'),
     )
   }
 }
@@ -684,69 +683,396 @@ html[data-theme="dark"] {
   --track: rgb(48, 48, 54);
 }
 
-.classifier { max-width: 960px; margin: 1.5rem auto 2rem; padding: 0 1.25rem; color: var(--fg); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 16px; line-height: 1.6; }
-.classifier h1 { font-size: 1.9rem; font-weight: 650; line-height: 1.15; margin: 0 0 1.35rem; letter-spacing: -0.01em; }
-.classifier h3 { font-size: 1.15rem; font-weight: 600; margin: 0; }
-.classifier .chartrow { position: relative; border: 1px solid var(--border); background: var(--panel); border-radius: 14px; overflow: hidden; margin-bottom: 2rem; }
-.classifier .chart { width: 100%; height: 150px; display: block; }
-.classifier .chart-label { position: absolute; top: .55rem; right: .9rem; display: flex; flex-direction: column; align-items: flex-end; gap: .05rem; pointer-events: none; }
-.classifier .chart-label-title { font-weight: 600; font-size: .9rem; }
-.classifier .chart-label-num { font-size: .8rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+body {
+  max-width: 960px;
+  margin: 1.5rem auto 2rem;
+  padding: 0 1.25rem;
+  color: var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+h1 {
+  font-size: 1.9rem;
+  font-weight: 650;
+  line-height: 1.15;
+  margin: 0 0 1.35rem;
+  letter-spacing: -0.01em;
+}
+
+h3 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+/* panel cards — chart row + hero stage */
+.chartrow,
+.stage {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 14px;
+  margin-bottom: 2rem;
+}
+
+.chartrow {
+  position: relative;
+  overflow: hidden;
+}
+
+.chart {
+  width: 100%;
+  height: 150px;
+  display: block;
+}
+
+.chart-label {
+  position: absolute;
+  top: .55rem;
+  right: .9rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: .05rem;
+  pointer-events: none;
+}
+
+.chart-label-title {
+  font-weight: 600;
+  font-size: .9rem;
+}
+
+.chart-label-num {
+  font-size: .8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 
 /* stage — the hero card */
-.classifier .stage { border: 1px solid var(--border); border-radius: 14px; background: var(--panel); padding: 1.25rem; margin-bottom: 2rem; }
-.classifier .loading { display: flex; align-items: center; justify-content: center; gap: .7rem; min-height: 150px; color: var(--muted); font-size: 1.05rem; }
+.stage { padding: 1.25rem; }
 
-.classifier .dropbar { display: flex; align-items: center; justify-content: center; gap: .5rem; padding: .7rem 1rem; margin-bottom: 1.25rem; border: 2px dashed var(--border); border-radius: 10px; color: var(--muted); font-size: .95rem; cursor: pointer; transition: border-color .15s, color .15s, background .15s; }
-.classifier .dropbar:hover, .classifier .dropbar.over { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--panel)); }
-.classifier .dropbar-plus { font-size: 1.2rem; font-weight: 300; line-height: 1; }
-.classifier .fileinput { display: none; }
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: .7rem;
+  min-height: 150px;
+  color: var(--muted);
+  font-size: 1.05rem;
+}
 
-.classifier .result { display: flex; gap: 1.75rem; align-items: flex-start; flex-wrap: wrap; }
-.classifier .shot-img { width: 240px; height: 240px; object-fit: cover; border-radius: 12px; display: block; box-shadow: 0 1px 5px rgba(0, 0, 0, .14); }
+.dropbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: .5rem;
+  padding: .7rem 1rem;
+  margin-bottom: 1.25rem;
+  border: 2px dashed var(--border);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: .95rem;
+  cursor: pointer;
+  transition: border-color .15s, color .15s, background .15s;
+}
 
-.classifier .readout { flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 1rem; }
-.classifier .readout-wait { display: flex; align-items: center; gap: .6rem; color: var(--muted); padding-top: 1rem; }
-.classifier .verdict { display: flex; align-items: baseline; gap: .6rem; }
-.classifier .verdict-class { font-size: 2rem; font-weight: 680; letter-spacing: -0.01em; text-transform: capitalize; }
-.classifier .verdict-pct { font-size: 1.05rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.dropbar:hover,
+.dropbar.over {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+}
 
-.classifier .bars { display: flex; flex-direction: column; gap: .5rem; }
-.classifier .bar { display: flex; align-items: center; gap: .7rem; }
-.classifier .barlab { width: 84px; text-align: right; color: var(--muted); text-transform: capitalize; }
-.classifier .track { flex: 1; height: 18px; background: var(--track); border-radius: 9px; overflow: hidden; }
-.classifier .fill { height: 100%; border-radius: 9px; transition: width .3s ease; }
-.classifier .barpct { width: 40px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.dropbar-plus {
+  font-size: 1.2rem;
+  font-weight: 300;
+  line-height: 1;
+}
 
-.classifier .teach { display: flex; flex-direction: column; gap: .5rem; margin-top: .25rem; }
-.classifier .teach-lbl { color: var(--muted); font-size: .95rem; }
-.classifier .teach-btns { display: flex; gap: .5rem; flex-wrap: wrap; }
-.classifier .teach-btn { font-size: .95rem; font-family: inherit; background: var(--panel); border: 1.5px solid var(--border); border-radius: 8px; padding: .35rem .8rem; cursor: pointer; text-transform: capitalize; transition: background .12s; }
-.classifier .teach-btn:hover { background: color-mix(in srgb, var(--fg) 6%, var(--panel)); }
-.classifier .teach-btn.newclass { border-style: dashed; color: var(--muted); text-transform: none; }
-.classifier .newclass-form { display: inline-flex; gap: .4rem; align-items: center; }
-.classifier .newclass-input { font: inherit; font-size: .95rem; padding: .35rem .6rem; border: 1.5px solid var(--accent); border-radius: 8px; background: var(--panel); color: var(--fg); width: 11rem; }
-.classifier .newclass-input:focus { outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+.fileinput { display: none; }
+
+.result {
+  display: flex;
+  gap: 1.75rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.shot-img {
+  width: 240px;
+  height: 240px;
+  object-fit: cover;
+  border-radius: 12px;
+  display: block;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .14);
+}
+
+.readout {
+  flex: 1;
+  min-width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.readout-wait {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  color: var(--muted);
+  padding-top: 1rem;
+}
+
+.verdict {
+  display: flex;
+  align-items: baseline;
+  gap: .6rem;
+}
+
+.verdict-class {
+  font-size: 2rem;
+  font-weight: 680;
+  letter-spacing: -0.01em;
+  text-transform: capitalize;
+}
+
+.verdict-pct {
+  font-size: 1.05rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.bars {
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+}
+
+.barlab {
+  width: 84px;
+  text-align: right;
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.track {
+  flex: 1;
+  height: 18px;
+  background: var(--track);
+  border-radius: 9px;
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+  border-radius: 9px;
+  transition: width .3s ease;
+}
+
+.barpct {
+  width: 40px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.teach {
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  margin-top: .25rem;
+}
+
+.teach-lbl {
+  color: var(--muted);
+  font-size: .95rem;
+}
+
+.teach-btns {
+  display: flex;
+  gap: .5rem;
+  flex-wrap: wrap;
+}
+
+.teach-btn {
+  font-size: .95rem;
+  font-family: inherit;
+  background: var(--panel);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: .35rem .8rem;
+  cursor: pointer;
+  text-transform: capitalize;
+  transition: background .12s;
+}
+
+.teach-btn:hover { background: color-mix(in srgb, var(--fg) 6%, var(--panel)); }
+
+.teach-btn.newclass {
+  border-style: dashed;
+  color: var(--muted);
+  text-transform: none;
+}
+
+.newclass-form {
+  display: inline-flex;
+  gap: .4rem;
+  align-items: center;
+}
+
+.newclass-input {
+  font: inherit;
+  font-size: .95rem;
+  padding: .35rem .6rem;
+  border: 1.5px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+  width: 11rem;
+}
+
+.newclass-input:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
 
 /* training set */
-.classifier .training { margin-bottom: 2rem; }
-.classifier .training-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
-.classifier .training h3 { margin: 0; }
-.classifier .reset-btn { font-family: inherit; font-size: .9rem; background: var(--panel); border: 1.5px solid var(--border); border-radius: 8px; padding: .3rem .8rem; cursor: pointer; color: var(--muted); transition: border-color .12s, color .12s; }
-.classifier .reset-btn:hover { border-color: var(--accent); color: var(--accent); }
-.classifier .gallery { display: flex; flex-wrap: wrap; gap: 1.25rem 1.75rem; }
-.classifier .classcol { display: flex; flex-direction: column; gap: .5rem; }
-.classifier .classlbl { font-weight: 600; text-transform: capitalize; }
-.classifier .strip { display: flex; gap: 8px; flex-wrap: nowrap; }
-.classifier .thumb { width: 76px; height: 76px; object-fit: cover; border-radius: 8px; border: 2px solid; display: block; cursor: pointer; transition: box-shadow .12s, transform .12s; }
-.classifier .thumb:hover { transform: translateY(-1px); }
-.classifier .thumb.selected { box-shadow: 0 0 0 3px var(--accent); }
+.training { margin-bottom: 2rem; }
+
+.training-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.reset-btn {
+  font-family: inherit;
+  font-size: .9rem;
+  background: var(--panel);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: .3rem .8rem;
+  cursor: pointer;
+  color: var(--muted);
+  transition: border-color .12s, color .12s;
+}
+
+.reset-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.gallery {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem 1.75rem;
+}
+
+.classcol {
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+}
+
+.classlbl {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.strip {
+  display: flex;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.thumb {
+  width: 76px;
+  height: 76px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 2px solid;
+  display: block;
+  cursor: pointer;
+  transition: box-shadow .12s, transform .12s;
+}
+
+.thumb:hover { transform: translateY(-1px); }
+.thumb.selected { box-shadow: 0 0 0 3px var(--accent); }
 
 /* about — at the bottom; functionality speaks first */
-.classifier .about { color: var(--muted); font-size: 1rem; line-height: 1.65; border-top: 1px solid var(--border); padding-top: 1.25rem; margin: 0; }
+.about {
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1.65;
+  border-top: 1px solid var(--border);
+  padding-top: 1.25rem;
+  margin: 0;
+}
 
-.classifier .spinner { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; display: inline-block; animation: classifier-spin .8s linear infinite; }
-@keyframes classifier-spin { to { transform: rotate(360deg); } }
+.about p { margin: 0 0 .9rem; }
+.about p:last-child { margin-bottom: 0; }
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  display: inline-block;
+  animation: spin .8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* below ~700px the image + readout no longer sit side by side — stack them.
+   The image goes fluid (capped at its 240px size) so it can shrink on narrow
+   screens instead of pinning the column width and keeping the bars wide. */
+@media (max-width: 700px) {
+  h1 { text-align: center; }
+  .result { flex-direction: column; }
+  .shot-img {
+    width: 100%;
+    max-width: 240px;
+    height: auto;
+    aspect-ratio: 1;
+    margin-inline: auto;
+  }
+  .readout {
+    width: 100%;
+    min-width: 0;
+  }
+  .verdict { justify-content: center; }
+}
+
+/* mobile: reclaim the page gutters and let thumbnail rows shrink to fit */
+@media (max-width: 640px) {
+  body { padding: 0 .6rem; }
+  .gallery { gap: 1.25rem; }
+  .classcol { width: 100%; }
+  .strip { gap: 6px; }
+  .thumb {
+    flex: 1 1 0;
+    min-width: 0;
+    width: auto;
+    height: auto;
+    aspect-ratio: 1;
+    max-width: 84px;
+  }
+  .bar { gap: .5rem; }
+  .barlab { width: 60px; }
+  .track { min-width: 0; }
+  .barpct { width: 30px; }
+}
 ```
 
 **index.html**
