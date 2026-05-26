@@ -309,13 +309,21 @@ export function categorical(logits: Tensor, axis: number = -1): Tensor {
   return axisReducing(logits, axis, 'categorical', categoricalLastIR)
 }
 
-/** GELU using the GPT-2 tanh approximation:
- *  `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))`. Composed. */
-export function gelu(a: Tensor): Tensor {
-  const c = 0.7978845608028654 // sqrt(2 / π)
-  const x3 = mul(mul(a, a), a)
-  const inner = mul(add(a, mul(x3, 0.044715)), c)
-  return mul(mul(a, 0.5), add(tanh(inner), 1))
+/** GELU `x·Φ(x)`. Defaults to the **exact** form `0.5·x·(1 + erf(x/√2))` —
+ *  the actual definition, and what PyTorch's `nn.GELU()` / timm / most
+ *  imported checkpoints use (so it matches a ported reference). Pass
+ *  `{ approximate: 'tanh' }` for the GPT-2 tanh approximation
+ *  `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))` (JAX's and GPT-2-family
+ *  models' default). Both are one cheap unary kernel — the ~1e-3 difference
+ *  only matters when matching a pretrained reference. Composed either way. */
+export function gelu(a: Tensor, opts: { approximate?: 'none' | 'tanh' } = {}): Tensor {
+  if (opts.approximate === 'tanh') {
+    const c = 0.7978845608028654 // sqrt(2 / π)
+    const x3 = mul(mul(a, a), a)
+    const inner = mul(add(a, mul(x3, 0.044715)), c)
+    return mul(mul(a, 0.5), add(tanh(inner), 1))
+  }
+  return mul(mul(a, 0.5), add(erf(mul(a, 1 / Math.SQRT2)), 1))
 }
 
 /** Leaky ReLU: `x` for `x > 0`, `alpha · x` otherwise. Composed as

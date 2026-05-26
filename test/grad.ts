@@ -71,16 +71,12 @@ assertGradMatchesFD('concat (variadic, gradient via narrow)', [3, 4], p => {
   return mean(concat([p, q], 1))
 }, { extraInputs: { q: makeRange([3, 5]) } })
 
-// 8. Composed activation: chain rule through multiple primitives
-//    (mul → add → mul → tanh → add → mul). Catches any layer-of-the-stack
-//    bug in chain-rule composition.
-assertGradMatchesFD('gelu (composed: chain rule through tanh approx)', [4], p => mean(gelu(p)))
-
-// 8b. erf primitive: analytic grad 2/√π·e^(−x²) vs finite-diff of the A&S
-//     forward. Also covers exact GELU, which composes from erf.
+// 8. erf primitive + the two GELU forms it underlies. erf's analytic grad
+//    is 2/√π·e^(−x²); both gelu variants are composed activations whose
+//    chain rule must hold through every primitive in the composition.
 assertGradMatchesFD('erf (analytic 2/√π·e^(−x²))', [5], p => mean(erf(p)))
-assertGradMatchesFD('gelu-exact (composed from erf)', [5],
-  p => mean(mul(mul(p, 0.5), add(erf(mul(p, 1 / Math.sqrt(2))), 1))))
+assertGradMatchesFD('gelu exact (default — composed via erf)', [5], p => mean(gelu(p)))
+assertGradMatchesFD('gelu tanh-approx (opt-in — composed via tanh)', [4], p => mean(gelu(p, { approximate: 'tanh' })))
 
 // 9. Conv2d (input gradient, two-input op with stride+padding). The param
 //    is the input image; the weight is a fixed tensor_input. Tests the

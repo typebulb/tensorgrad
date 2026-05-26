@@ -176,7 +176,10 @@ targets)` instead — same numerics, just unfused.
 **Use the `gelu` primitive, not a hand-rolled approximation.**
 `mul(x, sigmoid(mul(x, 1.702)))` is the fast-GELU shortcut; dropping the
 `sigmoid` silently collapses the MLP to linear and the trace still passes.
-Same goes for `RMSNorm` — use the primitive, not a hand-roll.
+`gelu(x)` is the **exact** form `0.5·x·(1 + erf(x/√2))` — matching PyTorch's
+`nn.GELU()` (and so any imported checkpoint); pass `gelu(x, { approximate:
+'tanh' })` for the GPT-2 tanh approximation when porting a model that used
+it. Same goes for `RMSNorm` — use the primitive, not a hand-roll.
 
 **`reshape` doesn't transpose.** It reinterprets the linear memory layout;
 total element count is preserved but axis order in memory is not.
