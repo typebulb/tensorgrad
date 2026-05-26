@@ -326,11 +326,12 @@ export function gelu(a: Tensor, opts: { approximate?: 'none' | 'tanh' } = {}): T
   return mul(mul(a, 0.5), add(erf(mul(a, 1 / Math.SQRT2)), 1))
 }
 
-/** Leaky ReLU: `x` for `x > 0`, `alpha · x` otherwise. Composed as
- *  `max(x, alpha · x)` (assumes `alpha < 1`, which it is for all standard
- *  uses — PyTorch default 0.01, DCGAN convention 0.2). */
+/** Leaky ReLU: `x` for `x > 0`, `alpha · x` otherwise. Matches PyTorch's
+ *  `F.leaky_relu` for *any* `alpha` (default 0.01) via an explicit `where` —
+ *  the old `max(x, alpha·x)` form was silently wrong for `alpha >= 1` (and
+ *  negative slopes). */
 export function leakyRelu(a: Tensor, alpha: number = 0.01): Tensor {
-  return max(a, mul(a, alpha))
+  return where(greater(a, 0), a, mul(a, alpha))
 }
 
 /** Softplus: smooth, strictly-positive `log(1 + exp(x))`. Composed in the

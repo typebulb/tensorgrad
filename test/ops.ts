@@ -8,8 +8,9 @@
 // transformer trace), and by the FD harness in test/grad.ts. Tests for
 // stable shape rules and obvious literal guards were pruned as padding.
 
-import { dropout } from '../src/index.js'
+import { dropout, leakyRelu } from '../src/index.js'
 import { traceFn, tensorInput } from '../src/trace.js'
+import { evalOutput } from './_eval.js'
 import { section, ok, fail, done } from './_assert.js'
 
 section('dropout — auto-managed per-op salt + shared seed input')
@@ -40,6 +41,20 @@ section('dropout — auto-managed per-op salt + shared seed input')
   const salts = dropoutOps.map(o => o.salt)
   if (new Set(salts).size !== salts.length) fail(`dropout salts must be unique: ${salts}`)
   ok(`${dropoutOps.length} dropouts: 1 shared seed input, unique salts [${salts.join(', ')}]`)
+}
+
+// leakyRelu forward correctness for alpha >= 1 — not covered by the FD harness
+// (self-consistent against its own forward) nor samples (which use alpha < 1).
+// The old `max(x, alpha·x)` form was silently wrong here.
+section('leakyRelu — correct for alpha >= 1 (regression guard)')
+{
+  const g = traceFn(() => leakyRelu(tensorInput('x', [4]), 2))
+  const out = evalOutput(g, { x: new Float32Array([-1, -0.5, 0.5, 1]) }) as Float32Array
+  const want = [-2, -1, 0.5, 1]  // PyTorch: x<0 → 2x, x>=0 → x
+  if (!want.every((w, i) => Math.abs(out[i]! - w) < 1e-6)) {
+    fail(`leakyRelu(α=2) = [${[...out]}], want [${want.join(', ')}]`)
+  }
+  ok(`leakyRelu(α=2): x<0 → 2x, x>=0 → x — [${[...out].join(', ')}]`)
 }
 
 done('test/ops.ts')
