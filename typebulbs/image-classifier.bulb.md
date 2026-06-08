@@ -456,9 +456,11 @@ class Root extends Component {
 
   view() {
     return div(
-      h1('Image Classifier'),
+      div({ class: 'header' },
+        h1('Image Classifier'),
+        this.chartSection(),
+      ),
       this.stage(),
-      this.chartSection(),
       this.trainingSet(),
       this.about(),
     )
@@ -488,7 +490,10 @@ class Root extends Component {
   }
 
   loading() {
-    return div({ class: 'loading' }, span({ class: 'spinner' }), span(this.model.status || 'Warming up…'))
+    return div({ class: 'loading' },
+      p({ class: 'loading-lead' }, 'This pretrained vision model runs entirely in your browser, on your GPU.'),
+      div({ class: 'loading-status' }, span({ class: 'spinner' }), span(this.model.status || 'Warming up…')),
+    )
   }
 
   fileInput() {
@@ -651,7 +656,7 @@ class Root extends Component {
 
   about() {
     return div({ class: 'about' },
-      p('This is a pretrained image model running in your browser with tensorgrad. Drop in a photo and it tells you what it sees; when it’s wrong, correct it or add a class of your own, and it learns from that one example right away.'),
+      p('This is a pretrained image classifier running in your browser with tensorgrad. On startup, we train the model to recognize 3 categories based on the 12 images. You can continue to train the model by adding your own images and classifying them.'),
       p('Under the hood the pretrained model is a frozen ViT-tiny that turns each image into a 192-dimensional feature vector. tensorgrad trains a one-layer head on top of those features, so the backbone never changes and only the head learns.'),
     )
   }
@@ -666,11 +671,12 @@ new App({ root: new Root(), id: 'app' })
 :root {
   --bg: rgb(255, 255, 255);
   --fg: rgb(28, 28, 30);
-  --muted: rgb(108, 110, 118);
+  --muted: rgb(82, 84, 92);
   --panel: rgb(252, 252, 253);
   --border: rgb(224, 224, 228);
   --accent: rgb(58, 125, 232);
   --track: rgb(233, 234, 238);
+  --thumb-hover-shadow: 0 0 14px rgba(0, 0, 0, .8);
 }
 
 html[data-theme="dark"] {
@@ -681,6 +687,7 @@ html[data-theme="dark"] {
   --border: rgb(58, 58, 64);
   --accent: rgb(122, 162, 250);
   --track: rgb(48, 48, 54);
+  --thumb-hover-shadow: 0 0 16px rgba(255, 255, 255, .28);
 }
 
 body {
@@ -694,21 +701,30 @@ body {
 }
 
 h1 {
-  font-size: 1.9rem;
+  font-size: 2.3rem;
   font-weight: 650;
   line-height: 1.15;
-  margin: 0 0 1.35rem;
+  margin: 0;
   letter-spacing: -0.01em;
 }
 
 h3 {
-  font-size: 1.15rem;
+  font-size: 1.2rem;
   font-weight: 600;
   margin: 0;
+  text-transform: uppercase;
+  letter-spacing: .05em;
 }
 
-/* panel cards — chart row + hero stage */
-.chartrow,
+/* header row — title beside the loss sparkline (stacks on mobile) */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  margin-bottom: 1.35rem;
+}
+
+/* hero stage card */
 .stage {
   border: 1px solid var(--border);
   background: var(--panel);
@@ -716,14 +732,17 @@ h3 {
   margin-bottom: 2rem;
 }
 
+/* loss sparkline — bare, fills the width beside the title */
 .chartrow {
   position: relative;
   overflow: hidden;
+  flex: 1;
+  min-width: 0;
 }
 
 .chart {
   width: 100%;
-  height: 150px;
+  height: 52px;
   display: block;
 }
 
@@ -754,12 +773,27 @@ h3 {
 
 .loading {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: .7rem;
-  min-height: 150px;
-  color: var(--muted);
+  gap: 1rem;
+  padding: 1.75rem 1rem;
+  text-align: center;
+}
+
+.loading-lead {
+  margin: 0;
+  color: var(--fg);
   font-size: 1.05rem;
+  line-height: 1.5;
+}
+
+.loading-status {
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+  color: var(--muted);
+  font-size: .95rem;
 }
 
 .dropbar {
@@ -902,6 +936,7 @@ h3 {
 
 .teach-btn {
   font-size: .95rem;
+  line-height: 1;
   font-family: inherit;
   background: var(--panel);
   border: 1.5px solid var(--border);
@@ -1001,10 +1036,10 @@ h3 {
   border: 2px solid;
   display: block;
   cursor: pointer;
-  transition: box-shadow .12s, transform .12s;
+  transition: box-shadow .12s;
 }
 
-.thumb:hover { transform: translateY(-1px); }
+.thumb:hover { box-shadow: var(--thumb-hover-shadow); }
 .thumb.selected { box-shadow: 0 0 0 3px var(--accent); }
 
 /* about — at the bottom; functionality speaks first */
@@ -1012,8 +1047,6 @@ h3 {
   color: var(--muted);
   font-size: 1rem;
   line-height: 1.65;
-  border-top: 1px solid var(--border);
-  padding-top: 1.25rem;
   margin: 0;
 }
 
@@ -1039,6 +1072,8 @@ h3 {
    screens instead of pinning the column width and keeping the bars wide. */
 @media (max-width: 700px) {
   h1 { text-align: center; }
+  /* title and sparkline stack; the chart reclaims its full row (same height) */
+  .header { flex-direction: column; align-items: stretch; gap: .9rem; }
   .result { flex-direction: column; }
   .shot-img {
     width: 100%;
@@ -1089,6 +1124,6 @@ h3 {
     "tensorgrad": "^0.3.0",
     "domeleon": "^0.6.0"
   },
-  "description": "Teach an image classifier in your browser — drop a photo to label it, fix its mistakes, or add your own classes, and watch it learn instantly on WebGPU."
+  "description": "Image classifier built with tensorgrad, running in your browser on WebGPU. Drop in photos, fix wrong guesses, and add new classes, live."
 }
 ```

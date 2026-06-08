@@ -12,6 +12,18 @@ Web Worker — every method on a compiled module returns a `Promise`.
 npm i tensorgrad
 ```
 
+## Samples
+
+Live samples w/ code:
+
+* [It's a sine](https://typebulb.com/u/samples/its-a-sine/full)
+* [NeRF](https://typebulb.com/u/samples/ne-rf/full)
+* [Classic handwritten digit recognition](https://typebulb.com/u/samples/neural-network/full)
+* [Vectors & Tensors Tutorial](https://typebulb.com/u/samples/tensors/full)
+* [Transformer learning in browser](https://typebulb.com/u/samples/transformer/full)
+* [Image Classifier (pretrained transformer)](https://typebulb.com/u/samples/image-classifier/full)
+* [NN-DNA (Diagram a neural network design with AI)](https://typebulb.com/u/samples/nn-dna/full)
+
 ## Minimal example
 
 A 2-layer MLP fitting `y = sin(x)`:
