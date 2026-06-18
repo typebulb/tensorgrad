@@ -496,7 +496,9 @@ const params = train.graph.ops
 **Flat param record.** `downloadParams()` returns a flat
 `Record<'l1.W' | 'l1.b' | ..., Float32Array>` — dotted keys mirror the
 Module class path. Round-trips directly back through `uploadParams`
-(e.g. save weights to IndexedDB, load on next visit). The string-literal
+(e.g. save weights to IndexedDB, load on next visit). Every call reads back
+the *full* param set — there's no per-param variant, so throttle it when a viz
+polls a few weights inside the training loop. The string-literal
 union autocompletes in TS, so `params['l1.W']` is typed access without a
 separate tree variant.
 
@@ -590,6 +592,7 @@ optimizer: { kind: 'adam', lr: 0.005, clipGradNorm: 1.0 }
 // AdamW — decoupled weight decay (Loshchilov & Hutter)
 optimizer: { kind: 'adamw', lr: 0.005, weightDecay: 0.01 }
 optimizer: { kind: 'adamw', lr: 0.005, weightDecay: 0.01, decayFilter: n => n.endsWith('.W') }
+optimizer: { kind: 'adamw', lr: 0.005, weightDecay: 0.01, beta1: 0.9, beta2: 0.95 }   // override the (0.9, 0.999) moment decays
 
 // Transformer recipe — pair with tied embeddings; LR schedule + clip together avoid the late-training NaN cliff
 optimizer: { kind: 'adamw', lr: lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 }), weightDecay: 0.01, clipGradNorm: 1.0 }
@@ -784,6 +787,11 @@ The library is small because of what it doesn't do. Plan accordingly:
 - **One model per training compile.** Forward specs attach via
   `train.attach(forwardSpec)` to share params; otherwise each `compile()`
   of a training spec spawns its own worker.
+- **Old / weak GPUs can silently mis-compute large kernels.** Some older
+  integrated GPUs (observed on Intel gen-9) drop a single oversized matmul
+  dispatch and return zeros with no error — training appears to run but the loss
+  is stuck. If a model trains on a normal GPU but not a weak one, scale the
+  model/batch down.
 
 ## License
 
