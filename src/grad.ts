@@ -363,14 +363,24 @@ function runAdjointRule(
 
     // ---- Linear algebra ---------------------------------------------------
     case 'matmul': {
-      // a: [..., M, K], b: [K, N]. dA = dC @ B^T, dB = sum_batch(A^T @ dC).
-      // The public `matmul` dispatches to the batched kernel for batched
-      // operands; sumToShape collapses dB's leading batch dims to [K, N].
+      // a: [..., M, K], b: [K, N]. dA = dC @ B^T.
+      // For dB we must contract every leading dim of a (batch *and* M). The old
+      // path did `matmul(swapAxes(a), outCotan)` → a per-batch [..., K, N] tensor,
+      // then summed it to [K, N]. That intermediate is `prod(batch) * K * N`
+      // floats — e.g. a SwiGLU's [B, d, 4d] is 302 MB at B=512/d=192, which blows
+      // past WebGPU's default maxBufferSize (256 MB). The buffer then silently
+      // fails validation (async, never thrown) and reads back as zeros, killing
+      // the gradient. Instead, flatten a and dC to 2D ([rows, K] / [rows, N]) and
+      // do a single [K, rows] @ [rows, N] → [K, N] matmul: the contraction never
+      // materializes the batch dim, so the only buffer is the [K, N] result.
       const a = tensorOf(op.a), b = tensorOf(op.b)
       accumulate(cotangents, op.a, matmul(outCotan, swapAxes(b, -1, -2)))
-      const aT = swapAxes(a, -1, -2)
-      const perBatchDb = matmul(aT, outCotan)
-      accumulate(cotangents, op.b, sumToShape(perBatchDb, b.shape))
+      const K = a.shape[a.shape.length - 1]!
+      const N = b.shape[b.shape.length - 1]!
+      const rows = a.shape.slice(0, -1).reduce((p, d) => p * d, 1)
+      const a2 = reshape(a, [rows, K])
+      const oc2 = reshape(outCotan, [rows, N])
+      accumulate(cotangents, op.b, sumToShape(matmul(swapAxes(a2, -1, -2), oc2), b.shape))
       return
     }
     case 'matmul_batched': {
