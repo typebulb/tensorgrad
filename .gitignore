@@ -16,11 +16,12 @@ build-artifacts/
 # Excluded from publication. Specs are working design notes; .claude/.github
 # are local config.
 .typebulb/
-/typebulbs-tentative
 .github/
 .claude/
-.claude-paste
-.claude-bulb
+.paste
 specs/
 temp/
 *.bin
+# agent switcher (local Claude Code model override)
+.claude/settings.local.json
+.claude/.cc-switcher.json
