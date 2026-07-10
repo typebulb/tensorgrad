@@ -336,6 +336,36 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const D = a.shape[a.shape.length - 1]!
       const outerSize = shapeSize(a.shape) / D
       const divisor = op.kind === 'mean_last' ? `f32(${D}u)` : '1.0'
+      // One-thread-per-row starves the GPU when there are few rows and each
+      // row is long — the worst case is the loss's full-tensor mean, which is
+      // ONE thread serially summing the whole tensor. Same pathology measured
+      // for conv2d_weight_grad (2026-07-10); below the thread threshold,
+      // switch to one WORKGROUP per row: WG_SIZE threads stride the row, then
+      // tree-reduce in shared memory. Naive form kept as reference and
+      // many-rows path. (outerSize == 1 still leaves just one workgroup live;
+      // if profiling ever shows that mattering, the fix is a two-stage split,
+      // not a bigger workgroup.)
+      if (outerSize < 32768 && D >= 256) {
+        const wgsl = `
+var<workgroup> partial : array<f32, ${WG_SIZE}>;
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
+  // One workgroup per output row. wid is workgroup-uniform, so the
+  // early-out keeps every barrier below in uniform control flow.
+  let i = wid.x + wid.y * 65535u;
+  if (i >= ${outerSize}u) { return; }
+  let base = i * ${D}u;
+  var s : f32 = 0.0;
+  for (var j : u32 = lid; j < ${D}u; j = j + ${WG_SIZE}u) {
+    s = s + a[base + j];
+  }
+${emitWorkgroupReduce('partial', 's')}
+  if (lid == 0u) { out[i] = partial[0] / ${divisor}; }
+}`.trim()
+        return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: outerSize * WG_SIZE, workgroupSize: WG_SIZE }
+      }
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<f32>;
 @group(0) @binding(1) var<storage, read_write> out : array<f32>;
@@ -472,6 +502,46 @@ ${outDimDecls}
       const N = b.shape[1]!
       const batch = shapeSize(a.shape) / (M * K)
       const total = batch * M * N
+      // Small output × long K is the dB-of-Linear case from grad.ts: the
+      // batch-flattened [K_w, rows] @ [rows, N] contraction has a few
+      // thousand outputs each reducing over every row the layer saw — at
+      // render-res SIREN shapes, 4k threads × 262k serial iterations. Same
+      // few-threads/long-loop pathology as conv2d_weight_grad; same fix:
+      // one WORKGROUP per output element, WG_SIZE threads striding K, tree
+      // reduce. Only for shapes the tiled GEMM below can't take (non-tile-
+      // aligned): where both apply, tiled measured faster even at 16
+      // workgroups (SIREN dW 193 → 117 ms/step; xf-small dW likewise) —
+      // 16× less traffic beats occupancy. Naive form kept as reference.
+      if (total < 32768 && K >= 256 && !(M % TILE === 0 && N % TILE === 0 && K % TILE === 0)) {
+        const wgsl = `
+var<workgroup> partial : array<f32, ${WG_SIZE}>;
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read> b : array<f32>;
+@group(0) @binding(2) var<storage, read_write> c : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
+  // One workgroup per output element. wid is workgroup-uniform, so the
+  // early-out keeps every barrier below in uniform control flow.
+  let i = wid.x + wid.y * 65535u;
+  if (i >= ${total}u) { return; }
+  let bi = i / ${M * N}u;
+  let mn = i % ${M * N}u;
+  let m = mn / ${N}u;
+  let n = mn % ${N}u;
+  let aBase = bi * ${M * K}u + m * ${K}u;
+  var s : f32 = 0.0;
+  for (var k : u32 = lid; k < ${K}u; k = k + ${WG_SIZE}u) {
+    s = s + a[aBase + k] * b[k * ${N}u + n];
+  }
+${emitWorkgroupReduce('partial', 's')}
+  if (lid == 0u) { c[i] = partial[0]; }
+}`.trim()
+        return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: total * WG_SIZE, workgroupSize: WG_SIZE }
+      }
+      if (M % TILE === 0 && N % TILE === 0 && K % TILE === 0) {
+        const wgsl = emitTiledMatmul(batch, M, K, N, false)
+        return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: batch * (M / TILE) * (N / TILE) * WG_SIZE, workgroupSize: WG_SIZE }
+      }
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<f32>;
 @group(0) @binding(1) var<storage, read> b : array<f32>;
@@ -503,6 +573,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const N = b.shape[b.shape.length - 1]!
       const batch = shapeSize(a.shape) / (M * K)
       const total = batch * M * N
+      if (M % TILE === 0 && N % TILE === 0 && K % TILE === 0) {
+        const wgsl = emitTiledMatmul(batch, M, K, N, true)
+        return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: batch * (M / TILE) * (N / TILE) * WG_SIZE, workgroupSize: WG_SIZE }
+      }
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<f32>;
 @group(0) @binding(1) var<storage, read> b : array<f32>;
@@ -834,19 +908,20 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       // Sum over each axis where target is 1 or missing (prefix axes).
       const out = tof(op.out)
       const a = tof(op.a)
-      const wgsl = emitSumToShape(a.shape, out.shape, a.dtype)
-      const total = shapeSize(out.shape)
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+      const { wgsl, threads } = emitSumToShape(a.shape, out.shape, a.dtype)
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads, workgroupSize: WG_SIZE }
     }
 
     // ---- 2D conv + pool ----------------------------------------------------
     case 'conv2d': {
+      // Grouped form: output channel cOut_'s group g reads only input channels
+      // [g·cInPerG, (g+1)·cInPerG). groups=1 makes g 0 and cInPerG = C_in.
       const input = tof(op.input)
       const weight = tof(op.weight)
       const out = tof(op.out)
       const [, cIn, H, W] = input.shape
-      const [cOut, , kH, kW] = weight.shape
-      const [, , hOut, wOut] = out.shape
+      const [cOut, cInPerG, kH, kW] = weight.shape
+      const cOutPerG = cOut! / op.groups
       const total = shapeSize(out.shape)
       const wgsl = `
 @group(0) @binding(0) var<storage, read> input : array<f32>;
@@ -857,10 +932,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${decompose4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_out', 'w_out'])}
-  let inBase    = b * ${cIn! * H! * W!}u;
-  let wBase     = cOut_ * ${cIn! * kH! * kW!}u;
+  let g         = cOut_ / ${cOutPerG}u;
+  let inBase    = b * ${cIn! * H! * W!}u + g * ${cInPerG! * H! * W!}u;
+  let wBase     = cOut_ * ${cInPerG! * kH! * kW!}u;
   var s : f32 = 0.0;
-  for (var c : u32 = 0u; c < ${cIn!}u; c = c + 1u) {
+  for (var c : u32 = 0u; c < ${cInPerG!}u; c = c + 1u) {
     let inChan = inBase + c * ${H! * W!}u;
     let wChan  = wBase  + c * ${kH! * kW!}u;
     for (var kh : u32 = 0u; kh < ${kH!}u; kh = kh + 1u) {
@@ -882,11 +958,14 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_o
     case 'conv2d_input_grad': {
       // Invert the forward index relation:
       //   h_out = (h_in + padH - kh) / strideH (must divide evenly).
+      // Grouped: input channel c_in_'s group g receives contributions only
+      // from output channels [g·cOutPerG, (g+1)·cOutPerG).
       const weight = tof(op.weight)
       const dy = tof(op.dy)
       const out = tof(op.out)
-      const [, cIn, inH, inW] = out.shape
-      const [cOut, , kH, kW] = weight.shape
+      const [, , inH, inW] = out.shape
+      const [cOut, cInPerG, kH, kW] = weight.shape
+      const cOutPerG = cOut! / op.groups
       const [, , hOut, wOut] = dy.shape
       const total = shapeSize(out.shape)
       const wgsl = `
@@ -898,9 +977,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${decompose4d(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_in', 'w_in'])}
+  let g      = c_in_ / ${cInPerG!}u;
+  let cLocal = c_in_ - g * ${cInPerG!}u;
   var s : f32 = 0.0;
-  for (var c_out : u32 = 0u; c_out < ${cOut!}u; c_out = c_out + 1u) {
-    let wBase  = c_out * ${cIn! * kH! * kW!}u + c_in_ * ${kH! * kW!}u;
+  for (var co : u32 = 0u; co < ${cOutPerG}u; co = co + 1u) {
+    let c_out  = g * ${cOutPerG}u + co;
+    let wBase  = c_out * ${cInPerG! * kH! * kW!}u + cLocal * ${kH! * kW!}u;
     let dyBase = b * ${cOut! * hOut! * wOut!}u + c_out * ${hOut! * wOut!}u;
     for (var kh : u32 = 0u; kh < ${kH!}u; kh = kh + 1u) {
       let numH = i32(h_in) + ${op.padH} - i32(kh);
@@ -927,13 +1009,59 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_i
     case 'conv2d_weight_grad': {
       // dWeight[c_out,c_in,kh,kw] = Σ_{b,h_out,w_out} input[b,c_in,h_in,w_in]
       // * dy[b,c_out,h_out,w_out], with h_in = h_out * strideH + kh - padH.
+      // Grouped: c_in_ is group-local; the actual input channel is
+      // g·cInPerG + c_in_ where g is c_out_'s group.
       const input = tof(op.input)
       const dy = tof(op.dy)
       const out = tof(op.out)
-      const [cOut, cIn, kH, kW] = out.shape
-      const [B, , H, W] = input.shape
+      const [cOut, cInPerG, kH, kW] = out.shape
+      const cOutPerG = cOut! / op.groups
+      const [B, cIn, H, W] = input.shape
       const [, , hOut, wOut] = dy.shape
       const total = shapeSize(out.shape)
+      const redLen = B! * hOut! * wOut!
+      // One-thread-per-weight starves the GPU when the weight is small and
+      // the reduction long: growing-nca's 1×1 convs give 8k/2k threads each
+      // serially summing 16k terms — measured (2026-07-10, wgrad-probe bulb)
+      // at ~63% of the whole training step, ~6× slower than the forward conv
+      // doing identical MACs with ample threads. Below the thread threshold,
+      // switch to one WORKGROUP per weight element: WG_SIZE threads split the
+      // Σ over b·h_out·w_out, then tree-reduce in shared memory. The naive
+      // form (below) remains the reference and the large-weight path.
+      if (total < 32768 && redLen >= 256) {
+        const wgsl = `
+var<workgroup> partial : array<f32, ${WG_SIZE}>;
+@group(0) @binding(0) var<storage, read> input : array<f32>;
+@group(0) @binding(1) var<storage, read> dy : array<f32>;
+@group(0) @binding(2) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
+  // One workgroup per weight element. wid is workgroup-uniform, so the
+  // early-out keeps every barrier below in uniform control flow.
+  let i = wid.x + wid.y * 65535u;
+  if (i >= ${total}u) { return; }
+${decompose4d(out.shape as [number, number, number, number], ['c_out_', 'c_in_', 'kh', 'kw'])}
+  let g = c_out_ / ${cOutPerG}u;
+  let inChan = (g * ${cInPerG!}u + c_in_) * ${H! * W!}u;
+  let dyChan = c_out_ * ${hOut! * wOut!}u;
+  var s : f32 = 0.0;
+  for (var r : u32 = lid; r < ${redLen}u; r = r + ${WG_SIZE}u) {
+    let b = r / ${hOut! * wOut!}u;
+    let hw = r % ${hOut! * wOut!}u;
+    let h_out = hw / ${wOut!}u;
+    let w_out = hw % ${wOut!}u;
+    let h_in = i32(h_out * ${op.strideH}u + kh) - ${op.padH};
+    let w_in = i32(w_out * ${op.strideW}u + kw) - ${op.padW};
+    if (h_in >= 0 && h_in < ${H!} && w_in >= 0 && w_in < ${W!}) {
+      s = s + input[b * ${cIn! * H! * W!}u + inChan + u32(h_in) * ${W!}u + u32(w_in)]
+            * dy[b * ${cOut! * hOut! * wOut!}u + dyChan + h_out * ${wOut!}u + w_out];
+    }
+  }
+${emitWorkgroupReduce('partial', 's')}
+  if (lid == 0u) { out[i] = partial[0]; }
+}`.trim()
+        return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.dy), buf(op.out)], threads: total * WG_SIZE, workgroupSize: WG_SIZE }
+      }
       const wgsl = `
 @group(0) @binding(0) var<storage, read> input : array<f32>;
 @group(0) @binding(1) var<storage, read> dy : array<f32>;
@@ -943,9 +1071,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   ${GID_LINE}
   if (i >= ${total}u) { return; }
 ${decompose4d(out.shape as [number, number, number, number], ['c_out_', 'c_in_', 'kh', 'kw'])}
+  let g = c_out_ / ${cOutPerG}u;
   var s : f32 = 0.0;
   for (var b : u32 = 0u; b < ${B!}u; b = b + 1u) {
-    let inBase = b * ${cIn! * H! * W!}u + c_in_ * ${H! * W!}u;
+    let inBase = b * ${cIn! * H! * W!}u + (g * ${cInPerG!}u + c_in_) * ${H! * W!}u;
     let dyBase = b * ${cOut! * hOut! * wOut!}u + c_out_ * ${hOut! * wOut!}u;
     for (var h_out : u32 = 0u; h_out < ${hOut!}u; h_out = h_out + 1u) {
       let h_in = i32(h_out * ${op.strideH}u + kh) - ${op.padH};
@@ -1059,6 +1188,84 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 
 
 // ---- WGSL helpers --------------------------------------------------------
 
+/** Tile edge for the shared-memory GEMM; TILE² must equal WG_SIZE so one
+ *  tile is exactly one workgroup. */
+const TILE = 16
+
+/** 16×16 tiled shared-memory GEMM — Performance.md §Phase 1, re-implemented
+ *  2026-07-10 (the original perf-tiled-matmul branch was lost). Emitted only
+ *  when M, N, K are all tile multiples, so the hot loop is bounds-check-free;
+ *  the naive kernel stays as the odd-shape fallback and reference. Each
+ *  workgroup computes one TILE×TILE block of C, looping K in TILE chunks and
+ *  cooperatively staging A/B tiles in workgroup memory — every global element
+ *  is read once per tile instead of once per thread (TILE× traffic cut),
+ *  which is where the measured MLP ~2.7× / small-transformer ~1.65× came
+ *  which is where the measured MLP ~2.7× / small-transformer ~1.65× came
+ *  from. Takes priority over the small-output/long-K reduced variant when
+ *  both apply — measured 2026-07-10: even at 16 workgroups (Linear dW
+ *  [64, 262k]@[262k, 64]) the TILE× traffic cut beats the reduced path's
+ *  occupancy (SIREN probe 193 → 117 ms/step, xf-small 13.7 → 11.0).
+ *  Known cost: the MLP bench regressed ~5.1 → ~6.5 ms/step at the per-step
+ *  sync floor — small K/N GEMMs pay barrier overhead; acceptable, revisit
+ *  with the profiler. Backward free-rides: matmul adjoints are
+ *  matmul-composed. Register blocking (4×4 micro-tiles) is the named
+ *  follow-on if dense-GEMM perf needs more. */
+function emitTiledMatmul(batch: number, M: number, K: number, N: number, batched: boolean): string {
+  const tilesM = M / TILE
+  const tilesN = N / TILE
+  const numWG = batch * tilesM * tilesN
+  const bBase = batched ? `bi * ${K * N}u` : '0u'
+  return `
+var<workgroup> Atile : array<f32, ${WG_SIZE}>;
+var<workgroup> Btile : array<f32, ${WG_SIZE}>;
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read> b : array<f32>;
+@group(0) @binding(2) var<storage, read_write> c : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
+  // One workgroup per output tile. wid is workgroup-uniform, so the
+  // early-out keeps the barriers below in uniform control flow.
+  let wg = wid.x + wid.y * 65535u;
+  if (wg >= ${numWG}u) { return; }
+  let bi = wg / ${tilesM * tilesN}u;
+  let t = wg % ${tilesM * tilesN}u;
+  let row = lid / ${TILE}u;
+  let col = lid % ${TILE}u;
+  let gRow = (t / ${tilesN}u) * ${TILE}u + row;
+  let gCol = (t % ${tilesN}u) * ${TILE}u + col;
+  let aRow = bi * ${M * K}u + gRow * ${K}u;
+  let bOff = ${bBase};
+  var s : f32 = 0.0;
+  for (var k0 : u32 = 0u; k0 < ${K}u; k0 = k0 + ${TILE}u) {
+    // Thread (row, col) stages A[gRow, k0+col] and B[k0+row, gCol].
+    Atile[lid] = a[aRow + k0 + col];
+    Btile[lid] = b[bOff + (k0 + row) * ${N}u + gCol];
+    workgroupBarrier();
+    for (var kk : u32 = 0u; kk < ${TILE}u; kk = kk + 1u) {
+      s = s + Atile[row * ${TILE}u + kk] * Btile[kk * ${TILE}u + col];
+    }
+    workgroupBarrier();
+  }
+  c[bi * ${M * N}u + gRow * ${N}u + gCol] = s;
+}`.trim()
+}
+
+/** Shared-memory tree reduction across one workgroup. The caller declares
+ *  `var<workgroup> <arrName> : array<f32, WG_SIZE>` at module scope, binds a
+ *  per-thread accumulator in `accVar`, and names its local index `lid`; this
+ *  emits the store + log₂(WG_SIZE) barrier/halve rounds leaving the sum in
+ *  `<arrName>[0]`. Also the intended kernel for a future `sum_last` fix —
+ *  specs/Performance.md §Phase 3 measured the same few-threads/long-loop
+ *  pathology there. */
+function emitWorkgroupReduce(arrName: string, accVar: string): string {
+  const lines = [`  ${arrName}[lid] = ${accVar};`, `  workgroupBarrier();`]
+  for (let off = WG_SIZE >> 1; off > 0; off >>= 1) {
+    lines.push(`  if (lid < ${off}u) { ${arrName}[lid] = ${arrName}[lid] + ${arrName}[lid + ${off}u]; }`)
+    lines.push(`  workgroupBarrier();`)
+  }
+  return lines.join('\n')
+}
+
 /** Decompose a flat thread index `i` into 4 row-major named axes — emits
  *  six `let` lines ready to interpolate inside a kernel body. */
 function decompose4d(shape: readonly [number, number, number, number], names: readonly [string, string, string, string]): string {
@@ -1165,8 +1372,15 @@ function broadcastIndexBlock(flatVar: string, outShape: Shape, srcShape: Shape, 
  * One thread per output cell. Reduced source axes — leading-prefix axes
  * (in src, missing from tgt) and any tgt=1/src>1 axis — get explicit nested
  * for-loops; pass-through axes are indexed directly via tgt_k.
+ *
+ * Except: few output cells × long reduction (bias grads, broadcast grads —
+ * e.g. a Linear bias reducing over every row the layer saw) starves the GPU
+ * the same way conv2d_weight_grad did; below the thread threshold the
+ * emitted kernel is one WORKGROUP per output cell, WG_SIZE threads striding
+ * a flattened reduction index, shared-memory tree reduce. Returns `threads`
+ * alongside the WGSL because the two forms dispatch differently.
  */
-function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' | 'bool'): string {
+function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' | 'bool'): { wgsl: string, threads: number } {
   const srcStrides = computeStrides(srcShape)
   const tgtStrides = computeStrides(tgtShape)
   const offset = srcShape.length - tgtShape.length
@@ -1189,6 +1403,45 @@ function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' |
   }
   const baseExpr = baseTerms.length > 0 ? baseTerms.join(' + ') : '0u'
 
+  const total = tgtShape.length === 0 ? 1 : (tgtStrides[0]! * tgtShape[0]!)
+  const redLen = reducedAxes.reduce((p, k) => p * srcShape[k]!, 1)
+  const reducedTerms = reducedAxes.map(k => `r${k} * ${srcStrides[k]}u`)
+
+  if (dtype === 'f32' && total < 32768 && redLen >= 256) {
+    // Decompose the flat reduction index r (row-major over reducedAxes'
+    // dims) back into per-axis coordinates, right to left.
+    const rDecomp: string[] = ['    var rem = r;']
+    for (let d = reducedAxes.length - 1; d >= 0; d--) {
+      const k = reducedAxes[d]!
+      if (d === 0) {
+        rDecomp.push(`    let r${k} = rem;`)
+      } else {
+        rDecomp.push(`    let r${k} = rem % ${srcShape[k]!}u;`)
+        rDecomp.push(`    rem = rem / ${srcShape[k]!}u;`)
+      }
+    }
+    const wgsl = `
+var<workgroup> partial : array<f32, ${WG_SIZE}>;
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read_write> out : array<f32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
+  // One workgroup per output cell. wid is workgroup-uniform, so the
+  // early-out keeps every barrier below in uniform control flow.
+  let i = wid.x + wid.y * 65535u;
+  if (i >= ${total}u) { return; }
+${decompose}
+  var s : f32 = 0.0;
+  for (var r : u32 = lid; r < ${redLen}u; r = r + ${WG_SIZE}u) {
+${rDecomp.join('\n')}
+    s = s + a[${baseExpr} + ${reducedTerms.join(' + ')}];
+  }
+${emitWorkgroupReduce('partial', 's')}
+  if (lid == 0u) { out[i] = partial[0]; }
+}`.trim()
+    return { wgsl, threads: total * WG_SIZE }
+  }
+
   const indent = (depth: number) => '  '.repeat(depth + 1)
   const loops: string[] = []
   for (let depth = 0; depth < reducedAxes.length; depth++) {
@@ -1196,7 +1449,6 @@ function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' |
     const dim = srcShape[k]!
     loops.push(`${indent(depth)}for (var r${k} : u32 = 0u; r${k} < ${dim}u; r${k} = r${k} + 1u) {`)
   }
-  const reducedTerms = reducedAxes.map(k => `r${k} * ${srcStrides[k]}u`)
   const fullExpr = reducedTerms.length > 0
     ? `${baseExpr} + ${reducedTerms.join(' + ')}`
     : baseExpr
@@ -1205,12 +1457,11 @@ function emitSumToShape(srcShape: Shape, tgtShape: Shape, dtype: 'f32' | 'i32' |
     loops.push(`${indent(depth)}}`)
   }
 
-  const total = tgtShape.length === 0 ? 1 : (tgtStrides[0]! * tgtShape[0]!)
   const loopBody = reducedAxes.length === 0
     ? `  s = s + a[${baseExpr}];`
     : loops.join('\n')
 
-  return `
+  const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<${wgslDtype(dtype)}>;
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(dtype)}>;
 @compute @workgroup_size(${WG_SIZE})
@@ -1222,4 +1473,5 @@ ${decompose}
 ${loopBody}
   out[i] = s;
 }`.trim()
+  return { wgsl, threads: total }
 }

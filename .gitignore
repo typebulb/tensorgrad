@@ -13,13 +13,12 @@ build-artifacts/
 # never committed — see the transfer-learning spec's hosting note).
 /weights/
 
-# Excluded from publication. Specs are working design notes; .claude/.github
-# are local config.
+# Excluded from publication. .claude/.github are local config.
+# (specs/ and .paste are ignored via .git/info/exclude so they stay out of
+# git but remain visible to Claude Code's @ picker — see that file.)
 .typebulb/
 .github/
 .claude/
-.paste
-specs/
 temp/
 *.bin
 # agent switcher (local Claude Code model override)

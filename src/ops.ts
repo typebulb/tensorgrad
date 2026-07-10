@@ -1071,6 +1071,11 @@ export interface Conv2dOptions {
   stride?: number | readonly [number, number]
   /** Per-side padding along H and W (zero-padding). Default 0. */
   padding?: number | readonly [number, number]
+  /** Number of channel groups (PyTorch semantics). The input's C_in and the
+   *  weight's C_out are each split into `groups` independent convolutions;
+   *  the weight's second dim is `C_in / groups`. Default 1 (dense).
+   *  `groups = C_in` with a `[C_in·k, 1, K_h, K_w]` weight is depthwise. */
+  groups?: number
 }
 
 /** Normalize a number-or-pair to a concrete `[number, number]`, applying
@@ -1082,7 +1087,7 @@ export function pairOpt(v: number | readonly [number, number] | undefined, defau
   return [v[0], v[1]]
 }
 
-/** 2D convolution. Input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
+/** 2D convolution. Input [B, C_in, H, W] · weight [C_out, C_in/groups, K_h, K_w]
  *  -> [B, C_out, H_out, W_out]. Bias is added separately via `add`; see
  *  `Conv2d` for the canonical layer wrapper. */
 export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOptions = {}): Tensor {
@@ -1091,10 +1096,11 @@ export function conv2d(input: Tensor, weight: Tensor, opts: Conv2dOptions = {}):
   if (weight.dtype !== 'f32') throw new ShapeError(`conv2d: weight must be f32, got ${weight.dtype}`, site)
   const [sH, sW] = pairOpt(opts.stride, 1)
   const [pH, pW] = pairOpt(opts.padding, 0)
-  const outShape = inferConv2d('conv2d', input.shape, weight.shape, sH, sW, pH, pW, site)
+  const groups = opts.groups ?? 1
+  const outShape = inferConv2d('conv2d', input.shape, weight.shape, sH, sW, pH, pW, groups, site)
   return addOp(currentGraph(), 'conv2d', outShape, 'f32', site, {
     input: input.id, weight: weight.id,
-    strideH: sH, strideW: sW, padH: pH, padW: pW,
+    strideH: sH, strideW: sW, padH: pH, padW: pW, groups,
   })
 }
 
@@ -1103,16 +1109,17 @@ export function conv2dInputGrad(
   weight: Tensor, dy: Tensor,
   inH: number, inW: number,
   strideH: number, strideW: number, padH: number, padW: number,
+  groups: number,
 ): Tensor {
   const site = captureSite('conv2dInputGrad')
-  const [cOut, cIn] = [weight.shape[0]!, weight.shape[1]!]
+  const [cOut, wInC] = [weight.shape[0]!, weight.shape[1]!]
   const B = dy.shape[0]!
-  const targetShape: Shape = [B, cIn, inH, inW]
+  const targetShape: Shape = [B, wInC * groups, inH, inW]
   if (dy.shape[1] !== cOut) {
     throw new ShapeError(`conv2dInputGrad: dy's C=${dy.shape[1]} doesn't match weight C_out=${cOut}`, site)
   }
   return addOp(currentGraph(), 'conv2d_input_grad', targetShape, 'f32', site, {
-    weight: weight.id, dy: dy.id, inH, inW, strideH, strideW, padH, padW,
+    weight: weight.id, dy: dy.id, inH, inW, strideH, strideW, padH, padW, groups,
   })
 }
 
@@ -1121,13 +1128,14 @@ export function conv2dWeightGrad(
   input: Tensor, dy: Tensor,
   kH: number, kW: number,
   strideH: number, strideW: number, padH: number, padW: number,
+  groups: number,
 ): Tensor {
   const site = captureSite('conv2dWeightGrad')
   const cIn = input.shape[1]!
   const cOut = dy.shape[1]!
-  const targetShape: Shape = [cOut, cIn, kH, kW]
+  const targetShape: Shape = [cOut, cIn / groups, kH, kW]
   return addOp(currentGraph(), 'conv2d_weight_grad', targetShape, 'f32', site, {
-    input: input.id, dy: dy.id, kH, kW, strideH, strideW, padH, padW,
+    input: input.id, dy: dy.id, kH, kW, strideH, strideW, padH, padW, groups,
   })
 }
 

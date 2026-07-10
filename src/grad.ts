@@ -476,10 +476,10 @@ function runAdjointRule(
       const kH = weight.shape[2]!
       const kW = weight.shape[3]!
       accumulate(cotangents, op.input, conv2dInputGrad(
-        weight, outCotan, inH, inW, op.strideH, op.strideW, op.padH, op.padW,
+        weight, outCotan, inH, inW, op.strideH, op.strideW, op.padH, op.padW, op.groups,
       ))
       accumulate(cotangents, op.weight, conv2dWeightGrad(
-        input, outCotan, kH, kW, op.strideH, op.strideW, op.padH, op.padW,
+        input, outCotan, kH, kW, op.strideH, op.strideW, op.padH, op.padW, op.groups,
       ))
       return
     }

@@ -22,7 +22,7 @@ export interface Conv2dLayerOptions extends Conv2dOptions {
  *  `torch.nn.Conv2d` so 1-shot ports don't need transposes. Wraps the
  *  pure `conv2d` op plus an optional broadcast-add bias. */
 export class Conv2d extends Module {
-  /** Weight, shape `[outC, inC, kH, kW]`. Init follows `opts.init`
+  /** Weight, shape `[outC, inC/groups, kH, kW]`. Init follows `opts.init`
    *  (default `randn` with scale 0.02). Pass `init.kaiming()` for
    *  Kaiming init. */
   W: Tensor
@@ -31,6 +31,7 @@ export class Conv2d extends Module {
   b: Tensor | null
   readonly strideH: number; readonly strideW: number
   readonly padH: number;    readonly padW: number
+  readonly groups: number
   constructor(
     public readonly inC: number,
     public readonly outC: number,
@@ -43,13 +44,24 @@ export class Conv2d extends Module {
     const [pH, pW] = pairOpt(opts.padding, 0)
     this.strideH = sH; this.strideW = sW
     this.padH = pH; this.padW = pW
-    this.W = this.param([outC, inC, kH, kW], paramOptsFrom(opts))
+    const groups = opts.groups ?? 1
+    if (!Number.isInteger(groups) || groups < 1) {
+      throw new ShapeError(`Conv2d: groups must be a positive integer, got ${groups}`, captureSite('Conv2d'))
+    }
+    if (inC % groups !== 0 || outC % groups !== 0) {
+      throw new ShapeError(
+        `Conv2d: inC=${inC} and outC=${outC} must both be divisible by groups=${groups}`,
+        captureSite('Conv2d'),
+      )
+    }
+    this.groups = groups
+    this.W = this.param([outC, inC / groups, kH, kW], paramOptsFrom(opts))
     this.b = opts.bias === false ? null : this.param([outC], { init: init.zeros() })
   }
   /** Apply this conv to `x`: `[B, inC, H, W] → [B, outC, H', W']`. Adds
    *  bias (broadcast over the spatial axes) when present. */
   fwd(x: Tensor): Tensor {
-    const y = conv2d(x, this.W, { stride: [this.strideH, this.strideW], padding: [this.padH, this.padW] })
+    const y = conv2d(x, this.W, { stride: [this.strideH, this.strideW], padding: [this.padH, this.padW], groups: this.groups })
     if (!this.b) return y
     const bShaped = reshape(this.b, [1, this.outC, 1, 1])
     return add(y, bShaped)

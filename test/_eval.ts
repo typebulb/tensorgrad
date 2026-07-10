@@ -623,20 +623,23 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       const wT = graph.tensors[op.weight]!
       const outT = graph.tensors[op.out]!
       const [, cIn, H, W] = inT.shape
-      const [cOut, , kH, kW] = wT.shape
+      const [cOut, cInPerG, kH, kW] = wT.shape
+      const cOutPerG = cOut! / op.groups
       const [, , hOut, wOut] = outT.shape
       const out = new Float32Array(shapeSize(outT.shape))
       const B = outT.shape[0]!
       for (let b = 0; b < B; b++) for (let co = 0; co < cOut!; co++) for (let ho = 0; ho < hOut!; ho++) for (let wo = 0; wo < wOut!; wo++) {
+        const g = Math.floor(co / cOutPerG)
         let s = 0
-        for (let ci = 0; ci < cIn!; ci++) for (let kh = 0; kh < kH!; kh++) {
+        for (let cl = 0; cl < cInPerG!; cl++) for (let kh = 0; kh < kH!; kh++) {
+          const ci = g * cInPerG! + cl
           const hi = ho * op.strideH + kh - op.padH
           if (hi < 0 || hi >= H!) continue
           for (let kw = 0; kw < kW!; kw++) {
             const wi = wo * op.strideW + kw - op.padW
             if (wi < 0 || wi >= W!) continue
             s += input[b * cIn! * H! * W! + ci * H! * W! + hi * W! + wi]!
-               * weight[co * cIn! * kH! * kW! + ci * kH! * kW! + kh * kW! + kw]!
+               * weight[co * cInPerG! * kH! * kW! + cl * kH! * kW! + kh * kW! + kw]!
           }
         }
         out[b * cOut! * hOut! * wOut! + co * hOut! * wOut! + ho * wOut! + wo] = s
@@ -649,13 +652,17 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       const wT = graph.tensors[op.weight]!
       const dyT = graph.tensors[op.dy]!
       const outT = graph.tensors[op.out]!
-      const [cOut, cIn, kH, kW] = wT.shape
+      const [cOut, cInPerG, kH, kW] = wT.shape
+      const cOutPerG = cOut! / op.groups
       const [, , hOut, wOut] = dyT.shape
-      const [B, , inH, inW] = outT.shape
+      const [B, cIn, inH, inW] = outT.shape
       const out = new Float32Array(shapeSize(outT.shape))
       for (let b = 0; b < B!; b++) for (let ci = 0; ci < cIn!; ci++) for (let hi = 0; hi < inH!; hi++) for (let wi = 0; wi < inW!; wi++) {
+        const g = Math.floor(ci / cInPerG!)
+        const cl = ci - g * cInPerG!
         let s = 0
-        for (let co = 0; co < cOut!; co++) {
+        for (let coL = 0; coL < cOutPerG; coL++) {
+          const co = g * cOutPerG + coL
           for (let kh = 0; kh < kH!; kh++) {
             const numH = hi + op.padH - kh
             if (numH < 0 || numH % op.strideH !== 0) continue
@@ -666,7 +673,7 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
               if (numW < 0 || numW % op.strideW !== 0) continue
               const wo = numW / op.strideW
               if (wo >= wOut!) continue
-              s += weight[co * cIn! * kH! * kW! + ci * kH! * kW! + kh * kW! + kw]!
+              s += weight[co * cInPerG! * kH! * kW! + cl * kH! * kW! + kh * kW! + kw]!
                  * dy[b * cOut! * hOut! * wOut! + co * hOut! * wOut! + ho * wOut! + wo]!
             }
           }
@@ -683,9 +690,12 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       const outT = graph.tensors[op.out]!
       const [B, cIn, H, W] = inT.shape
       const [, cOut, hOut, wOut] = dyT.shape
-      const [, , kH, kW] = outT.shape
+      const [, cInPerG, kH, kW] = outT.shape
+      const cOutPerG = cOut! / op.groups
       const out = new Float32Array(shapeSize(outT.shape))
-      for (let co = 0; co < cOut!; co++) for (let ci = 0; ci < cIn!; ci++) for (let kh = 0; kh < kH!; kh++) for (let kw = 0; kw < kW!; kw++) {
+      for (let co = 0; co < cOut!; co++) for (let cl = 0; cl < cInPerG!; cl++) for (let kh = 0; kh < kH!; kh++) for (let kw = 0; kw < kW!; kw++) {
+        const g = Math.floor(co / cOutPerG)
+        const ci = g * cInPerG! + cl
         let s = 0
         for (let b = 0; b < B!; b++) {
           for (let ho = 0; ho < hOut!; ho++) {
@@ -699,7 +709,7 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
             }
           }
         }
-        out[co * cIn! * kH! * kW! + ci * kH! * kW! + kh * kW! + kw] = s
+        out[co * cInPerG! * kH! * kW! + cl * kH! * kW! + kh * kW! + kw] = s
       }
       return out
     }

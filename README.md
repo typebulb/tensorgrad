@@ -110,6 +110,7 @@ for (let step = 0; step < 1000; step++) {
 | `pos_emb(torch.arange(T))` (transformer position embeddings) | `pos_emb.fwd(arange(T))` |
 | `torch.flatten(x, start_dim=1)` / `nn.Flatten()` | `reshape(x, [B, -1])` (no `flatten` op — `reshape` is the only shape primitive) |
 | `nn.Conv2d(in, out, k, stride=s, padding=p)` | `new Conv2d(in, out, k, { stride: s, padding: p })` |
+| `nn.Conv2d(in, out, k, groups=g)` (grouped / depthwise conv) | `new Conv2d(in, out, k, { groups: g })` — weight is `[out, in/g, kH, kW]`, PyTorch layout |
 | `F.max_pool2d(x, k, stride=s, padding=p)` | `maxPool2d(x, k, { stride: s, padding: p })` |
 | `F.interpolate(x, scale_factor=k, mode='nearest')` | `nearestUpsample2d(x, k)` |
 | `torch.randn(shape)` | `randn(shape)` — uses the per-step PRNG; zero gradient |
@@ -216,6 +217,8 @@ const y  = reshape(conv.fwd(x4), [B, Cout, Tout])
 ```
 
 **Transfer learning is two-stage: frozen features, then a trained head.** There's no param-freeze flag — instead run a frozen backbone with `compileForward`, cache its feature vectors in JS, then train a small head on those features with the ordinary `compile` training API. The backbone is a `Module` *you* define and load weights into (via `loadSafetensors` → `uploadParams`); tensorgrad ships no pretrained backbones, and matching a checkpoint requires the exact same graph (per-tensor shapes must match; only naming + storage layout — e.g. PyTorch's `[out, in]` Linear weights vs tensorgrad's `[in, out]` — are reconcilable, transpose on import). Weights are f32-only, so convert non-f32 checkpoints offline before hosting.
+
+A lighter freeze idiom also works *inside* a training compile: pass fixed weights as a regular `inputs` tensor (rather than a param) and feed the same TypedArray every step. Dead-code elimination removes backward work whose result nothing consumes, so a frozen filter bank fed this way costs only its forward pass — no weight-gradient kernels are compiled for it.
 
 ```ts
 // 1. Run the frozen backbone (its own params, no training counterpart).
@@ -388,7 +391,7 @@ Imported from `'tensorgrad'`:
 - Const-tensor builders: `zeros(shape, dtype?)`, `ones(shape, dtype?)` (default `f32`; non-differentiable; pair with `randn`/`arange` as the complete set — no `full`, `eye`, `linspace`, `tril`, `zerosLike`, or `like`-variants)
 - Slicing / structural: `narrow(t, axis, start, length)` (PyTorch `torch.narrow`), `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal(x, fillValue)` (mask below the diagonal; pairs with `softmaxCausal` when you need a non-softmax causal mask)
-- 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`
+- 2D conv / pool / upsample (NCHW): `conv2d(input, weight, { stride?, padding?, groups? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`
 
 `add`, `sub`, `mul`, `div`, `min`, `max`, `less`, `greater` all accept `(Tensor, Tensor)`, `(Tensor, number)`, or `(number, Tensor)` — scalar broadcasts on either side. Non-commutative ops (`sub`, `div`, `less`, `greater`) honor the operand order: `sub(2, x) === 2 - x`. `argmax` and `argmin` return `i32` and are non-differentiable. The standard loss tail is `crossEntropy(logits, targets)` (reduces to scalar mean by default).
 
@@ -406,8 +409,11 @@ new Linear(inDim, outDim, { bias?, init?, decay? })   // .fwd(x); W: [inDim, out
 new LayerNorm(dim, { eps?, bias?, decay? })  // .fwd(x); g (gain) [dim], b (bias) [dim] or null when bias:false
 new RMSNorm(dim, { eps?, decay? })           // .fwd(x); g (gain) only — Llama-style
 new Embedding(vocab, dim, { init?, decay? })          // .fwd(idx); W: [vocab, dim]; idx is i32 [...]
-new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? }) // .fwd(x); NCHW; dense only (no `groups`); k/stride/padding accept int or [kH, kW]
+new Conv2d(inC, outC, k, { stride?, padding?, groups?, bias?, init?, decay? }) // .fwd(x); NCHW; k/stride/padding accept int or [kH, kW]
                                       // x: [B, inC, H, W] -> [B, outC, H', W']
+                                      // groups (default 1) splits channels into independent convs
+                                      // (PyTorch semantics); W is [outC, inC/groups, kH, kW].
+                                      // groups = inC with outC a multiple of inC is depthwise.
 crossEntropy(logits, targets, { reduction? })  // [..., V] + [...] → scalar; fused log-softmax + NLL; default mean
 nllLoss(logProbs, targets, { reduction? })     // NLL only; pair with logSoftmax for the log-prob intermediate
 ```

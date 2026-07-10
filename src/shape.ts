@@ -316,24 +316,40 @@ export function inferConv2dOutputSpatial(
   return out
 }
 
-/** conv2d: input [B, C_in, H, W] · weight [C_out, C_in, K_h, K_w]
- *  -> [B, C_out, H_out, W_out]. */
+/** conv2d: input [B, C_in, H, W] · weight [C_out, C_in/G, K_h, K_w]
+ *  -> [B, C_out, H_out, W_out]. `groups` (G) splits channels into G
+ *  independent convolutions (PyTorch semantics); G=1 is the dense case. */
 export function inferConv2d(
   opName: string,
   inputShape: Shape, weightShape: Shape,
   strideH: number, strideW: number, padH: number, padW: number,
+  groups: number,
   site: CallSite | null,
 ): Shape {
   if (inputShape.length !== 4) {
     fail(`${opName}: input must be rank-4 [B, C_in, H, W], got ${showShape(inputShape)}`, site)
   }
   if (weightShape.length !== 4) {
-    fail(`${opName}: weight must be rank-4 [C_out, C_in, K_h, K_w], got ${showShape(weightShape)}`, site)
+    fail(`${opName}: weight must be rank-4 [C_out, C_in/groups, K_h, K_w], got ${showShape(weightShape)}`, site)
+  }
+  if (!Number.isInteger(groups) || groups < 1) {
+    fail(`${opName}: groups must be a positive integer, got ${groups}`, site)
   }
   const [B, cIn, H, W] = [inputShape[0]!, inputShape[1]!, inputShape[2]!, inputShape[3]!]
   const [cOut, wInC, kH, kW] = [weightShape[0]!, weightShape[1]!, weightShape[2]!, weightShape[3]!]
-  if (cIn !== wInC) {
-    fail(`${opName}: input C_in=${cIn} doesn't match weight C_in=${wInC}`, site)
+  if (cIn % groups !== 0) {
+    fail(`${opName}: input C_in=${cIn} is not divisible by groups=${groups}`, site)
+  }
+  if (cOut % groups !== 0) {
+    fail(`${opName}: weight C_out=${cOut} is not divisible by groups=${groups}`, site)
+  }
+  if (cIn / groups !== wInC) {
+    fail(
+      groups === 1
+        ? `${opName}: input C_in=${cIn} doesn't match weight C_in=${wInC}`
+        : `${opName}: weight's second dim must be C_in/groups=${cIn / groups} (C_in=${cIn}, groups=${groups}), got ${wInC}`,
+      site,
+    )
   }
   const hOut = inferConv2dOutputSpatial(opName, H, kH, strideH, padH, 'H', site)
   const wOut = inferConv2dOutputSpatial(opName, W, kW, strideW, padW, 'W', site)

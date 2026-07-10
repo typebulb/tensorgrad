@@ -61,7 +61,7 @@ export interface CallSite {
  * op-specific scalar parameters baked at trace time.
  *
  * Adding a new op means:
- *   1. add a variant here, plus a `getOpInputs` case below,
+  *   1. add a variant here, plus a `remapOpInputs` case below,
  *   2. add a shape rule in `src/shape.ts`,
  *   3. add an adjoint rule in `src/grad.ts`,
  *   4. add a kernel template in `src/codegen.ts`,
@@ -207,14 +207,19 @@ export type OpNode =
   | { kind: 'relu_grad'; out: number; x: number; dy: number }
 
   // ---- 2D convolution (NCHW). Bias is added separately via `add` + reshape
-  // so these ops stay pure. Stride/padding are non-negative ints.
+  // so these ops stay pure. Stride/padding are non-negative ints. `groups`
+  // (>= 1) splits channels into independent convolutions: input channels
+  // [g*C_in/G, (g+1)*C_in/G) feed output channels [g*C_out/G, (g+1)*C_out/G),
+  // and the weight's second dim is C_in/G. groups=1 is dense; groups=C_in
+  // with C_out=C_in is depthwise.
   | {
-      kind: 'conv2d'                                // [B, C_in, H, W] · [C_out, C_in, K_h, K_w]
+      kind: 'conv2d'                                // [B, C_in, H, W] · [C_out, C_in/G, K_h, K_w]
       out: number
       input: number
       weight: number
       strideH: number; strideW: number
       padH: number; padW: number
+      groups: number
     }
   // dInput as transposed-conv of dy with weight. Implemented as a gather:
   // each input position sums contributions from every output whose receptive
@@ -227,9 +232,10 @@ export type OpNode =
       inH: number; inW: number
       strideH: number; strideW: number
       padH: number; padW: number
+      groups: number
     }
   // dWeight as correlation between input and dy. Gather over (B, H_out, W_out)
-  // per (C_out, C_in, K_h, K_w).
+  // per (C_out, C_in/G, K_h, K_w).
   | {
       kind: 'conv2d_weight_grad'
       out: number
@@ -238,6 +244,7 @@ export type OpNode =
       kH: number; kW: number
       strideH: number; strideW: number
       padH: number; padW: number
+      groups: number
     }
 
   // ---- 2D max pooling (NCHW). Argmax indices are not stored; backward
@@ -328,16 +335,34 @@ export function addOp<K extends OpNode['kind']>(
  * before rhs for binops, condition before branches for `where`, etc. Scalar
  * parameters baked into the op (e.g. `dropout.p`, `mul_scalar.scalar`) are
  * not tensors and don't appear.
+  *
+  * Derived from `remapOpInputs` (the one switch over every op kind) with an
+  * id-collecting identity mapper, so the two can never drift.
  */
 export function getOpInputs(op: OpNode): readonly number[] {
+  const ids: number[] = []
+  remapOpInputs(op, id => (ids.push(id), id))
+  return ids
+}
+
+/**
+ * A copy of `op` with every input tensor id passed through `f`. The write-side
+  * canonical form of the op-kind → input-field mapping; `getOpInputs` is
+  * derived from it, so this is the ONLY switch to extend when adding an op.
+  * Field order matters: `getOpInputs` reports ids in the order `f` is called.
+ * `out` is copied unchanged; callers that renumber outputs (the DCE pass)
+ * overwrite it on the result.
+ */
+export function remapOpInputs(op: OpNode, f: (id: number) => number): OpNode {
   switch (op.kind) {
     case 'param_input': case 'tensor_input': case 'state_input':
-    case 'arange': case 'const_scalar': case 'const_fill': case 'randn':
-      return []
+    case 'arange': case 'const_scalar': case 'const_fill':
+      return { ...op }
+    case 'randn': return { ...op, seed: f(op.seed) }
     case 'add': case 'sub': case 'mul': case 'div': case 'min': case 'max':
     case 'less': case 'greater':
     case 'matmul': case 'matmul_batched':
-      return [op.a, op.b]
+      return { ...op, a: f(op.a), b: f(op.b) }
     case 'mul_scalar': case 'add_scalar':
     case 'sqrt': case 'rsqrt': case 'log': case 'exp': case 'relu':
     case 'neg': case 'abs': case 'tanh': case 'sigmoid': case 'erf': case 'sin': case 'cos':
@@ -347,24 +372,25 @@ export function getOpInputs(op: OpNode): readonly number[] {
     case 'where_causal': case 'stop_gradient':
     case 'slice_range': case 'scatter_axis':
     case 'broadcast_to': case 'sum_to_shape':
-      return [op.a]
-    case 'dropout': return [op.a, op.seed]
-    case 'categorical_last': return [op.a, op.seed]
-    case 'one_hot': return [op.indices]
-    case 'where': return [op.cond, op.a, op.b]
-    case 'concat': return op.inputs
-    case 'relu_grad': return [op.x, op.dy]
-    case 'adam_update_m': return [op.m, op.g]
-    case 'adam_update_v': return [op.v, op.g]
+      return { ...op, a: f(op.a) }
+    case 'dropout': return { ...op, a: f(op.a), seed: f(op.seed) }
+    case 'categorical_last': return { ...op, a: f(op.a), seed: f(op.seed) }
+    case 'one_hot': return { ...op, indices: f(op.indices) }
+    case 'where': return { ...op, cond: f(op.cond), a: f(op.a), b: f(op.b) }
+    case 'concat': return { ...op, inputs: op.inputs.map(f) }
+    case 'relu_grad': return { ...op, x: f(op.x), dy: f(op.dy) }
+    case 'adam_update_m': return { ...op, m: f(op.m), g: f(op.g) }
+    case 'adam_update_v': return { ...op, v: f(op.v), g: f(op.g) }
     case 'adam_update_p':
-      return op.decayShrinkTensor !== null
-        ? [op.p, op.mNew, op.vNew, op.lrt, op.decayShrinkTensor]
-        : [op.p, op.mNew, op.vNew, op.lrt]
-    case 'conv2d': return [op.input, op.weight]
-    case 'conv2d_input_grad': return [op.weight, op.dy]
-    case 'conv2d_weight_grad': return [op.input, op.dy]
-    case 'max_pool_2d': return [op.input]
-    case 'max_pool_2d_grad': return [op.input, op.dy]
+      return {
+        ...op, p: f(op.p), mNew: f(op.mNew), vNew: f(op.vNew), lrt: f(op.lrt),
+        decayShrinkTensor: op.decayShrinkTensor !== null ? f(op.decayShrinkTensor) : null,
+      }
+    case 'conv2d': return { ...op, input: f(op.input), weight: f(op.weight) }
+    case 'conv2d_input_grad': return { ...op, weight: f(op.weight), dy: f(op.dy) }
+    case 'conv2d_weight_grad': return { ...op, input: f(op.input), dy: f(op.dy) }
+    case 'max_pool_2d': return { ...op, input: f(op.input) }
+    case 'max_pool_2d_grad': return { ...op, input: f(op.input), dy: f(op.dy) }
   }
 }
 

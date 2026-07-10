@@ -94,6 +94,27 @@ assertGradMatchesFD('conv2d (weight gradient, stride 2, padding 1)', [3, 2, 2, 2
   return mean(conv2d(x, p, { stride: 2, padding: 1 }))
 }, { extraInputs: { x: makeRange([1, 2, 4, 4]) } })
 
+// 9f. Grouped conv, both gradient sides. The group index arithmetic is new
+//     code in all three kernels; FD catches a wrong group offset on either
+//     the input-grad or weight-grad path. C_in=4, C_out=6, groups=2 →
+//     weight [6, 2, 2, 2]: non-trivial cInPerG (2) and cOutPerG (3).
+assertGradMatchesFD('conv2d groups=2 (input gradient)', [1, 4, 4, 4], p => {
+  const k = tensorInput('k', [6, 2, 2, 2])
+  return mean(conv2d(p, k, { groups: 2 }))
+}, { extraInputs: { k: makeRange([6, 2, 2, 2]) } })
+
+assertGradMatchesFD('conv2d groups=2 (weight gradient, stride 2, padding 1)', [6, 2, 2, 2], p => {
+  const x = tensorInput('x', [1, 4, 4, 4])
+  return mean(conv2d(x, p, { stride: 2, padding: 1, groups: 2 }))
+}, { extraInputs: { x: makeRange([1, 4, 4, 4]) } })
+
+// 9g. Depthwise extreme: groups = C_in, weight [C, 1, 3, 3] — the growing-nca
+//     perception-stage shape class.
+assertGradMatchesFD('conv2d depthwise groups=C (input gradient)', [1, 3, 4, 4], p => {
+  const k = tensorInput('k', [3, 1, 3, 3])
+  return mean(conv2d(p, k, { padding: 1, groups: 3 }))
+}, { extraInputs: { k: makeRange([3, 1, 3, 3]) } })
+
 // 9c. Slice + scatter-into-zero backward. `narrow` on a non-last axis is the
 //     general path; its adjoint emits the scatter_axis op (narrow's reverse). A
 //     stable test takes a slice and reduces — gradient is 1/N inside the slice,
@@ -146,6 +167,42 @@ assertGradMatchesFD('maxPool2d (argmax-routing gradient)', [1, 2, 4, 4], p => {
     }
   }
   ok(`stopGradient blocks backward — autograd grad is 1/N on the un-detached path only`)
+}
+
+// 12. Grouped conv forward == dense conv with a block-diagonal weight. The
+//     defining equation of `groups`: expanding the grouped weight into a
+//     dense [C_out, C_in, K, K] weight that is zero off its group's block
+//     must reproduce the grouped output exactly.
+{
+  const [B, cIn, cOut, G, K, H, W] = [2, 4, 6, 2, 3, 5, 5]
+  const cInPerG = cIn / G, cOutPerG = cOut / G
+  const x = makeRange([B, cIn, H, W])
+  const wGrouped = makeRange([cOut, cInPerG, K, K])
+  const wDense = new Float32Array(cOut * cIn * K * K)
+  for (let co = 0; co < cOut; co++) {
+    const g = Math.floor(co / cOutPerG)
+    for (let cl = 0; cl < cInPerG; cl++) for (let i = 0; i < K * K; i++) {
+      wDense[co * cIn * K * K + (g * cInPerG + cl) * K * K + i] =
+        wGrouped[co * cInPerG * K * K + cl * K * K + i]!
+    }
+  }
+  const gGrouped = traceFn(() => conv2d(
+    tensorInput('x', [B, cIn, H, W]), tensorInput('w', [cOut, cInPerG, K, K]),
+    { padding: 1, groups: G },
+  ))
+  const gDense = traceFn(() => conv2d(
+    tensorInput('x', [B, cIn, H, W]), tensorInput('w', [cOut, cIn, K, K]),
+    { padding: 1 },
+  ))
+  const outGrouped = evalGraph(gGrouped, { x, w: wGrouped }).get(gGrouped.outputs[0]!) as Float32Array
+  const outDense = evalGraph(gDense, { x, w: wDense }).get(gDense.outputs[0]!) as Float32Array
+  if (outGrouped.length !== outDense.length) fail(`grouped vs dense: output sizes differ (${outGrouped.length} vs ${outDense.length})`)
+  for (let i = 0; i < outGrouped.length; i++) {
+    if (Math.abs(outGrouped[i]! - outDense[i]!) > 1e-5) {
+      fail(`grouped vs dense conv mismatch at ${i}: ${outGrouped[i]} vs ${outDense[i]}`)
+    }
+  }
+  ok('conv2d groups=2 forward == dense conv with block-diagonal weight')
 }
 
 done('test/grad.ts')

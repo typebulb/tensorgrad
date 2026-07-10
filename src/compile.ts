@@ -16,6 +16,7 @@
 import type { Tensor, Shape, Dtype } from './ir.js'
 import { traceFn, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
+import { eliminateDeadCode } from './dce.js'
 import {
   appendAdam, wireAdamConfig,
   type AdamConfig, type AdamWConfig, type AdamResult,
@@ -483,13 +484,24 @@ async function buildTrainingIR<M extends Module, I extends InputDecls>(
   const inputs = opts.inputs as InputDecls
   const { graph, materialized } = traceModule(opts.model, loss, inputs)
   await yieldToUI()
-  const { paramGrads, loss: lossTensor } = appendGrad(graph)
+  const gradOut = appendGrad(graph)
+  // DCE before the optimizer pass: autograd emits an adjoint for every
+  // differentiable op it walks, including gradients nobody consumes (the
+  // headline case: weight-grads for frozen weights passed as tensor inputs).
+  // Pruning here — before appendAdam/appendSGD — keeps the optimizer's own
+  // tensors out of the renumbering entirely. Handles taken before the pass
+  // (param grads, the loss, materialized param tensors) are re-resolved
+  // through the returned id map.
+  const idMap = eliminateDeadCode(graph, Object.values(gradOut.paramGrads).map(t => t.id))
+  const paramGrads = remapTensorRecord(gradOut.paramGrads, idMap)
+  const paramTensors = remapTensorRecord(materialized.tensors, idMap)
+  const lossTensor = idMap.get(gradOut.loss.id)!
   await yieldToUI()
   const adamResult = opts.optimizer.kind === 'adam' || opts.optimizer.kind === 'adamw'
-    ? appendAdam(graph, paramGrads, materialized.tensors, opts.optimizer, materialized.decayFlags)
+    ? appendAdam(graph, paramGrads, paramTensors, opts.optimizer, materialized.decayFlags)
     : undefined
   const sgdResult = opts.optimizer.kind === 'sgd'
-    ? appendSGD(graph, paramGrads, materialized.tensors, opts.optimizer, materialized.decayFlags)
+    ? appendSGD(graph, paramGrads, paramTensors, opts.optimizer, materialized.decayFlags)
     : undefined
   const writebacks = adamResult?.writebacks ?? sgdResult?.writebacks ?? []
   await yieldToUI()
@@ -497,6 +509,19 @@ async function buildTrainingIR<M extends Module, I extends InputDecls>(
   const kernels = emitKernels(graph, plan)
   const ir: CompiledIR = { graph, paramGrads, loss: lossTensor, plan, kernels }
   return { ir, materialized, adamResult, sgdResult }
+}
+
+/** Re-resolve a name → Tensor record through a DCE id map. Every tensor in
+ *  the record must have survived the pass (param leaves and param grads are
+ *  DCE roots, so this holds by construction). */
+function remapTensorRecord(rec: Record<string, Tensor>, idMap: Map<number, Tensor>): Record<string, Tensor> {
+  const out: Record<string, Tensor> = {}
+  for (const [name, t] of Object.entries(rec)) {
+    const mapped = idMap.get(t.id)
+    if (!mapped) throw new Error(`dce: tensor '${name}' (#${t.id}) did not survive dead-code elimination`)
+    out[name] = mapped
+  }
+  return out
 }
 
 /** Pure-JS portion of a forward-only graph build. Shared by `traceForward()`
@@ -509,6 +534,9 @@ async function buildForwardIR<M extends Module>(
   decls: InputDecls,
 ): Promise<{ ir: CompiledIR; materialized: MaterializedParams }> {
   const { graph, materialized } = traceModule(model, forward, decls)
+  // Forward graphs get the same sweep: user forwards can compute values that
+  // never reach the output (config-driven branches, debug leftovers).
+  eliminateDeadCode(graph)
   await yieldToUI()
   const outputTensor = graph.tensors[graph.outputs[0]!]!
   const plan = planBuffers(graph, {})

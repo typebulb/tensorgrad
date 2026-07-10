@@ -39,6 +39,13 @@ const N_LAYERS = 3
 const N_HEADS = 4
 const D_HEAD = D_MODEL / N_HEADS
 const BATCH_SIZE = 128
+// Training steps per UI yield. The loop yields to requestAnimationFrame once per
+// BURST, not once per step — so the step rate isn't pinned to the ~60 Hz frame
+// clock (which capped throughput at ~60·BATCH_SIZE ≈ 7.7k ex/s no matter how
+// fast the GPU finished a step, leaving it idle most of each frame). Bursting
+// lets training run at GPU speed between frames while the UI still refreshes
+// every frame. Tune down if the page feels less responsive.
+const STEPS_PER_YIELD = 16
 const T_LEN = SEQ_LEN - 1
 const LR_SCHEDULE = lr.linear({ peak: 0.005, final: 0.0005, steps: 1500 })
 
@@ -529,7 +536,11 @@ class Model extends Component implements IModel {
     let lastPredictUpdate = 0
     let lastDiagnostic = 0
     while (this.isRunning) {
-      await this.trainOneStep()
+      // Run a burst of steps at GPU speed, then yield ONCE for the UI. Yielding
+      // per-step (the old code) pinned the step rate to the ~60 Hz frame clock.
+      for (let i = 0; i < STEPS_PER_YIELD && this.isRunning; i++) {
+        await this.trainOneStep()
+      }
       await new Promise<void>(r => requestAnimationFrame(() => r()))
       const now = performance.now()
       if (now - lastUiUpdate > 100) {
