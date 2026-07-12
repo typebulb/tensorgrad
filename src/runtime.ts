@@ -182,6 +182,15 @@ export async function createRuntime(
       buffers.set(spec.id, shared)
       continue
     }
+    // Oversized bindings don't throw — they invalidate the command buffer at
+    // submit and every readback silently returns zeros. Fail loudly instead.
+    if (spec.byteSize > device.limits.maxStorageBufferBindingSize) {
+      throw new Error(
+        `tensor '${spec.name ?? `t${spec.id}`}' needs ${spec.byteSize} bytes, over this device's ` +
+        `maxStorageBufferBindingSize (${device.limits.maxStorageBufferBindingSize}). ` +
+        `Shrink the batch/resolution, or run on an adapter with higher limits.`,
+      )
+    }
     const buf = device.createBuffer({
       size: spec.byteSize,
       usage: STORAGE_RW,

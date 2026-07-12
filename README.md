@@ -88,6 +88,7 @@ for (let step = 0; step < 1000; step++) {
 | `optim.Adam(params, lr=...)` | `optimizer: { kind: 'adam', lr }` in `compile({ ... })` |
 | `optim.AdamW(params, lr=..., weight_decay=w)` | `optimizer: { kind: 'adamw', lr, weightDecay: w }` |
 | `optim.SGD(params, lr=..., momentum=..., nesterov=...)` | `optimizer: { kind: 'sgd', lr, momentum?, nesterov? }` in `compile({ ... })` |
+| `p.grad /= p.grad.norm() + 1e-8` in the training loop (NCA recipes) | `optimizer: { ..., normalizeGrads: true }` — or a param-name filter |
 | `StepLR(opt, step_size=N, gamma=g)` | `lr.staircase({ peak, every: N, gamma: g })` |
 | `MultiStepLR(opt, milestones=[..], gamma=g)` | `lr.multiStep({ peak, milestones: [..], gamma: g })` |
 | `CosineAnnealingLR(opt, T_max=N, eta_min=m)` | `lr.cosineAnnealing({ peak, final: m, steps: N })` |
@@ -432,6 +433,7 @@ import { lr } from 'tensorgrad'
 // Plain Adam
 optimizer: { kind: 'adam', lr: 0.005 }
 optimizer: { kind: 'adam', lr: 0.005, clipGradNorm: 1.0 }
+optimizer: { kind: 'adam', lr: 0.005, normalizeGrads: true }   // per-param g/(‖g‖+1e-8); or pass a name filter
 
 // AdamW — decoupled weight decay (Loshchilov & Hutter)
 optimizer: { kind: 'adamw', lr: 0.005, weightDecay: 0.01 }
@@ -472,7 +474,7 @@ await train.setLR(
 )  // non-constant schedules auto-rebase so step 1 = next training step
 ```
 
-### Gradient clipping
+### Gradient clipping and normalization
 
 Global L2-norm clipping matches PyTorch's `clip_grad_norm_` and optax's `clip_by_global_norm`. Set `clipGradNorm` on either the Adam or SGD optimizer config:
 
@@ -484,6 +486,8 @@ const compiled = await compile({
 ```
 
 The clip is **global** across all params (one shared scale factor), applied between backward and the optimizer update. Constant at compile time — there's no runtime knob to change `clipGradNorm` after compile.
+
+`normalizeGrads` is the per-parameter counterpart: each selected gradient is rescaled to unit norm (`g / (||g||₂ + 1e-8)`, the NCA recipes' `p.grad /= p.grad.norm()`), before clipping when both are set. Pass `true` for all params or a name filter for a subset; a filter that matches nothing throws at compile.
 
 ### Param init (`init` namespace)
 
@@ -585,15 +589,19 @@ The library is small because of what it doesn't do. Plan accordingly:
 - **One transformation: `grad`.** No `vmap`, `pmap`, `jvp`, `custom_vjp`.
   Batch your data explicitly.
 - **Only `lr` is hot-mutable.** `weightDecay`, `beta1`, `beta2`, `clipGradNorm`,
-  and which params receive decay are baked at compile time. Use `setLR` for
-  live LR changes; everything else needs `replaceModel({ optimizer })`.
+  `normalizeGrads`, and which params receive decay are baked at compile time.
+  Use `setLR` for live LR changes; everything else needs
+  `replaceModel({ optimizer })`.
 - **Loss must be a scalar.** A training spec's `loss` returns a rank-0 tensor.
 - **Closures don't cross the worker boundary.** LR schedules and inits are
   serializable shapes, not functions.
 - **One model per training compile.** Forward specs attach via
   `train.attach(forwardSpec)` to share params; otherwise each `compile()`
   of a training spec spawns its own worker.
-- **Buffers over 256 MB read back as zeros.** This is a reasonable limit and ensures your code is portable across a wide range of WebGPU devices. If you hit it, loss sticks at 0.000 — shrink the batch or split the op.
+- **Buffer sizes are bounded by your adapter's limits.** The device is
+  requested at the adapter's maximum (capped at 2 GB); a tensor over the
+  storage-binding limit fails the compile loudly with the tensor's name.
+  Limits vary by adapter — a graph that fits on desktop may not on mobile.
 
 ## License
 

@@ -23,7 +23,7 @@ import {
   stopGradient,
 } from '../src/index.js'
 import { traceFn, paramInput, tensorInput } from '../src/trace.js'
-import { appendGrad } from '../src/grad.js'
+import { appendGrad, appendGradNormalize } from '../src/grad.js'
 import { evalGraph } from './_eval.js'
 import { section, ok, fail, done } from './_assert.js'
 import { assertGradMatchesFD } from './_fdgrad.js'
@@ -203,6 +203,50 @@ assertGradMatchesFD('maxPool2d (argmax-routing gradient)', [1, 2, 4, 4], p => {
     }
   }
   ok('conv2d groups=2 forward == dense conv with block-diagonal weight')
+}
+
+// 13. Per-param gradient normalization: the selected param's normalized
+//     gradient has unit L2 norm and preserves direction; a filtered-out
+//     param's gradient is passed through untouched (same tensor).
+{
+  const N = 6
+  const init = makeRange([N])
+  const graph = traceFn(() => {
+    const p = paramInput('w', [N])
+    const q = paramInput('v', [N])
+    return add(mean(mul(p, p)), mean(mul(q, q)))
+  })
+  const { paramGrads } = appendGrad(graph)
+  const normed = appendGradNormalize(graph, paramGrads, name => name === 'w')
+  if (normed['v'] !== paramGrads['v']) fail('normalizeGrads: filtered-out param grad should pass through untouched')
+  const vals = evalGraph(graph, { w: init, v: init })
+  const raw = vals.get(paramGrads['w']!.id) as Float32Array
+  const g = vals.get(normed['w']!.id) as Float32Array
+  let norm = 0, rawNorm = 0
+  for (let i = 0; i < N; i++) { norm += g[i]! * g[i]!; rawNorm += raw[i]! * raw[i]! }
+  norm = Math.sqrt(norm); rawNorm = Math.sqrt(rawNorm)
+  if (Math.abs(norm - 1) > 1e-4) fail(`normalizeGrads: ||g|| = ${norm}, expected 1`)
+  for (let i = 0; i < N; i++) {
+    if (Math.abs(g[i]! - raw[i]! / (rawNorm + 1e-8)) > 1e-5) {
+      fail(`normalizeGrads: g[${i}]=${g[i]} != raw/||raw|| (direction not preserved)`)
+    }
+  }
+  ok('appendGradNormalize — unit-norm gradient, direction preserved, filter respected')
+}
+
+// 13b. A normalizeGrads filter that matches no param is a config bug (typo'd
+//      name) and must throw rather than silently skip the recipe.
+{
+  const graph = traceFn(() => {
+    const p = paramInput('w', [4])
+    return mean(mul(p, p))
+  })
+  const { paramGrads } = appendGrad(graph)
+  let threw = false
+  try { appendGradNormalize(graph, paramGrads, name => name === 'typo.W') }
+  catch { threw = true }
+  if (!threw) fail('normalizeGrads: zero-match filter should throw')
+  ok('appendGradNormalize — zero-match filter throws at compile')
 }
 
 done('test/grad.ts')

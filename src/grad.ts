@@ -129,6 +129,48 @@ export function appendGradClip(
   })
 }
 
+/**
+ * Append per-parameter gradient normalization to `graph`: each selected
+ * gradient is replaced by `g / (||g||_2 + 1e-8)`. Standard NCA training
+ * practice (Mordvintsev et al.; Cells2Pixels' `normalize_model_grads`) —
+ * it is what makes L1-style losses safe on cellular automata, where raw
+ * gradient magnitudes swing violently across the rollout.
+ *
+ * Unlike `appendGradClip` (one global scale across all params), the scale
+ * here is per-parameter and always applied — it rescales rather than caps.
+ * `filter` selects which params normalize (e.g. NCA weights but not the
+ * decoder's, the reference's setup); omitted means all.
+ *
+ * A post-grad transform like `appendGradClip`: the optimizers call it when
+ * `normalizeGrads` is set (before clipping, when both are set), and it's
+ * usable directly when composing with a custom optimizer.
+ */
+export function appendGradNormalize(
+  graph: Graph,
+  paramGrads: Record<string, Tensor>,
+  filter?: (paramName: string) => boolean,
+): Record<string, Tensor> {
+  return traceInto(graph, () => {
+    const out: Record<string, Tensor> = {}
+    let matched = 0
+    for (const [name, g] of Object.entries(paramGrads)) {
+      if (filter && !filter(name)) { out[name] = g; continue }
+      matched++
+      const norm = add(sqrt(sum(mul(g, g))), 1e-8)
+      out[name] = div(g, broadcastTo(norm, g.shape))
+    }
+    // A filter that selects nothing is a config bug (typo'd param name), and
+    // silently skipping it would fake the recipe the caller asked for.
+    if (filter && matched === 0 && Object.keys(paramGrads).length > 0) {
+      throw new Error(
+        `normalizeGrads: the filter matched no parameters. Param names are ` +
+        `property paths like 'w1.W' — available: ${Object.keys(paramGrads).join(', ')}`,
+      )
+    }
+    return out
+  })
+}
+
 // Sum into the cotangent of `inputId` (multiple consumers accumulate).
 function accumulate(cotangents: Map<number, Tensor>, inputId: number, contribution: Tensor): void {
   const existing = cotangents.get(inputId)

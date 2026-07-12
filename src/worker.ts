@@ -73,7 +73,19 @@ async function ensureDevice(): Promise<GPUDevice> {
     if (adapter) break
   }
   if (!adapter) throw new Error('tensorgrad worker: no WebGPU adapter')
-  device = await adapter.requestDevice()
+  // Default WebGPU limits cap a single storage-buffer BINDING at 128 MB and a
+  // buffer at 256 MB — one big activation tensor (e.g. a [B·H·W, C] matmul
+  // operand at render resolution) silently invalidates the whole command
+  // buffer if it exceeds them. Ask for what the adapter actually supports,
+  // capped at 2 GB (the practical WGSL i32-indexing horizon).
+  const CAP = 2147483644   // 2 GB - 4, the common adapter max
+  const lim = adapter.limits
+  device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: Math.min(lim.maxStorageBufferBindingSize, CAP),
+      maxBufferSize: Math.min(lim.maxBufferSize, CAP),
+    },
+  })
   return device
 }
 

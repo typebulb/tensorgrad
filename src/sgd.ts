@@ -12,7 +12,7 @@ import type { Tensor, Graph } from './ir.js'
 import type { WritebackDecl } from './buffers.js'
 import { traceInto, stateInput, tensorInput } from './trace.js'
 import { add, sub, mul, mulScalar, broadcastTo } from './ops.js'
-import { appendGradClip } from './grad.js'
+import { appendGradClip, appendGradNormalize } from './grad.js'
 import { type LR, isLRDynamic } from './lr.js'
 import type { WireSGDConfig } from './worker-protocol.js'
 
@@ -41,6 +41,10 @@ export interface SGDConfig {
    *  by `min(1, maxNorm / (totalNorm + 1e-6))` before the SGD update.
    *  Matches PyTorch's `clip_grad_norm_`. */
   clipGradNorm?: number
+  /** Per-parameter gradient normalization: `g / (||g||_2 + 1e-8)` per
+   *  selected param, before the update (and before `clipGradNorm` when both
+   *  are set). `true` = all params; a filter selects by name. */
+  normalizeGrads?: boolean | ((paramName: string) => boolean)
 }
 
 /** Resolved hyperparameters with all fields populated. `lr` stays as the
@@ -102,7 +106,14 @@ export function appendSGD(
   config: SGDConfig,
   decayFlags?: Record<string, boolean>,
 ): SGDResult {
-  // Clipping happens in-graph before the rest of the update.
+  // Grad transforms happen in-graph before the rest of the update:
+  // per-param normalization first, then global clipping.
+  if (config.normalizeGrads) {
+    paramGrads = appendGradNormalize(
+      graph, paramGrads,
+      typeof config.normalizeGrads === 'function' ? config.normalizeGrads : undefined,
+    )
+  }
   if (config.clipGradNorm !== undefined && config.clipGradNorm > 0) {
     paramGrads = appendGradClip(graph, paramGrads, config.clipGradNorm)
   }

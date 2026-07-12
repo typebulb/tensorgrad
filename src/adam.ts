@@ -16,7 +16,7 @@ import type { Graph } from './ir.js'
 import type { WritebackDecl } from './buffers.js'
 import { traceInto, stateInput, tensorInput } from './trace.js'
 import { adamUpdateM, adamUpdateV, adamUpdateP } from './ops.js'
-import { appendGradClip } from './grad.js'
+import { appendGradClip, appendGradNormalize } from './grad.js'
 import { type LR, resolveLR, isLRDynamic } from './lr.js'
 import type { WireAdamConfig } from './worker-protocol.js'
 
@@ -38,6 +38,17 @@ export interface AdamConfig {
    *  optax's `clip_by_global_norm`. Use `appendGradClip` directly if you
    *  need to compose clipping with a custom optimizer. */
   clipGradNorm?: number
+  /** Per-parameter gradient normalization: each selected gradient is
+   *  replaced by `g / (||g||_2 + 1e-8)` before the update (and before
+   *  `clipGradNorm`, when both are set). This is the NCA recipes'
+   *  `p.grad /= p.grad.norm()` — note it interacts with Adam: Adam already
+   *  rescales per-coordinate by the second moment, so this effectively
+   *  equalizes per-TENSOR update magnitude (a trust-ratio move that is
+   *  load-bearing in cellular-automata training, not general hygiene).
+   *  Pass `true` for all params, or a filter selecting which param names
+   *  normalize (e.g. `(n) => n.startsWith('nca.')`); a filter that matches
+   *  nothing throws at compile. */
+  normalizeGrads?: boolean | ((paramName: string) => boolean)
 }
 
 /** AdamW hyperparameters (Loshchilov & Hutter — decoupled weight decay).
@@ -153,7 +164,14 @@ export function appendAdam(
    *  `decayFilter` for names not present (low-level callers without a Module). */
   decayFlags?: Record<string, boolean>,
 ): AdamResult {
-  // Clipping happens in-graph before Adam consumes the gradients.
+  // Grad transforms happen in-graph before Adam consumes the gradients:
+  // per-param normalization first, then global clipping.
+  if (config.normalizeGrads) {
+    paramGrads = appendGradNormalize(
+      graph, paramGrads,
+      typeof config.normalizeGrads === 'function' ? config.normalizeGrads : undefined,
+    )
+  }
   if (config.clipGradNorm !== undefined && config.clipGradNorm > 0) {
     paramGrads = appendGradClip(graph, paramGrads, config.clipGradNorm)
   }
