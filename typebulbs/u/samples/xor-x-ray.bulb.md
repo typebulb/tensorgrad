@@ -1490,7 +1490,7 @@ body {
 {
   "description": "A 2-2-1 neural network learns XOR. Step through the full training loop: forward arithmetic, chain-rule backward, optimizer update.",
   "dependencies": {
-    "domeleon": "^0.6.0"
+    "domeleon": "^0.6.1"
   }
 }
 ```

@@ -1749,7 +1749,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "tensorgrad": "^0.4.2",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
-    "domeleon": "^0.6.0"
+    "domeleon": "^0.6.1"
   }
 }
 ```

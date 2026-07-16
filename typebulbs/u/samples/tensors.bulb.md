@@ -2193,7 +2193,7 @@ body {
 ```json
 {
   "dependencies": {
-    "domeleon": "^0.6.0"
+    "domeleon": "^0.6.1"
   },
   "description": "The building blocks of neural networks explained interactively. Vectors, tensors, matmul, softmax, embedding, and more."
 }
