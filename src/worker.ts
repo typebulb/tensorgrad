@@ -225,7 +225,11 @@ async function handleStep(payload: {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
 }): Promise<{ loss: number; captures: Record<string, Float32Array | Int32Array> | null }> {
-  const slot = mustGet(payload.graphId)
+  // A step can land in replaceModel's destroy→createRuntime window (same
+  // graphId, slot briefly absent). That's a cancellation, not a failure —
+  // same contract as the destroyed-mid-flight case below.
+  const slot = graphs.get(payload.graphId)
+  if (!slot) throw abortErr('step aborted: graph replaced mid-flight')
   const merged = injectPrngSeed(slot, injectOptimizerScalars(slot, payload.inputs))
   const hasCaptures = Object.keys(slot.captureShapes).length > 0
   try {
@@ -247,7 +251,8 @@ async function handleRun(payload: {
   graphId: number
   inputs: Record<string, Int32Array | Float32Array>
 }): Promise<{ output: Float32Array | Int32Array; captures: Record<string, Float32Array | Int32Array> | null }> {
-  const slot = mustGet(payload.graphId)
+  const slot = graphs.get(payload.graphId)
+  if (!slot) throw abortErr('run aborted: graph replaced mid-flight')
   const merged = injectPrngSeed(slot, payload.inputs)
   const hasCaptures = Object.keys(slot.captureShapes).length > 0
   try {
