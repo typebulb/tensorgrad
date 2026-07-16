@@ -1,6 +1,6 @@
 ---
 format: typebulb/v1
-name: Neural Network (tensorgrad)
+name: Neural Network
 ---
 
 **code.tsx**

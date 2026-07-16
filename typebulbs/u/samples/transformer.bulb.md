@@ -1,6 +1,6 @@
 ---
 format: typebulb/v1
-name: Transformer (tensorgrad)
+name: Transformer
 ---
 
 **code.tsx**
