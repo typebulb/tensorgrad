@@ -1633,13 +1633,13 @@ The source MUST end with:
     new LayerNorm(dim, { eps?, bias?, decay? })
     new RMSNorm(dim, { eps?, decay? })
     new Embedding(vocab, dim, { init?, decay? })
-    new Conv2d(inC, outC, k, { stride?, padding?, bias?, init?, decay? })  // dense only; no groups; k/stride/padding accept int or [kH, kW]
+    new Conv2d(inC, outC, k, { stride?, padding?, groups?, bias?, init?, decay? })  // k/stride/padding accept int or [kH, kW]; groups (default 1) is PyTorch grouped/depthwise conv, weight [outC, inC/g, kH, kW]
 **Compile/lifecycle**: `Module`, `compile`, `lr`, `init`.
 **Losses**: `crossEntropy(logits, targets, { reduction? })`, `nllLoss(logProbs, targets, { reduction? })` — default reduction is mean; use `'none'` for per-position output.
 **Arithmetic**: `add`, `sub`, `mul`, `div`, `min`, `max` — each takes `(Tensor, Tensor)` or `(Tensor, number)`.
 **Comparison**: `less`, `greater` (same scalar overload as arithmetic), `where(cond, ifTrue, ifFalse)`.
-**Unary math**: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`.
-**Activations**: `relu`, `tanh`, `sigmoid`, `gelu`, `silu`, `leakyRelu(x, alpha?)` (default alpha 0.01), `softplus` (numerically-stable `log(1 + exp(x))`).
+**Unary math**: `sqrt`, `rsqrt`, `log`, `exp`, `neg`, `abs`, `square`, `sin`, `cos`, `erf`.
+**Activations**: `relu`, `tanh`, `sigmoid`, `gelu(x, { approximate? })` (exact erf form by default, matching `nn.GELU()`; `{ approximate: 'tanh' }` for GPT-2-style ports), `silu`, `leakyRelu(x, alpha?)` (default alpha 0.01), `softplus` (numerically-stable `log(1 + exp(x))`).
 **Clamping**: `clamp(x, lo, hi)` — `lo` and `hi` are numbers.
 **Reductions**: `mean(x, axis?, { keepDims? })`, `sum(x, axis?, { keepDims? })`, `argmax`, `argmin`.
 **Shape**: `reshape(x, [dims])` (one `-1` allowed, inferred from total size — use `reshape(x, [B, -1])` or `reshape(x, [-1])` instead of a `flatten` op; tensorgrad doesn't have one), `permute`, `swapAxes` (= PyTorch `transpose`).
@@ -1649,7 +1649,7 @@ The source MUST end with:
 **Slicing/structural**: `narrow(t, axis, start, len)`, `concat([a, b, ...], axis)`, `stack([a, b, ...], axis)`, `split(t, [size1, size2, ...], axis)`.
 **Fused ML**: `softmax`, `logSoftmax`, `softmaxCausal`, `whereCausal`.
 **Attention layout**: `splitHeads(x, nHeads)`, `mergeHeads(x)`, `rope(q, k, { base? })` (rotary position embedding on the Q/K pair; returns the pair rotated).
-**Conv/pool**: `conv2d(input, weight, { stride?, padding? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`.
+**Conv/pool**: `conv2d(input, weight, { stride?, padding?, groups? })`, `maxPool2d(x, k, { stride?, padding? })`, `nearestUpsample2d(x, factor)`.
 **Stochastic/grad**: `dropout(x, p)`, `randn(shape)`, `categorical(logits, axis?)` (samples from logits via Gumbel-max; i32, non-diff), `stopGradient(x)` (= PyTorch `.detach`), `capture(name, t)`.
 
 ## Gotchas
@@ -1670,7 +1670,7 @@ The source MUST end with:
 - **Use a loop for repeated blocks, not manual unrolling.** `layers = []; for (let i = 0; i < N_LAYERS; i++) layers.push(new Block())` + `for (const layer of m.layers) ...`. Manually-named fields (`layer0`, `layer1`, …) make `N_LAYERS` decorative — editing the const won't change architecture.
 - **Attention scaling**: multiply scores by `1 / Math.sqrt(D_HEAD)` before `softmaxCausal`.
 - **`stack` adds a new axis; `concat` joins an existing one.** `stack([a, b, …], axis)` of N tensors of shape `[B, H]` gives `[B, N, H]` (or wherever `axis` puts it). Don't `reshape(h, [B, 1, H])` and then `stack(outs, 1)` — that double-adds the axis, producing `[B, T, 1, H]` instead of `[B, T, H]`. The bug runs: downstream Linear/reshape silently swallow the extra size-1 dim until something stricter (MSE `sub`, broadcasting) catches it.
-- **No `groups` on Conv2d, no `Conv1d`.** Conv2d is dense conv only.
+- **No `Conv1d`.** Reshape to `[B, C, 1, T]` and use a `[1, K]` Conv2d kernel (see Conventions).
 - **No in-forward param creation.** `this.param` is class-field only; forwards are pure tensor compositions over the already-built module.
 - **No `scan` / `cumsum`.** Unroll trace-time loops; keep T small.
 
@@ -1746,7 +1746,7 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "submitTitle": "Diagram It"
   },
   "dependencies": {
-    "tensorgrad": "^0.3.0",
+    "tensorgrad": "^0.4.2",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
     "domeleon": "^0.6.0"
