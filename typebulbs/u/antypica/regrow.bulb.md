@@ -63,7 +63,7 @@ const TRAINED_URL = `${R2}/regrow/donut.safetensors`
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms))
 const nextFrame = () => new Promise(res => requestAnimationFrame(res))
 const clamp01 = (v: number) => v < 0 ? 0 : v > 1 ? 1 : v
-const slog = (s: string) => { if (tb.mode === "local") tb.server.log(s) }
+const slog = (s: string) => { if (tb.mode === "local") tb.log(s) }
 
 // seeded uniform(-bound, bound) for the SIREN init (paper: uniform draws)
 const uniformInit = (n: number, bound: number, seed: number) => {

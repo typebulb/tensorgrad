@@ -19,6 +19,7 @@ build-artifacts/
 .typebulb/
 .github/
 .claude/
+CLAUDE.md
 temp/
 *.bin
 # agent switcher (local Claude Code model override)

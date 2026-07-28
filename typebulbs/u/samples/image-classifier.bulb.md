@@ -257,7 +257,7 @@ class Model extends Component {
 
   setStatus(s: string) {
     this.status = s
-    tb.server.log(s)
+    tb.log(s)
     this.update()
   }
 
@@ -285,7 +285,7 @@ class Model extends Component {
     this.setStatus('Training the head…')
     await this.retrain()
     await this.preselect()
-    tb.server.log('Ready.')
+    tb.log('Ready.')
   }
 
   async embOf(image: HTMLImageElement): Promise<Float32Array> {
@@ -320,7 +320,7 @@ class Model extends Component {
     if (!this.#trained || !this.shot?.feat) return
     const r = await this.#trained.infer.run({ f: this.shot.feat })
     if (r.kind !== 'completed') {
-      tb.server.log(`classify ${r.kind}`)
+      tb.log(`classify ${r.kind}`)
       return
     }
     this.probs = r.output as Float32Array
@@ -349,7 +349,7 @@ class Model extends Component {
       if (this.shot) this.shot.feat = feat
       await this.classify()
     } catch (err) {
-      tb.server.log(`couldn't read image: ${(err as Error).message}`)
+      tb.log(`couldn't read image: ${(err as Error).message}`)
     }
   }
 

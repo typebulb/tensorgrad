@@ -37,7 +37,7 @@ const TARGET_URL = `${ASSETS}/chameleon.png`
 
 const nextFrame = () => new Promise(res => requestAnimationFrame(res))
 const clamp01 = (v: number) => v < 0 ? 0 : v > 1 ? 1 : v
-const slog = (s: string) => { if (tb.mode === "local") tb.server.log(s) }
+const slog = (s: string) => { if (tb.mode === "local") tb.log(s) }
 
 // Fetch once from the network, thereafter from CacheStorage (offline-friendly);
 // falls back to a plain fetch if the Cache API is unavailable.
