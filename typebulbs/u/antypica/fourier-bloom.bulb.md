@@ -263,6 +263,13 @@ function projectKnot(W_U: Float32Array, refine = false): { pts: [number, number,
 // ============================================================================
 class Trainer extends Component {
   status = "starting…"
+  // Held from the start of a run until the first beads land on the stage. While it holds,
+  // `status` is superimposed on the canvas instead of parked in the dock: compiling takes
+  // seconds, and a blank scene with a caption at the bottom reads as a bulb that doesn't
+  // work. `failed` marks the terminal no-WebGPU case, where the message stays put (and
+  // stops shimmering) because nothing will ever render behind it.
+  loading = true
+  failed = false
   #runId = 0
 
   get #stage() { return (this.ctx.root as unknown as IRoot).stage }
@@ -279,7 +286,9 @@ class Trainer extends Component {
   async run() {
     const stage = this.#stage
     const run = ++this.#runId          // invalidates any earlier run still looping
+    this.loading = true                // a retrain recompiles too: put the status back on the stage
     if (!isWebGPUAvailable()) {
+      this.failed = true
       this.#setStatus("This needs WebGPU (recent Chrome/Edge/Safari).")
       return
     }
@@ -293,7 +302,11 @@ class Trainer extends Component {
     if (run !== this.#runId) return
     const infer = await t.attach({ forward: predictFn, inputs: { tokens: { shape: [null, SEQ_LEN], dtype: "i32" } } })
     if (run !== this.#runId) return
+    // First beads on screen. The stage speaks for itself from here, so hand the running
+    // commentary back to the dock readout.
     stage.applyCoords(projectKnot((await t.downloadParams())["unembed.W"]!))
+    this.loading = false
+    this.update()
     let step = 0, valAcc = 0, trainAcc = 0, loss = 0, cv = 1, freqs: [number, number] = [K1, K2], grokAt = -1
     while (step < MAX_STEPS) {
       if (run !== this.#runId) return   // a reset (or auto-retry) superseded this run
@@ -722,8 +735,16 @@ class Root extends Component implements IRoot {
   }
 
   view() {
-    return div({ class: "stage" },
+    const t = this.trainer
+    return div({ class: t.loading ? ["stage", "busy"] : "stage" },
       canvas({ class: "scene", key: "scene", onMounted: (el: Element) => this.#boot(el) }),
+      // The compile/reload status, superimposed over the middle of the scene (the same move
+      // kata-go makes over its board) rather than left in the dock where it's easy to miss.
+      t.loading
+        ? div({ class: "note-overlay" },
+            p({ class: "stage-note" },
+              t.failed ? t.status : span({ class: "shimmer" }, t.status)))
+        : null,
       div({ class: "header" },
         h1({ class: "title" }, "Fourier Bloom"),
         p({ class: "tag" }, "a tiny transformer learns clock math in your browser"),
@@ -875,6 +896,24 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); f
 .icon-btn:focus-visible, .morph input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .ico { width: 1.45em; height: 1.45em; flex: none; }   /* the icon glyph inside a button */
 .morph-sep { width: 1px; align-self: stretch; background: var(--panel-border); }
+/* Boot status, superimposed on the scene. Until the first knot lands the canvas is empty,
+   so a status parked at the bottom of the dock reads as "this bulb is broken" rather than
+   "this bulb is loading". pointer-events:none so the card never swallows a drag headed for
+   the OrbitControls canvas underneath. */
+.note-overlay { position: absolute; inset: 0; display: grid; place-items: center; padding: 0 18px; pointer-events: none; }
+/* A card, not bare text: the beads fade in underneath the moment coords land, and loose
+   glyphs over a rotating rainbow knot are unreadable. Matches the .morph dock panel. */
+.stage-note { margin: 0; padding: 8px 14px; max-width: 34ch; border-radius: 12px; background: var(--panel); border: 1px solid var(--panel-border); backdrop-filter: blur(6px); font-family: var(--font-mono); color: var(--readout); line-height: 1.5; text-align: center; }
+/* Sweep a highlight band across the glyphs themselves (background-clip:text) so the wait
+   reads as the text working, rather than as a spinner parked beside it. Both stops are
+   themed tokens, so it stays legible either way; with motion suppressed it degrades to a
+   static gradient rather than to invisible text. */
+.shimmer { display: inline-block; background: linear-gradient(90deg, var(--readout) 35%, var(--accent) 50%, var(--readout) 65%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 1.6s linear infinite; }
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .shimmer { animation: none; } }
+/* Hidden, not emptied: the readout keeps its box, so the dock height is identical before
+   and after the overlay goes and #resize()'s band fit doesn't jump when training starts. */
+.stage.busy .readout { visibility: hidden; }
 /* short viewports: the overlays don't shrink with height, so reclaim band space
    for the knot — drop the descriptive caption and tighten the vertical rhythm */
 @media (max-height: 620px) {
@@ -891,8 +930,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); f
   "description": "A tiny transformer learns clock math in your browser.",
   "dependencies": {
     "three": "^0.160.0",
-    "tensorgrad": "^0.3.1",
-    "domeleon": "^0.6.0"
+    "tensorgrad": "^0.4.3",
+    "domeleon": "^0.6.3"
   }
 }
 ```

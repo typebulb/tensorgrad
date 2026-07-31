@@ -259,7 +259,7 @@ code {
 ```json
 {
   "dependencies": {
-    "tensorgrad": "^0.4.2"
+    "tensorgrad": "^0.4.3"
   },
   "description": "The smallest end-to-end tensorgrad training loop: a 3-layer MLP learns y = sin(x)."
 }

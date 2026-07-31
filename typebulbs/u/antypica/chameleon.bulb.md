@@ -595,8 +595,8 @@ img.thumb { box-sizing: border-box; padding: 16.667%; }
 {
   "description": "A neural cellular automaton grows a chameleon from one cell on your GPU, using weights from the paper “From Cells to Pixels”. Scratch it and it heals.",
   "dependencies": {
-    "tensorgrad": "^0.4.2",
-    "domeleon": "^0.6.0"
+    "tensorgrad": "^0.4.3",
+    "domeleon": "^0.6.3"
   }
 }
 ```

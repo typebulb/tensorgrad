@@ -1277,8 +1277,8 @@ body { font-size: var(--text); }
 {
   "description": "A neural cellular automaton grows a 3D donut from one cell, trained live on WebGPU with the Cells-to-Pixels recipe.",
   "dependencies": {
-    "tensorgrad": "^0.4.2",
-    "domeleon": "^0.6.0"
+    "tensorgrad": "^0.4.3",
+    "domeleon": "^0.6.3"
   }
 }
 ```

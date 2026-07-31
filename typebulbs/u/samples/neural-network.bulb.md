@@ -1044,11 +1044,11 @@ new App({
 ```json
 {
   "dependencies": {
-    "domeleon": "^0.6.1",
+    "domeleon": "^0.6.3",
     "@unocss/preset-wind3": "^66.5.3",
     "pako": "^2.1.0",
     "fabric": "^7.0.0",
-    "tensorgrad": "^0.4.2"
+    "tensorgrad": "^0.4.3"
   },
   "description": "Train a neural network to recognize handwritten digits (MNIST) live in your browser. Draw on the canvas and watch the model improve in real time. Built with tensorgrad (autograd + WebGPU)."
 }

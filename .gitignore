@@ -22,6 +22,9 @@ build-artifacts/
 CLAUDE.md
 temp/
 *.bin
+# ...except bulb weight assets under the wholesale-whitelisted antypica folder
+# (.gitignore outranks .git/info/exclude, so the exception has to live here).
+!typebulbs/u/antypica/**/*.bin
 # agent switcher (local Claude Code model override)
 .claude/settings.local.json
 .claude/.cc-switcher.json

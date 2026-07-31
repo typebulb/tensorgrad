@@ -446,48 +446,125 @@ function buildDag(graph: Graph, leaves: readonly LeafGroup[]): DagNode[] {
 // tightest period is the natural body the user wrote. Each cluster's children
 // array is analyzed independently; matching outer-cluster signatures guarantee
 // identical inner structure across iterations.
+//
+// Two signature views per sibling list. The `exact` view is the strict one:
+// matching signatures guarantee identical inner structure. The `loose` view
+// additionally normalizes repetition *inside* a node, so a cluster whose own
+// inner loop grows across outer iterations still matches its siblings — the
+// case that matters is a depth-wise residual attending over an ever-longer
+// list of previous blocks, which otherwise gives every block a unique
+// signature and defeats detection entirely. Two normalizations are needed,
+// because a repeated sub-call lands in one of two places depending on whether
+// its ops merge into a single leaf: `collapseRepeats` is therefore applied both
+// to a leaf's op-kind list and to a cluster's child-signature list. Loose is
+// consulted only where exact finds nothing, so it can never change an existing
+// diagram; the cost where it does fire is that "…hidden iterations…" may
+// conceal iterations whose inner repeat counts differ from the ones shown.
 
-type LoopRun = { start: number; period: number; iterations: number; children: LoopRun[] }
+type LoopRun = { start: number; period: number; iterations: number; children: LoopRun[]; foldable: boolean }
 
-function nodeSignature(node: TreeNode, graph: Graph): string {
-  if (node.kind === 'leaf') {
-    if (node.ops.length === 1) {
-      const op = graph.ops[node.ops[0]!]!
-      if (op.kind === "const_scalar") return `const_scalar:${(op as { value: number }).value}`
-      if (op.kind === "tensor_input") return `tensor_input:${(op as { name: string }).name}`
-    }
-    const frameKey = `${node.frame.url}#${node.frame.line}`
-    const opKinds = node.ops.map(i => graph.ops[i]!.kind).join(",")
-    return `leaf:${frameKey}:${opKinds}`
+// A detected loop is drawn FOLDED: one copy of the body labeled `×n`, with the
+// loop-carried dependencies (an RNN's hidden state, a block stack's residual
+// stream) drawn as back edges into it. Detection already proved every iteration
+// structurally identical, so extra copies carry no information — the old
+// "first 2 + last + a ghost" rule was a workaround for having no way to draw
+// the loop itself, and it multiplied badly: 3 shown at each of 3 nesting levels
+// is up to 27 copies of the innermost body.
+//
+// Folding needs a position-wise pairing between iterations, so it requires
+// equal leaf counts. The exact signature view guarantees that; the loose view
+// tolerates differing inner repeat counts, so a mismatch is possible and such a
+// loop stays unfolded rather than claiming a uniformity nobody verified.
+function leavesOfChildren(children: readonly TreeNode[]): LeafGroup[] {
+  const out: LeafGroup[] = []
+  const walk = (n: TreeNode) => {
+    if (n.kind === 'leaf') out.push(n)
+    else for (const c of n.children) walk(c)
   }
-  // Sibling clusters with same call site AND structurally-identical bodies
-  // produce matching signatures, which is what loop detection matches on.
-  const childSigs = node.children.map(c => nodeSignature(c, graph)).join("|")
-  return `cluster:${node.frame.url}#${node.frame.line}:[${childSigs}]`
+  for (const c of children) walk(c)
+  return out
 }
 
-function detectLoops(children: readonly TreeNode[], graph: Graph): LoopRun[] {
-  const signatures = children.map(n => nodeSignature(n, graph))
-  return detectLoopsInRange(signatures, 0, signatures.length)
+function annotateFoldable(loops: readonly LoopRun[], children: readonly TreeNode[]): void {
+  for (const loop of loops) {
+    let counts = -1
+    loop.foldable = true
+    for (let iter = 0; iter < loop.iterations; iter++) {
+      const s = loop.start + iter * loop.period
+      const n = leavesOfChildren(children.slice(s, s + loop.period)).length
+      if (counts === -1) counts = n
+      else if (n !== counts) { loop.foldable = false; break }
+    }
+  }
 }
 
-function detectLoopsInRange(signatures: readonly string[], lo: number, hi: number): LoopRun[] {
-  const loops: LoopRun[] = []
-  let i = lo
-  while (i < hi) {
+// Two tensors sit in different iterations of some shared enclosing loop, i.e.
+// an edge between them is loop-carried rather than within-body. Compared over
+// the common prefix only, so a tensor from OUTSIDE the loop (shorter path) is
+// an entry edge, not a back edge.
+function crossesIteration(a: readonly number[], b: readonly number[]): boolean {
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return true
+  return false
+}
+
+// Signatures are rebuilt on every detectLoops call — three passes per level
+// (ghosts, emit, count) times the policy search — and one block cluster's
+// signature can run to thousands of characters. Memoize per node, and intern
+// to integer ids so the period scan compares numbers instead of strings.
+// Nodes are rebuilt by buildGroupTree each render, so the WeakMap self-cleans;
+// the intern table is cleared explicitly.
+const sigCache = new WeakMap<TreeNode, [string | undefined, string | undefined]>()
+const sigIds = new Map<string, number>()
+
+function clearSignatureCaches(): void {
+  sigIds.clear()
+}
+
+function nodeSignature(node: TreeNode, graph: Graph, loose = false): string {
+  let slot = sigCache.get(node)
+  if (!slot) {
+    slot = [undefined, undefined]
+    sigCache.set(node, slot)
+  }
+  const i = loose ? 1 : 0
+  const hit = slot[i]
+  if (hit !== undefined) return hit
+  const sig = computeSignature(node, graph, loose)
+  slot[i] = sig
+  return sig
+}
+
+function signatureId(node: TreeNode, graph: Graph, loose: boolean): number {
+  const sig = nodeSignature(node, graph, loose)
+  let id = sigIds.get(sig)
+  if (id === undefined) {
+    id = sigIds.size
+    sigIds.set(sig, id)
+  }
+  return id
+}
+
+// Collapse maximal period-k repetitions in a list to one copy of each period.
+// Same greedy coverage/tie rules as loop detection, but starting at k=1 so
+// plain adjacent duplicates collapse too. Runs rather than whole-list
+// periodicity is the point: `stack` over N tensors lowers to `reshape × N`
+// followed by one `concat`, and the trailing element would defeat any
+// divides-evenly test.
+function collapseRepeats(sigs: readonly string[]): string[] {
+  const out: string[] = []
+  let i = 0
+  while (i < sigs.length) {
     let bestK = 0
     let bestN = 0
-    // Period >= 2: single-line iteration bodies merge into one leaf via
-    // tree building, so legit period-1 loops can't exist; any period-1
-    // match is coincidence.
-    for (let k = 2; k <= Math.floor((hi - i) / 2); k++) {
+    for (let k = 1; k <= (sigs.length - i) >> 1; k++) {
       let n = 1
       while (true) {
         const next = i + n * k
-        if (next + k > hi) break
+        if (next + k > sigs.length) break
         let match = true
         for (let j = 0; j < k; j++) {
-          if (signatures[i + j] !== signatures[next + j]) { match = false; break }
+          if (sigs[i + j] !== sigs[next + j]) { match = false; break }
         }
         if (!match) break
         n++
@@ -498,8 +575,78 @@ function detectLoopsInRange(signatures: readonly string[], lo: number, hi: numbe
       }
     }
     if (bestN >= 2) {
-      const children = detectLoopsInRange(signatures, i, i + bestK)
-      loops.push({ start: i, period: bestK, iterations: bestN, children })
+      for (let j = 0; j < bestK; j++) out.push(sigs[i + j]!)
+      i += bestK * bestN
+    } else {
+      out.push(sigs[i]!)
+      i++
+    }
+  }
+  return out
+}
+
+function computeSignature(node: TreeNode, graph: Graph, loose: boolean): string {
+  if (node.kind === 'leaf') {
+    if (node.ops.length === 1) {
+      const op = graph.ops[node.ops[0]!]!
+      if (op.kind === "const_scalar") return `const_scalar:${(op as { value: number }).value}`
+      if (op.kind === "tensor_input") return `tensor_input:${(op as { name: string }).name}`
+    }
+    const frameKey = `${node.frame.url}#${node.frame.line}`
+    const kinds = node.ops.map(i => graph.ops[i]!.kind)
+    const opKinds = (loose ? collapseRepeats(kinds) : kinds).join(",")
+    return `leaf:${frameKey}:${opKinds}`
+  }
+  // Sibling clusters with same call site AND structurally-identical bodies
+  // produce matching signatures, which is what loop detection matches on.
+  const childSigs = node.children.map(c => nodeSignature(c, graph, loose))
+  const parts = loose ? collapseRepeats(childSigs) : childSigs
+  return `cluster:${node.frame.url}#${node.frame.line}:[${parts.join("|")}]`
+}
+
+function detectLoops(children: readonly TreeNode[], graph: Graph): LoopRun[] {
+  const loops = detectLoopsInRange([
+    children.map(n => signatureId(n, graph, false)),
+    children.map(n => signatureId(n, graph, true)),
+  ], 0, children.length)
+  annotateFoldable(loops, children)
+  return loops
+}
+
+// `sigViews` are tried in order and the first to find a run wins, so the exact
+// view's verdict always takes precedence over the loose one.
+function detectLoopsInRange(sigViews: readonly (readonly number[])[], lo: number, hi: number): LoopRun[] {
+  const loops: LoopRun[] = []
+  let i = lo
+  while (i < hi) {
+    let bestK = 0
+    let bestN = 0
+    for (const signatures of sigViews) {
+      // Period >= 2: single-line iteration bodies merge into one leaf via
+      // tree building, so legit period-1 loops can't exist; any period-1
+      // match is coincidence.
+      for (let k = 2; k <= Math.floor((hi - i) / 2); k++) {
+        let n = 1
+        while (true) {
+          const next = i + n * k
+          if (next + k > hi) break
+          let match = true
+          for (let j = 0; j < k; j++) {
+            if (signatures[i + j] !== signatures[next + j]) { match = false; break }
+          }
+          if (!match) break
+          n++
+        }
+        if (n >= 2 && (k * n > bestK * bestN || (k * n === bestK * bestN && k < bestK))) {
+          bestK = k
+          bestN = n
+        }
+      }
+      if (bestN >= 2) break
+    }
+    if (bestN >= 2) {
+      const children = detectLoopsInRange(sigViews, i, i + bestK)
+      loops.push({ start: i, period: bestK, iterations: bestN, children, foldable: true })
       i += bestK * bestN
     } else {
       i++
@@ -582,33 +729,44 @@ function buildDOT(
   const tidToColor = new Map<number, string>()
   for (const node of dag) tidToColor.set(node.tensorId, nodeColor(node, graph))
 
-  // Truncate long loops: show first 2 + last iteration, with a "…" cluster
-  // for the elided middle. Threshold ≥ 4 — 3 iterations are already brief.
-  // Applied per nesting level independently.
-  const isHiddenIter = (loop: LoopRun, iter: number): boolean =>
-    loop.iterations >= 4 && iter >= 2 && iter <= loop.iterations - 2
+  // Fold map. Every leaf tid gets the iteration path of its enclosing folded
+  // loops, and — when it sits in an iteration that isn't drawn — the tid of its
+  // counterpart in the drawn one. Built before emission so the edge pass can
+  // canonicalize both endpoints.
+  const EMPTY_ITERS: readonly number[] = []
+  const tidCanon = new Map<number, number>()
+  const tidIters = new Map<number, readonly number[]>()
+  const canonOf = (tid: number): number => tidCanon.get(tid) ?? tid
+  const itersOf = (tid: number): readonly number[] => tidIters.get(tid) ?? EMPTY_ITERS
 
-  // Walk the tree to populate ghost-tid map (tid → ghost cluster ID for leaf
-  // tids inside hidden iterations at any level). Computed before emission so
-  // edges can redirect through ghosts.
-  const tidGhost = new Map<number, string>()
-  const markGhostLeafTids = (node: TreeNode, ghostKey: string) => {
-    if (node.kind === 'leaf') tidGhost.set(node.output, ghostKey)
-    else for (const child of node.children) markGhostLeafTids(child, ghostKey)
-  }
-  const populateGhosts = (children: readonly TreeNode[], idPath: string) => {
+  const populateFold = (children: readonly TreeNode[], idPath: string, iters: readonly number[]) => {
     const loops = detectLoops(children, graph)
     for (let li = 0; li < loops.length; li++) {
       const loop = loops[li]!
-      const ghostKey = `${idPath}_l${li}`
-      for (let iter = 0; iter < loop.iterations; iter++) {
-        const iterStart = loop.start + iter * loop.period
-        if (isHiddenIter(loop, iter)) {
-          for (let k = iterStart; k < iterStart + loop.period; k++) {
-            markGhostLeafTids(children[k]!, ghostKey)
-          }
-        } else {
-          populateGhosts(children.slice(iterStart, iterStart + loop.period), `${idPath}_l${li}i${iter}`)
+      const sliceOf = (iter: number) =>
+        children.slice(loop.start + iter * loop.period, loop.start + (iter + 1) * loop.period)
+      if (!loop.foldable) {
+        for (let iter = 0; iter < loop.iterations; iter++) {
+          const s = sliceOf(iter)
+          for (const leaf of leavesOfChildren(s)) tidIters.set(leaf.output, [...iters, iter])
+          populateFold(s, `${idPath}_l${li}i${iter}`, [...iters, iter])
+        }
+        continue
+      }
+      // The drawn iteration is walked first, so its leaves carry their final
+      // (possibly deeper) paths before the rest are paired against them.
+      const drawnLeaves = leavesOfChildren(sliceOf(0))
+      for (const leaf of drawnLeaves) tidIters.set(leaf.output, [...iters, 0])
+      populateFold(sliceOf(0), `${idPath}_l${li}i0`, [...iters, 0])
+      for (let iter = 1; iter < loop.iterations; iter++) {
+        const cur = leavesOfChildren(sliceOf(iter))
+        for (let j = 0; j < cur.length; j++) {
+          const twin = drawnLeaves[j]!
+          tidCanon.set(cur[j]!.output, canonOf(twin.output))
+          // Same path as its twin, except at THIS loop's level.
+          const path = [...itersOf(twin.output)]
+          path[iters.length] = iter
+          tidIters.set(cur[j]!.output, path)
         }
       }
     }
@@ -619,10 +777,10 @@ function buildDOT(
     for (let k = 0; k < children.length; k++) {
       if (loopCovers.has(k)) continue
       const c = children[k]!
-      if (c.kind === 'cluster') populateGhosts(c.children, `${idPath}_n${k}`)
+      if (c.kind === 'cluster') populateFold(c.children, `${idPath}_n${k}`, iters)
     }
   }
-  populateGhosts(tree.children, "r")
+  populateFold(tree.children, "r", [])
 
   // Heavier penwidth + explicit margin so the dashed border has breathing
   // room from the inner user-cluster's tint; without these, the default thin
@@ -641,12 +799,6 @@ function buildDOT(
     for (const a of attrs) lines.push(`    ${a}`)
     body()
     lines.push(`  }`)
-  }
-
-  const emitGhostNode = (ghostKey: string) => {
-    emitCluster(`ghost_${ghostKey}`, "…hidden iterations…", LOOP_ITER_ATTRS, () => {
-      lines.push(`    "tghost_${ghostKey}" [label="…" shape=plaintext fontsize=22 fontcolor="#888" class="ti-ghost-${ghostKey}"]`)
-    })
   }
 
   // stripRedundantShapeComment is safe on any label — the regex doesn't match
@@ -682,20 +834,25 @@ function buildDOT(
       const entry = loopByStart.get(i)
       if (entry) {
         const { loop, index } = entry
-        for (let iter = 0; iter < loop.iterations; iter++) {
-          if (isHiddenIter(loop, iter)) continue
-          const iterStart = loop.start + iter * loop.period
-          emitCluster(`${idPath}_l${index}_iter${iter}`,
-            `iteration ${iter + 1} of ${loop.iterations}`, LOOP_ITER_ATTRS, () => {
-              emitChildren(children.slice(iterStart, iterStart + loop.period), `${idPath}_l${index}i${iter}`)
-            })
+        const sliceOf = (iter: number) =>
+          children.slice(loop.start + iter * loop.period, loop.start + (iter + 1) * loop.period)
+        if (loop.foldable) {
+          emitCluster(`${idPath}_l${index}_iter0`, `×${loop.iterations}`, LOOP_ITER_ATTRS, () => {
+            emitChildren(sliceOf(0), `${idPath}_l${index}i0`)
+          })
+        } else {
+          for (let iter = 0; iter < loop.iterations; iter++) {
+            emitCluster(`${idPath}_l${index}_iter${iter}`,
+              `iteration ${iter + 1} of ${loop.iterations}`, LOOP_ITER_ATTRS, () => {
+                emitChildren(sliceOf(iter), `${idPath}_l${index}i${iter}`)
+              })
+          }
         }
-        if (loop.iterations >= 4) emitGhostNode(`${idPath}_l${index}`)
         i = loop.start + loop.period * loop.iterations
       } else {
         const child = children[i]!
         if (child.kind === 'leaf') {
-          if (!tidGhost.has(child.output)) emitNodeBox(child.output, frameSourceText(child.frame, srcCache))
+          emitNodeBox(child.output, frameSourceText(child.frame, srcCache))
         } else {
           emitCluster(`${idPath}_n${i}`, frameSourceText(child.frame, srcCache), USER_CLUSTER_ATTRS, () => {
             emitChildren(child.children, `${idPath}_n${i}`)
@@ -707,29 +864,24 @@ function buildDOT(
   }
   emitChildren(tree.children, "r")
 
-  // Edges. For each consumer→producer pair, redirect through ghosts when one
-  // side sits inside a hidden iteration. Dedupe ghost-touching edges so a
-  // many-iter fan-in collapses to one line.
-  type Endpoint = { id: string; cls: string; hidden: boolean }
-  const endpoint = (tid: number): Endpoint => {
-    const g = tidGhost.get(tid)
-    return g === undefined
-      ? { id: `t${tid}`, cls: `ti-${tid}`, hidden: false }
-      : { id: `tghost_${g}`, cls: `ti-ghost-${g}`, hidden: true }
-  }
-  const emittedGhostEdges = new Set<string>()
+  // Edges. Both endpoints canonicalize into the drawn iteration, so a fan-in
+  // from every iteration collapses to one line. An edge whose endpoints sit in
+  // different iterations of a shared loop IS the loop-carried dependency and is
+  // drawn as a dashed back edge; `constraint=false` keeps it out of rank
+  // assignment so the cycle doesn't disturb the forward layout.
+  const emittedEdges = new Set<string>()
   for (const node of dag) {
-    const dst = endpoint(node.tensorId)
+    const dstTid = canonOf(node.tensorId)
     for (const inTid of node.inputs) {
-      const src = endpoint(inTid)
-      if (src.hidden && dst.hidden && src.id === dst.id) continue
-      const color = src.hidden ? "#888" : tidToColor.get(inTid)!
-      if (src.hidden || dst.hidden) {
-        const key = `${src.id}->${dst.id}`
-        if (emittedGhostEdges.has(key)) continue
-        emittedGhostEdges.add(key)
-      }
-      lines.push(`  "${src.id}" -> "${dst.id}" [color="${color}" class="${src.cls} ${dst.cls}"]`)
+      const srcTid = canonOf(inTid)
+      const carried = crossesIteration(itersOf(inTid), itersOf(node.tensorId))
+      if (srcTid === dstTid && !carried) continue
+      const key = `${srcTid}->${dstTid}:${carried ? "c" : "f"}`
+      if (emittedEdges.has(key)) continue
+      emittedEdges.add(key)
+      const color = tidToColor.get(srcTid) ?? "#888"
+      const attrs = carried ? ` style="dashed" constraint=false arrowhead=vee` : ""
+      lines.push(`  "t${srcTid}" -> "t${dstTid}" [color="${color}" class="ti-${srcTid} ti-${dstTid}"${attrs}]`)
     }
   }
   lines.push("}")
@@ -865,8 +1017,6 @@ function buildMetrics(args: {
 // children's count. Hidden iters contribute 0; each loop with hidden iters
 // contributes 1 for its ghost.
 function countVisibleLeaves(tree: CallCluster, graph: Graph): number {
-  const isHiddenIter = (loop: LoopRun, iter: number): boolean =>
-    loop.iterations >= 4 && iter >= 2 && iter <= loop.iterations - 2
   const countChildren = (children: readonly TreeNode[]): number => {
     const loops = detectLoops(children, graph)
     const loopCovers = new Set<number>()
@@ -875,12 +1025,11 @@ function countVisibleLeaves(tree: CallCluster, graph: Graph): number {
     }
     let total = 0
     for (const loop of loops) {
-      for (let iter = 0; iter < loop.iterations; iter++) {
-        if (isHiddenIter(loop, iter)) continue
+      const drawn = loop.foldable ? 1 : loop.iterations
+      for (let iter = 0; iter < drawn; iter++) {
         const iterStart = loop.start + iter * loop.period
         total += countChildren(children.slice(iterStart, iterStart + loop.period))
       }
-      if (loop.iterations >= 4) total += 1  // ghost node
     }
     for (let k = 0; k < children.length; k++) {
       if (loopCovers.has(k)) continue
@@ -1188,6 +1337,7 @@ class IRViewer extends Component {
       const kind = graph.ops[i]!.kind
       if (kind !== "param_input" && kind !== "tensor_input") included.add(i)
     }
+    clearSignatureCaches()
     const tree = buildGroupTree(graph, included)
     const leaves = collectLeaves(tree)
     const dag = buildDag(graph, leaves)
@@ -1746,10 +1896,10 @@ If the user pastes their own (possibly broken) code, fix it to match these conve
     "submitTitle": "Diagram It"
   },
   "dependencies": {
-    "tensorgrad": "^0.4.2",
+    "tensorgrad": "^0.4.3",
     "@viz-js/viz": "^3.27.0",
     "sucrase": "^3.35.0",
-    "domeleon": "^0.6.1"
+    "domeleon": "^0.6.3"
   }
 }
 ```
