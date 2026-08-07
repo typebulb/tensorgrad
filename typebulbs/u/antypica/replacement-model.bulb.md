@@ -1443,7 +1443,7 @@ html[data-theme="dark"] .orig-line { stroke: #6b7280; }
   "description": "A tiny transformer invents Pokémon names. Then its MLPs are removed and sparse transcoders imitate them in place. It still speaks. Live on WebGPU.",
   "dependencies": {
     "domeleon": "^0.6.3",
-    "tensorgrad": "^0.4.4"
+    "tensorgrad": "^0.4.5"
   }
 }
 ```

@@ -1122,7 +1122,7 @@ h3 {
 ```json
 {
   "dependencies": {
-    "tensorgrad": "^0.4.4",
+    "tensorgrad": "^0.4.5",
     "domeleon": "^0.6.3"
   },
   "description": "Image classifier built with tensorgrad, running in your browser on WebGPU. Drop in photos, fix wrong guesses, and add new classes, live."
