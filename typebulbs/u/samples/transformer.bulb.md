@@ -2664,7 +2664,7 @@ new App({
   "dependencies": {
     "domeleon": "^0.6.3",
     "@unocss/preset-wind3": "^66.5.3",
-    "tensorgrad": "^0.4.5"
+    "tensorgrad": "^0.4.6"
   },
   "description": "Watch a transformer learn 2-digit addition from scratch in your browser. Type two numbers and see it predict the sum digit by digit. Built with tensorgrad (autograd + WebGPU)."
 }
