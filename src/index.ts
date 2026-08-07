@@ -50,7 +50,7 @@ export {
   type StepResult, type RunResult,
   type InputDecl, type InputDecls, type TypedInputs,
 } from './compile.js'
-export { checkWebGPU, type WebGPUSupport } from './webgpu.js'
+export { checkWebGPU, type WebGPUSupport, type WebGPUFailureReason } from './webgpu.js'
 export { loadSafetensors, type SafetensorsData } from './safetensors.js'
 export { Module, init, type InitSpec, type ParamOptions } from './module.js'
 export { singleFlight, type SingleFlightResult } from './single-flight.js'
