@@ -359,13 +359,6 @@ function randomSeed(): number {
   return (Math.random() * 0x100000000) >>> 0
 }
 
-/** True when this environment has WebGPU. Use as a friendly gate before
- *  `compile` so you can surface a "WebGPU required" message rather than
- *  crash deep inside the worker. */
-export function isWebGPUAvailable(): boolean {
-  return typeof navigator !== 'undefined' && 'gpu' in navigator
-}
-
 /**
  * Build the full training IR (forward + backward + optimizer ops + buffer
  * plan + emitted kernels) without spawning a worker, compiling WGSL in the

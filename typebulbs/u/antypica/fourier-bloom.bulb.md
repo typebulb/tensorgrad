@@ -10,7 +10,7 @@ import * as THREE from "three"
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls"
 import { App, Component, a, button, canvas, div, h1, inputRange, p, path, polygon, rect, span, svg } from "domeleon"
 import {
-  Module, compile, isWebGPUAvailable, Linear, RMSNorm, lr,
+  Module, compile, checkWebGPU, Linear, RMSNorm, lr,
   add, mul, matmul, swapAxes, softmaxCausal, silu, narrow, reshape,
   embedding, arange, splitHeads, mergeHeads, crossEntropy,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -287,9 +287,10 @@ class Trainer extends Component {
     const stage = this.#stage
     const run = ++this.#runId          // invalidates any earlier run still looping
     this.loading = true                // a retrain recompiles too: put the status back on the stage
-    if (!isWebGPUAvailable()) {
+    const gpu = await checkWebGPU()
+    if (!gpu.ok) {
       this.failed = true
-      this.#setStatus("This needs WebGPU (recent Chrome/Edge/Safari).")
+      this.#setStatus(gpu.message)
       return
     }
     this.#setStatus("compiling WGSL kernels…")
@@ -930,7 +931,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); f
   "description": "A tiny transformer learns clock math in your browser.",
   "dependencies": {
     "three": "^0.160.0",
-    "tensorgrad": "^0.4.3",
+    "tensorgrad": "^0.4.4",
     "domeleon": "^0.6.3"
   }
 }

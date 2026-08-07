@@ -10,7 +10,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 
 import {
-  Module, compile, isWebGPUAvailable, Linear,
+  Module, compile, checkWebGPU, Linear,
   mul, sub, mean, reshape, relu, sigmoid, concat,
   sin, cos, square,
   type Tensor, type CompiledTraining, type CompiledForward,
@@ -222,8 +222,9 @@ function App() {
   }
 
   async function boot() {
-    if (!isWebGPUAvailable()) {
-      setStatus('WebGPU not available. Try Chrome 113+ or Safari 17.4+.')
+    const gpu = await checkWebGPU()
+    if (!gpu.ok) {
+      setStatus(gpu.message)
       return
     }
     const rgb = makeDefaultImage()
@@ -511,7 +512,7 @@ code {
 {
   "description": "NeRF is a coordinate-network MLP learns the (x, y) → RGB mapping for one 64×64 image, using sinusoidal positional encoding so it can fit high-frequency detail.",
   "dependencies": {
-    "tensorgrad": "^0.4.3",
+    "tensorgrad": "^0.4.4",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   }

@@ -20,6 +20,7 @@ build-artifacts/
 .github/
 .claude/
 CLAUDE.md
+ISSUES.md
 temp/
 *.bin
 # ...except bulb weight assets under the wholesale-whitelisted antypica folder

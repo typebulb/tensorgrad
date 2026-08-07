@@ -8,7 +8,7 @@ name: Regrow
 ```tsx
 import { App, Component, a, button, canvas, div, h1, p, path, polygon, polyline, rect, span, svg } from "domeleon"
 import {
-  Module, compile, isWebGPUAvailable, Conv2d, Linear, init, lr, capture, loadSafetensors,
+  Module, compile, checkWebGPU, Conv2d, Linear, init, lr, capture, loadSafetensors,
   conv2d, maxPool2d, relu, sin, greater, where, mul, add, sub, div as tdiv, mean, sum, abs, square, sqrt, clamp,
   matmul, narrow, concat, reshape, permute, randn, ones, zeros,
   type Tensor, type CompiledTraining, type CompiledForward, type LR,
@@ -712,8 +712,9 @@ class Trainer extends Component {
   async run() {
     const stage = this.#stage
     const run = ++this.#runId
-    if (!isWebGPUAvailable()) {
-      this.#setStatus("This needs WebGPU (recent Chrome, Edge, or Safari).")
+    const gpu = await checkWebGPU()
+    if (!gpu.ok) {
+      this.#setStatus(gpu.message)
       return
     }
 
@@ -1277,7 +1278,7 @@ body { font-size: var(--text); }
 {
   "description": "A neural cellular automaton grows a 3D donut from one cell, trained live on WebGPU with the Cells-to-Pixels recipe.",
   "dependencies": {
-    "tensorgrad": "^0.4.3",
+    "tensorgrad": "^0.4.4",
     "domeleon": "^0.6.3"
   }
 }

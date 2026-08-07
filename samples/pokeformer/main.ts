@@ -5,7 +5,7 @@
 // caught by running this sample against the live workspace tensorgrad.
 
 import {
-  isWebGPUAvailable,
+  checkWebGPU,
   type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 import {
@@ -158,8 +158,9 @@ async function startTraining(): Promise<void> {
   running = true
   step = 0
   try {
-    if (!isWebGPUAvailable()) {
-      onStatus('WebGPU not available. Use Chrome 113+ or Safari 17.4+.', 'err')
+    const gpu = await checkWebGPU()
+    if (!gpu.ok) {
+      onStatus(gpu.message, 'err')
       running = false
       return
     }

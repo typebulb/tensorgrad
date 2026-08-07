@@ -7,6 +7,7 @@ import { adamStepScalars } from './adam.js'
 import { PRNG_SEED_INPUT } from './ops.js'
 import type { Req, Res, WireIR, WireAdamConfig, WireSGDConfig, WireOptimizerConfig, WireError } from './worker-protocol.js'
 import { wireError } from './worker-protocol.js'
+import { requestAdapterWithRetry, webGPUFailureMessage } from './webgpu.js'
 
 interface GraphSlot {
   runtime: CompiledRuntime
@@ -57,22 +58,13 @@ let device: GPUDevice | null = null
 async function ensureDevice(): Promise<GPUDevice> {
   if (device) return device
   if (typeof navigator === 'undefined' || !navigator.gpu) {
-    throw new Error('tensorgrad worker: WebGPU not available in this environment')
+    throw new Error('tensorgrad worker: ' + webGPUFailureMessage('no-webgpu'))
   }
-  // requestAdapter() resolves with null (not throws) when the GPU process
-  // is transiently unhealthy — recent crash, power-state transition, sandboxed
-  // iframe+blob worker quirk, etc. Retry with backoff before giving up.
   // `high-performance` selects the discrete GPU on dual-GPU laptops (the
   // default often picks the integrated one). No-op on single-GPU machines;
   // correct default for a training workload.
-  let adapter: GPUAdapter | null = null
-  const delays = [0, 100, 400]
-  for (const ms of delays) {
-    if (ms > 0) await new Promise(r => setTimeout(r, ms))
-    adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
-    if (adapter) break
-  }
-  if (!adapter) throw new Error('tensorgrad worker: no WebGPU adapter')
+  const adapter = await requestAdapterWithRetry({ powerPreference: 'high-performance' })
+  if (!adapter) throw new Error('tensorgrad worker: ' + webGPUFailureMessage('no-adapter'))
   // Default WebGPU limits cap a single storage-buffer BINDING at 128 MB and a
   // buffer at 256 MB — one big activation tensor (e.g. a [B·H·W, C] matmul
   // operand at render resolution) silently invalidates the whole command

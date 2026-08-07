@@ -13,7 +13,7 @@ import { inflate } from 'pako'
 import * as fabric from 'fabric'
 
 import {
-  Module, compile, isWebGPUAvailable, Linear, crossEntropy, relu, singleFlight,
+  Module, compile, checkWebGPU, Linear, crossEntropy, relu, singleFlight,
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 
@@ -157,14 +157,19 @@ class Model extends Component implements IModel {
     super()
     // Gate the entire UI on WebGPU. Without this, the main UI renders and the
     // predict/train fail silently on first lazy compile — looking broken rather
-    // than unsupported.
-    if (!isWebGPUAvailable()) {
-      this.status = 'This demo requires WebGPU. Try a recent Chrome, Edge, or Safari (17.4+).'
-      return
-    }
-    this.loadData().catch(err => {
-      this.status = "Error: " + err.message
-      this.update()
+    // than unsupported. The probe is async: it asks for a real adapter, so
+    // browsers that expose the API but hand out none (Chrome on Linux) are
+    // caught too.
+    checkWebGPU().then(gpu => {
+      if (!gpu.ok) {
+        this.status = gpu.message
+        this.update()
+        return
+      }
+      this.loadData().catch(err => {
+        this.status = "Error: " + err.message
+        this.update()
+      })
     })
   }
 
@@ -1048,7 +1053,7 @@ new App({
     "@unocss/preset-wind3": "^66.5.3",
     "pako": "^2.1.0",
     "fabric": "^7.0.0",
-    "tensorgrad": "^0.4.3"
+    "tensorgrad": "^0.4.4"
   },
   "description": "Train a neural network to recognize handwritten digits (MNIST) live in your browser. Draw on the canvas and watch the model improve in real time. Built with tensorgrad (autograd + WebGPU)."
 }

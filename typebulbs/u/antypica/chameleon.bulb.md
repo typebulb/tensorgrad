@@ -8,7 +8,7 @@ name: Chameleon
 ```tsx
 import { App, Component, a, button, canvas, div, h1, img, p, path, polygon, rect, span, svg } from "domeleon"
 import {
-  Module, compileForward, isWebGPUAvailable, Conv2d, Linear, init,
+  Module, compileForward, checkWebGPU, Conv2d, Linear, init,
   conv2d, maxPool2d, relu, sin, greater, where, mul, add,
   narrow, concat, reshape, permute, randn, ones, zeros,
   type Tensor, type CompiledForward,
@@ -313,8 +313,9 @@ class Root extends Component {
   }
 
   async run() {
-    if (!isWebGPUAvailable()) {
-      this.#setStatus("This needs WebGPU (recent Chrome, Edge, or Safari).")
+    const gpu = await checkWebGPU()
+    if (!gpu.ok) {
+      this.#setStatus(gpu.message)
       return
     }
     this.#setStatus("compiling WGSL kernels…")
@@ -595,7 +596,7 @@ img.thumb { box-sizing: border-box; padding: 16.667%; }
 {
   "description": "A neural cellular automaton grows a chameleon from one cell on your GPU, using weights from the paper “From Cells to Pixels”. Scratch it and it heals.",
   "dependencies": {
-    "tensorgrad": "^0.4.3",
+    "tensorgrad": "^0.4.4",
     "domeleon": "^0.6.3"
   }
 }

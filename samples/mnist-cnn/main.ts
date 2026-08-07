@@ -19,7 +19,7 @@
 // Status is streamed to the vite dev server via POST /__log so you can
 // tail it in the terminal instead of copying from the browser console.
 
-import { isWebGPUAvailable, type CompiledTraining, type CompiledForward } from 'tensorgrad'
+import { checkWebGPU, type CompiledTraining, type CompiledForward } from 'tensorgrad'
 import {
   CNN, irSpec, compileTraining,
   BATCH_SIZE, EVAL_BATCH, N_CLASSES,
@@ -163,8 +163,9 @@ log = (msg) => {
 }
 
 async function boot(): Promise<void> {
-  if (!isWebGPUAvailable()) {
-    log('WebGPU not available. Use Chrome 113+ or Safari 17.4+.')
+  const gpu = await checkWebGPU()
+  if (!gpu.ok) {
+    log(gpu.message)
     return
   }
   log('loading MNIST…')

@@ -7,7 +7,7 @@ name: KataGo
 
 ```tsx
 import {
-  Module, Conv2d, compileForward, isWebGPUAvailable,
+  Module, Conv2d, compileForward, checkWebGPU,
   add, mul, matmul, relu, reshape, concat, mean, maxPool2d,
   type Tensor,
 } from 'tensorgrad'
@@ -1898,8 +1898,9 @@ class Game extends Component {
     // that has not reached the screen by here would not appear until the engine
     // is up.
     await nextFrame()
-    if (!isWebGPUAvailable()) {
-      this.#setStatus('WebGPU is unavailable in this browser, and this bulb needs it.')
+    const gpu = await checkWebGPU()
+    if (!gpu.ok) {
+      this.#setStatus(gpu.message)
       return
     }
     this.#setStatus('Compiling the graph and uploading the weights…', true)
@@ -2456,7 +2457,7 @@ canvas {
   "description": "A real KataGo network (b6c96) playing full-size Go in the browser. 1.16 MB of weights, compiled to WGSL by tensorgrad.",
   "dependencies": {
     "domeleon": "^0.6.3",
-    "tensorgrad": "^0.4.3"
+    "tensorgrad": "^0.4.4"
   }
 }
 ```

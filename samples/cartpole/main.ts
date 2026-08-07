@@ -21,7 +21,7 @@
 // as the other samples.
 
 import {
-  isWebGPUAvailable,
+  checkWebGPU,
   type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
 import {
@@ -324,8 +324,9 @@ renderEnv(resetEnv())
 // ---------------------------------------------------------------------------
 
 async function boot(): Promise<void> {
-  if (!isWebGPUAvailable()) {
-    onStatus('WebGPU not available. Try Chrome 113+ or Safari 17.4+.')
+  const gpu = await checkWebGPU()
+  if (!gpu.ok) {
+    onStatus(gpu.message)
     return
   }
   await buildGraphs()

@@ -9,7 +9,7 @@ name: Image Classifier
 import {
   Module, Conv2d, Linear, LayerNorm, compileForward, compile, loadSafetensors,
   add, mul, matmul, swapAxes, reshape, concat, narrow, split,
-  splitHeads, mergeHeads, softmax, gelu, crossEntropy, isWebGPUAvailable, type Tensor,
+  splitHeads, mergeHeads, softmax, gelu, crossEntropy, checkWebGPU, type Tensor,
 } from 'tensorgrad'
 import {
   App, Component, div, h1, h3, p, span, button, img, label, input, inputText, svg, polyline, polygon,
@@ -262,8 +262,9 @@ class Model extends Component {
   }
 
   async start() {
-    if (!isWebGPUAvailable()) {
-      this.setStatus('WebGPU isn’t available in this browser.')
+    const gpu = await checkWebGPU()
+    if (!gpu.ok) {
+      this.setStatus(gpu.message)
       return
     }
 
@@ -1121,7 +1122,7 @@ h3 {
 ```json
 {
   "dependencies": {
-    "tensorgrad": "^0.4.3",
+    "tensorgrad": "^0.4.4",
     "domeleon": "^0.6.3"
   },
   "description": "Image classifier built with tensorgrad, running in your browser on WebGPU. Drop in photos, fix wrong guesses, and add new classes, live."

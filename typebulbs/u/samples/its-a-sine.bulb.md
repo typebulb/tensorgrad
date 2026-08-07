@@ -6,7 +6,7 @@ name: "It's a sine"
 **code.tsx**
 
 ```tsx
-import { Module, compile, Linear, mul, sub, mean, relu, type Tensor } from 'tensorgrad'
+import { Module, compile, checkWebGPU, Linear, mul, sub, mean, relu, type Tensor } from 'tensorgrad'
 
 const HIDDEN = 64
 const BATCH_SIZE = 256
@@ -96,6 +96,13 @@ runBtn.onclick = async () => {
   runBtn.disabled = true
   stopBtn.disabled = false
   stopRequested = false
+  const gpu = await checkWebGPU()
+  if (!gpu.ok) {
+    statusEl.textContent = gpu.message
+    runBtn.disabled = false
+    stopBtn.disabled = true
+    return
+  }
   statusEl.textContent = 'Compiling…'
 
   const { train, infer, compileMs } = await buildGraphs()
@@ -259,7 +266,7 @@ code {
 ```json
 {
   "dependencies": {
-    "tensorgrad": "^0.4.3"
+    "tensorgrad": "^0.4.4"
   },
   "description": "The smallest end-to-end tensorgrad training loop: a 3-layer MLP learns y = sin(x)."
 }

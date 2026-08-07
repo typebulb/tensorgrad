@@ -12,7 +12,7 @@ import {
   add, mul, sub, sum, div as tdiv, matmul, swapAxes, reshape, embedding,
   splitHeads, mergeHeads, rope, softmaxCausal, categorical, relu,
   abs, mean, square, capture,
-  crossEntropy, isWebGPUAvailable, init,
+  crossEntropy, checkWebGPU, init,
   type Tensor,
 } from "tensorgrad"
 
@@ -386,10 +386,12 @@ class Demo {
   wordActs: Map<string, { in0: Float32Array; out0: Float32Array; in1: Float32Array; out1: Float32Array; len: number }> = new Map()
   generating = false
   evalNames: string[] = []
+  gpuMsg = ""
 
   async run() {
     try {
-      if (!isWebGPUAvailable()) { this.phase = "no-webgpu"; this.onUpdate?.(); return }
+      const gpu = await checkWebGPU()
+      if (!gpu.ok) { this.gpuMsg = gpu.message; this.phase = "no-webgpu"; this.onUpdate?.(); return }
       await this.boot()
       await this.trainLM()
       await this.harvest()
@@ -870,7 +872,7 @@ class Root extends Component {
           span({ class: "kw" }, "sparse transcoders"),
           ", trained only to imitate each MLP's input-to-output behavior, are seated in the empty sockets. Attention stays original. If the model still speaks, the machinery itself, not just its messages, has an interpretable stand-in."),
       ),
-      d.phase === "no-webgpu" ? div({ class: ["panel", "boot"] }, "WebGPU is not available in this browser. Use Chrome 113+ or Safari 17.4+.")
+      d.phase === "no-webgpu" ? div({ class: ["panel", "boot"] }, d.gpuMsg)
       : d.phase === "error" ? div({ class: ["panel", "boot"] }, `Something broke: ${d.errorMsg}`)
       : d.phase === "boot" ? div({ class: ["panel", "boot"] }, "Compiling training + replacement graphs to WebGPU…")
       : div({},
@@ -1441,7 +1443,7 @@ html[data-theme="dark"] .orig-line { stroke: #6b7280; }
   "description": "A tiny transformer invents Pokémon names. Then its MLPs are removed and sparse transcoders imitate them in place. It still speaks. Live on WebGPU.",
   "dependencies": {
     "domeleon": "^0.6.3",
-    "tensorgrad": "^0.4.3"
+    "tensorgrad": "^0.4.4"
   }
 }
 ```

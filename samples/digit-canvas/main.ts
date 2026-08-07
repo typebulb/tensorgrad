@@ -35,7 +35,7 @@
 // entirely in the UI section.
 
 import {
-  isWebGPUAvailable, singleFlight,
+  checkWebGPU, singleFlight,
   type CompiledTraining, type CompiledForward, type SingleFlightResult,
 } from 'tensorgrad'
 import {
@@ -468,8 +468,9 @@ loadBtn.addEventListener('click', () => { void loadWeights() })
 // ========== BOOT ==========
 
 async function boot(): Promise<void> {
-  if (!isWebGPUAvailable()) {
-    statusEl.textContent = 'WebGPU not available in this browser. Try Chrome 113+ or Safari 17.4+.'
+  const gpu = await checkWebGPU()
+  if (!gpu.ok) {
+    statusEl.textContent = gpu.message
     trainBtn.disabled = true
     return
   }

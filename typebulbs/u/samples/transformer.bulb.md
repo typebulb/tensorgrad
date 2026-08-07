@@ -12,7 +12,7 @@ import { UnoThemeManager, type ThemeProxy } from 'domeleon/unocss'
 import { inputNumber } from 'domeleon/maskito'
 
 import {
-  Module, compile, isWebGPUAvailable, lr, Linear, LayerNorm, crossEntropy, capture, singleFlight,
+  Module, compile, checkWebGPU, lr, Linear, LayerNorm, crossEntropy, capture, singleFlight,
   add, mul, sum, swapAxes,
   relu, matmul, embedding, arange,
   softmaxCausal, splitHeads, mergeHeads,
@@ -368,18 +368,22 @@ class Model extends Component implements IModel {
 
   constructor() {
     super()
-    if (!isWebGPUAvailable()) {
-      this.isReady = false
-      this.status = 'This demo requires WebGPU. Try a recent Chrome, Edge, or Safari (17.4+).'
-      return
-    }
     this.isReady = true
     this.status = 'Ready (will compile WGSL on first run)'
   }
 
   // refreshPrediction needs this.root.ctx wired, which only happens at attach time.
-  override onAttached() {
-    if (!this.isReady) return
+  // The WebGPU gate lives here, not the constructor: checkWebGPU is async
+  // because it probes for a real adapter, catching browsers that expose the
+  // API but hand out none (Chrome on Linux without its flags).
+  override async onAttached() {
+    const gpu = await checkWebGPU()
+    if (!gpu.ok) {
+      this.isReady = false
+      this.status = gpu.message
+      this.update()
+      return
+    }
     this.refreshPrediction()
     if (!this.isRunning) this.toggleRun()
   }
@@ -2660,7 +2664,7 @@ new App({
   "dependencies": {
     "domeleon": "^0.6.3",
     "@unocss/preset-wind3": "^66.5.3",
-    "tensorgrad": "^0.4.3"
+    "tensorgrad": "^0.4.4"
   },
   "description": "Watch a transformer learn 2-digit addition from scratch in your browser. Type two numbers and see it predict the sum digit by digit. Built with tensorgrad (autograd + WebGPU)."
 }
