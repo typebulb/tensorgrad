@@ -254,7 +254,6 @@ train.replaceModel(newModel, { seed?, optimizer? }): Promise<void>
 trace(trainingSpec): Promise<CompiledIR>                 // IR only — no worker, no GPU
 traceForward(forwardSpec): Promise<CompiledIR>           // forward-only IR
 checkWebGPU(): Promise<WebGPUSupport>                    // pre-flight: probes for a real adapter; on failure, a user-showable message
-isWebGPUAvailable(): boolean                             // deprecated — API surface only, adapter not guaranteed; use checkWebGPU()
 ```
 
 `compile()` is the worker-spawning executor; `train.attach()` adds a sibling forward graph that shares the training compile's worker and param buffers. `compileForward()` is the third path: a worker-spawning, forward-only executor for a model with its *own* params and no training counterpart — same `CompiledForward` surface as `attach` (`run`/`uploadParams`/`downloadParams`/`destroy`/`paramNames`), minus the parent. Load weights in via `uploadParams` (e.g. from `loadSafetensors`), then `run`. This is *not* a general pretrained-inference offering; it runs a model you've defined as a `Module` and supplied weights for. Both take plain options objects — types are inferred from the model + forward function, so you rarely need to import them (but `CompiledTraining<M, I>` / `CompiledForward<M, I>` are exported for class fields, `useRef`, and other storage that breaks inference):
