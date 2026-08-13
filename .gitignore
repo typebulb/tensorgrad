@@ -22,6 +22,8 @@ build-artifacts/
 CLAUDE.md
 ISSUES.md
 temp/
+scripts/
+archive/
 *.bin
 # ...except bulb weight assets under the wholesale-whitelisted antypica folder
 # (.gitignore outranks .git/info/exclude, so the exception has to live here).
