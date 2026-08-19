@@ -8,7 +8,7 @@ name: How Watermarking Text Works
 ```tsx
 import {
   Module, Linear, LayerNorm, compileForward, checkWebGPU,
-  add, mul, matmul, sum, reshape, swapAxes,
+  add, mul, matmul, sum, reshape, swapAxes, narrow, concat, zeros,
   splitHeads, mergeHeads, softmaxCausal, gelu,
   type Tensor,
 } from 'tensorgrad'
@@ -28,6 +28,7 @@ import {
 // transformer stack only 0.4M. The copy shipped here is 3.63M: the exporter keeps the
 // first 256 rows of the 2048-row position table, which is all a 256-token window reaches.
 const D = 64, L = 8, HEADS = 16, VOCAB = 50257
+const HEAD_DIM = D / HEADS
 
 // The compiled graph is one fixed length. 256 is also GPT-Neo's local-attention window:
 // this checkpoint alternates global and local(256) attention layers, and below 256 tokens
@@ -60,6 +61,26 @@ class TinyStories extends Module {
   }
 }
 
+/** tensorgrad's tile edge: a matmul with M, N and K all multiples of 16 compiles to the
+ *  shared-memory GEMM, and anything else falls to a plain one-thread-per-output kernel.
+ *
+ *  That fallback is where this page spent its first month being broken on phones. Qualcomm's
+ *  Adreno driver miscompiles it at the shape this model's attention produces — 16 batched
+ *  [256,256] @ [256,4] products, head dim 4 because the checkpoint runs 16 heads over 64
+ *  channels — and returns a wrong answer, deterministically, with no error anywhere. Every
+ *  tensor before it is exact to 1e-7 and every tensor after it is noise, so the stories came
+ *  out as one word repeated and the detector read a mark that was not there.
+ *
+ *  Padding v's 4 columns out to 16 makes all three dimensions tile multiples, so the product
+ *  goes through the GEMM instead, which is correct on that driver. The added columns are
+ *  zeros and the slice takes only the original 4 back, so the arithmetic is untouched: on
+ *  hardware that never had the bug the logits are bit-identical either way.
+ *
+ *  Measured by typebulbs/u/antypica/tiny-stories-gpu-probe.bulb.md, which runs this model on
+ *  the GPU and again in plain JavaScript and diffs every intermediate. Delete this the day
+ *  tensorgrad stops emitting the naive kernel for shapes the tiled one could take. */
+const TILE = 16
+
 // GPT-Neo is PRE-norm, and its attention does NOT divide qk by sqrt(headDim). That missing
 // scale is a Mesh-Tensorflow inheritance and the single easiest way to get this port wrong:
 // adding it still yields fluent stories, drawn from a distribution ~45% off the real one.
@@ -72,7 +93,9 @@ function block(b: Block, h: Tensor): Tensor {
   const q = splitHeads(b.q.fwd(a), HEADS)
   const k = splitHeads(b.k.fwd(a), HEADS)
   const v = splitHeads(b.v.fwd(a), HEADS)
-  const ctx = mergeHeads(matmul(softmaxCausal(matmul(q, swapAxes(k, -1, -2)), -1), v))
+  const attn = softmaxCausal(matmul(q, swapAxes(k, -1, -2)), -1)
+  const vPad = concat([v, zeros([1, HEADS, CTX, TILE - HEAD_DIM])], -1)
+  const ctx = mergeHeads(narrow(matmul(attn, vPad), -1, 0, HEAD_DIM))
   const h2 = add(h, b.attnOut.fwd(ctx))
   const m = b.ln2.fwd(h2)
   return add(h2, b.proj.fwd(gelu(b.fc.fwd(m), { approximate: 'tanh' })))
@@ -132,7 +155,15 @@ function hash32(a: number, b: number): number {
  *  words in front of them, at any position, with nothing to align and nothing to search. */
 const SEED_CONTEXT = 4
 
-/** Deployed value in Gemini, and the ceiling on the slider. */
+/** The layer count the paper runs its experiments at, and the ceiling on the slider.
+ *
+ *  NOT "the deployed value". The paper says "Unless otherwise mentioned, for all SynthID-Text
+ *  experiments, we use m = 30 tournament layers", and separately that the non-distortionary
+ *  configuration is productionized in Gemini. It never joins the two, and never publishes
+ *  Gemini's own m, H or scorer. Copy on this page kept being regenerated from this comment, so
+ *  the wording here is load-bearing: say published, never deployed. See specs/watermarking.md
+ *  A.5. What the paper DOES pin about the deployment is the non-distortion level, single
+ *  sequence at K = 1, so "runs in Gemini" about the scheme itself is fair and stays. */
 const MAX_LAYERS = 30
 
 /** r_t: the seed for the position that follows `ids[t-SEED_CONTEXT .. t-1]`. */
@@ -1146,8 +1177,14 @@ class Engine extends Component {
     return s
   }
 
-  /** What the Generate tab reads: the document it just wrote, scored the way a stranger with
-   *  the key would score it, with no knowledge of how it was made. */
+  /** What the Generate tab reads: the document it just wrote, scored with the key alone and no
+   *  record of how it was written.
+   *
+   *  Not quite what a stranger would compute, and the difference is worth naming because both
+   *  numbers can be on screen at once. This scores `documentIds`, the stream as generated, so
+   *  the marks line up with the spans that were drawn. A stranger has to tokenize the text
+   *  first, which is what the Detect tab does, and BPE can merge across the seam between the
+   *  prompt and the first generated word. `selftest`'s `tokenization` row measures the gap. */
   liveScore(): Score {
     return this.scoreOf(this.documentIds())
   }
@@ -1214,15 +1251,30 @@ class Engine extends Component {
    *  same fair setting.
    *
    *  Run over the words carrying all but a millionth of the model's mass rather than all 50257,
-   *  which buys the twenty-fold speedup that lets the check run at the deployed thirty layers.
-   *  Two bounds sit on that support and which one binds depends on the temperature. At ordinary
-   *  settings the millionth binds: the omitted tail shifts the heads mass by at most that and the
-   *  distance by twice it, four orders of magnitude under the noise being measured. At the top of
-   *  the temperature slider the 4096-word cap binds first instead, and `covers` reads about 0.998
-   *  (measured at temperature 1.4 and thirty layers), leaving the omitted tail worth a few
-   *  percent of the roughness rather than a millionth of it. Still far under the order of
-   *  magnitude that separates a fair tournament from a bent one, the only judgement this check
-   *  is asked to make, but not the bound the millionth advertises. */
+   *  which buys the twenty-fold speedup that lets the check run at the published thirty layers.
+   *  Two bounds sit on that support and which one binds depends on the temperature: at ordinary
+   *  settings the millionth binds, and at the top of the temperature slider the 4096-word cap
+   *  binds first instead, with `covers` reading about 0.998 at temperature 1.4.
+   *
+   *  **`base` is renormalised by `covers`, and it has to be.** Left unnormalised it sums to
+   *  `covers` while `tournamentLayer` computes m1 over the same short support, so both
+   *  multipliers come out slightly too large and the surviving mass creeps back toward 1 layer by
+   *  layer. One layer leaves m1(2-m1) + (c-m1)(1-m1) = 1 - (1-c)(1-m1), so the deficit halves per
+   *  layer and is gone well before thirty. The check then scored a distribution summing to 1
+   *  against a `base` summing to 0.998 and called the difference watermark bias: an additive
+   *  0.0008 that, unlike roughness, did NOT shrink as more keys were averaged, so the ratio
+   *  stopped converging and turned back up. `verify` at 8000 keys sat right where it turns.
+   *  Reproduced outside the bulb in scripts/check-fairness-support-bias.mjs.
+   *
+   *  Renormalising means both columns of the table describe the truncated distribution rather
+   *  than the model's, which is the honest thing anyway: that IS what this check tests. They stay
+   *  on one scale, so the comparison the card exists to make is unaffected, and at default
+   *  settings `covers` is a millionth off 1 and nothing moves at all.
+   *
+   *  Read the ratio's TREND, never its level. The fair-case ratio is not 1 and is not constant:
+   *  about 1.2 at thirty layers, 0.76 at four. `tvNoise` assumes the per-word mean is normal and
+   *  the per-key values span many orders of magnitude, so it has no business being exact either
+   *  way. FAIR_RATIO is set well clear of that spread for exactly this reason. */
   async checkFairness(keys = 2000, competitors = 2): Promise<Fairness | undefined> {
     // Deliberately not guarded on fairBusy: a reader dragging a slider supersedes their own
     // measurement, and the run counter below already retires the one they left behind.
@@ -1250,7 +1302,9 @@ class Engine extends Component {
       }
 
       const S = support.length
-      const base = Float64Array.from(support, v => probs[v]!)
+      // Renormalised, not raw. See the note above: an unnormalised base makes the tournament
+      // appear to manufacture the mass the truncation removed, and scores it as bias.
+      const base = Float64Array.from(support, v => probs[v]! / covers)
       const work = new Float64Array(S)
       const coin = new Uint8Array(S)
       const acc = new Float64Array(S)
@@ -1368,17 +1422,25 @@ class Engine extends Component {
     }
   }
 
-  /** Where in the current story each teachable bracket lives: a position with eight different
-   *  words in it, a position where only one word was ever possible, and a position where one
-   *  word held several slots and won for that reason. */
+  /** Where in the current story each teachable bracket lives: a position with many different
+   *  words in it, a bracket that came out unanimous, and a position where one word held several
+   *  slots and won for that reason.
+   *
+   *  The middle key is `unanimous`, not `forced`, and the distinction is the whole of P1 in
+   *  specs/watermarking-corrections.md. What `distinct === 1` detects is that every slot drew
+   *  the same word, which is a fact about the DRAW. It is not evidence that only one word was
+   *  possible: slots are filled with replacement, so P(all identical) is about p(top)^slots and
+   *  runs at 44% for p = 0.95. Measured on the shipped default, this case lands on a word the
+   *  model gave 95%, and the popover prints that number. Naming it `forced` is how the false
+   *  version got into four strings of copy, so the name stays descriptive of what was seen. */
   bracketCases() {
-    let spread = -1, forced = -1, repeated = -1
+    let spread = -1, unanimous = -1, repeated = -1
     let widest = 0
     for (let i = 0; i < this.steps.length; i++) {
       const b = this.steps[i]!.bracket
       if (!b) continue
       const slots = b.rounds[0]!.slots
-      if (b.distinct === 1 && forced < 0) forced = i
+      if (b.distinct === 1 && unanimous < 0) unanimous = i
       if (b.distinct > widest) { widest = b.distinct; spread = i }
       if (repeated < 0 && b.distinct > 1 && b.distinct < slots.length) {
         const winner = this.steps[i]!.id
@@ -1387,7 +1449,8 @@ class Engine extends Component {
     }
     return {
       spread: spread < 0 ? undefined : { at: spread, distinct: widest, text: this.steps[spread]!.text },
-      forced: forced < 0 ? undefined : { at: forced, text: this.steps[forced]!.text },
+      unanimous: unanimous < 0 ? undefined
+        : { at: unanimous, text: this.steps[unanimous]!.text },
       repeated: repeated < 0 ? undefined : { at: repeated, text: this.steps[repeated]!.text },
     }
   }
@@ -1400,6 +1463,23 @@ class Engine extends Component {
     this.prompt = DEFAULT_PROMPT
     await this.generate()
     out['watermarked'] = this.runStats()
+
+    // The Generate tab scores the stream it generated; a detector handed the same text has to
+    // tokenize it first, and BPE can merge across the seam between prompt and story. A reader
+    // can put both numbers side by side by pressing "Restore the story", so the gap is worth
+    // measuring rather than assuming. A merge perturbs the four following context windows
+    // before the seeds resynchronise, so a small gap is expected. Reported rather than
+    // asserted: what the right tolerance is has never been measured, and a threshold guessed
+    // here would be a red test nobody trusts rather than a fact anybody knows.
+    const genIds = this.documentIds()
+    const reIds = this.#tok!.encode(this.fullText())
+    const zGen = this.scoreOf(genIds).z, zRe = this.scoreOf(reIds).z
+    out['tokenization'] = {
+      sameStream: genIds.length === reIds.length && genIds.every((v, i) => v === reIds[i]),
+      generatedTokens: genIds.length, retokenizedTokens: reIds.length,
+      zGenerated: +zGen.toFixed(2), zRetokenized: +zRe.toFixed(2),
+      dz: +(zGen - zRe).toFixed(2),
+    }
 
     // No determinism trap here, unlike the distortion-free bulb: the candidates are drawn for
     // real, so a fixed key leaves the loop plenty of randomness of its own. Confirmed rather
@@ -1491,8 +1571,8 @@ const pctTight = (x: number) =>
         : '~0%'
 
 /** How many candidates a bracket holds, written the way it can be read at that size: a drawable
- *  bracket is a count the reader can check against the picture, and a deployed one is an order of
- *  magnitude and nothing more. 3^30 is fifteen digits, which is a number nobody reads.
+ *  bracket is a count the reader can check against the picture, and a thirty-layer one is an
+ *  order of magnitude and nothing more. 3^30 is fifteen digits, which is a number nobody reads.
  *
  *  Shared by the layers slider and the inspector, which have to agree: the inspector used to
  *  announce "Thirty layers" over whatever count the slider was actually on. */
@@ -1585,6 +1665,12 @@ const source = (href: string, label: VElement | string) =>
 
 const PAPER_SYNTHID = 'https://www.nature.com/articles/s41586-024-08025-4'
 const PAPER_ATTACK = 'https://arxiv.org/abs/2603.03410'
+/** Anthropic's own account, 14 August 2026. It is what lets this page say Claude's watermark
+ *  shares the method: "Claude's text watermark is a version of the SynthID-Text approach
+ *  published by Google DeepMind in a Nature paper in 2024." It publishes no parameters, so the
+ *  copy stops at the method and does not claim the configuration. Text in
+ *  specs/watermarking-anthropic-source.txt. */
+const PAPER_ANTHROPIC = 'https://www.anthropic.com/news/claude-text-watermark'
 
 /** Which edge the inspector hangs from, so a word near either margin doesn't push it out of
  *  the story block. Measured once per hover rather than tracked, since the token doesn't move. */
@@ -1804,10 +1890,10 @@ class Root extends Component {
     const slots = 2 ** e.layers
     const count = slotCount(e.layers)
     // Only two settings on this slider are real: the largest bracket that can be drawn for a
-    // reader, and the one Google runs. Everything between them is interpolation, and naming the
-    // two stops is what stops a continuous slider implying m is a per-message dial.
+    // reader, and the one the paper publishes. Everything between them is interpolation, and
+    // naming the two stops is what stops a continuous slider implying m is a per-message dial.
     const anchor = slots <= BRACKET_MAX ? ', drawable'
-      : e.layers === MAX_LAYERS ? ', as deployed' : ''
+      : e.layers === MAX_LAYERS ? ', as published' : ''
     return this.knob('Tournament layers',
       `${e.layers}, ${count} candidates${anchor}`,
       inputRange({
@@ -1820,9 +1906,9 @@ class Root extends Component {
       compact ? undefined
       : 'Rounds of the tournament, and so coins per word. Every layer is another coin the test ' +
       `counts, so the mark sharpens as this rises. Two settings on here are real: small enough ` +
-      `to draw, which stops at ${BRACKET_MAX} candidates, and thirty, which is what Gemini ` +
-      'runs. A deployment picks one number and keeps it, because the detector has to know how ' +
-      'many coins to count.')
+      `to draw, which stops at ${BRACKET_MAX} candidates, and thirty, which is the number the ` +
+      'paper publishes. A deployment picks one and keeps it, because the detector has to know ' +
+      'how many coins to count.')
   }
 
   /** Help is optional: beside the check that measures it, the layers slider appears a second time
@@ -1978,10 +2064,17 @@ class Root extends Component {
    *  Where the bracket is small enough it is drawn slot by slot, which is the reason this bulb
    *  exists: a knockout tournament is understood before a reader has finished looking at it,
    *  and three things become visible at once that a paragraph struggles with. A position with
-   *  eight different words is the mechanism. A position holding the same word eight times is
-   *  the best available answer to whether this damages the text, because where only one word
-   *  will do there is nothing to decide. And a likely word holding several slots at once is
-   *  WHY the scheme is fair rather than merely a claim that it is. */
+   *  eight different words is the mechanism. A likely word holding several slots at once is WHY
+   *  the scheme is fair rather than merely a claim that it is. And a bracket where that word
+   *  holds EVERY slot is the same thing taken to its limit: nothing to decide, no say for the
+   *  key.
+   *
+   *  That last case is not evidence of a position where only one word would do, and must not be
+   *  described as one. Slots are filled with replacement, so P(all identical) is about
+   *  p(top)^slots: 44% at p = 0.95, 18% at 0.9, 7% at 0.85, and at one layer it is simply
+   *  sum p(x)^2, the common case at any peaked position. The popover prints the drawn word's
+   *  own probability two lines above this text, so calling it forced contradicts a number the
+   *  reader can already see. See specs/watermarking-corrections.md P1. */
   inspector(i: number) {
     const e = this.engine
     const active = e.hovered >= 0 ? e.hovered : e.selected
@@ -2114,9 +2207,10 @@ class Root extends Component {
     const e = this.engine
     const b = step.bracket
     if (b && b.distinct === 1) {
-      return 'Every slot in this bracket holds the same word, so there was nothing to decide ' +
-        'and the key had no say. Its coins still get counted, and being fair coins they carry ' +
-        'no evidence either way. Where the text has no freedom the mark has no effect.'
+      return 'Every slot here drew the same word. Slots are filled with replacement, so a word ' +
+        'the model rates highly often takes all of them at once, and then there is nothing to ' +
+        'decide and the key has no say. Its coins are still counted, and being fair coins they ' +
+        'carry no evidence either way.'
     }
     if (b) {
       return 'Each match is won by the candidate whose coin came up heads, and two matching ' +
@@ -2125,7 +2219,7 @@ class Root extends Component {
     return `${e.layers} layers is ${slotCount(e.layers)} candidates, so the ` +
       'tournament is computed rather than played out. The distribution it produces has an ' +
       'exact formula costing one pass over the vocabulary per layer, which is what lets the ' +
-      'deployed thirty layers, a billion candidates wide, run at all.'
+      'published thirty layers, a billion candidates wide, run at all.'
   }
 
   // ---- the detector ---------------------------------------------------------
@@ -2359,7 +2453,8 @@ class Root extends Component {
     if (t.how === 'walkover') {
       return ['Both tickets say ', strong(TOY_NAME[TOY_BAG[t.picked[0]]!]),
         ', so there was nothing to decide and the coins were never looked at. That is five ' +
-        'draws in nine here, and it is every position in a real text where only one word fits.']
+        'draws in nine here, with two different words in the bag: drawing with replacement is ' +
+        'what makes it so common.']
     }
     if (t.how === 'coin') {
       return ['One of each. The coins disagree, so the key settles it and ',
@@ -2424,9 +2519,10 @@ class Root extends Component {
       p({ class: 'aside' },
         'Everything here is tournament sampling, published as SynthID-Text by ',
         source(PAPER_SYNTHID, 'Dathathri and colleagues in Nature (2024)'),
-        '. It runs in Gemini and it is open source in HuggingFace Transformers. Anthropic said ' +
-        'in August 2026 that Claude embeds a statistical watermark, but has not published which ' +
-        'construction it uses, so nothing here is a replica of that.'),
+        ' and running in Gemini. ',
+        source(PAPER_ANTHROPIC, 'Anthropic says'),
+        ' Claude\'s watermark is a version of the same approach, without publishing its ' +
+        'settings, so this is the method rather than the exact configuration.'),
 
       h3('A tournament among the model\'s own words'),
       p('A language model does not choose the next word. It works out a probability for every ' +
@@ -2447,14 +2543,17 @@ class Root extends Component {
         'asked for: not approximately, exactly, and for any number of rounds. That is a claim ' +
         'you can measure here rather than take on trust.'),
       this.fairnessCard(),
-      p('There is also a whole class of position where the key cannot do anything at all. Point ' +
-        'at a word on the Generate tab and you will sometimes find every slot in its bracket ' +
-        'holding the same word, because only one word would do. Nothing was decided there. The ' +
-        'watermark rides entirely on freedom the model already had.'),
+      p('Point at a word on the Generate tab and you will regularly find every slot in its ' +
+        'bracket holding the same word. That is the draw rather than the position: slots are ' +
+        'filled with replacement, so a word the model likes takes all of them and wins for that ' +
+        'reason. Nothing was decided there and the key had no say.'),
+      p('Separately, there are positions where only one word is possible at all, and those ' +
+        'carry no evidence in either direction. The watermark rides entirely on freedom the ' +
+        'model already had.'),
       p({ class: 'aside' },
-        'Google reported running this configuration across about 20 million Gemini responses. ' +
-        'The rate at which people gave a response a thumbs up differed by 0.01% from ' +
-        'unwatermarked, which they report as not statistically significant.'),
+        'Google ran an experiment spanning about 20 million Gemini responses, half of them ' +
+        'watermarked. The rate at which people gave a response a thumbs up differed by 0.01% ' +
+        'from unwatermarked, which they report as not statistically significant.'),
 
       h3('Finding it again'),
       p('The coins are seeded from the four words in front of each position, so anyone holding ' +
@@ -2462,7 +2561,7 @@ class Root extends Component {
         'was written. Walk the words, look up the coins belonging to the word that is actually ' +
         'there, and count the heads. Someone writing without the key gets heads half the time, ' +
         'so text running far enough above half is the evidence, and every extra round of the ' +
-        'tournament is another coin to count. The deployed system runs thirty of them.'),
+        'tournament is another coin to count. The published configuration runs thirty of them.'),
       p('One rule keeps the count honest. If the same four words have already come up, that ' +
         'position is skipped, because reusing a context would reuse the coins. Those are the ' +
         'greyed out words, along with the opening few that have nothing in front of them.'),
@@ -2484,12 +2583,12 @@ class Root extends Component {
         'on your device. Nothing about the scheme needs the model to be small or good, because ' +
         'the tournament acts on the probabilities, and every language model produces those.'),
       p('Two simplifications worth naming. The score here is the plain mean of the coins, while ' +
-        'the deployed detector uses a learned Bayesian score that ',
+        'the detector the paper publishes uses a learned Bayesian score that ',
         source(PAPER_ATTACK, 'later work'),
         ' finds more robust. And nothing here is built to survive editing, which the paper ' +
         'does measure.'),
       p('The paper also defines a variant that runs more than two candidates in each match. It ' +
-        'needs less text to detect, and it pays for that by bending the model\'s rates, so it ' +
+        'needs less text to detect, and it gets there by bending the model\'s rates, so it ' +
         'is neither what Gemini runs nor what is here.'),
       p('Most of the copy in this explainer was, ironically, generated by Opus 5 (though with ' +
         'considerable feedback to streamline the explanations).'),
@@ -3087,6 +3186,25 @@ html[data-theme="dark"] .pop-card { box-shadow: 0 4px 16px rgba(0, 0, 0, .55); }
   border: 1px solid var(--border); background: var(--raised);
   padding: .9rem 1rem; margin: .2rem 0 1rem;
 }
+/* A chip inside a card is the one place the default chip fill disappears: `.chip` paints itself
+   `--raised` and so does `.check`, so the control and its container are the same surface and only
+   the 1px border separates them. Every other chip on the page sits on a `.panel`, which is
+   `--panel`, and reads fine.
+
+   Stepping the fill toward `--fg` rather than picking a lighter or darker value is what makes this
+   work in both themes from one rule: `--fg` flips with the theme, so the chip darkens on the light
+   page and lightens on the dark one, and in both cases it moves AWAY from the card. Same idiom as
+   `.toggle`, which mixes `--fg` into its own track for the same reason.
+
+   The hover is restated rather than inherited. `.chip:hover` and `.check .chip` both score one
+   class plus one element, so the later of the two wins outright, and this block sits after it:
+   without the line below, giving the chip a resting border here would silently kill its hover
+   border everywhere inside a card. Same trap as `.check p` beating `.check-caption`. */
+.check .chip {
+  background: color-mix(in srgb, var(--fg) 10%, var(--raised));
+  border-color: color-mix(in srgb, var(--fg) 20%, transparent);
+}
+.check .chip:not([disabled]):hover { color: var(--accent); border-color: var(--accent); }
 .check-head {
   display: flex; justify-content: space-between; align-items: center;
   gap: .5rem 1rem; flex-wrap: wrap; margin-bottom: .5rem;
@@ -3182,8 +3300,20 @@ html[data-theme="dark"] .pop-card { box-shadow: 0 4px 16px rgba(0, 0, 0, .55); }
   display: flex; justify-content: center; align-items: center; gap: .6rem; flex-wrap: wrap;
   margin-bottom: .35rem;
 }
+/* An empty slot used to be `background: transparent`, which on a `.check` card means it paints
+   nothing and shows `--raised` through itself: identical to its container, with only a `--border`
+   dashed outline to say it is there at all. Same failure as the chip above, one step worse,
+   because a dashed line at `--border` is fainter than a solid one.
+
+   It is deliberately NOT given the filled slot's `--panel`. Empty and filled should differ in
+   three channels rather than two, so the fill steps only a little way off the card while the
+   dashed border and the muted `?` carry the rest. Mixing toward `--fg` again, so the step is
+   away from the container on both themes rather than only one. Kept below the chip's 10% because
+   this is a place waiting to be filled, not a control asking to be pressed. */
 .toy-slot:not(.filled) {
-  border-style: dashed; background: transparent; color: var(--muted);
+  border-style: dashed; color: var(--muted);
+  background: color-mix(in srgb, var(--fg) 6%, var(--raised));
+  border-color: color-mix(in srgb, var(--fg) 16%, transparent);
 }
 /* Both lines hold their height with or without text, so a coin appearing at the last stage moves
    nothing under the pointer. Reserved in CSS rather than by a space in the markup, which is what
