@@ -15,10 +15,18 @@ import { shapeSize } from './shape.js'
 // 2D dispatch with significant over-dispatch.
 const WG_SIZE = 256
 
-// Global thread index packed across the 2D dispatch grid (see runtime.ts).
-// `MAX_X * WG_SIZE = 65535 * 256 = 16776960`. Inlined as a string so the WGSL
-// compiler sees the value as a literal constant.
-const GID_LINE = 'let i = gid.x + gid.y * 16776960u;'
+/** WebGPU's per-dimension cap on `dispatchWorkgroups`, and the guaranteed minimum for
+ *  `maxComputeWorkgroupsPerDimension`. Exported so runtime.ts folds on the same number the
+ *  kernels were emitted against. */
+export const MAX_DISPATCH = 65535
+
+/** Stride between rows of a 1-D grid folded across x and y, in whatever the builtin counts:
+ *  threads for `gid`, workgroups for `wid`. Interpolated as a literal so the WGSL compiler
+ *  sees a constant. */
+const FOLD_STRIDE = { gid: MAX_DISPATCH * WG_SIZE, wid: MAX_DISPATCH } as const
+
+/** Global thread index packed across the 2-D dispatch grid (see runtime.ts). */
+const GID_LINE = `let i = gid.x + gid.y * ${FOLD_STRIDE.gid}u;`
 
 /** One emitted compute kernel. The runtime turns each `KernelSpec` with
  *  non-empty `wgsl` into a `GPUComputePipeline` + bind group; logical ops
@@ -38,62 +46,51 @@ export interface KernelSpec {
    * (read_write).
    */
   bindings: number[]
-  /** Number of threads to dispatch (1-D). 0 means "skip" (e.g. reshape no-op). */
+  /** Threads to dispatch — one grid slice's worth when `dispatchY` or `dispatchZ` is set,
+   *  the whole grid otherwise. 0 means "skip" (e.g. reshape no-op). */
   threads: number
-  /** Extent of the z dispatch axis. Kernels carrying a batch use it rather than packing the
-   *  batch into the linear index; `threads` then counts threads per z-slice. Absent means a
-   *  plain 1-D grid folded into 2-D. See the note below. */
+  /** Extent of the z dispatch axis, when an axis rides z rather than being packed into the
+   *  thread index. Absent means a plain 1-D grid folded across x and y. */
   dispatchZ?: number
-  /** Extent of the y dispatch axis, for kernels that put a second real axis there rather
-   *  than folding a 1-D grid across x and y. When set, `threads` counts threads per
-   *  (y, z) slice and no fold happens: x is sized from `threads` alone. */
+  /** Extent of the y dispatch axis, when a second axis rides y. That leaves no room for the
+   *  fold, so x alone carries `threads`. */
   dispatchY?: number
   /** Workgroup size; usually WG_SIZE. */
   workgroupSize: number
 }
 
-// A batched kernel used to pack (batch, row, col) into one linear thread index and divide it
-// back out. Qualcomm's Adreno miscompiles that: with `M*N` at 512 or 1024 and a reduction of
-// 72 or more, `bi = i / (M*N)` yields a wrong answer, silently and deterministically, with
-// every operand exact. Measured 2026-08-20 over 68 shapes across K, N, M and batch — the
-// naive kernel was wrong at 22 of them; see specs/Adreno-matmul.md and the reproduction in
-// typebulbs/u/antypica/matmul-kernel-lab.bulb.md.
+// ---- Index prologues -------------------------------------------------------
 //
-// WebGPU dispatches a 3-D grid, so the batch never needed packing. `bi` is a builtin, the
-// division is gone, and every one of those 68 shapes is right. Identical thread count,
-// identical memory pattern, measured at parity on both Adreno and desktop.
+// Qualcomm's Adreno miscompiles the arithmetic that recovers per-axis indices from a packed
+// thread id: wrong answers, every operand exact, no error anywhere. The two helpers below
+// emit the forms that survive it, and each returns its WGSL, the expression for the output
+// index, and the dispatch shape together — those are three halves of one decision, and a
+// caller recomputing any of them is how they drift apart.
 //
-// The rule this leaves behind: a kernel whose grid carries a batch takes it on the z axis.
-// Don't reintroduce a packed batch index.
+// Both forms were chosen by measurement, not by reasoning about the source, because
+// reasoning about the source does not work here: deleting a `+ gid.y * 0u` term that
+// computes nothing flips correctness in BOTH directions depending on the shape. Sweeps in
+// typebulbs-tentative/kernel-fixes/packed-index-lab.bulb.md; account in
+// specs/Adreno-matmul.md.
+//
+// The rule they leave behind: never recover an axis index by dividing a packed thread id
+// when a dispatch axis can carry it instead.
 
-/** WebGPU's per-dimension cap on `dispatchWorkgroups`, and the guaranteed minimum for
- *  `maxComputeWorkgroupsPerDimension`. */
-const MAX_DISPATCH = 65535
-
-/** The index prologue for a one-thread-per-output kernel whose output is 4-D and whose body
- *  loops — conv2d, its input gradient, and both pooling kernels.
+/** Prologue for a one-thread-per-output kernel over a 4-D output whose body loops — conv2d,
+ *  its input gradient, and both pooling kernels.
  *
- *  Four output axes, three dispatch axes, so exactly one division is unavoidable. This puts
- *  the outer two axes on real dispatch axes and packs only the innermost pair, so the one
- *  surviving division is by the last extent (an image width) rather than by a product.
+ *  Four output axes and three dispatch axes, so one division is unavoidable. The outer two
+ *  axes ride real dispatch axes and only the innermost pair is packed, which leaves that
+ *  division by the last extent (an image width) rather than by a product. Correct at 135 of
+ *  135 swept shapes, where the fully packed form was wrong at 20 of 93 and the batch-on-z
+ *  form below at 67 of 95.
  *
- *  That choice is empirical, and deliberately so. Adreno miscompiles index decomposition in
- *  these kernels in a way no reading of the source predicts: the fully packed form is wrong
- *  at 20 of 93 measured shapes, the batch-on-z form (the matmul remedy) is wrong at 67 of
- *  95, and toggling the 2-D fold — an edit that computes nothing, since the y extent is 1 —
- *  flips correctness in BOTH directions depending on the shape. So "the construct is gone,
- *  therefore it is fixed" is not an argument that holds here. This form is used because it
- *  is correct at 135 of 135 adversarially swept shapes and for no other reason. The sweep is
- *  typebulbs/u/antypica/packed-index-lab.bulb.md; the account is specs/Adreno-matmul.md.
- *
- *  The trade is occupancy. One workgroup covers up to 256 of `d2*d3` and no more, so an
- *  output whose spatial extent is under 256 leaves lanes idle — kata-go's global max pool,
- *  at 1x1 out of [8,96,1,1], dispatches 768 workgroups where the packed form needed 3. That
- *  is 196k threads for 768 outputs, which is small in absolute terms but is a 256x
- *  over-dispatch, and over-dispatch is free on desktop and 3-8x on Adreno. Unmeasured.
- *  If it ever bites, the fix is a 2-D workgroup shaped to `d2*d3` rather than a fallback to
- *  a form that is known wrong. */
-function decompose4dDispatch(
+ *  The trade is occupancy: one workgroup covers at most 256 of `d2*d3`, so an output with a
+ *  small spatial extent leaves lanes idle. kata-go's global max pool, 1x1 out of
+ *  [8,96,1,1], dispatches 768 workgroups where the packed form needed 3 — a 256x
+ *  over-dispatch, free on desktop and 3-8x on Adreno, unmeasured. If it ever bites the fix
+ *  is a 2-D workgroup shaped to `d2*d3`, not a fallback to a form known to be wrong. */
+function gridIndex4d(
   shape: readonly [number, number, number, number],
   names: readonly [string, string, string, string],
 ) {
@@ -112,9 +109,9 @@ function decompose4dDispatch(
       spec: { threads: perSlice, dispatchY: d1, dispatchZ: d0 },
     }
   }
-  // Past a dispatch cap the axes cannot ride the grid and the packed form is the only
-  // option. It is the form measured wrong at some shapes, so this is a fallback rather than
-  // a choice; reaching it needs more than 65535 batch items or channels.
+  // Past a dispatch cap the axes cannot ride the grid, so the packed form is the only option
+  // left — a fallback rather than a choice. Reaching it needs more than 65535 batch items or
+  // channels.
   const total = d0 * d1 * perSlice
   return {
     wgsl: `  ${GID_LINE}\n  if (i >= ${total}u) { return; }\n${decompose4d(shape, names)}`,
@@ -123,33 +120,35 @@ function decompose4dDispatch(
   }
 }
 
-/** The index prologue for a kernel whose grid carries a batch: declares `bi` and the
- *  within-slice index `name`, and reports the dispatch shape that goes with it.
+/** Prologue for a matmul kernel whose grid carries a batch: the batch rides z and the rest
+ *  of the index is folded across x and y as usual. Correct at all 68 swept shapes, where the
+ *  packed form was wrong at 22.
  *
- *  `builtin` picks which id the kernel reads — `gid` for one-thread-per-output kernels,
- *  `wid` for one-workgroup-per-tile ones — which also sets the stride of the 2-D fold and
- *  whether `threads` counts threads or workgroups' worth of them. */
+ *  `builtin` picks which id the kernel reads — `gid` for one-thread-per-output kernels, `wid`
+ *  for one-workgroup-per-tile ones — which also sets the fold stride and whether `threads`
+ *  counts threads or workgroups' worth of them. */
 function batchIndex(name: string, perSlice: number, batch: number, builtin: 'gid' | 'wid') {
-  const stride = builtin === 'gid' ? '16776960u' : '65535u'
+  const stride = FOLD_STRIDE[builtin]
   const scale = builtin === 'wid' ? WG_SIZE : 1
   if (batch <= MAX_DISPATCH) {
     return {
-      wgsl: `  let ${name} = ${builtin}.x + ${builtin}.y * ${stride};\n` +
+      wgsl: `  let ${name} = ${builtin}.x + ${builtin}.y * ${stride}u;\n` +
         `  if (${name} >= ${perSlice}u) { return; }\n` +
         `  let bi = ${builtin}.z;`,
+      outIdx: `bi * ${perSlice}u + ${name}`,
       spec: { threads: perSlice * scale, dispatchZ: batch },
     }
   }
-  // Past the cap the batch cannot ride z and has to go back into the packed index — the form
-  // Adreno miscompiles. It needs `perSlice` at 512 or 1024 to bite, and a graph with more
-  // than 65535 batch items at that width would be a 33M-element output, so nothing tensorgrad
-  // runs reaches both at once. Left as the fallback rather than an error for that reason.
+  // Past the cap the batch cannot ride z and goes back into the packed index — the form
+  // Adreno miscompiles. It needs `perSlice` at 512 or 1024 to bite, and 65535 batch items at
+  // that width is a 33M-element output, so nothing tensorgrad runs reaches both at once.
   const total = batch * perSlice
   return {
-    wgsl: `  let _i = ${builtin}.x + ${builtin}.y * ${stride};\n` +
+    wgsl: `  let _i = ${builtin}.x + ${builtin}.y * ${stride}u;\n` +
       `  if (_i >= ${total}u) { return; }\n` +
       `  let bi = _i / ${perSlice}u;\n` +
       `  let ${name} = _i % ${perSlice}u;`,
+    outIdx: '_i',
     spec: { threads: total * scale },
   }
 }
@@ -632,8 +631,7 @@ var<workgroup> partial : array<f32, ${WG_SIZE}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
   // One workgroup per output element. wid is workgroup-uniform, so the
-  // early-out keeps every barrier below in uniform control flow. The batch
-  // rides the z axis (see the note above KernelSpec).
+  // early-out keeps every barrier below in uniform control flow.
 ${mnIdx.wgsl}
   let m = mn / ${N}u;
   let n = mn % ${N}u;
@@ -643,7 +641,7 @@ ${mnIdx.wgsl}
     s = s + a[aBase + k] * b[k * ${N}u + n];
   }
 ${emitWorkgroupReduce('partial', 's')}
-  if (lid == 0u) { c[bi * ${M * N}u + mn] = partial[0]; }
+  if (lid == 0u) { c[${mnIdx.outIdx}] = partial[0]; }
 }`.trim()
         return {
           opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
@@ -672,7 +670,7 @@ ${mnIdx.wgsl}
   for (var k : u32 = 0u; k < ${K}u; k = k + 1u) {
     s = s + a[aBase + k] * b[k * ${N}u + n];
   }
-  c[bi * ${M * N}u + mn] = s;
+  c[${mnIdx.outIdx}] = s;
 }`.trim()
       return {
         opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
@@ -711,7 +709,7 @@ ${mnIdx.wgsl}
   for (var k : u32 = 0u; k < ${K}u; k = k + 1u) {
     s = s + a[aBase + k] * b[bBase + k * ${N}u + n];
   }
-  c[bi * ${M * N}u + mn] = s;
+  c[${mnIdx.outIdx}] = s;
 }`.trim()
       return {
         opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
@@ -1041,7 +1039,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const [, cIn, H, W] = input.shape
       const [cOut, cInPerG, kH, kW] = weight.shape
       const cOutPerG = cOut! / op.groups
-      const idx = decompose4dDispatch(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_out', 'w_out'])
+      const idx = gridIndex4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_out', 'w_out'])
       const wgsl = `
 @group(0) @binding(0) var<storage, read> input : array<f32>;
 @group(0) @binding(1) var<storage, read> weight : array<f32>;
@@ -1087,7 +1085,7 @@ ${idx.wgsl}
       const [cOut, cInPerG, kH, kW] = weight.shape
       const cOutPerG = cOut! / op.groups
       const [, , hOut, wOut] = dy.shape
-      const idx = decompose4dDispatch(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_in', 'w_in'])
+      const idx = gridIndex4d(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_in', 'w_in'])
       const wgsl = `
 @group(0) @binding(0) var<storage, read> weight : array<f32>;
 @group(0) @binding(1) var<storage, read> dy : array<f32>;
@@ -1217,8 +1215,7 @@ ${decompose4d(out.shape as [number, number, number, number], ['c_out_', 'c_in_',
       const input = tof(op.input)
       const out = tof(op.out)
       const [, C, H, W] = input.shape
-      const [B, , hOut, wOut] = out.shape
-      const poolIdx = decompose4dDispatch(out.shape as [number, number, number, number], ['b', 'c', 'h_out', 'w_out'])
+      const poolIdx = gridIndex4d(out.shape as [number, number, number, number], ['b', 'c', 'h_out', 'w_out'])
       // Padding never wins; ties favor earliest in scan order (strictly-greater
       // comparison). Backward must replicate this exact scan to match.
       const NEG = '-3.4e38'
@@ -1254,11 +1251,10 @@ ${poolIdx.wgsl}
       const input = tof(op.input)
       const dy = tof(op.dy)
       const out = tof(op.out)
-      const [B, C, H, W] = input.shape
+      const [, C, H, W] = input.shape
       const [, , hOut, wOut] = dy.shape
-      const gradIdx = decompose4dDispatch(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 'w_in'])
+      const gradIdx = gridIndex4d(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 'w_in'])
       const NEG = '-3.4e38'
-      void B
       const wgsl = `
 @group(0) @binding(0) var<storage, read> input : array<f32>;
 @group(0) @binding(1) var<storage, read> dy : array<f32>;
@@ -1350,10 +1346,9 @@ var<workgroup> Btile : array<f32, ${WG_SIZE}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
   // One workgroup per output tile. wid is workgroup-uniform, so the
-  // early-out keeps the barriers below in uniform control flow. The batch
-  // rides the z axis (see the note above KernelSpec) — this kernel measured
-  // correct on Adreno with the packed index too, but the construct is the one
-  // that miscompiles and there is no reason to keep it anywhere.
+  // early-out keeps the barriers below in uniform control flow. This kernel
+  // measured correct on Adreno with the packed batch index too; it changed
+  // anyway, because the construct is the one that miscompiles.
 ${idx.wgsl}
   let row = lid / ${TILE}u;
   let col = lid % ${TILE}u;

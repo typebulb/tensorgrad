@@ -1,15 +1,16 @@
-// Batched kernels must carry the batch on the z dispatch axis, never packed into the linear
-// thread index and divided back out.
+// A kernel must not recover an axis index by dividing a packed thread id when a dispatch
+// axis could carry it instead — matmul takes its batch on z, and conv/pool take two axes on
+// y and z.
 //
 // This is a correctness test wearing the clothes of a style test. Qualcomm's Adreno
-// miscompiles `bi = i / (M*N)` — with M*N at 512 or 1024 and a reduction of 72 or more it
-// returns a wrong answer, silently, with every operand exact. Measured over 68 shapes; the
-// naive kernel was wrong at 22 of them and right at all 68 once the division went away. The
-// full account is in specs/Adreno-matmul.md.
+// miscompiles that division: wrong answers, every operand exact, no error anywhere. The
+// forms asserted below are the ones measured correct on the device; the ones interdicted
+// were measured wrong. specs/Adreno-matmul.md is the account.
 //
-// Nothing here needs a GPU: it reads the emitted WGSL and the dispatch shape, which is where
-// the bug lives. The device that actually miscompiles is in nobody's CI, so a shape-level
-// guard is the only kind of regression test available.
+// Nothing here needs a GPU — it reads the emitted WGSL and the dispatch shape, which is
+// where the bug lives. The device that miscompiles is in nobody's CI, so a shape-level
+// guard is the only regression test available, and the rest of the suite never executes
+// WGSL at all.
 
 import { matmul, reshape, conv2d, maxPool2d, type Tensor } from '../src/index.js'
 import { traceFn, tensorInput } from '../src/trace.js'

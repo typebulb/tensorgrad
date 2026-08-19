@@ -1,7 +1,7 @@
 // WebGPU runtime. Browser-only — needs `navigator.gpu` at runtime.
 
 import type { BufferPlan } from './buffers.js'
-import type { KernelSpec } from './codegen.js'
+import { MAX_DISPATCH, type KernelSpec } from './codegen.js'
 
 // lib.dom declares the WebGPU types but not this runtime constant.
 declare const GPUMapMode: { readonly READ: number; readonly WRITE: number }
@@ -340,18 +340,14 @@ export async function createRuntime(
       const pass = encoder.beginComputePass({ label: k.opKind })
       pass.setPipeline(pipeline)
       pass.setBindGroup(0, bindGroup)
-      // WebGPU caps each dispatch dim at 65535 workgroups; split into 2D when
-      // the X axis overflows. Kernels compute the global index as
-      // `gid.x + gid.y * (65535 * workgroup_size)` to match this stride.
-      // A kernel that carries a batch declares `dispatchZ` and reads it from the
-      // z builtin instead of dividing it back out of a packed index; `threads`
-      // then counts threads per z-slice. See the note above KernelSpec.
-      // A kernel that also puts a real axis on y declares `dispatchY`; there is no
-      // 1-D fold in that case, so x is sized from `threads` alone.
+      // Three grid shapes, picked by which dispatch axes the kernel claimed. A plain 1-D
+      // grid folds across x and y, and its kernel recovers the index with the matching
+      // stride. `dispatchZ` means an axis rides z, so `threads` counts one z-slice.
+      // `dispatchY` means a second axis rides y, which leaves no room to fold, so x takes
+      // the whole per-slice count. See the note above the index prologues in codegen.ts.
       const wgCount = Math.max(1, Math.ceil(k.threads / k.workgroupSize))
-      const MAX_X = 65535
-      const wgX = k.dispatchY === undefined ? Math.min(wgCount, MAX_X) : wgCount
-      const wgY = k.dispatchY ?? Math.ceil(wgCount / MAX_X)
+      const wgX = k.dispatchY === undefined ? Math.min(wgCount, MAX_DISPATCH) : wgCount
+      const wgY = k.dispatchY ?? Math.ceil(wgCount / MAX_DISPATCH)
       pass.dispatchWorkgroups(wgX, wgY, k.dispatchZ ?? 1)
       pass.end()
     }
