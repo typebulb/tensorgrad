@@ -343,11 +343,16 @@ export async function createRuntime(
       // WebGPU caps each dispatch dim at 65535 workgroups; split into 2D when
       // the X axis overflows. Kernels compute the global index as
       // `gid.x + gid.y * (65535 * workgroup_size)` to match this stride.
+      // A kernel that carries a batch declares `dispatchZ` and reads it from the
+      // z builtin instead of dividing it back out of a packed index; `threads`
+      // then counts threads per z-slice. See the note above KernelSpec.
+      // A kernel that also puts a real axis on y declares `dispatchY`; there is no
+      // 1-D fold in that case, so x is sized from `threads` alone.
       const wgCount = Math.max(1, Math.ceil(k.threads / k.workgroupSize))
       const MAX_X = 65535
-      const wgX = Math.min(wgCount, MAX_X)
-      const wgY = Math.ceil(wgCount / MAX_X)
-      pass.dispatchWorkgroups(wgX, wgY, 1)
+      const wgX = k.dispatchY === undefined ? Math.min(wgCount, MAX_X) : wgCount
+      const wgY = k.dispatchY ?? Math.ceil(wgCount / MAX_X)
+      pass.dispatchWorkgroups(wgX, wgY, k.dispatchZ ?? 1)
       pass.end()
     }
     // Writebacks for Adam state + updated params. Empty for forward-only.

@@ -40,8 +40,118 @@ export interface KernelSpec {
   bindings: number[]
   /** Number of threads to dispatch (1-D). 0 means "skip" (e.g. reshape no-op). */
   threads: number
+  /** Extent of the z dispatch axis. Kernels carrying a batch use it rather than packing the
+   *  batch into the linear index; `threads` then counts threads per z-slice. Absent means a
+   *  plain 1-D grid folded into 2-D. See the note below. */
+  dispatchZ?: number
+  /** Extent of the y dispatch axis, for kernels that put a second real axis there rather
+   *  than folding a 1-D grid across x and y. When set, `threads` counts threads per
+   *  (y, z) slice and no fold happens: x is sized from `threads` alone. */
+  dispatchY?: number
   /** Workgroup size; usually WG_SIZE. */
   workgroupSize: number
+}
+
+// A batched kernel used to pack (batch, row, col) into one linear thread index and divide it
+// back out. Qualcomm's Adreno miscompiles that: with `M*N` at 512 or 1024 and a reduction of
+// 72 or more, `bi = i / (M*N)` yields a wrong answer, silently and deterministically, with
+// every operand exact. Measured 2026-08-20 over 68 shapes across K, N, M and batch — the
+// naive kernel was wrong at 22 of them; see specs/Adreno-matmul.md and the reproduction in
+// typebulbs/u/antypica/matmul-kernel-lab.bulb.md.
+//
+// WebGPU dispatches a 3-D grid, so the batch never needed packing. `bi` is a builtin, the
+// division is gone, and every one of those 68 shapes is right. Identical thread count,
+// identical memory pattern, measured at parity on both Adreno and desktop.
+//
+// The rule this leaves behind: a kernel whose grid carries a batch takes it on the z axis.
+// Don't reintroduce a packed batch index.
+
+/** WebGPU's per-dimension cap on `dispatchWorkgroups`, and the guaranteed minimum for
+ *  `maxComputeWorkgroupsPerDimension`. */
+const MAX_DISPATCH = 65535
+
+/** The index prologue for a one-thread-per-output kernel whose output is 4-D and whose body
+ *  loops — conv2d, its input gradient, and both pooling kernels.
+ *
+ *  Four output axes, three dispatch axes, so exactly one division is unavoidable. This puts
+ *  the outer two axes on real dispatch axes and packs only the innermost pair, so the one
+ *  surviving division is by the last extent (an image width) rather than by a product.
+ *
+ *  That choice is empirical, and deliberately so. Adreno miscompiles index decomposition in
+ *  these kernels in a way no reading of the source predicts: the fully packed form is wrong
+ *  at 20 of 93 measured shapes, the batch-on-z form (the matmul remedy) is wrong at 67 of
+ *  95, and toggling the 2-D fold — an edit that computes nothing, since the y extent is 1 —
+ *  flips correctness in BOTH directions depending on the shape. So "the construct is gone,
+ *  therefore it is fixed" is not an argument that holds here. This form is used because it
+ *  is correct at 135 of 135 adversarially swept shapes and for no other reason. The sweep is
+ *  typebulbs/u/antypica/packed-index-lab.bulb.md; the account is specs/Adreno-matmul.md.
+ *
+ *  The trade is occupancy. One workgroup covers up to 256 of `d2*d3` and no more, so an
+ *  output whose spatial extent is under 256 leaves lanes idle — kata-go's global max pool,
+ *  at 1x1 out of [8,96,1,1], dispatches 768 workgroups where the packed form needed 3. That
+ *  is 196k threads for 768 outputs, which is small in absolute terms but is a 256x
+ *  over-dispatch, and over-dispatch is free on desktop and 3-8x on Adreno. Unmeasured.
+ *  If it ever bites, the fix is a 2-D workgroup shaped to `d2*d3` rather than a fallback to
+ *  a form that is known wrong. */
+function decompose4dDispatch(
+  shape: readonly [number, number, number, number],
+  names: readonly [string, string, string, string],
+) {
+  const [d0, d1, d2, d3] = shape
+  const [n0, n1, n2, n3] = names
+  const perSlice = d2 * d3
+  if (d0 <= MAX_DISPATCH && d1 <= MAX_DISPATCH && Math.ceil(perSlice / WG_SIZE) <= MAX_DISPATCH) {
+    return {
+      wgsl: `  let _p = gid.x;\n` +
+        `  if (_p >= ${perSlice}u) { return; }\n` +
+        `  let ${n0} = gid.z;\n` +
+        `  let ${n1} = gid.y;\n` +
+        `  let ${n2} = _p / ${d3}u;\n` +
+        `  let ${n3} = _p % ${d3}u;`,
+      outIdx: `(${n0} * ${d1}u + ${n1}) * ${perSlice}u + _p`,
+      spec: { threads: perSlice, dispatchY: d1, dispatchZ: d0 },
+    }
+  }
+  // Past a dispatch cap the axes cannot ride the grid and the packed form is the only
+  // option. It is the form measured wrong at some shapes, so this is a fallback rather than
+  // a choice; reaching it needs more than 65535 batch items or channels.
+  const total = d0 * d1 * perSlice
+  return {
+    wgsl: `  ${GID_LINE}\n  if (i >= ${total}u) { return; }\n${decompose4d(shape, names)}`,
+    outIdx: 'i',
+    spec: { threads: total },
+  }
+}
+
+/** The index prologue for a kernel whose grid carries a batch: declares `bi` and the
+ *  within-slice index `name`, and reports the dispatch shape that goes with it.
+ *
+ *  `builtin` picks which id the kernel reads — `gid` for one-thread-per-output kernels,
+ *  `wid` for one-workgroup-per-tile ones — which also sets the stride of the 2-D fold and
+ *  whether `threads` counts threads or workgroups' worth of them. */
+function batchIndex(name: string, perSlice: number, batch: number, builtin: 'gid' | 'wid') {
+  const stride = builtin === 'gid' ? '16776960u' : '65535u'
+  const scale = builtin === 'wid' ? WG_SIZE : 1
+  if (batch <= MAX_DISPATCH) {
+    return {
+      wgsl: `  let ${name} = ${builtin}.x + ${builtin}.y * ${stride};\n` +
+        `  if (${name} >= ${perSlice}u) { return; }\n` +
+        `  let bi = ${builtin}.z;`,
+      spec: { threads: perSlice * scale, dispatchZ: batch },
+    }
+  }
+  // Past the cap the batch cannot ride z and has to go back into the packed index — the form
+  // Adreno miscompiles. It needs `perSlice` at 512 or 1024 to bite, and a graph with more
+  // than 65535 batch items at that width would be a 33M-element output, so nothing tensorgrad
+  // runs reaches both at once. Left as the fallback rather than an error for that reason.
+  const total = batch * perSlice
+  return {
+    wgsl: `  let _i = ${builtin}.x + ${builtin}.y * ${stride};\n` +
+      `  if (_i >= ${total}u) { return; }\n` +
+      `  let bi = _i / ${perSlice}u;\n` +
+      `  let ${name} = _i % ${perSlice}u;`,
+    spec: { threads: total * scale },
+  }
 }
 
 /** Generate a KernelSpec per compute op in graph.ops (in dispatch order). */
@@ -513,6 +623,7 @@ ${outDimDecls}
       // workgroups (SIREN dW 193 → 117 ms/step; xf-small dW likewise) —
       // 16× less traffic beats occupancy. Naive form kept as reference.
       if (total < 32768 && K >= 256 && !(M % TILE === 0 && N % TILE === 0 && K % TILE === 0)) {
+        const mnIdx = batchIndex('mn', M * N, batch, 'wid')
         const wgsl = `
 var<workgroup> partial : array<f32, ${WG_SIZE}>;
 @group(0) @binding(0) var<storage, read> a : array<f32>;
@@ -521,11 +632,9 @@ var<workgroup> partial : array<f32, ${WG_SIZE}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
   // One workgroup per output element. wid is workgroup-uniform, so the
-  // early-out keeps every barrier below in uniform control flow.
-  let i = wid.x + wid.y * 65535u;
-  if (i >= ${total}u) { return; }
-  let bi = i / ${M * N}u;
-  let mn = i % ${M * N}u;
+  // early-out keeps every barrier below in uniform control flow. The batch
+  // rides the z axis (see the note above KernelSpec).
+${mnIdx.wgsl}
   let m = mn / ${N}u;
   let n = mn % ${N}u;
   let aBase = bi * ${M * K}u + m * ${K}u;
@@ -534,24 +643,28 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index)
     s = s + a[aBase + k] * b[k * ${N}u + n];
   }
 ${emitWorkgroupReduce('partial', 's')}
-  if (lid == 0u) { c[i] = partial[0]; }
+  if (lid == 0u) { c[bi * ${M * N}u + mn] = partial[0]; }
 }`.trim()
-        return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: total * WG_SIZE, workgroupSize: WG_SIZE }
+        return {
+          opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
+          ...mnIdx.spec, workgroupSize: WG_SIZE,
+        }
       }
       if (M % TILE === 0 && N % TILE === 0 && K % TILE === 0) {
-        const wgsl = emitTiledMatmul(batch, M, K, N, false)
-        return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: batch * (M / TILE) * (N / TILE) * WG_SIZE, workgroupSize: WG_SIZE }
+        const tiled = emitTiledMatmul(batch, M, K, N, false)
+        return {
+          opIndex, opKind: op.kind, wgsl: tiled.wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
+          ...tiled.spec, workgroupSize: WG_SIZE,
+        }
       }
+      const mnIdx = batchIndex('mn', M * N, batch, 'gid')
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<f32>;
 @group(0) @binding(1) var<storage, read> b : array<f32>;
 @group(0) @binding(2) var<storage, read_write> c : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  ${GID_LINE}
-  if (i >= ${total}u) { return; }
-  let bi = i / ${M * N}u;
-  let mn = i % ${M * N}u;
+${mnIdx.wgsl}
   let m = mn / ${N}u;
   let n = mn % ${N}u;
   let aBase = bi * ${M * K}u + m * ${K}u;
@@ -559,9 +672,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   for (var k : u32 = 0u; k < ${K}u; k = k + 1u) {
     s = s + a[aBase + k] * b[k * ${N}u + n];
   }
-  c[i] = s;
+  c[bi * ${M * N}u + mn] = s;
 }`.trim()
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+      return {
+        opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
+        ...mnIdx.spec, workgroupSize: WG_SIZE,
+      }
     }
 
     case 'matmul_batched': {
@@ -572,21 +688,21 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const K = a.shape[a.shape.length - 1]!
       const N = b.shape[b.shape.length - 1]!
       const batch = shapeSize(a.shape) / (M * K)
-      const total = batch * M * N
       if (M % TILE === 0 && N % TILE === 0 && K % TILE === 0) {
-        const wgsl = emitTiledMatmul(batch, M, K, N, true)
-        return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: batch * (M / TILE) * (N / TILE) * WG_SIZE, workgroupSize: WG_SIZE }
+        const tiled = emitTiledMatmul(batch, M, K, N, true)
+        return {
+          opIndex, opKind: op.kind, wgsl: tiled.wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
+          ...tiled.spec, workgroupSize: WG_SIZE,
+        }
       }
+      const mnIdx = batchIndex('mn', M * N, batch, 'gid')
       const wgsl = `
 @group(0) @binding(0) var<storage, read> a : array<f32>;
 @group(0) @binding(1) var<storage, read> b : array<f32>;
 @group(0) @binding(2) var<storage, read_write> c : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  ${GID_LINE}
-  if (i >= ${total}u) { return; }
-  let bi = i / ${M * N}u;
-  let mn = i % ${M * N}u;
+${mnIdx.wgsl}
   let m = mn / ${N}u;
   let n = mn % ${N}u;
   let aBase = bi * ${M * K}u + m * ${K}u;
@@ -595,9 +711,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   for (var k : u32 = 0u; k < ${K}u; k = k + 1u) {
     s = s + a[aBase + k] * b[bBase + k * ${N}u + n];
   }
-  c[i] = s;
+  c[bi * ${M * N}u + mn] = s;
 }`.trim()
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+      return {
+        opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
+        ...mnIdx.spec, workgroupSize: WG_SIZE,
+      }
     }
 
     // ---- One-hot ------------------------------------------------------------
@@ -922,16 +1041,14 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const [, cIn, H, W] = input.shape
       const [cOut, cInPerG, kH, kW] = weight.shape
       const cOutPerG = cOut! / op.groups
-      const total = shapeSize(out.shape)
+      const idx = decompose4dDispatch(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_out', 'w_out'])
       const wgsl = `
 @group(0) @binding(0) var<storage, read> input : array<f32>;
 @group(0) @binding(1) var<storage, read> weight : array<f32>;
 @group(0) @binding(2) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  ${GID_LINE}
-  if (i >= ${total}u) { return; }
-${decompose4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_out', 'w_out'])}
+${idx.wgsl}
   let g         = cOut_ / ${cOutPerG}u;
   let inBase    = b * ${cIn! * H! * W!}u + g * ${cInPerG! * H! * W!}u;
   let wBase     = cOut_ * ${cInPerG! * kH! * kW!}u;
@@ -950,9 +1067,12 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_o
       }
     }
   }
-  out[i] = s;
+  out[${idx.outIdx}] = s;
 }`.trim()
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.weight), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+      return {
+        opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.weight), buf(op.out)],
+        ...idx.spec, workgroupSize: WG_SIZE,
+      }
     }
 
     case 'conv2d_input_grad': {
@@ -967,16 +1087,14 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_o
       const [cOut, cInPerG, kH, kW] = weight.shape
       const cOutPerG = cOut! / op.groups
       const [, , hOut, wOut] = dy.shape
-      const total = shapeSize(out.shape)
+      const idx = decompose4dDispatch(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_in', 'w_in'])
       const wgsl = `
 @group(0) @binding(0) var<storage, read> weight : array<f32>;
 @group(0) @binding(1) var<storage, read> dy : array<f32>;
 @group(0) @binding(2) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  ${GID_LINE}
-  if (i >= ${total}u) { return; }
-${decompose4d(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_in', 'w_in'])}
+${idx.wgsl}
   let g      = c_in_ / ${cInPerG!}u;
   let cLocal = c_in_ - g * ${cInPerG!}u;
   var s : f32 = 0.0;
@@ -1001,9 +1119,12 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_i
       }
     }
   }
-  out[i] = s;
+  out[${idx.outIdx}] = s;
 }`.trim()
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.weight), buf(op.dy), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+      return {
+        opIndex, opKind: op.kind, wgsl, bindings: [buf(op.weight), buf(op.dy), buf(op.out)],
+        ...idx.spec, workgroupSize: WG_SIZE,
+      }
     }
 
     case 'conv2d_weight_grad': {
@@ -1097,7 +1218,7 @@ ${decompose4d(out.shape as [number, number, number, number], ['c_out_', 'c_in_',
       const out = tof(op.out)
       const [, C, H, W] = input.shape
       const [B, , hOut, wOut] = out.shape
-      const total = shapeSize(out.shape)
+      const poolIdx = decompose4dDispatch(out.shape as [number, number, number, number], ['b', 'c', 'h_out', 'w_out'])
       // Padding never wins; ties favor earliest in scan order (strictly-greater
       // comparison). Backward must replicate this exact scan to match.
       const NEG = '-3.4e38'
@@ -1106,9 +1227,7 @@ ${decompose4d(out.shape as [number, number, number, number], ['c_out_', 'c_in_',
 @group(0) @binding(1) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  ${GID_LINE}
-  if (i >= ${total}u) { return; }
-${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_out', 'w_out'])}
+${poolIdx.wgsl}
   let inChan = b * ${C! * H! * W!}u + c * ${H! * W!}u;
   var m : f32 = ${NEG};
   for (var kh : u32 = 0u; kh < ${op.kH}u; kh = kh + 1u) {
@@ -1121,9 +1240,12 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_out',
       if (v > m) { m = v; }
     }
   }
-  out[i] = m;
+  out[${poolIdx.outIdx}] = m;
 }`.trim()
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+      return {
+        opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.out)],
+        ...poolIdx.spec, workgroupSize: WG_SIZE,
+      }
     }
 
     case 'max_pool_2d_grad': {
@@ -1134,7 +1256,7 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_out',
       const out = tof(op.out)
       const [B, C, H, W] = input.shape
       const [, , hOut, wOut] = dy.shape
-      const total = shapeSize(out.shape)
+      const gradIdx = decompose4dDispatch(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 'w_in'])
       const NEG = '-3.4e38'
       void B
       const wgsl = `
@@ -1143,9 +1265,7 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_out',
 @group(0) @binding(2) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  ${GID_LINE}
-  if (i >= ${total}u) { return; }
-${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 'w_in'])}
+${gradIdx.wgsl}
   let inChan = b * ${C! * H! * W!}u + c * ${H! * W!}u;
   let dyChan = b * ${C! * hOut! * wOut!}u + c * ${hOut! * wOut!}u;
   var s : f32 = 0.0;
@@ -1179,9 +1299,12 @@ ${decompose4d(out.shape as [number, number, number, number], ['b', 'c', 'h_in', 
       }
     }
   }
-  out[i] = s;
+  out[${gradIdx.outIdx}] = s;
 }`.trim()
-      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.dy), buf(op.out)], threads: total, workgroupSize: WG_SIZE }
+      return {
+        opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.dy), buf(op.out)],
+        ...gradIdx.spec, workgroupSize: WG_SIZE,
+      }
     }
   }
 }
@@ -1210,12 +1333,15 @@ const TILE = 16
  *  with the profiler. Backward free-rides: matmul adjoints are
  *  matmul-composed. Register blocking (4×4 micro-tiles) is the named
  *  follow-on if dense-GEMM perf needs more. */
-function emitTiledMatmul(batch: number, M: number, K: number, N: number, batched: boolean): string {
+function emitTiledMatmul(batch: number, M: number, K: number, N: number, batched: boolean) {
   const tilesM = M / TILE
   const tilesN = N / TILE
-  const numWG = batch * tilesM * tilesN
   const bBase = batched ? `bi * ${K * N}u` : '0u'
-  return `
+  // Returned together, not recomputed by the caller: the guard below and the dispatch extent
+  // are two halves of one decision, and if they ever disagreed the kernel would drop work or
+  // write out of range, silently. test/dispatch.ts pins the pair.
+  const idx = batchIndex('t', tilesM * tilesN, batch, 'wid')
+  return { spec: idx.spec, wgsl: `
 var<workgroup> Atile : array<f32, ${WG_SIZE}>;
 var<workgroup> Btile : array<f32, ${WG_SIZE}>;
 @group(0) @binding(0) var<storage, read> a : array<f32>;
@@ -1224,11 +1350,11 @@ var<workgroup> Btile : array<f32, ${WG_SIZE}>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
   // One workgroup per output tile. wid is workgroup-uniform, so the
-  // early-out keeps the barriers below in uniform control flow.
-  let wg = wid.x + wid.y * 65535u;
-  if (wg >= ${numWG}u) { return; }
-  let bi = wg / ${tilesM * tilesN}u;
-  let t = wg % ${tilesM * tilesN}u;
+  // early-out keeps the barriers below in uniform control flow. The batch
+  // rides the z axis (see the note above KernelSpec) — this kernel measured
+  // correct on Adreno with the packed index too, but the construct is the one
+  // that miscompiles and there is no reason to keep it anywhere.
+${idx.wgsl}
   let row = lid / ${TILE}u;
   let col = lid % ${TILE}u;
   let gRow = (t / ${tilesN}u) * ${TILE}u + row;
@@ -1247,7 +1373,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index)
     workgroupBarrier();
   }
   c[bi * ${M * N}u + gRow * ${N}u + gCol] = s;
-}`.trim()
+}`.trim() }
 }
 
 /** Shared-memory tree reduction across one workgroup. The caller declares
