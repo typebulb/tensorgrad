@@ -8,7 +8,7 @@ name: How Watermarking Text Works
 ```tsx
 import {
   Module, Linear, LayerNorm, compileForward, checkWebGPU,
-  add, mul, matmul, sum, reshape, swapAxes, narrow, concat, zeros,
+  add, mul, matmul, sum, reshape, swapAxes,
   splitHeads, mergeHeads, softmaxCausal, gelu,
   type Tensor,
 } from 'tensorgrad'
@@ -61,26 +61,6 @@ class TinyStories extends Module {
   }
 }
 
-/** tensorgrad's tile edge: a matmul with M, N and K all multiples of 16 compiles to the
- *  shared-memory GEMM, and anything else falls to a plain one-thread-per-output kernel.
- *
- *  That fallback is where this page spent its first month being broken on phones. Qualcomm's
- *  Adreno driver miscompiles it at the shape this model's attention produces — 16 batched
- *  [256,256] @ [256,4] products, head dim 4 because the checkpoint runs 16 heads over 64
- *  channels — and returns a wrong answer, deterministically, with no error anywhere. Every
- *  tensor before it is exact to 1e-7 and every tensor after it is noise, so the stories came
- *  out as one word repeated and the detector read a mark that was not there.
- *
- *  Padding v's 4 columns out to 16 makes all three dimensions tile multiples, so the product
- *  goes through the GEMM instead, which is correct on that driver. The added columns are
- *  zeros and the slice takes only the original 4 back, so the arithmetic is untouched: on
- *  hardware that never had the bug the logits are bit-identical either way.
- *
- *  Measured by typebulbs/u/antypica/tiny-stories-gpu-probe.bulb.md, which runs this model on
- *  the GPU and again in plain JavaScript and diffs every intermediate. Delete this the day
- *  tensorgrad stops emitting the naive kernel for shapes the tiled one could take. */
-const TILE = 16
-
 // GPT-Neo is PRE-norm, and its attention does NOT divide qk by sqrt(headDim). That missing
 // scale is a Mesh-Tensorflow inheritance and the single easiest way to get this port wrong:
 // adding it still yields fluent stories, drawn from a distribution ~45% off the real one.
@@ -94,8 +74,12 @@ function block(b: Block, h: Tensor): Tensor {
   const k = splitHeads(b.k.fwd(a), HEADS)
   const v = splitHeads(b.v.fwd(a), HEADS)
   const attn = softmaxCausal(matmul(q, swapAxes(k, -1, -2)), -1)
-  const vPad = concat([v, zeros([1, HEADS, CTX, TILE - HEAD_DIM])], -1)
-  const ctx = mergeHeads(narrow(matmul(attn, vPad), -1, 0, HEAD_DIM))
+  // 16 batched [256,256] @ [256,4] products — head dim 4, because the checkpoint runs 16
+  // heads over 64 channels. This is the shape that spent this page's first month broken on
+  // every Android phone: tensorgrad emitted a kernel Qualcomm's Adreno driver miscompiled,
+  // so the stories came out as one word repeated and the detector read a mark that was not
+  // there. Fixed in the library as of 0.4.7, which this bulb requires.
+  const ctx = mergeHeads(matmul(attn, v))
   const h2 = add(h, b.attnOut.fwd(ctx))
   const m = b.ln2.fwd(h2)
   return add(h2, b.proj.fwd(gelu(b.fc.fwd(m), { approximate: 'tanh' })))
@@ -3344,7 +3328,7 @@ html[data-theme="dark"] .pop-card { box-shadow: 0 4px 16px rgba(0, 0, 0, .55); }
 ```json
 {
   "dependencies": {
-    "tensorgrad": "^0.4.6",
+    "tensorgrad": "^0.4.7",
     "domeleon": "^0.6.6"
   },
   "description": "Learn how text watermarking works in your browser: a secret key runs a tournament between words the model drew, so the winner is one it would say."
