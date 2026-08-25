@@ -186,12 +186,12 @@ function vggTaps(rgb01: Tensor, inp: Record<string, Tensor>): Tensor[] {
 function lpips(x: Tensor, y: Tensor, inp: Record<string, Tensor>): Tensor {
   const fx = vggTaps(x, inp), fy = vggTaps(y, inp)
   const unit = (f: Tensor) => tdiv(f, add(sqrt(sum(mul(f, f), 1, { keepDims: true })), 1e-10))
-  let total: Tensor | null = null
+  let total: Tensor | undefined
   for (let k = 0; k < 5; k++) {
     const d = sub(unit(fx[k]!), unit(fy[k]!))
     const w = mul(mul(d, d), inp[`lp_lin${k}`]!)
     const s = mul(mean(w), TAP_C[k]!)      // mean over BCHW × C = channel-sum, batch+spatial mean
-    total = total === null ? s : add(total, s)
+    total = total ? add(total, s) : s
   }
   return total!
 }
@@ -318,7 +318,7 @@ const makeSeedAt = (x: number, y: number) => {
 }
 let SEED = makeSeedAt(G >> 1, G >> 1)
 let SEED_POS: [number, number] = [G >> 1, G >> 1]
-let LO_TARGET: Float32Array | null = null   // S×S box-averaged target (drift probe only — no loss term)
+let LO_TARGET: Float32Array | undefined     // S×S box-averaged target (drift probe only — no loss term)
 
 // the paper seeds dead center, but the donut is a hole there. If the seed pixel
 // is transparent, death is absorbing (a lethal rule), so relocate the seed to
@@ -587,7 +587,7 @@ async function cachedFetch(url: string, onProgress?: Progress): Promise<ArrayBuf
 }
 
 let LP: Record<string, Float32Array> = {}
-let lpipsPromise: Promise<void> | null = null
+let lpipsPromise: Promise<void> | undefined
 function ensureLpips(onProgress?: Progress): Promise<void> {
   if (!lpipsPromise) lpipsPromise = (async () => {
     let buf: ArrayBuffer
@@ -623,9 +623,9 @@ class Trainer extends Component {
   mode: "pretrained" | "train" = "train"
   lossHist: number[] = []
   #runId = 0
-  #train: CompiledTraining<NCAModel> | null = null
-  #infer: CompiledForward | null = null
-  #render: CompiledForward | null = null
+  #train?: CompiledTraining<NCAModel>
+  #infer?: CompiledForward
+  #render?: CompiledForward
 
   get #stage() { return (this.ctx.root as unknown as IRoot).stage }
 
@@ -650,7 +650,7 @@ class Trainer extends Component {
   // never ran, saturating the GPU and freezing the page (and the host UI).
   async #compileFresh(): Promise<void> {
     this.#train?.destroy()
-    this.#train = null; this.#infer = null; this.#render = null
+    this.#train = this.#infer = this.#render = undefined
     const full = this.mode === "train"
     const t = full
       ? await compile({
@@ -881,19 +881,19 @@ class Stage extends Component {
   paused = false
   demoActive = false
   #live = false                               // has either left box painted yet? gates the "loading…" overlay
-  #canvas: HTMLCanvasElement | null = null
-  #ctx: CanvasRenderingContext2D | null = null
-  #img: ImageData | null = null
-  #cellsCtx: CanvasRenderingContext2D | null = null
-  #cellsImg: ImageData | null = null
+  #canvas?: HTMLCanvasElement
+  #ctx?: CanvasRenderingContext2D
+  #img?: ImageData
+  #cellsCtx?: CanvasRenderingContext2D
+  #cellsImg?: ImageData
   #demoToken = 0
-  #state: Float32Array | null = null
+  #state?: Float32Array
   #painting = false
-  #tctx: CanvasRenderingContext2D | null = null
-  #timg: ImageData | null = null
-  #target: Float32Array | null = null
-  #renderDamaged: (() => void) | null = null
-  onTrainCarve: ((x: number, y: number) => void) | null = null
+  #tctx?: CanvasRenderingContext2D
+  #timg?: ImageData
+  #target?: Float32Array
+  #renderDamaged?: () => void
+  onTrainCarve?: (x: number, y: number) => void
   #pendingCarves: [number, number][] = []
 
   boot(cv: HTMLCanvasElement) {
@@ -976,8 +976,10 @@ class Stage extends Component {
     this.demoActive = true
     this.#state = SEED.slice()
     let renderBusy = false
+    // paused pokes repaint on demand; while running the loop is already about
+    // to repaint, so don't race a second render against it
     this.#renderDamaged = () => {
-      if (renderBusy || token !== this.#demoToken) return
+      if (!this.paused || renderBusy || token !== this.#demoToken) return
       renderBusy = true
       render.run({ state: this.#state!, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 }).then(r => {
         renderBusy = false
@@ -1013,7 +1015,7 @@ class Stage extends Component {
   stopDemo() {
     this.#demoToken++
     this.demoActive = false
-    this.#renderDamaged = null
+    this.#renderDamaged = undefined
     this.#live = false            // a fresh (re)compile is coming — show the loading overlay again
     this.update()
   }
@@ -1106,20 +1108,20 @@ class Root extends Component implements IRoot {
       div({ class: "row" },
         div({ class: "panel" },
           div({ class: "pane-wrap" },
-            canvas({ class: "pane cells", key: "cells", onMounted: (el: Element) => this.stage.bootCells(el as HTMLCanvasElement) }),
+            canvas({ class: "pane cells", key: "cells", ariaLabel: "cells", onMounted: (el: Element) => this.stage.bootCells(el as HTMLCanvasElement) }),
             this.stage.live ? null : span({ class: "pane-loading" }, "loading…"),
           ),
           span({ class: "pane-label" }, `cells ${G}² · raw lattice`),
         ),
         div({ class: "panel" },
           div({ class: "pane-wrap" },
-            canvas({ class: "pane grid", key: "grid", onMounted: (el: Element) => this.#boot(el) }),
+            canvas({ class: "pane grid", key: "grid", ariaLabel: "donut", onMounted: (el: Element) => this.#boot(el) }),
             this.stage.live ? null : span({ class: "pane-loading" }, "loading…"),
           ),
           span({ class: "pane-label" }, `painted ${GH}² · bite me`),
         ),
         div({ class: "panel" },
-          canvas({ class: "pane", key: "target", onMounted: (el: Element) => this.stage.bootTarget(el as HTMLCanvasElement) }),
+          canvas({ class: "pane", key: "target", ariaLabel: "target", onMounted: (el: Element) => this.stage.bootTarget(el as HTMLCanvasElement) }),
           span({ class: "pane-label" }, "target · the donut"),
         ),
       ),
@@ -1278,7 +1280,7 @@ body { font-size: var(--text); }
 {
   "description": "A neural cellular automaton grows a 3D donut from one cell, trained live on WebGPU with the Cells-to-Pixels recipe.",
   "dependencies": {
-    "tensorgrad": "^0.4.6",
+    "tensorgrad": "^0.4.8",
     "domeleon": "^0.6.3"
   }
 }
