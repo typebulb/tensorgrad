@@ -111,7 +111,7 @@ function App() {
     dstCtx.drawImage(small, 0, 0, dstCanvas.width, dstCanvas.height)
   }
 
-  function bytesToCanvas(bytes: Uint8ClampedArray<ArrayBuffer>, dstCanvas: HTMLCanvasElement) {
+  function bytesToCanvas(bytes: ImageData['data'], dstCanvas: HTMLCanvasElement) {
     const smallCtx = smallCtxRef.current!
     smallCtx.putImageData(new ImageData(bytes, IMG_W, IMG_H), 0, 0)
     dstCanvas.getContext('2d')!.drawImage(smallRef.current!, 0, 0, dstCanvas.width, dstCanvas.height)

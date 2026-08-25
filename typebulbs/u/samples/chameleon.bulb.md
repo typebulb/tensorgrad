@@ -14,16 +14,10 @@ import {
   type Tensor, type CompiledForward,
 } from "tensorgrad"
 
-// ============================================================================
-// One organism from "From Cells to Pixels" (Pajouheshgar et al., SIGGRAPH
-// 2026), running the authors' own trained weights — zero training, zero local
-// files. A neural cellular automaton evolves a 96×96 cell grid, and a
-// jointly-trained SIREN field decodes each cell's 32-dim state + sub-cell
-// coordinates into 384×384 RGBA: the chameleon. Weights (~280KB, base64
-// float32 in JSON) and the target image load from assets/ — a local file in
-// chameleon/assets/ (e.g. your own trained weights) shadows the hosted copy.
-// Scratch it and it regrows. The Menagerie bulb is the 24-organism version.
-// ============================================================================
+// "From Cells to Pixels" (Pajouheshgar et al., SIGGRAPH 2026) with the authors' trained
+// weights: a neural CA evolves a 96×96 cell grid, and a jointly-trained SIREN decodes
+// each cell's 32-dim state + sub-cell coords into 384×384 RGBA. Weights and target come
+// from assets/, where a local chameleon/assets/ file shadows the hosted copy.
 
 const C = 32, FC = 256, H = 64, OMEGA = 10 // channels, update-MLP width, SIREN width/freq (paper config)
 const G = 96                               // cell grid — the paper's training lattice
@@ -39,8 +33,6 @@ const nextFrame = () => new Promise(res => requestAnimationFrame(res))
 const clamp01 = (v: number) => v < 0 ? 0 : v > 1 ? 1 : v
 const slog = (s: string) => { if (tb.mode === "local") tb.log(s) }
 
-// Fetch once from the network, thereafter from CacheStorage (offline-friendly);
-// falls back to a plain fetch if the Cache API is unavailable.
 async function cachedFetch(url: string): Promise<ArrayBuffer> {
   const download = async (): Promise<ArrayBuffer> => {
     const res = await fetch(url)
@@ -59,17 +51,9 @@ async function cachedFetch(url: string): Promise<ArrayBuffer> {
   }
 }
 
-// ============================================================================
-// The model — same fields (and so same tensorgrad param names) as the other
-// Cells-to-Pixels bulbs. Init is irrelevant: everything here, the frame
-// constants included, is uploaded before any run.
-//
-// The three constant tensors are parameters rather than per-run inputs on
-// purpose. An input is re-sent (and structure-cloned across the worker
-// boundary) on every single run; `coords` alone is 2.4MB, which is more bytes
-// per frame than the state and the image put together. As params they're
-// uploaded once and then just sit in their GPU buffers.
-// ============================================================================
+// Init is irrelevant — every param, the three frame constants included, is uploaded
+// before any run. Those constants are params rather than inputs because inputs are
+// re-sent and structure-cloned to the worker every run, and `coords` alone is 2.4MB.
 class NCAModel extends Module {
   w1 = new Conv2d(4 * C, FC, 1, { init: init.zeros() })
   w2 = new Conv2d(FC, C, 1, { bias: false, init: init.zeros() })
@@ -88,21 +72,14 @@ class NCAModel extends Module {
   }
 }
 
-// ============================================================================
-// Weight importer — the authors' JSON layout → tensorgrad's param record.
-//   nca.w1.weight [FC, 4C]: input columns are FEATURE-major (k·C + c, k over
-//     identity/sobelX/sobelY/laplacian — the layout their GLSL shader wants);
-//     our grouped perception conv emits CHANNEL-major (c·4 + k, the torch
-//     training layout) — permute the columns back.
-//   nca.w2.weight.T [FC, C]: shipped pre-transposed for the shader; our
-//     Conv2d weight is [C, FC] — transpose.
-//   lppn.net.*: torch Linear [out, in]; tensorgrad Linear is [in, out] (x@W)
-//     — transpose all four.
-// The SIREN's ω is folded into the three hidden layers here rather than
-// applied in the graph: sin(ω·(xW + b)) is sin(x·(ωW) + ωb), and a scalar
-// multiply over [147456, 64] is a full 75MB pass on the GPU for arithmetic
-// that costs nothing at import.
-// ============================================================================
+// The authors' JSON layout → tensorgrad's param record.
+//   nca.w1.weight [FC, 4C]: columns are feature-major (k·C + c, k over identity/
+//     sobelX/sobelY/laplacian) for their GLSL shader; our grouped perception conv
+//     emits channel-major (c·4 + k, the torch training layout) — permute back.
+//   nca.w2.weight.T [FC, C]: pre-transposed for the shader; Conv2d wants [C, FC].
+//   lppn.net.*: torch Linear is [out, in]; tensorgrad's is [in, out] (x@W).
+// ω is folded into the hidden weights: sin(ω·(xW + b)) = sin(x·(ωW) + ωb), so the
+// graph skips a scalar multiply over [147456, 64].
 type TheirTensor = { shape: number[]; dtype: string; data64: string }
 
 function importModel(src: Record<string, TheirTensor>): Record<string, Float32Array> {
@@ -146,18 +123,10 @@ function importModel(src: Record<string, TheirTensor>): Record<string, Float32Ar
   }
 }
 
-// ============================================================================
-// The graph — CA step and SIREN decode, verbatim from the reference: circular
-// perception padding, Bernoulli-0.5 update mask, pre×post alive gating (the
-// torch training semantics).
-//
-// Both live in ONE compiled forward. Two separately compiled graphs means two
-// workers, two GPU devices and so two round trips per frame: the state has to
-// come back to the CPU and go straight out again just to cross from one device
-// to the other, and each `run` pays its own submit-and-map latency. Fused, the
-// state never leaves the GPU mid-frame; the new state rides home as a capture
-// alongside the image.
-// ============================================================================
+// CA step and SIREN decode, verbatim from the reference: circular perception padding,
+// Bernoulli-0.5 update mask, pre×post alive gating. Both must stay in ONE compiled
+// forward — split, each gets its own worker and GPU device, so the state would
+// round-trip through the CPU mid-frame just to cross between them.
 const alive = (s: Tensor) =>
   greater(maxPool2d(narrow(s, 1, 3, 1), 3, { stride: 1, padding: 1 }), 0.1)
 
@@ -179,21 +148,18 @@ function ncaStep(m: NCAModel, s: Tensor): Tensor {
   return mul(s2, mul(boolToF32(pre, G), boolToF32(post, G)))
 }
 
-// exact bilinear ×S upsample of `ch` channels via a depthwise tent conv, with
-// the depth-to-space shuffle landing straight in the SIREN's [pixel, channel]
-// row order — the same permute either way, so laying out the rows here saves
-// transposing all 36 feature planes again downstream
+// exact bilinear ×S upsample of `ch` channels via a depthwise tent conv; the
+// depth-to-space shuffle lands in the SIREN's [pixel, channel] row order, so nothing
+// downstream has to transpose
 function bilinearRows(x: Tensor, w: Tensor, ch: number): Tensor {
   const shifted = conv2d(x, w, { padding: 1, groups: ch })   // [1, ch·S², G, G]
   const t = reshape(shifted, [1, ch, S, S, G, G])
   return reshape(permute(t, [0, 4, 2, 5, 3, 1]), [GGH, ch])  // [1, G, S, G, S, ch]
 }
 
-// the Cells2Pixels decoder, alive-gated the AUTHORS' renderer's way: the alpha
-// channel is bilinearly upsampled to render res and maxpooled over 3×3 RENDER
-// pixels (a smooth, sub-cell-accurate silhouette). That upsampled alpha is
-// column 3 of `up` — the C-channel upsample already computed it, so there's no
-// second pass over the alpha plane.
+// alive gating follows the authors' renderer, not the CA: alpha is maxpooled over 3×3
+// RENDER pixels, giving a sub-cell-accurate silhouette. Column 3 of `up` is that
+// upsampled alpha, already computed by the C-channel upsample.
 function decode(m: NCAModel, s: Tensor): Tensor {
   const up = bilinearRows(s, m.bilin, C)                         // [GGH, C]
   let h = sin(m.s1.fwd(concat([m.coords, up], 1)))               // ω is in the weights
@@ -205,30 +171,21 @@ function decode(m: NCAModel, s: Tensor): Tensor {
   return mul(img, reshape(boolToF32(mask, GH), [GGH, 1]))
 }
 
-// display packing on the GPU: un-premultiply RGB with capped gain, straight
-// alpha, four bytes per pixel — the readback IS ImageData's byte layout, so
-// the image leaves the GPU at 4 bytes per pixel instead of 16 and the host
-// never touches a float
+// un-premultiply with capped gain and pack on the GPU: the readback is ImageData's
+// byte layout, so the image comes back at 4 bytes per pixel instead of 16
 function toPixels(rgba: Tensor): Tensor {
   const a = clamp(narrow(rgba, 1, 3, 1), 0, 1)                                // [GGH, 1]
   const gain = where(greater(a, 0.01), tdiv(1, max(a, 0.2)), zeros([GGH, 1]))
   return packRGBA8(concat([mul(narrow(rgba, 1, 0, 3), gain), a], 1))          // [GGH] i32
 }
 
-// One frame: advance the CA (unless `advance` is 0 — a repaint of a state the
-// pointer just scratched), clamp, hand the new state back as a capture, decode.
-// The clamp is the box the training-time overflow penalty (weight 100) kept the
-// state in, so it's a near-no-op while healthy; it rides along on the GPU
-// rather than costing the CPU a pass over 295k floats every frame.
+// advance=0 decodes the state as-is, for repainting a scratch without stepping the CA.
+// The clamp is the box the training-time overflow penalty kept the state in.
 function frameFn(m: NCAModel, { state, advance }: { state: Tensor; advance: Tensor }) {
   const stepped = clamp(ncaStep(m, state), -1, 1)
   return toPixels(decode(m, capture("state", where(greater(advance, 0), stepped, state))))
 }
 
-// ============================================================================
-// Host-side constants: perception filters, bilinear tent tables, coord
-// features, seed.
-// ============================================================================
 const F3 = [
   [0, 0, 0, 0, 1, 0, 0, 0, 0],                          // identity
   [-1, 0, 1, -2, 0, 2, -1, 0, 1],                       // sobel_x
@@ -243,6 +200,7 @@ const FILTERS = (() => {
   return a
 })()
 
+// 1D tent weights for the four sub-cell offsets, ×S upsample
 const W1D = [
   [0.375, 0.625, 0],
   [0.125, 0.875, 0],
@@ -262,9 +220,8 @@ const BILIN = (() => {
   return a
 })()
 
-// sub-cell coord features [sin(πy), sin(πx), cos(πy), cos(πx)] per render
-// pixel — the reference's num_frequencies=1 encoding, periodic per 4×4 tile.
-// Row-major [GGH, 4]: the layout the SIREN consumes.
+// [sin(πy), sin(πx), cos(πy), cos(πx)] per render pixel — the reference's
+// num_frequencies=1 encoding, periodic per 4×4 tile
 const COORDS = (() => {
   const a = new Float32Array(GGH * 4)
   const f = [-0.75, -0.25, 0.25, 0.75]
@@ -304,10 +261,6 @@ const aliveCount = (s: Float32Array) => {
   return n
 }
 
-// ============================================================================
-// Root — the whole app in one component: the compiled forward, the imported
-// weights, the frame loop, and the view. No training machinery anywhere.
-// ============================================================================
 const icon = (...kids: any[]) => svg({ class: "ico", viewBox: "0 0 24 24", fill: "currentColor" }, ...kids)
 const ICON = {
   play: () => icon(polygon({ points: "8,5 8,19 19,12" })),
@@ -406,7 +359,7 @@ class Root extends Component {
           const n = aliveCount(next)
           this.#state = (n === 0 || n > GG * 0.6) ? SEED.slice() : next
           this.#paintRender(r.output)
-          this.#paintCells(next)   // not #state: on a reseed frame, both canvases show the frame that was decoded
+          this.#paintCells(next)   // not #state: on a reseed frame both canvases show the decoded frame
         }
         frames++
         if (frames % 300 === 0) slog(`t=${frames} alive=${aliveCount(this.#state!)}`)
@@ -417,18 +370,16 @@ class Root extends Component {
 
   #damageAt(e: PointerEvent) {
     if (!this.#state) return
-    const rect = this.#canvas!.getBoundingClientRect()
-    const x = Math.floor((e.clientX - rect.left) / rect.width * G)
-    const y = Math.floor((e.clientY - rect.top) / rect.height * G)
+    const box = this.#canvas!.getBoundingClientRect()
+    const x = Math.floor((e.clientX - box.left) / box.width * G)
+    const y = Math.floor((e.clientY - box.top) / box.height * G)
     carveDisc(this.#state, x, y, DAMAGE_R)
     this.#pendingCarves.push([x, y])                     // re-applied if a step was in flight
     this.#paintCells(this.#state)
     this.#renderDamaged()
   }
 
-  // paused pokes still repaint: one decode of the scratched state, the CA held
-  // still. While running the loop is already about to repaint, so leave it be
-  // rather than racing a second full frame in against it.
+  // only while paused: running, the loop is already about to repaint
   #renderDamaged() {
     if (!this.paused || this.#renderBusy || !this.#frame || !this.#state) return
     this.#renderBusy = true
@@ -438,14 +389,12 @@ class Root extends Component {
     })
   }
 
-  // [GGH] packed RGBA8 straight off the GPU (see toPixels) — already
-  // ImageData's bytes; composites onto the themed page background
-  #paintRender(bytes: Uint8ClampedArray<ArrayBuffer>) {
+  #paintRender(bytes: ImageData['data']) {
     if (!this.#ctx) return
     this.#ctx.putImageData(new ImageData(bytes, GH, GH), 0, 0)
   }
 
-  // the cell grid stays planar CHW at 96² — same un-premultiply, strided reads
+  // the cell grid stays planar CHW at 96², so un-premultiply on the host with strided reads
   #paintCells(arr: Float32Array) {
     if (!this.#cellsCtx) return
     const d = this.#cellsImg!.data
@@ -533,8 +482,7 @@ tb.onMessage((m: unknown) => {
 **styles.css**
 
 ```css
-/* Theme tokens — same scheme as the other tensorgrad bulbs. The render canvas
-   is transparent, so the organism composites straight onto --bg. */
+/* The render canvas is transparent, so the organism composites onto --bg. */
 :root {
   color-scheme: light;
   --font: ui-sans-serif, system-ui, sans-serif;
@@ -589,8 +537,8 @@ body { font-size: var(--text); }
 .thumb-box { display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .thumb { width: 84px; aspect-ratio: 1; border: 1px solid var(--panel-border); border-radius: 6px; object-fit: contain; }
 .thumb.cells { image-rendering: pixelated; }
-/* the hosted png is the tight 512² target; the paper centers it in a 768²
-   frame (the 96² lattice), so pad 1/6 per side to match the cells' framing */
+/* the png is the tight 512² target; the paper centers it in a 768² frame (the 96²
+   lattice), so pad 1/6 per side to match the cells' framing */
 img.thumb { box-sizing: border-box; padding: 16.667%; }
 .thumb-label { font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); }
 .dock { padding-bottom: calc(var(--gap) + 4px); }
@@ -601,7 +549,7 @@ img.thumb { box-sizing: border-box; padding: 16.667%; }
 .ico { width: 1.45em; height: 1.45em; flex: none; }
 .readout { font-family: var(--font-mono); color: var(--readout); user-select: text; cursor: text; }
 @media (max-width: 620px) {
-  /* min-height: auto keeps the flex min-content floor, so a squeezed stage-box
+  /* min-height: auto restores the flex min-content floor, so a squeezed stage-box
      scrolls instead of letting the strip overflow into the dock */
   .stage-box { flex-direction: column; gap: 10px; min-height: auto; }
   .strip { flex-direction: row; gap: 8px; }
@@ -622,7 +570,7 @@ img.thumb { box-sizing: border-box; padding: 16.667%; }
   "description": "A neural cellular automaton grows a chameleon from one cell on your GPU, using weights from the paper “From Cells to Pixels”. Scratch it and it heals.",
   "dependencies": {
     "tensorgrad": "^0.4.9",
-    "domeleon": "^0.6.3"
+    "domeleon": "^0.6.6"
   }
 }
 ```

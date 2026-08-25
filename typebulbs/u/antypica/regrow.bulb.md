@@ -940,7 +940,7 @@ class Stage extends Component {
   #markLive() { if (!this.#live) { this.#live = true; this.update() } }
 
   // packed RGBA8 straight off the GPU (see toPixels): already ImageData's bytes
-  paintRender(bytes: Uint8ClampedArray<ArrayBuffer>) {
+  paintRender(bytes: ImageData['data']) {
     if (!this.#ctx) return
     this.#ctx.putImageData(new ImageData(bytes, GH, GH), 0, 0)
     this.#markLive()
