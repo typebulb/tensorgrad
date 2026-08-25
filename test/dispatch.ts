@@ -174,4 +174,24 @@ section('conv and pool put two axes on the dispatch grid')
   }
 }
 
+section('a dense conv takes the tiled implicit-GEMM path: tiles fold across x/y, batch on z')
+{
+  // K = 32·3·3 = 288 is a tile multiple, so this is the tiled kernel (Performance.md §Phase 7).
+  // M = 64 output channels is one 64-row tile, N = 32·32 pixels is sixteen 64-wide tiles:
+  // 16 workgroups per batch item, the batch on z, and the guard is the tile count.
+  const conv = traceFn(() => {
+    const x = tensorInput('x', [8, 32, 32, 32], 'f32')
+    const w = tensorInput('w', [64, 32, 3, 3], 'f32')
+    return conv2d(x, w, { padding: 1 }) as Tensor
+  })
+  const ck = emitKernels(conv, planBuffers(conv, {})).find(k => k.opKind === 'conv2d')!
+  assert(ck.wgsl.includes('Atile'), 'conv2d: tiled kernel emitted for K = 288')
+  assertEq(ck.dispatchZ, 8, 'conv2d tiled: batch on z')
+  assert(ck.dispatchY === undefined, 'conv2d tiled: no y axis, tiles fold across x/y')
+  assertEq(ck.threads, 16 * 256, 'conv2d tiled: one workgroup per tile')
+  const m = />=\s*(\d+)u/.exec(ck.wgsl)
+  if (!m) fail('conv2d tiled emits no tile guard')
+  assertEq(Number(m![1]), 16, 'conv2d tiled: guard matches its tile count')
+}
+
 done('test/dispatch.ts')

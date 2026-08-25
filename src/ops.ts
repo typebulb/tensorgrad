@@ -370,6 +370,22 @@ function sumLastIR(a: Tensor): Tensor {
   return addOp(currentGraph(), 'sum_last', outShape, a.dtype, site, { a: a.id })
 }
 
+/** Σ over every element, as a 0-d tensor. A big tensor is summed in two stages — rows
+ *  of `D`, then the row sums — so the kernel has workgroups to fill: as one row, the
+ *  whole tensor is ONE workgroup striding it, which regrow's LPIPS means measured at
+ *  3 GB/s, 5 ms for 4M elements (Performance.md §Phase 7). `D` is the largest divisor
+ *  of `n` in [256, 4096]; a size with none stays single-stage. Backward free-rides:
+ *  two broadcasts instead of one. */
+function sumAll(a: Tensor): Tensor {
+  const n = a.shape.reduce((p, d) => p * d, 1)
+  if (n >= 65536) {
+    for (let D = 4096; D >= 256; D--) {
+      if (n % D === 0) return sumLastIR(sumLastIR(reshape(a, [n / D, D])))
+    }
+  }
+  return sumLastIR(reshape(a, [-1]))
+}
+
 function argmaxLastIR(a: Tensor): Tensor {
   const site = captureSite('argmax')
   if (a.dtype !== 'f32') throw new ShapeError(`argmax: requires f32, got ${a.dtype}`, site)
@@ -407,7 +423,7 @@ export function mean(a: Tensor, axis?: number, opts?: ReduceOptions): Tensor {
   if (axis === undefined) {
     const n = a.shape.reduce((p, d) => p * d, 1)
     if (n === 0) throw new ShapeError(`mean: cannot mean over zero elements`, captureSite('mean'))
-    return mulScalar(sumLastIR(reshape(a, [-1])), 1 / n)
+    return mulScalar(sumAll(a), 1 / n)
   }
   return reduceAxis(a, axis, !!opts?.keepDims, 'mean')
 }
@@ -422,7 +438,7 @@ export function mean(a: Tensor, axis?: number, opts?: ReduceOptions): Tensor {
  *  sum(x, -1, { keepDims: true })  // preserve the trailing axis as size 1
  *  ``` */
 export function sum(a: Tensor, axis?: number, opts?: ReduceOptions): Tensor {
-  if (axis === undefined) return sumLastIR(reshape(a, [-1]))
+  if (axis === undefined) return sumAll(a)
   return reduceAxis(a, axis, !!opts?.keepDims, 'sum')
 }
 

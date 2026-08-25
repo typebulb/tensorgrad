@@ -644,7 +644,8 @@ ${outDimDecls}
       // aligned): where both apply, tiled measured faster even at 16
       // workgroups (SIREN dW 193 → 117 ms/step; xf-small dW likewise) —
       // 16× less traffic beats occupancy. Naive form kept as reference.
-      if (total < 32768 && K >= 256 && !(M % TILE === 0 && N % TILE === 0 && K % TILE === 0)) {
+      const tileable = K % TILE === 0 && M >= TILE && N >= TILE
+      if (total < 32768 && K >= 256 && !tileable) {
         const mnIdx = batchIndex('mn', M * N, batch, 'wid')
         const wgsl = `
 var<workgroup> partial : array<f32, ${WG_SIZE}>;
@@ -671,7 +672,7 @@ ${emitWorkgroupReduce('partial', 's')}
           ...mnIdx.spec, workgroupSize: WG_SIZE,
         }
       }
-      if (M % TILE === 0 && N % TILE === 0 && K % TILE === 0) {
+      if (tileable) {
         const tiled = emitTiledMatmul(batch, M, K, N, false)
         return {
           opIndex, opKind: op.kind, wgsl: tiled.wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
@@ -709,7 +710,7 @@ ${mnIdx.wgsl}
       const K = a.shape[a.shape.length - 1]!
       const N = b.shape[b.shape.length - 1]!
       const batch = shapeSize(a.shape) / (M * K)
-      if (M % TILE === 0 && N % TILE === 0 && K % TILE === 0) {
+      if (K % TILE === 0 && M >= TILE && N >= TILE) {
         const tiled = emitTiledMatmul(batch, M, K, N, true)
         return {
           opIndex, opKind: op.kind, wgsl: tiled.wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
@@ -1062,6 +1063,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const [, cIn, H, W] = input.shape
       const [cOut, cInPerG, kH, kW] = weight.shape
       const cOutPerG = cOut! / op.groups
+      const tiledFwd = emitTiledConv('fwd', convDims(input.shape, weight.shape, out.shape, op))
+      if (tiledFwd) {
+        return {
+          opIndex, opKind: op.kind, wgsl: tiledFwd.wgsl, bindings: [buf(op.input), buf(op.weight), buf(op.out)],
+          ...tiledFwd.spec, workgroupSize: WG_SIZE,
+        }
+      }
       const idx = gridIndex4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_out', 'w_out'])
       const wgsl = `
 @group(0) @binding(0) var<storage, read> input : array<f32>;
@@ -1108,6 +1116,13 @@ ${idx.wgsl}
       const [cOut, cInPerG, kH, kW] = weight.shape
       const cOutPerG = cOut! / op.groups
       const [, , hOut, wOut] = dy.shape
+      const tiledDx = emitTiledConv('dx', convDims(out.shape, weight.shape, dy.shape, op))
+      if (tiledDx) {
+        return {
+          opIndex, opKind: op.kind, wgsl: tiledDx.wgsl, bindings: [buf(op.weight), buf(op.dy), buf(op.out)],
+          ...tiledDx.spec, workgroupSize: WG_SIZE,
+        }
+      }
       const idx = gridIndex4d(out.shape as [number, number, number, number], ['b', 'c_in_', 'h_in', 'w_in'])
       const wgsl = `
 @group(0) @binding(0) var<storage, read> weight : array<f32>;
@@ -1162,6 +1177,13 @@ ${idx.wgsl}
       const [, , hOut, wOut] = dy.shape
       const total = shapeSize(out.shape)
       const redLen = B! * hOut! * wOut!
+      const tiledDw = emitTiledConv('dw', convDims(input.shape, out.shape, dy.shape, op))
+      if (tiledDw) {
+        return {
+          opIndex, opKind: op.kind, wgsl: tiledDw.wgsl, bindings: [buf(op.input), buf(op.dy), buf(op.out)],
+          ...tiledDw.spec, workgroupSize: WG_SIZE,
+        }
+      }
       // One-thread-per-weight starves the GPU when the weight is small and
       // the reduction long: growing-nca's 1×1 convs give 8k/2k threads each
       // serially summing 16k terms — measured (2026-07-10, wgrad-probe bulb)
@@ -1334,64 +1356,122 @@ ${gradIdx.wgsl}
  *  tile is exactly one workgroup. */
 const TILE = 16
 
-/** 16×16 tiled shared-memory GEMM — Performance.md §Phase 1, re-implemented
- *  2026-07-10 (the original perf-tiled-matmul branch was lost). Emitted only
- *  when M, N, K are all tile multiples, so the hot loop is bounds-check-free;
- *  the naive kernel stays as the odd-shape fallback and reference. Each
- *  workgroup computes one TILE×TILE block of C, looping K in TILE chunks and
- *  cooperatively staging A/B tiles in workgroup memory — every global element
- *  is read once per tile instead of once per thread (TILE× traffic cut),
- *  which is where the measured MLP ~2.7× / small-transformer ~1.65× came
- *  which is where the measured MLP ~2.7× / small-transformer ~1.65× came
- *  from. Takes priority over the small-output/long-K reduced variant when
- *  both apply — measured 2026-07-10: even at 16 workgroups (Linear dW
- *  [64, 262k]@[262k, 64]) the TILE× traffic cut beats the reduced path's
- *  occupancy (SIREN probe 193 → 117 ms/step, xf-small 13.7 → 11.0).
- *  Known cost: the MLP bench regressed ~5.1 → ~6.5 ms/step at the per-step
- *  sync floor — small K/N GEMMs pay barrier overhead; acceptable, revisit
- *  with the profiler. Backward free-rides: matmul adjoints are
- *  matmul-composed. Register blocking (4×4 micro-tiles) is the named
- *  follow-on if dense-GEMM perf needs more. */
-function emitTiledMatmul(batch: number, M: number, K: number, N: number, batched: boolean) {
-  const tilesM = M / TILE
-  const tilesN = N / TILE
-  const bBase = batched ? `bi * ${K * N}u` : '0u'
-  // Returned together, not recomputed by the caller: the guard below and the dispatch extent
-  // are two halves of one decision, and if they ever disagreed the kernel would drop work or
-  // write out of range, silently. test/dispatch.ts pins the pair.
-  const idx = batchIndex('t', tilesM * tilesN, batch, 'wid')
-  return { spec: idx.spec, wgsl: `
-var<workgroup> Atile : array<f32, ${WG_SIZE}>;
-var<workgroup> Btile : array<f32, ${WG_SIZE}>;
-@group(0) @binding(0) var<storage, read> a : array<f32>;
-@group(0) @binding(1) var<storage, read> b : array<f32>;
-@group(0) @binding(2) var<storage, read_write> c : array<f32>;
+/** What emitTiledGemm needs from a caller beyond the template: the GEMM's extents, how its
+ *  operands are addressed, and where its tile grid stops being worth dispatching. */
+type TiledGemm = {
+  M: number; N: number; K: number
+  /** Dispatch z extent — the batch (× groups) the tile grid repeats over; `bi` in the kernel. */
+  z: number
+  /** Binding names of the A and B buffers, in binding order; the output is always `out`. */
+  names: [string, string]
+  /** WGSL run once `bi` is known (decoding it into batch and group); '' when the snippets
+   *  use `bi` as it is. */
+  prologue: string
+  /** `a` assigns v = A[m,k] and `b` assigns v = B[k,n], each guarding its own row (m < M) or
+   *  column (n < N); they are spliced where m, k, n and a zeroed v are in scope. `c` is the
+   *  flat index of C[m,n]. */
+  a: string; b: string; c: string
+  /** Stage B with consecutive threads walking k instead of n — for a B contiguous along k. */
+  bAlongK?: boolean
+  /** A tile grid smaller than this returns null, so the caller's other paths take over. */
+  minGrid?: number
+}
+
+/** The one tiled GEMM template behind matmul (both forms) and the conv family —
+ *  Performance.md §Phase 1 (16×16 shared-memory tiles, re-implemented 2026-07-10 after the
+ *  original perf-tiled-matmul branch was lost) and §Phase 7 (register blocking, M/N bounds,
+ *  the conv operands gathered from NCHW; matmul folded onto the same template 2026-08-25 —
+ *  its kernels gained the micro-tiles, transformer-heavy GPU 16.05 → 15.3 ms/step and the
+ *  other demos within noise, conv kernels byte-identical before and after).
+ *
+ *  Each workgroup computes one TILE_M×TILE_N block of C, looping K in TILE chunks and
+ *  cooperatively staging the A and B chunks in workgroup memory, so every global element is
+ *  read once per tile instead of once per thread — the TILE× traffic cut behind Phase 1's
+ *  MLP ~2.7× / small-transformer ~1.65×. Each thread owns a TM×TN micro-tile of C in
+ *  registers, so one staged element feeds TM or TN FMAs instead of one: 4×4 when both
+ *  extents allow, halved while the grid would leave most of the GPU idle (a handful of big
+ *  tiles each striding a long K is the wrong trade). M and N are bounds-checked at the
+ *  staging loads and the store, so the only gate is K % TILE == 0; every caller keeps its
+ *  naive kernel as reference and odd-K fallback. Staging is arranged so consecutive threads
+ *  touch consecutive addresses: A along k; B along n, or along k when the caller says B is
+ *  contiguous that way (conv's weight-grad, where k is the pixel index), in which case the
+ *  B tile is staged transposed.
+ *
+ *  The batch rides wid.z, never a packed-index division: Adreno miscompiles that construct
+ *  (specs/Adreno-matmul.md), and this kernel measured correct there with the z form. wid is
+ *  workgroup-uniform, so the tile-count early-out keeps every barrier below in uniform
+ *  control flow. The WGSL and its dispatch spec are returned together because the guard and
+ *  the grid are two halves of one decision — if they ever disagreed the kernel would drop
+ *  work or write out of range, silently; test/dispatch.ts pins the pair. Known cost since
+ *  Phase 1: small K/N GEMMs pay the barrier overhead (the MLP bench ~5.1 → ~6.5 ms/step at
+ *  the per-step sync floor). The reduced long-K matmul variant yields to this one where both
+ *  apply — measured 2026-07-10, even at 16 workgroups the traffic cut beats occupancy. */
+function emitTiledGemm(g: TiledGemm): { wgsl: string; spec: { threads: number; dispatchZ?: number } } | null {
+  const { M, N, K, z } = g
+  if (K % TILE !== 0) return null
+  let TM = M >= 64 ? 4 : M >= 32 ? 2 : 1
+  let TN = N >= 64 ? 4 : N >= 32 ? 2 : 1
+  const grid = () => Math.ceil(M / (TILE * TM)) * Math.ceil(N / (TILE * TN)) * z
+  while (grid() < 64 && (TM > 1 || TN > 1)) { if (TM >= TN) TM >>= 1; else TN >>= 1 }
+  if (g.minGrid && grid() < g.minGrid) return null
+  const TILE_M = TILE * TM, TILE_N = TILE * TN
+  const tilesM = Math.ceil(M / TILE_M), tilesN = Math.ceil(N / TILE_N)
+  const idx = batchIndex('t', tilesM * tilesN, z, 'wid')
+  const range = (n: number) => Array.from({ length: n }, (_, i) => i)
+  // Which B[k,n] of the tile a thread stages on pass i (the header says which way and why).
+  const bSlot = g.bAlongK
+    ? (i: number): [string, string] => [`col`, `row + ${i * TILE}u`]
+    : (i: number): [string, string] => [`lid / ${TILE_N}u + ${i * (WG_SIZE / TILE_N)}u`, `lid % ${TILE_N}u`]
+  const stageA = range(TM).map(i =>
+    `    { let m = m0 + row + ${i * TILE}u; let k = k0 + col; var v : f32 = 0.0; ${g.a} Atile[(row + ${i * TILE}u) * ${TILE}u + col] = v; }`)
+  const stageB = range(TN).map(i => {
+    const [bk, bn] = bSlot(i)
+    return `    { let bk = ${bk}; let bn = ${bn}; let k = k0 + bk; let n = n0 + bn; var v : f32 = 0.0; ${g.b} Btile[bk * ${TILE_N}u + bn] = v; }`
+  })
+  const accs = range(TM).flatMap(i => range(TN).map(j => `acc${i}${j}`))
+  const wgsl = `
+var<workgroup> Atile : array<f32, ${TILE_M * TILE}>;
+var<workgroup> Btile : array<f32, ${TILE * TILE_N}>;
+@group(0) @binding(0) var<storage, read> ${g.names[0]} : array<f32>;
+@group(0) @binding(1) var<storage, read> ${g.names[1]} : array<f32>;
+@group(0) @binding(2) var<storage, read_write> out : array<f32>;
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
-  // One workgroup per output tile. wid is workgroup-uniform, so the
-  // early-out keeps the barriers below in uniform control flow. This kernel
-  // measured correct on Adreno with the packed batch index too; it changed
-  // anyway, because the construct is the one that miscompiles.
-${idx.wgsl}
+  // One workgroup per ${TILE_M}×${TILE_N} output tile, ${TM}×${TN} outputs per thread. wid is
+  // workgroup-uniform, so the early-out keeps the barriers below in uniform control flow.
+${[idx.wgsl, g.prologue].filter(Boolean).join('\n')}
   let row = lid / ${TILE}u;
   let col = lid % ${TILE}u;
-  let gRow = (t / ${tilesN}u) * ${TILE}u + row;
-  let gCol = (t % ${tilesN}u) * ${TILE}u + col;
-  let aRow = bi * ${M * K}u + gRow * ${K}u;
-  let bOff = ${bBase};
-  var s : f32 = 0.0;
+  let m0 = (t / ${tilesN}u) * ${TILE_M}u;
+  let n0 = (t % ${tilesN}u) * ${TILE_N}u;
+${accs.map(a => `  var ${a} : f32 = 0.0;`).join('\n')}
   for (var k0 : u32 = 0u; k0 < ${K}u; k0 = k0 + ${TILE}u) {
-    // Thread (row, col) stages A[gRow, k0+col] and B[k0+row, gCol].
-    Atile[lid] = a[aRow + k0 + col];
-    Btile[lid] = b[bOff + (k0 + row) * ${N}u + gCol];
+${stageA.join('\n')}
+${stageB.join('\n')}
     workgroupBarrier();
     for (var kk : u32 = 0u; kk < ${TILE}u; kk = kk + 1u) {
-      s = s + Atile[row * ${TILE}u + kk] * Btile[kk * ${TILE}u + col];
+${range(TM).map(i => `      let a${i} = Atile[(row + ${i * TILE}u) * ${TILE}u + kk];`).join('\n')}
+${range(TN).map(j => `      let b${j} = Btile[kk * ${TILE_N}u + col + ${j * TILE}u];`).join('\n')}
+${range(TM).flatMap(i => range(TN).map(j => `      acc${i}${j} = fma(a${i}, b${j}, acc${i}${j});`)).join('\n')}
     }
     workgroupBarrier();
   }
-  c[bi * ${M * N}u + gRow * ${N}u + gCol] = s;
-}`.trim() }
+${range(TM).flatMap(i => range(TN).map(j =>
+    `  { let m = m0 + row + ${i * TILE}u; let n = n0 + col + ${j * TILE}u; if (m < ${M}u && n < ${N}u) { out[${g.c}] = acc${i}${j}; } }`)).join('\n')}
+}`.trim()
+  return { wgsl, spec: idx.spec }
+}
+
+/** matmul on the tiled template: A and B read flat, `bi` addressing the batch slice of A
+ *  and — when B is batched too — of B. Non-null by construction: the callers' `tileable`
+ *  gate is exactly the K % TILE test, and matmul sets no grid floor. */
+function emitTiledMatmul(batch: number, M: number, K: number, N: number, batched: boolean) {
+  return emitTiledGemm({
+    M, N, K, z: batch, names: ['a', 'b'], prologue: '',
+    a: `if (m < ${M}u) { v = a[bi * ${M * K}u + m * ${K}u + k]; }`,
+    b: `if (n < ${N}u) { v = b[${batched ? `bi * ${K * N}u + ` : ''}k * ${N}u + n]; }`,
+    c: `bi * ${M * N}u + m * ${N}u + n`,
+  })!
 }
 
 /** Shared-memory tree reduction across one workgroup. The caller declares
@@ -1408,6 +1488,107 @@ function emitWorkgroupReduce(arrName: string, accVar: string): string {
     lines.push(`  workgroupBarrier();`)
   }
   return lines.join('\n')
+}
+
+type ConvDims = {
+  B: number; cIn: number; H: number; W: number
+  cOut: number; cInPerG: number; kH: number; kW: number
+  Hout: number; Wout: number
+  sH: number; sW: number; pH: number; pW: number; groups: number
+}
+
+/** The one shape record the three conv kernels share: the activation `input` is
+ *  `[B, cIn, H, W]`, `weight` is `[cOut, cInPerG, kH, kW]`, and `spatial` is whichever
+ *  tensor carries `[.., .., Hout, Wout]` (the output for the forward, dy for the grads). */
+function convDims(
+  input: Shape, weight: Shape, spatial: Shape,
+  op: { strideH: number; strideW: number; padH: number; padW: number; groups: number },
+): ConvDims {
+  return {
+    B: input[0]!, cIn: input[1]!, H: input[2]!, W: input[3]!,
+    cOut: weight[0]!, cInPerG: weight[1]!, kH: weight[2]!, kW: weight[3]!,
+    Hout: spatial[2]!, Wout: spatial[3]!,
+    sH: op.strideH, sW: op.strideW, pH: op.padH, pW: op.padW, groups: op.groups,
+  }
+}
+
+/** The conv family on the tiled GEMM template (2026-08-25, Performance.md §Phase 7) —
+ *  conv2d, its input gradient and its weight gradient are each a GEMM whose operands are
+ *  gathered from the NCHW tensors instead of read as matrices:
+ *
+ *    fwd  out[b,co,p] = Σ_k W[co,k] · X[b, k→(ci,kh,kw), p→(ho,wo)]   M=cOutPerG  N=Hout·Wout      K=cInPerG·kH·kW
+ *    dx   dx[b,ci,p]  = Σ_k W[k→(co,kh,kw),ci] · dY[b,co,p→(hi,wi)]  M=cInPerG   N=H·W            K=cOutPerG·kH·kW
+ *    dw   dW[co,n]    = Σ_k dY[k→(b,ho,wo),co] · X[b, n→(ci,kh,kw)]  M=cOutPerG  N=cInPerG·kH·kW  K=B·Hout·Wout
+ *
+ *  The gathers carry the padding checks and the template bounds M and N, so the gate is
+ *  K % TILE == 0 alone; the naive kernels remain the reference and the odd-K fallback
+ *  (depthwise 3×3 has K = 9). fwd and dx repeat the tile grid over batch × group on z; dw
+ *  over the group alone, its K already spanning the batch. dw's B is contiguous along k
+ *  (there k is the pixel index), so it asks for the transposed staging.
+ *
+ *  Why it exists: regrow's step measured 80% conv — the naive one-thread-per-output
+ *  kernels ran the VGG16 layers at ~1.1 TFLOP/s on a ~20 TFLOP/s part, and a 32768-element
+ *  1×1 weight-grad fell one element outside the Phase 5 gate into the naive path (89 ms of
+ *  a 404 ms step on its own). Measured (regrow-perf bulb, RTX 3080 Ti laptop, GPU-validated
+ *  by conv-tiled-validate): this alone took the step 404 → 221 ms; conv family 254 → 66 ms
+ *  of GPU time, the VGG 3×3 layers at 3.3-4.4 TFLOP/s, that weight-grad 89 → 16 ms. */
+function emitTiledConv(
+  kind: 'fwd' | 'dx' | 'dw', d: ConvDims,
+): { wgsl: string; spec: { threads: number; dispatchZ?: number } } | null {
+  const { B, cIn, H, W, cOut, cInPerG, kH, kW, Hout, Wout, sH, sW, pH, pW, groups } = d
+  const cOutPerG = cOut / groups
+  const kHW = kH * kW, HWo = Hout * Wout, HW = H * W
+  const M = kind === 'dx' ? cInPerG : cOutPerG
+  const N = kind === 'fwd' ? HWo : kind === 'dx' ? HW : cInPerG * kHW
+  const K = kind === 'fwd' ? cInPerG * kHW : kind === 'dx' ? cOutPerG * kHW : B * HWo
+  const z = kind === 'dw' ? groups : B * groups
+
+  // (outer, kh, kw) from a flattened (outer·kH·kW) index; the 1×1 case folds to identity.
+  const tap = (k: string, outer: string) => kHW === 1
+    ? `let ${outer} = ${k}; let kh = 0u; let kw = 0u;`
+    : `let ${outer} = ${k} / ${kHW}u; let _r = ${k} % ${kHW}u; let kh = _r / ${kW}u; let kw = _r % ${kW}u;`
+  // v = X[b, ci, ho*sH + kh - pH, wo*sW + kw - pW], zero outside the image. `b` names the
+  // batch variable in scope; ci, kh, kw, ho, wo are the names the decoders above declare.
+  const gatherX = (b: string) =>
+    `let hi = i32(ho * ${sH}u + kh) - ${pH}; let wi = i32(wo * ${sW}u + kw) - ${pW};\n` +
+    `      if (hi >= 0 && hi < ${H} && wi >= 0 && wi < ${W}) { v = input[((${b} * ${cIn}u + g * ${cInPerG}u + ci) * ${H}u + u32(hi)) * ${W}u + u32(wi)]; }`
+  const bg = groups === 1 ? `  let b = bi;\n  let g = 0u;` : `  let b = bi / ${groups}u;\n  let g = bi % ${groups}u;`
+
+  // Where each kind's GEMM operands sit in the NCHW buffers, in the TiledGemm contract; the
+  // prologue decodes bi into the batch variable and g, which the snippets use as well.
+  const gemms: Record<typeof kind, Pick<TiledGemm, 'names' | 'prologue' | 'a' | 'b' | 'c'>> = {
+    fwd: {
+      names: ['input', 'weight'], prologue: bg,
+      a: `if (m < ${M}u) { v = weight[(g * ${cOutPerG}u + m) * ${K}u + k]; }`,
+      b: `if (n < ${N}u) {\n      ${tap('k', 'ci')}\n      let ho = n / ${Wout}u; let wo = n % ${Wout}u;\n      ${gatherX('b')}\n    }`,
+      c: `(b * ${cOut}u + g * ${cOutPerG}u + m) * ${HWo}u + n`,
+    },
+    dx: {
+      names: ['weight', 'dy'], prologue: bg,
+      a: `if (m < ${M}u) { ${kHW === 1 ? `let co = k; let _r = 0u;` : `let co = k / ${kHW}u; let _r = k % ${kHW}u;`} v = weight[((g * ${cOutPerG}u + co) * ${cInPerG}u + m) * ${kHW}u + _r]; }`,
+      b: `if (n < ${N}u) {\n      ${tap('k', 'co')}\n      let hi = n / ${W}u; let wi = n % ${W}u;\n` +
+        `      let numH = i32(hi) + ${pH} - i32(kh); let numW = i32(wi) + ${pW} - i32(kw);\n` +
+        `      if (numH >= 0 && numW >= 0${sH > 1 ? ` && (numH % ${sH}) == 0` : ''}${sW > 1 ? ` && (numW % ${sW}) == 0` : ''}) {\n` +
+        `        let ho = numH / ${sH}; let wo = numW / ${sW};\n` +
+        `        if (ho < ${Hout} && wo < ${Wout}) { v = dy[((b * ${cOut}u + g * ${cOutPerG}u + co) * ${Hout}u + u32(ho)) * ${Wout}u + u32(wo)]; }\n` +
+        `      }\n    }`,
+      c: `(b * ${cIn}u + g * ${cInPerG}u + m) * ${HW}u + n`,
+    },
+    dw: {
+      names: ['input', 'dy'], prologue: `  let g = bi;`,
+      a: `if (m < ${M}u) { let ab = k / ${HWo}u; let ahw = k % ${HWo}u; v = dy[(ab * ${cOut}u + g * ${cOutPerG}u + m) * ${HWo}u + ahw]; }`,
+      b: `if (n < ${N}u) {\n      let bb = k / ${HWo}u; let bhw = k % ${HWo}u;\n      let ho = bhw / ${Wout}u; let wo = bhw % ${Wout}u;\n` +
+        `      ${tap('n', 'ci')}\n      ${gatherX('bb')}\n    }`,
+      c: `(g * ${cOutPerG}u + m) * ${N}u + n`,
+    },
+  }
+  // dw's K is B·Hout·Wout, so a small weight leaves a handful of workgroups each striding
+  // tens of thousands of terms while Phase 5's reduce kernel has one workgroup PER weight:
+  // the sample bench's MNIST-sized CNN went 0.67 → 2.60 ms of GPU on the tiled path (its
+  // [16,8,3,3] grad was 5 workgroups over K = 12544). Regrow's [32,256,1,1] still won at
+  // 32, so that is the floor; below it the reduce/naive paths take over. Split-K would
+  // remove the cliff — Performance.md §Phase 7 names it as the next lever.
+  return emitTiledGemm({ M, N, K, z, ...gemms[kind], ...(kind === 'dw' ? { bAlongK: true, minGrid: 32 } : {}) })
 }
 
 /** Decompose a flat thread index `i` into 4 row-major named axes — emits
