@@ -148,15 +148,42 @@ export function planBuffers(
   const isPoolable = (id: number): boolean =>
     cls.get(id)!.kind === 'intermediate' && !captureTensorIds.has(id) && !writebackSourceIds.has(id)
 
+  // `reshape` and `stop_gradient` hand back the same bytes under a new label —
+  // their kernels are element-for-element copies. When BOTH ends are poolable
+  // intermediates the two tensors can name one buffer, and codegen then drops
+  // the kernel (see the `reshape` case there): the copy computed nothing.
+  //
+  // Restricted to intermediate→intermediate on purpose. Everything else —
+  // params, inputs, state, outputs, captures, writeback sources — is read or
+  // written from OUTSIDE the dispatch sequence (uploads, readbacks, the
+  // end-of-step writeback copies), and those buffers each carry a `kind` the
+  // runtime branches on. Two names for one such buffer would need a merged
+  // classification, which buys a couple of copies at the edges of a graph and
+  // risks the whole allocator; the interior is where the copies actually are.
+  //
+  // `aliasedTo` maps an aliased tensor to the ROOT tensor whose buffer it
+  // shares. Ops are topologically ordered, so a chain of reshapes resolves to
+  // its root in one pass and every lookup is a single hop.
+  const aliasedTo = new Map<number, number>()
+  const rootOf = (id: number): number => aliasedTo.get(id) ?? id
+  for (const op of graph.ops) {
+    if (op.kind !== 'reshape' && op.kind !== 'stop_gradient') continue
+    if (!isPoolable(op.out) || !isPoolable(op.a)) continue
+    aliasedTo.set(op.out, rootOf(op.a))
+  }
+
   // Liveness over execution (== graph.ops) order: lastUse[t] = index of the
   // last op that reads t. graph.ops is topologically ordered, so this is the
   // order the runtime dispatches kernels, and a buffer freed at op i is
-  // available from op i+1 on.
+  // available from op i+1 on. Keyed by ROOT tensor: an aliased tensor and the
+  // one it shares a buffer with are one lifetime, so the buffer must stay live
+  // until the last reader of any member has run.
   const lastUse = new Map<number, number>()
   graph.ops.forEach((op, i) => {
     for (const inId of getOpInputs(op)) {
-      const prev = lastUse.get(inId)
-      if (prev === undefined || i > prev) lastUse.set(inId, i)
+      const root = rootOf(inId)
+      const prev = lastUse.get(root)
+      if (prev === undefined || i > prev) lastUse.set(root, i)
     }
   })
 
@@ -178,7 +205,10 @@ export function planBuffers(
     const t = tensorsById.get(op.out)!
     const need = Math.max(4, shapeSize(t.shape) * dtypeBytes[t.dtype])
     let bufId: number
-    if (isPoolable(op.out)) {
+    if (aliasedTo.has(op.out)) {
+      // no allocation: this tensor is another name for a buffer already placed
+      bufId = tensorToBuffer.get(rootOf(op.out))!
+    } else if (isPoolable(op.out)) {
       let best = -1  // best-fit: smallest free buffer that's big enough
       for (let k = 0; k < free.length; k++) {
         if (free[k]!.byteSize >= need && (best < 0 || free[k]!.byteSize < free[best]!.byteSize)) best = k
@@ -197,13 +227,15 @@ export function planBuffers(
 
     const freed = new Set<number>()
     for (const inId of getOpInputs(op)) {
-      if (freed.has(inId) || !isPoolable(inId) || lastUse.get(inId) !== i) continue
-      freed.add(inId)
-      const b = tensorToBuffer.get(inId)!
+      const root = rootOf(inId)
+      if (freed.has(root) || !isPoolable(root) || lastUse.get(root) !== i) continue
+      freed.add(root)
+      const b = tensorToBuffer.get(root)!
       free.push({ bufId: b, byteSize: buffers[b]!.byteSize })
     }
     // an intermediate nothing ever reads is dead the instant it's written
-    if (isPoolable(op.out) && lastUse.get(op.out) === undefined) {
+    // (an aliased tensor never owns its buffer, so it never frees one)
+    if (!aliasedTo.has(op.out) && isPoolable(op.out) && lastUse.get(op.out) === undefined) {
       free.push({ bufId, byteSize: buffers[bufId]!.byteSize })
     }
   }
@@ -220,7 +252,7 @@ export function planBuffers(
   graph.ops.forEach((op, i) => defIdx.set(op.out, i))
   const occupants = new Map<number, { tid: number; def: number; end: number }[]>()
   for (const [tid, bufId] of tensorToBuffer) {
-    if (!isPoolable(tid)) continue
+    if (!isPoolable(tid) || aliasedTo.has(tid)) continue   // aliases share the root's interval
     const def = defIdx.get(tid)
     if (def === undefined) continue
     const list = occupants.get(bufId) ?? []

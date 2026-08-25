@@ -555,10 +555,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
     // ---- Shape / detach ----------------------------------------------------
     // Both ops are byte-identical memcpy; reshape relabels the shape, while
-    // stop_gradient detaches from the autograd graph. Aliasing the buffers
-    // would save a copy but complicates the buffer plan; we have headroom.
+    // stop_gradient detaches from the autograd graph. When the buffer plan has
+    // given input and output ONE buffer (see `aliasedTo` in buffers.ts) the
+    // copy would be from a buffer to itself, so there is nothing to dispatch —
+    // the bytes are already where the consumer will look for them. The plan
+    // only does that when both ends are interior intermediates, so the
+    // remaining copies here are the ones that cross a param/output boundary.
     case 'reshape':
     case 'stop_gradient': {
+      if (buf(op.a) === buf(op.out)) return empty()
       const out = tof(op.out)
       const a = tof(op.a)
       const total = shapeSize(out.shape)
