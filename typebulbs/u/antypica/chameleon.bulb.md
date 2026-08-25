@@ -20,7 +20,8 @@ import {
 // files. A neural cellular automaton evolves a 96×96 cell grid, and a
 // jointly-trained SIREN field decodes each cell's 32-dim state + sub-cell
 // coordinates into 384×384 RGBA: the chameleon. Weights (~280KB, base64
-// float32 in JSON) and the target image are fetched from our asset host.
+// float32 in JSON) and the target image load from assets/ — a local file in
+// chameleon/assets/ (e.g. your own trained weights) shadows the hosted copy.
 // Scratch it and it regrows. The Menagerie bulb is the 24-organism version.
 // ============================================================================
 
@@ -31,9 +32,8 @@ const GG = G * G, STATE_LEN = C * GG, GGH = GH * GH
 const SIN = 4 + C                          // SIREN input: 4 trig coord features + C state channels
 const DAMAGE_R = 7                         // scratch radius in cells
 
-const ASSETS = "https://assets.typebulb.com/regrow"
-const MODEL_URL = `${ASSETS}/chameleon.json`
-const TARGET_URL = `${ASSETS}/chameleon.png`
+const MODEL_URL = "assets/chameleon.json"
+const TARGET_URL = "assets/chameleon.png"
 
 const nextFrame = () => new Promise(res => requestAnimationFrame(res))
 const clamp01 = (v: number) => v < 0 ? 0 : v > 1 ? 1 : v
