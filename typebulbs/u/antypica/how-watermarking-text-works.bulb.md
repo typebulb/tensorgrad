@@ -3328,7 +3328,7 @@ html[data-theme="dark"] .pop-card { box-shadow: 0 4px 16px rgba(0, 0, 0, .55); }
 ```json
 {
   "dependencies": {
-    "tensorgrad": "^0.4.7",
+    "tensorgrad": "^0.4.9",
     "domeleon": "^0.6.6"
   },
   "description": "Learn how text watermarking works in your browser: a secret key runs a tournament between words the model drew, so the winner is one it would say."

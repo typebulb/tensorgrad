@@ -2457,7 +2457,7 @@ canvas {
   "description": "A real KataGo network (b6c96) playing full-size Go in the browser. 1.16 MB of weights, compiled to WGSL by tensorgrad.",
   "dependencies": {
     "domeleon": "^0.6.3",
-    "tensorgrad": "^0.4.6"
+    "tensorgrad": "^0.4.9"
   }
 }
 ```

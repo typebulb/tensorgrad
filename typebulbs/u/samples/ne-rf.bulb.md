@@ -11,7 +11,7 @@ import { createRoot } from 'react-dom/client'
 
 import {
   Module, compile, checkWebGPU, Linear,
-  mul, sub, mean, reshape, relu, sigmoid, concat,
+  mul, sub, mean, reshape, relu, sigmoid, concat, ones, packRGBA8,
   sin, cos, square,
   type Tensor, type CompiledTraining, type CompiledForward,
 } from 'tensorgrad'
@@ -65,8 +65,11 @@ function lossFn(
   return mean(square(sub(modelFwd(m, coords, freqs), rgb)))
 }
 
+// The reconstruction is packed to canvas bytes on the GPU: the readback is
+// ImageData's layout, so painting it is one putImageData, no float→byte loop.
 function predictFn(m: NeRFTiny, { coords, freqs }: { coords: Tensor; freqs: Tensor }): Tensor {
-  return modelFwd(m, coords, freqs)
+  const rgb = modelFwd(m, coords, freqs)                        // [N_PIXELS, 3] in [0, 1]
+  return packRGBA8(concat([rgb, ones([N_PIXELS, 1])], 1))       // [N_PIXELS] opaque RGBA bytes
 }
 
 const PIXEL_SCALE = 4
@@ -78,7 +81,7 @@ function App() {
 
   // Long-lived (non-render) state lives in refs so updates don't trigger re-renders.
   const trainRef    = useRef<CompiledTraining<NeRFTiny> | null>(null)
-  const inferRef       = useRef<CompiledForward<NeRFTiny> | null>(null)
+  const inferRef       = useRef<CompiledForward<NeRFTiny, { coords: number[]; freqs: number[] }, 'rgba8'> | null>(null)
   const targetRgbRef   = useRef<Float32Array | null>(null)
   const runningRef     = useRef(false)
   const stepRef        = useRef(0)
@@ -108,6 +111,12 @@ function App() {
     dstCtx.drawImage(small, 0, 0, dstCanvas.width, dstCanvas.height)
   }
 
+  function bytesToCanvas(bytes: Uint8ClampedArray<ArrayBuffer>, dstCanvas: HTMLCanvasElement) {
+    const smallCtx = smallCtxRef.current!
+    smallCtx.putImageData(new ImageData(bytes, IMG_W, IMG_H), 0, 0)
+    dstCanvas.getContext('2d')!.drawImage(smallRef.current!, 0, 0, dstCanvas.width, dstCanvas.height)
+  }
+
   function nextBatch() {
     const targetRgb = targetRgbRef.current!
     const coords = new Float32Array(BATCH_SIZE * 2)
@@ -127,7 +136,7 @@ function App() {
     const infer = inferRef.current
     if (!infer) return
     const r = await infer.run({ coords: GRID_COORDS, freqs: FREQS })
-    if (r.kind === 'completed') rgbToCanvas(r.output, reconCanvasRef.current!)
+    if (r.kind === 'completed') bytesToCanvas(r.output, reconCanvasRef.current!)
   }
 
   async function runTraining() {
@@ -174,6 +183,7 @@ function App() {
         coords: [N_PIXELS, 2],
         freqs:  [L_FREQS],
       },
+      output: 'rgba8',
     })
     trainRef.current = train
     inferRef.current = infer
@@ -512,7 +522,7 @@ code {
 {
   "description": "NeRF is a coordinate-network MLP learns the (x, y) → RGB mapping for one 64×64 image, using sinusoidal positional encoding so it can fit high-frequency detail.",
   "dependencies": {
-    "tensorgrad": "^0.4.6",
+    "tensorgrad": "^0.4.9",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   }

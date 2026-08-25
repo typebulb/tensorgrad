@@ -931,7 +931,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); f
   "description": "A tiny transformer learns clock math in your browser.",
   "dependencies": {
     "three": "^0.160.0",
-    "tensorgrad": "^0.4.6",
+    "tensorgrad": "^0.4.9",
     "domeleon": "^0.6.3"
   }
 }

@@ -9,7 +9,7 @@ name: Chameleon
 import { App, Component, a, button, canvas, div, h1, img, p, path, polygon, rect, span, svg } from "domeleon"
 import {
   Module, compileForward, checkWebGPU, Conv2d, Linear, init, capture,
-  conv2d, maxPool2d, relu, sin, greater, where, mul, add, clamp,
+  conv2d, maxPool2d, relu, sin, greater, where, mul, add, div as tdiv, max, clamp, packRGBA8,
   narrow, concat, reshape, permute, randn, ones, zeros,
   type Tensor, type CompiledForward,
 } from "tensorgrad"
@@ -205,6 +205,16 @@ function decode(m: NCAModel, s: Tensor): Tensor {
   return mul(img, reshape(boolToF32(mask, GH), [GGH, 1]))
 }
 
+// display packing on the GPU: un-premultiply RGB with capped gain, straight
+// alpha, four bytes per pixel — the readback IS ImageData's byte layout, so
+// the image leaves the GPU at 4 bytes per pixel instead of 16 and the host
+// never touches a float
+function toPixels(rgba: Tensor): Tensor {
+  const a = clamp(narrow(rgba, 1, 3, 1), 0, 1)                                // [GGH, 1]
+  const gain = where(greater(a, 0.01), tdiv(1, max(a, 0.2)), zeros([GGH, 1]))
+  return packRGBA8(concat([mul(narrow(rgba, 1, 0, 3), gain), a], 1))          // [GGH] i32
+}
+
 // One frame: advance the CA (unless `advance` is 0 — a repaint of a state the
 // pointer just scratched), clamp, hand the new state back as a capture, decode.
 // The clamp is the box the training-time overflow penalty (weight 100) kept the
@@ -212,7 +222,7 @@ function decode(m: NCAModel, s: Tensor): Tensor {
 // rather than costing the CPU a pass over 295k floats every frame.
 function frameFn(m: NCAModel, { state, advance }: { state: Tensor; advance: Tensor }) {
   const stepped = clamp(ncaStep(m, state), -1, 1)
-  return decode(m, capture("state", where(greater(advance, 0), stepped, state)))
+  return toPixels(decode(m, capture("state", where(greater(advance, 0), stepped, state))))
 }
 
 // ============================================================================
@@ -308,12 +318,11 @@ const ICON = {
 class Root extends Component {
   status = "starting…"
   paused = false
-  #frame?: CompiledForward
+  #frame?: CompiledForward<NCAModel, { state: number[]; advance: number[] }, "rgba8">
   #state?: Float32Array
   #token = 0
   #canvas?: HTMLCanvasElement
   #ctx?: CanvasRenderingContext2D
-  #img?: ImageData
   #cellsCtx?: CanvasRenderingContext2D
   #cellsImg?: ImageData
   #painting = false
@@ -325,7 +334,6 @@ class Root extends Component {
     cv.width = cv.height = GH
     this.#canvas = cv
     this.#ctx = cv.getContext("2d")!
-    this.#img = new ImageData(GH, GH)
     cv.addEventListener("pointerdown", e => {
       this.#painting = true
       cv.setPointerCapture(e.pointerId)
@@ -353,6 +361,7 @@ class Root extends Component {
     this.#frame = await compileForward({
       model: new NCAModel(), forward: frameFn,
       inputs: { state: [1, C, G, G], advance: [1] },
+      output: "rgba8",
     })
     this.#setStatus("fetching the authors' trained chameleon…")
     try {
@@ -396,7 +405,7 @@ class Root extends Component {
           this.#pendingCarves.length = 0
           const n = aliveCount(next)
           this.#state = (n === 0 || n > GG * 0.6) ? SEED.slice() : next
-          this.#paintRender(r.output as Float32Array)
+          this.#paintRender(r.output)
           this.#paintCells(next)   // not #state: on a reseed frame, both canvases show the frame that was decoded
         }
         frames++
@@ -425,24 +434,15 @@ class Root extends Component {
     this.#renderBusy = true
     this.#frame.run({ state: this.#state, advance: HOLD }).then(r => {
       this.#renderBusy = false
-      if (r.kind === "completed") this.#paintRender(r.output as Float32Array)
+      if (r.kind === "completed") this.#paintRender(r.output)
     })
   }
 
-  // [GGH, 4] premultiplied RGBA straight off the GPU: un-premultiply RGB with
-  // capped gain, straight alpha, composites onto the themed page background
-  #paintRender(arr: Float32Array) {
+  // [GGH] packed RGBA8 straight off the GPU (see toPixels) — already
+  // ImageData's bytes; composites onto the themed page background
+  #paintRender(bytes: Uint8ClampedArray<ArrayBuffer>) {
     if (!this.#ctx) return
-    const d = this.#img!.data
-    for (let j = 0; j < GGH * 4; j += 4) {
-      const a = clamp01(arr[j + 3]!)
-      const ia = a > 0.01 ? 1 / Math.max(a, 0.2) : 0
-      d[j] = clamp01(arr[j]! * ia) * 255
-      d[j + 1] = clamp01(arr[j + 1]! * ia) * 255
-      d[j + 2] = clamp01(arr[j + 2]! * ia) * 255
-      d[j + 3] = a * 255
-    }
-    this.#ctx.putImageData(this.#img!, 0, 0)
+    this.#ctx.putImageData(new ImageData(bytes, GH, GH), 0, 0)
   }
 
   // the cell grid stays planar CHW at 96² — same un-premultiply, strided reads
@@ -621,7 +621,7 @@ img.thumb { box-sizing: border-box; padding: 16.667%; }
 {
   "description": "A neural cellular automaton grows a chameleon from one cell on your GPU, using weights from the paper “From Cells to Pixels”. Scratch it and it heals.",
   "dependencies": {
-    "tensorgrad": "^0.4.8",
+    "tensorgrad": "^0.4.9",
     "domeleon": "^0.6.3"
   }
 }

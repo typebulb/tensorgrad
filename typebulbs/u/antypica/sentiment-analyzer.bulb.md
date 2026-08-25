@@ -1587,7 +1587,7 @@ words it exercises the windowing path the moment the page opens.
 ```json
 {
   "dependencies": {
-    "tensorgrad": "^0.4.6",
+    "tensorgrad": "^0.4.9",
     "domeleon": "^0.6.3"
   },
   "description": "Analyze the sentiment of any text — reviews, emails, essays — with a neural network in your browser. Private: your data never leaves your device."

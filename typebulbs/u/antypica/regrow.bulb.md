@@ -9,7 +9,7 @@ name: Regrow
 import { App, Component, a, button, canvas, div, h1, p, path, polygon, polyline, rect, span, svg } from "domeleon"
 import {
   Module, compile, checkWebGPU, Conv2d, Linear, init, lr, capture, loadSafetensors,
-  conv2d, maxPool2d, relu, sin, greater, where, mul, add, sub, div as tdiv, mean, sum, abs, square, sqrt, clamp,
+  conv2d, maxPool2d, relu, sin, greater, where, mul, add, sub, div as tdiv, max, mean, sum, abs, square, sqrt, clamp, packRGBA8,
   matmul, narrow, concat, reshape, permute, randn, ones, zeros,
   type Tensor, type CompiledTraining, type CompiledForward, type LR,
 } from "tensorgrad"
@@ -248,9 +248,20 @@ function demoFn(m: NCAModel, { state, filters }: { state: Tensor; filters: Tenso
   return ncaStep(m, state, filters, 1)
 }
 
-function renderFn(m: NCAModel, { state, bilin, bilin1, coords }: { state: Tensor; bilin: Tensor; bilin1: Tensor; coords: Tensor }) {
-  return decode(m, state, bilin, bilin1, coords, 1).rendered
+// the display path only (decode itself stays planar for the loss): un-premultiply
+// RGB with capped gain, straight alpha, packed to ImageData's bytes on the GPU —
+// the readback is 4 bytes per pixel and the host never touches a float
+function toPixels(rendered: Tensor): Tensor {
+  const rows = reshape(permute(rendered, [0, 2, 3, 1]), [GGH, 4])          // [1, 4, GH, GH] → [GGH, 4]
+  const a = clamp(narrow(rows, 1, 3, 1), 0, 1)
+  const gain = where(greater(a, 0.01), tdiv(1, max(a, 0.2)), zeros([GGH, 1]))
+  return packRGBA8(concat([mul(narrow(rows, 1, 0, 3), gain), a], 1))        // [GGH] bytes
 }
+
+function renderFn(m: NCAModel, { state, bilin, bilin1, coords }: { state: Tensor; bilin: Tensor; bilin1: Tensor; coords: Tensor }) {
+  return toPixels(decode(m, state, bilin, bilin1, coords, 1).rendered)
+}
+type RenderForward = CompiledForward<NCAModel, { state: number[]; bilin: number[]; bilin1: number[]; coords: number[] }, "rgba8">
 
 // ============================================================================
 // Host-side constant tables: perception filters, ×S bilinear upsample kernels,
@@ -625,7 +636,7 @@ class Trainer extends Component {
   #runId = 0
   #train?: CompiledTraining<NCAModel>
   #infer?: CompiledForward
-  #render?: CompiledForward
+  #render?: RenderForward
 
   get #stage() { return (this.ctx.root as unknown as IRoot).stage }
 
@@ -686,6 +697,7 @@ class Trainer extends Component {
     this.#render = await t.attach({
       forward: renderFn,
       inputs: { state: [1, C, G, G], bilin: [C * S * S, 1, 3, 3], bilin1: [S * S, 1, 3, 3], coords: [1, 4, GH, GH] },
+      output: "rgba8",
     })
     this.#train = t
   }
@@ -807,7 +819,7 @@ class Trainer extends Component {
           if (aliveCount(viewState) === 0) viewState.set(SEED)   // fully scrubbed: regrow
           stage.paintCells(viewState)
           const rr = await this.#render!.run({ state: viewState, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 })
-          if (rr.kind === "completed") stage.paintRender(rr.output as Float32Array)
+          if (rr.kind === "completed") stage.paintRender(rr.output)
           await nextFrame()
         }
       }
@@ -839,7 +851,7 @@ class Trainer extends Component {
         viewCarves.length = 0
         stage.paintCells(viewState)
         const rr = await this.#render!.run({ state: viewState, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 })
-        if (rr.kind === "completed") stage.paintRender(rr.output as Float32Array)
+        if (rr.kind === "completed") stage.paintRender(rr.output)
         if (step % 10 === 0 || step === 1) {
           let mx = 0, alive0 = 0
           for (let i = 0; i < STATE_LEN; i++) { const v = Math.abs(fin[i]!); if (v > mx) mx = v }
@@ -883,7 +895,6 @@ class Stage extends Component {
   #live = false                               // has either left box painted yet? gates the "loading…" overlay
   #canvas?: HTMLCanvasElement
   #ctx?: CanvasRenderingContext2D
-  #img?: ImageData
   #cellsCtx?: CanvasRenderingContext2D
   #cellsImg?: ImageData
   #demoToken = 0
@@ -901,7 +912,6 @@ class Stage extends Component {
     cv.width = cv.height = GH
     this.#canvas = cv
     this.#ctx = cv.getContext("2d")!
-    this.#img = new ImageData(GH, GH)
     cv.addEventListener("pointerdown", e => {
       this.#painting = true
       cv.setPointerCapture(e.pointerId)
@@ -929,10 +939,10 @@ class Stage extends Component {
   get live() { return this.#live }
   #markLive() { if (!this.#live) { this.#live = true; this.update() } }
 
-  paintRender(arr: Float32Array) {
+  // packed RGBA8 straight off the GPU (see toPixels): already ImageData's bytes
+  paintRender(bytes: Uint8ClampedArray<ArrayBuffer>) {
     if (!this.#ctx) return
-    this.#fill(arr, this.#img!, GGH)
-    this.#ctx.putImageData(this.#img!, 0, 0)
+    this.#ctx.putImageData(new ImageData(bytes, GH, GH), 0, 0)
     this.#markLive()
   }
 
@@ -971,7 +981,7 @@ class Stage extends Component {
     }
   }
 
-  async startDemo(infer: CompiledForward, render: CompiledForward) {
+  async startDemo(infer: CompiledForward, render: RenderForward) {
     const token = ++this.#demoToken
     this.demoActive = true
     this.#state = SEED.slice()
@@ -983,7 +993,7 @@ class Stage extends Component {
       renderBusy = true
       render.run({ state: this.#state!, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 }).then(r => {
         renderBusy = false
-        if (token === this.#demoToken && r.kind === "completed") this.paintRender(r.output as Float32Array)
+        if (token === this.#demoToken && r.kind === "completed") this.paintRender(r.output)
       })
     }
     this.update()
@@ -1002,7 +1012,7 @@ class Stage extends Component {
         const rr = await render.run({ state: this.#state!, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 })
         if (token !== this.#demoToken) return
         if (rr.kind === "completed") {
-          this.paintRender(rr.output as Float32Array)
+          this.paintRender(rr.output)
           this.paintCells(this.#state!)
         }
         frames++
@@ -1280,7 +1290,7 @@ body { font-size: var(--text); }
 {
   "description": "A neural cellular automaton grows a 3D donut from one cell, trained live on WebGPU with the Cells-to-Pixels recipe.",
   "dependencies": {
-    "tensorgrad": "^0.4.8",
+    "tensorgrad": "^0.4.9",
     "domeleon": "^0.6.3"
   }
 }
