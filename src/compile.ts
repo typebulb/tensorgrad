@@ -25,7 +25,7 @@ import { resolveLR, type LR } from './lr.js'
 import { appendSGD, wireSGDConfig, type SGDConfig, type SGDResult } from './sgd.js'
 import { planBuffers, type BufferPlan } from './buffers.js'
 import { emitKernels, type KernelSpec } from './codegen.js'
-import { Captures, type OutputArray, type DtypeArray } from './runtime.js'
+import { Captures, type OutputArray, type DtypeArray, type OutputDtype } from './runtime.js'
 import { Module, materializeParams, cloneModule, mulberry32, type MaterializedParams, type Rng, type InitFn } from './module.js'
 import { WorkerProxy } from './worker-proxy.js'
 import {
@@ -101,10 +101,11 @@ export type StepResult =
 
 /** Discriminated result of `compiled.run(...)`. Same shape as `StepResult`
  *  but `'completed'` carries the full output tensor (not just a scalar).
- *  Parameterized by the forward spec's `output` dtype: defaults to `'f32'`
- *  (output is `Float32Array`), use `output: 'i32'` in the spec for graphs
- *  that end in `categorical` / `argmax` / `argmin` (output is `Int32Array`). */
-export type RunResult<O extends 'f32' | 'i32' = 'f32'> =
+ *  Parameterized by the forward spec's `output` tag: defaults to `'f32'`
+ *  (output is `Float32Array`); `'i32'` for graphs that end in `categorical` /
+ *  `argmax` / `argmin` (`Int32Array`); `'rgba8'` for graphs that end in
+ *  `packRGBA8` (`Uint8ClampedArray`, `ImageData`-ready). */
+export type RunResult<O extends OutputDtype = 'f32'> =
   | { kind: 'completed'; output: DtypeArray<O>; captures: Captures }
   | { kind: 'aborted' }
   | { kind: 'failed'; error: Error }
@@ -155,17 +156,18 @@ export interface TrainingSpec<M extends Module, I extends InputDecls = InputDecl
 /** Forward spec passed to `train.attach({ ... })`. The forward function
  *  reads the parent training compile's params — every training-step
  *  update is immediately visible. */
-export interface ForwardSpec<M extends Module, I extends InputDecls = InputDecls, O extends 'f32' | 'i32' = 'f32'> {
+export interface ForwardSpec<M extends Module, I extends InputDecls = InputDecls, O extends OutputDtype = 'f32'> {
   /** Forward function returning the output tensor. The first argument is
    *  the parent compile's model (cloned internally per trace). */
   forward: ForwardFn<M, I>
   /** Input shape declarations. `null` dims become parametric; the
    *  proxy caches a sibling per distinct resolved shape on first `run()`. */
   inputs: I
-  /** Output tensor dtype. Defaults to `'f32'`. Set `'i32'` when the forward
-   *  returns indices (`categorical`, `argmax`, `argmin`) so `r.output` types
-   *  as `Int32Array` instead of `Float32Array`. Validated at compile against
-   *  the actual graph output's dtype; mismatch throws. */
+  /** What `r.output` is. Defaults to `'f32'`. `'i32'` when the forward
+   *  returns indices (`categorical`, `argmax`, `argmin`) — `Int32Array`.
+   *  `'rgba8'` when it ends in `packRGBA8` — a `Uint8ClampedArray` over the
+   *  readback, ready for `ImageData`. Validated at compile against the traced
+   *  graph (dtype, or the pack op for `'rgba8'`); mismatch throws. */
   output?: O
   /** Maximum number of distinct resolved shapes to cache simultaneously.
    *  Evicts the least-recently-used shape when full. Default: 8. */
@@ -178,7 +180,7 @@ export interface ForwardSpec<M extends Module, I extends InputDecls = InputDecls
  *  init `seed`. The returned `CompiledForward` exposes
  *  `run`/`uploadParams`/`downloadParams`/`destroy`/`paramNames` — load weights
  *  in via `uploadParams` (e.g. from `loadSafetensors`) before running. */
-export interface ForwardExecutorSpec<M extends Module, I extends InputDecls = InputDecls, O extends 'f32' | 'i32' = 'f32'>
+export interface ForwardExecutorSpec<M extends Module, I extends InputDecls = InputDecls, O extends OutputDtype = 'f32'>
   extends ForwardSpec<M, I, O>
 {
   /** A model instance — `new Model()`. Cloned internally before tracing,
@@ -277,7 +279,7 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
    *  inputs: per-shape kernels are compiled lazily and cached on first
    *  `run()` at each new resolved shape. The cache is LRU-bounded
    *  (default 8 shapes; tune via `maxCachedShapes`). */
-  attach<I2 extends InputDecls, O2 extends 'f32' | 'i32' = 'f32'>(opts: ForwardSpec<M, I2, O2>): Promise<CompiledForward<M, I2, O2>>
+  attach<I2 extends InputDecls, O2 extends OutputDtype = 'f32'>(opts: ForwardSpec<M, I2, O2>): Promise<CompiledForward<M, I2, O2>>
 
   /** Tear down the worker + GPU resources, plus any attached forward
    *  compiles. */
@@ -291,7 +293,7 @@ export interface CompiledTraining<M extends Module, I extends InputDecls = Input
  *  No top-level `graph` / `kernels`: forward proxies are polymorphic and
  *  hold one IR per shape. Use `graphFor(inputs)` to fetch (and lazily
  *  compile) the IR for a specific shape. */
-export interface CompiledForward<M extends Module = Module, I extends InputDecls = InputDecls, O extends 'f32' | 'i32' = 'f32'> {
+export interface CompiledForward<M extends Module = Module, I extends InputDecls = InputDecls, O extends OutputDtype = 'f32'> {
   /** Same as the parent training graph's param names. */
   readonly paramNames: readonly string[]
 
@@ -421,7 +423,7 @@ export async function traceForward<M extends Module, I extends InputDecls>(
  * With fully concrete input shapes the owner is created eagerly, so
  * `uploadParams` / `downloadParams` work before the first `run()`.
  */
-export async function compileForward<M extends Module, I extends InputDecls, O extends 'f32' | 'i32' = 'f32'>(
+export async function compileForward<M extends Module, I extends InputDecls, O extends OutputDtype = 'f32'>(
   spec: ForwardExecutorSpec<M, I, O>,
 ): Promise<CompiledForward<M, I, O>> {
   const proxy = new WorkerProxy(__WORKER_SOURCE__)
@@ -662,10 +664,10 @@ class CompiledTrainingProxy<M extends Module, I extends InputDecls> implements C
     ).then(() => undefined)
   }
 
-  async attach<I2 extends InputDecls, O2 extends 'f32' | 'i32' = 'f32'>(
+  async attach<I2 extends InputDecls, O2 extends OutputDtype = 'f32'>(
     opts: ForwardSpec<M, I2, O2>,
   ): Promise<CompiledForward<M, I2, O2>> {
-    const declaredOutput: 'f32' | 'i32' = opts.output ?? 'f32'
+    const declaredOutput: OutputDtype = opts.output ?? 'f32'
     const child: ForwardProxy<M, I2, O2> = new ForwardProxy<M, I2, O2>(
       this.proxy,
       this,
@@ -731,7 +733,7 @@ const DEFAULT_MAX_CACHED_SHAPES = 8
  *  shapes (concrete is the cache-size-1 case). Sibling of a training graph;
  *  shares its param GPUBuffers. Holds a reference to the parent proxy so it
  *  picks up the current model factory after `replaceModel`. */
-class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i32' = 'f32'>
+class ForwardProxy<M extends Module, I extends InputDecls, O extends OutputDtype = 'f32'>
   implements CompiledForward<M, I, O>, ChildProxy
 {
   /** Per-shape sibling cache (LRU; see `ShapeCache`). */
@@ -742,7 +744,7 @@ class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i3
     private readonly parent: ParentRef<M>,
     private readonly forward: ForwardFn<M, I>,
     private readonly decls: NormalizedDecls,
-    private readonly declaredOutput: 'f32' | 'i32',
+    private readonly declaredOutput: OutputDtype,
     private readonly nextGraphId: { v: number },
     maxCachedShapes: number,
     private readonly onDestroy: () => void,
@@ -772,10 +774,7 @@ class ForwardProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i3
       const r = await this.proxy.request<RunResultWire>(
         { kind: 'run', payload: { graphId: sib.graphId, inputs } },
       )
-      // r.output's concrete TypedArray class matches the declared output
-      // dtype (validated above + runtime returns the right class via
-      // wrapReadback). Cast to the typed array the generic O resolves to.
-      return { kind: 'completed' as const, output: r.output as DtypeArray<O>, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
+      return { kind: 'completed' as const, output: viewOutput(r.output, this.declaredOutput) as DtypeArray<O>, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
     })
   }
 
@@ -841,18 +840,42 @@ function toWireIR(ir: CompiledIR): WireIR {
   return { graph: ir.graph, plan: ir.plan, kernels: ir.kernels }
 }
 
-/** Validate a forward graph's actual output dtype against the spec's declared
- *  `output`. A mismatch (e.g. `output: 'i32'` on an f32-returning forward)
- *  would otherwise produce wrong-class TypedArray reads at every call site, so
- *  fail loudly at compile. `label` names the entry point in the message. */
-function assertOutputDtype(ir: CompiledIR, declared: 'f32' | 'i32', label: 'attach' | 'compileForward'): void {
-  const actual = ir.graph.tensors[ir.graph.outputs[0]!]!.dtype
+/** Validate a forward graph against the spec's declared `output`. `'f32'` /
+ *  `'i32'` must match the output tensor's dtype; `'rgba8'` names an OP, not a
+ *  dtype, so the graph must end in `packRGBA8` (an i32 tensor from anything
+ *  else is indices, not bytes). A mismatch would otherwise produce wrong-class
+ *  TypedArray reads at every call site, so fail loudly at compile. `label`
+ *  names the entry point in the message. Exported for the test suite. */
+export function assertOutputDtype(ir: CompiledIR, declared: OutputDtype, label: 'attach' | 'compileForward'): void {
+  const outId = ir.graph.outputs[0]!
+  const actual = ir.graph.tensors[outId]!.dtype
+  if (declared === 'rgba8') {
+    const producer = ir.graph.ops.find(op => op.out === outId)
+    if (producer?.kind !== 'pack_rgba8') {
+      throw new Error(
+        `${label}: forward declares output: 'rgba8' but the traced graph does not end in packRGBA8(...) ` +
+        `(its output is a '${actual}' tensor from '${producer?.kind ?? 'unknown'}'). ` +
+        `End the forward in packRGBA8, or declare output: '${actual}'.`,
+      )
+    }
+    return
+  }
   if (actual !== declared) {
     throw new Error(
       `${label}: forward declares output: '${declared}' but the traced graph's output tensor is '${actual}'. ` +
       `Use \`output: '${actual}'\` in the forward spec (or default by omitting the field for f32).`,
     )
   }
+}
+
+/** The host-side view of a run's output for the declared tag. Only `'rgba8'`
+ *  needs work: the worker reads the packed buffer back as i32, and the caller
+ *  wants the bytes — a zero-copy view over the same buffer, typed for
+ *  `ImageData`. */
+function viewOutput(out: OutputArray, declared: OutputDtype): OutputArray | Uint8ClampedArray<ArrayBuffer> {
+  return declared === 'rgba8'
+    ? new Uint8ClampedArray(out.buffer as ArrayBuffer, out.byteOffset, out.byteLength)
+    : out
 }
 
 /** LRU cache of per-shape compiled siblings, keyed by resolved-shape string.
@@ -899,7 +922,7 @@ class ShapeCache {
  *
  *  The owner is held separately from the LRU sibling cache so it's never
  *  evicted: evicting it would free the param buffers every sibling shares. */
-class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f32' | 'i32' = 'f32'>
+class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends OutputDtype = 'f32'>
   implements CompiledForward<M, I, O>
 {
   /** Owner graph (graphId 0). Null until created — eagerly for concrete input
@@ -920,7 +943,7 @@ class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f3
     private readonly model: M,
     private readonly forward: ForwardFn<M, I>,
     private readonly decls: NormalizedDecls,
-    private readonly declaredOutput: 'f32' | 'i32',
+    private readonly declaredOutput: OutputDtype,
     maxCachedShapes: number,
     private readonly seed: number,
     private readonly initFns: Record<string, InitFn>,
@@ -979,7 +1002,7 @@ class ForwardExecutorProxy<M extends Module, I extends InputDecls, O extends 'f3
       const r = await this.proxy.request<RunResultWire>(
         { kind: 'run', payload: { graphId: sib.graphId, inputs } },
       )
-      return { kind: 'completed' as const, output: r.output as DtypeArray<O>, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
+      return { kind: 'completed' as const, output: viewOutput(r.output, this.declaredOutput) as DtypeArray<O>, captures: makeCaptures(r.captures, sib.meta.captureShapes) }
     })
   }
 

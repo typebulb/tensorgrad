@@ -6,10 +6,16 @@ import { MAX_DISPATCH, type KernelSpec } from './codegen.js'
 // lib.dom declares the WebGPU types but not this runtime constant.
 declare const GPUMapMode: { readonly READ: number; readonly WRITE: number }
 
-/** Maps an output dtype tag (`'f32'` or `'i32'`) to its host-side
- *  TypedArray. Used to give `r.output` the right concrete type per the
- *  declared output dtype on the forward spec. */
-export type DtypeArray<D extends 'f32' | 'i32'> = D extends 'i32' ? Int32Array : Float32Array
+/** Output tags a forward spec can declare. `'f32'` / `'i32'` name the graph
+ *  output's dtype; `'rgba8'` names a graph ending in `packRGBA8`, whose i32
+ *  readback is handed to the caller as the bytes it is. */
+export type OutputDtype = 'f32' | 'i32' | 'rgba8'
+
+/** Maps an output tag to its host-side TypedArray. Used to give `r.output`
+ *  the right concrete type per the declared output on the forward spec.
+ *  `'rgba8'` is `ImageData`-ready. */
+export type DtypeArray<D extends OutputDtype> =
+  D extends 'rgba8' ? Uint8ClampedArray<ArrayBuffer> : D extends 'i32' ? Int32Array : Float32Array
 
 /** Union of all output-shaped TypedArrays. Used internally by the runtime
  *  and by `Captures.get` (where per-capture dtype isn't separately declared

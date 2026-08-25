@@ -242,6 +242,17 @@ const head = await compile({
 })
 ```
 
+**Painting a canvas from the GPU.** End an inference forward with `packRGBA8` and declare `output: 'rgba8'`: the readback is 4 bytes per pixel in `ImageData`'s byte order, so there is no host-side float→byte pass. Compositing (un-premultiply, background) stays ordinary graph ops before the pack.
+
+```ts
+const frame = await compileForward({
+  model, forward: (m, inp) => packRGBA8(render(m, inp)),   // render: [H·W, 4] RGBA in [0, 1]
+  inputs, output: 'rgba8',
+})
+const r = await frame.run(inputs)
+if (r.kind === 'completed') ctx.putImageData(new ImageData(r.output, W, H), 0, 0)
+```
+
 ## Public API
 
 ### Compile entry points
@@ -349,7 +360,7 @@ train.destroy()                              // tear down worker + GPU (cascades
 infer.run(inputs)                            // → { kind: 'completed', output, captures } | { kind: 'aborted' }
 ```
 
-`r.output` defaults to `Float32Array`. For forwards ending in `categorical` / `argmax` / `argmin`, pass `output: 'i32'` on the attach spec and `r.output` types as `Int32Array` (validated at compile).
+`r.output` defaults to `Float32Array`. For forwards ending in `categorical` / `argmax` / `argmin`, pass `output: 'i32'` on the attach spec and `r.output` types as `Int32Array`; for one ending in `packRGBA8`, pass `output: 'rgba8'` and it is a `Uint8ClampedArray` in `ImageData`'s layout. Both are validated at compile (dtype, or the pack op for `'rgba8'`).
 
 **Concurrent `step` / `run` auto-serialize.** A `run()` issued while a `step()` is in flight is queued automatically — same worker, same single output staging buffer; the runtime chains the second call so the two `mapAsync`s don't collide. Useful for the "training in the background, refresh preview on every input change" pattern: just fire both — no manual lock needed. The flip side: a long burst of `run()`s (e.g. autoregressive sampling — N sequential calls) stalls training for its full duration; batch with parametric `B` to do all N samples in one call.
 
@@ -388,7 +399,7 @@ Imported from `'tensorgrad'`:
 - Shape: `reshape`, `permute`, `swapAxes` (`permute` is full-axis reorder, like PyTorch's `permute` / JAX's `jnp.transpose`)
 - Attention layout: `splitHeads(x, nHeads)` (`[..., T, D] → [..., H, T, D/H]`), `mergeHeads(x)` (inverse), `rope(q, k, { base? })` (rotary position embedding on the Q/K pair; returns the pair rotated)
 - Linear algebra: `matmul` (dispatches unbatched [..., M, K] · [K, N] vs both-batched [..., M, K] · [..., K, N] on rhs rank; batch ranks must match exactly when rhs is batched — no size-1 broadcasting)
-- Indexing / casting: `oneHot`, `arange(n, dtype?)` (default `i32` — pass `'f32'` for float math like sinusoidal positions), `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (general per-axis gather; both array/data first to match PyTorch functional, JAX, NumPy)
+- Indexing / casting: `oneHot`, `arange(n, dtype?)` (default `i32` — pass `'f32'` for float math like sinusoidal positions), `embedding(table, indices)`, `takeAlongAxis(input, indices, axis)` (general per-axis gather; both array/data first to match PyTorch functional, JAX, NumPy), `packRGBA8(x)` (`[..., 4]` f32 → `[...]` packed bytes, WGSL's `pack4x8unorm`; the readback is `ImageData`'s byte layout, 4 bytes per pixel instead of 16)
 - Const-tensor builders: `zeros(shape, dtype?)`, `ones(shape, dtype?)` (default `f32`; non-differentiable; pair with `randn`/`arange` as the complete set — no `full`, `eye`, `linspace`, `tril`, `zerosLike`, or `like`-variants)
 - Slicing / structural: `narrow(t, axis, start, length)` (PyTorch `torch.narrow`), `concat(tensors, axis)`, `stack(tensors, axis)`, `split(t, sizes, axis)`
 - Fused ML primitives: `softmax(x, axis?)`, `logSoftmax(x, axis?)`, `softmaxCausal(x, axis?)`, `whereCausal(x, fillValue)` (mask below the diagonal; pairs with `softmaxCausal` when you need a non-softmax causal mask)
@@ -585,7 +596,7 @@ The library is small because of what it doesn't do. Plan accordingly:
 - **WebGPU only.** No Wasm, WebGL, or native fallback.
 - **Static shapes.** Every shape is fixed at compile time. Changing a batch
   size means recompiling.
-- **`f32` for math, `i32` for indices.** Params and differentiable tensors are f32; index tensors (`categorical`, `argmax`, `argmin`, `arange`, embedding lookups) are i32. No mixed precision.
+- **`f32` for math, `i32` for indices.** Params and differentiable tensors are f32; index tensors (`categorical`, `argmax`, `argmin`, `arange`, embedding lookups) are i32. No mixed precision. The one exception is `packRGBA8`'s output — bytes carried as i32, which `output: 'rgba8'` hands back as bytes.
 - **One transformation: `grad`.** No `vmap`, `pmap`, `jvp`, `custom_vjp`.
   Batch your data explicitly.
 - **Only `lr` is hot-mutable.** `weightDecay`, `beta1`, `beta2`, `clipGradNorm`,

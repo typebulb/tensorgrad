@@ -479,7 +479,8 @@ function runAdjointRule(
 
     case 'argmax_last':
     case 'categorical_last':
-      // Non-differentiable: index output is discrete.
+    case 'pack_rgba8':
+      // Non-differentiable: the output is discrete (an index, or packed bytes).
       return
 
     case 'where': {

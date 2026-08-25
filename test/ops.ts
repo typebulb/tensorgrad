@@ -8,7 +8,7 @@
 // transformer trace), and by the FD harness in test/grad.ts. Tests for
 // stable shape rules and obvious literal guards were pruned as padding.
 
-import { dropout, leakyRelu } from '../src/index.js'
+import { dropout, leakyRelu, packRGBA8 } from '../src/index.js'
 import { traceFn, tensorInput } from '../src/trace.js'
 import { evalOutput } from './_eval.js'
 import { section, ok, fail, done } from './_assert.js'
@@ -55,6 +55,31 @@ section('leakyRelu — correct for alpha >= 1 (regression guard)')
     fail(`leakyRelu(α=2) = [${[...out]}], want [${want.join(', ')}]`)
   }
   ok(`leakyRelu(α=2): x<0 → 2x, x>=0 → x — [${[...out].join(', ')}]`)
+}
+
+// packRGBA8 pins WGSL pack4x8unorm's exact byte semantics on the CPU
+// reference: saturate, ×255, round-half-up, R in the low byte — so an
+// i32 readback views as ImageData bytes with no host-side pass.
+section('packRGBA8 — pack4x8unorm semantics: saturate, round, RGBA in memory order')
+{
+  const g = traceFn(() => packRGBA8(tensorInput('x', [2, 4])))
+  const outT = g.tensors[g.outputs[0]!]!
+  if (outT.dtype !== 'i32' || outT.shape.length !== 1 || outT.shape[0] !== 2) {
+    fail(`packRGBA8([2, 4]) should be i32 [2], got ${outT.dtype} [${outT.shape}]`)
+  }
+  const out = evalOutput(g, { x: new Float32Array([0, 0.5, 1, 2, -1, 0.2, 0.998, 0.4]) }) as Int32Array
+  const bytes = new Uint8ClampedArray(out.buffer, out.byteOffset, out.byteLength)
+  // 0.5 → floor(0.5 + 127.5) = 128; 2 and -1 saturate; 0.998 → floor(0.5 + 254.49) = 254
+  const want = [0, 128, 255, 255, 0, 51, 254, 102]
+  for (let i = 0; i < want.length; i++) {
+    if (bytes[i] !== want[i]) fail(`packRGBA8 byte ${i}: got ${bytes[i]}, want ${want[i]}`)
+  }
+  ok(`bytes [${[...bytes].join(', ')}] — i32 readback views straight as Uint8ClampedArray`)
+
+  let threw = false
+  try { traceFn(() => packRGBA8(tensorInput('x', [3, 3]))) } catch { threw = true }
+  if (!threw) fail('packRGBA8 should reject a last axis that is not 4')
+  ok('a last axis other than 4 is a trace-time shape error')
 }
 
 done('test/ops.ts')

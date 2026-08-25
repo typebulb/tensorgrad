@@ -7,6 +7,7 @@ import { addOp, captureSite } from './ir.js'
 import { currentGraph, tensorInput } from './trace.js'
 import {
   inferElementwiseBinop, inferUnary, inferMeanLast, inferSumLast, inferArgmaxLast,
+  inferPackRGBA8,
   inferReshape, inferPermute, inferMatmul, inferMatmulBatched,
   inferOneHot, inferWhereCausal, inferSliceRange, inferScatterAxis, inferConcat,
   inferBroadcastTo, inferSumToShape, inferReluGrad, inferWhere,
@@ -542,6 +543,19 @@ export function matmul(a: Tensor, b: Tensor): Tensor {
 /** One-hot encode an `i32` index tensor of shape `[...]` into shape
  *  `[..., depth]`. Result dtype defaults to `f32`. Used internally by
  *  `embedding`; pair with `matmul` for end-to-end differentiable lookup. */
+/** Pack `[..., 4]` f32 RGBA into one `i32` per pixel: each channel saturated
+ *  to [0, 1], scaled to a byte, R in the low byte — WGSL's `pack4x8unorm`,
+ *  which is the byte order `ImageData` reads. The point is readback: an image
+ *  leaves the GPU as 4 bytes per pixel instead of 16, and the result's buffer
+ *  views directly as `Uint8ClampedArray`. Compile the forward with
+ *  `output: 'i32'`. Non-differentiable. */
+export function packRGBA8(a: Tensor): Tensor {
+  const site = captureSite('packRGBA8')
+  if (a.dtype !== 'f32') throw new ShapeError(`packRGBA8: requires f32, got ${a.dtype}`, site)
+  const outShape = inferPackRGBA8('packRGBA8', a.shape, site)
+  return addOp(currentGraph(), 'pack_rgba8', outShape, 'i32', site, { a: a.id })
+}
+
 export function oneHot(indices: Tensor, depth: number, dtype: Dtype = 'f32'): Tensor {
   const site = captureSite('oneHot')
   if (indices.dtype !== 'i32') {

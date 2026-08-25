@@ -136,6 +136,12 @@ export type OpNode =
   // ---- Indexing / casting --------------------------------------------------
   | { kind: 'one_hot'; out: number; indices: number; depth: number; dtype: Dtype }
   | { kind: 'arange'; out: number; n: number; dtype: Dtype }
+  // Pack [..., 4] f32 into one i32 per leading position: each component
+  // saturated to [0, 1], scaled to a byte, component 0 in the low byte —
+  // WGSL's `pack4x8unorm`, which is the byte order `ImageData` reads. Exists
+  // so an image can leave the GPU as 4 bytes per pixel instead of 16.
+  // Non-differentiable.
+  | { kind: 'pack_rgba8'; out: number; a: number }
 
   // ---- ML primitives (fused for cleaner autograd) -------------------------
   | { kind: 'softmax_causal_last'; out: number; a: number }
@@ -366,7 +372,7 @@ export function remapOpInputs(op: OpNode, f: (id: number) => number): OpNode {
     case 'mul_scalar': case 'add_scalar':
     case 'sqrt': case 'rsqrt': case 'log': case 'exp': case 'relu':
     case 'neg': case 'abs': case 'tanh': case 'sigmoid': case 'erf': case 'sin': case 'cos':
-    case 'mean_last': case 'sum_last': case 'argmax_last':
+    case 'mean_last': case 'sum_last': case 'argmax_last': case 'pack_rgba8':
     case 'reshape': case 'permute':
     case 'softmax_causal_last': case 'log_softmax_last':
     case 'where_causal': case 'stop_gradient':

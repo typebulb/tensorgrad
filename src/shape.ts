@@ -95,6 +95,15 @@ export function inferArgmaxLast(opName: string, aShape: Shape, site: CallSite | 
   return inferSumLast(opName, aShape, site)
 }
 
+/** pack_rgba8 folds the last axis, which must be exactly 4 (RGBA), into one
+ *  value. The output dtype is i32, set by the caller. */
+export function inferPackRGBA8(opName: string, aShape: Shape, site: CallSite | null): Shape {
+  if (aShape.length === 0 || aShape[aShape.length - 1] !== 4) {
+    fail(`${opName}: expects a last axis of size 4 (RGBA), got ${showShape(aShape)}`, site)
+  }
+  return aShape.slice(0, -1)
+}
+
 export function inferReshape(opName: string, aShape: Shape, newShape: Shape, site: CallSite | null): Shape {
   let inferIdx = -1
   let knownSize = 1

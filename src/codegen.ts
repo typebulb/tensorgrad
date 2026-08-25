@@ -515,6 +515,24 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: outerSize, workgroupSize: WG_SIZE }
     }
 
+    case 'pack_rgba8': {
+      // pack4x8unorm saturates, scales to a byte and rounds each component,
+      // component 0 in the low byte. Stored through a bitcast because the
+      // library has no u32 dtype; the host views the readback as bytes.
+      const outerSize = shapeSize(tof(op.out).shape)
+      const wgsl = `
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read_write> out : array<i32>;
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  ${GID_LINE}
+  if (i >= ${outerSize}u) { return; }
+  let base = i * 4u;
+  out[i] = bitcast<i32>(pack4x8unorm(vec4<f32>(a[base], a[base + 1u], a[base + 2u], a[base + 3u])));
+}`.trim()
+      return { opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.out)], threads: outerSize, workgroupSize: WG_SIZE }
+    }
+
     case 'categorical_last': {
       // Gumbel-max sampling: sample ~ argmax_j (logit_j + g_j) where
       // g_j = -log(-log(u_j)) and u_j ~ Uniform(0,1). Mathematically

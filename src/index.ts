@@ -27,7 +27,7 @@ export {
   // Linear algebra
   matmul,
   // Indexing / casting
-  oneHot, arange, embedding, takeAlongAxis,
+  oneHot, arange, embedding, takeAlongAxis, packRGBA8,
   // Const-tensor builders
   zeros, ones,
   // ML primitives
@@ -42,7 +42,7 @@ export {
 export { lr, type LR } from './lr.js'
 export { type AdamConfig, type AdamWConfig } from './adam.js'
 export { type SGDConfig } from './sgd.js'
-export { Captures, type OutputArray, type DtypeArray } from './runtime.js'
+export { Captures, type OutputArray, type DtypeArray, type OutputDtype } from './runtime.js'
 export {
   compile, compileForward, trace, traceForward,
   type TrainingSpec, type ForwardSpec, type ForwardExecutorSpec, type CompiledIR, type ForwardFn,

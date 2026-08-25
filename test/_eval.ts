@@ -234,6 +234,17 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       }
       return out
     }
+    case 'pack_rgba8': {
+      // WGSL pack4x8unorm: floor(0.5 + 255 * clamp(x, 0, 1)) per component,
+      // component 0 in the low byte.
+      const a = v(op.a) as Float32Array
+      const out = new Int32Array(a.length / 4)
+      const byte = (x: number) => Math.floor(0.5 + 255 * Math.min(Math.max(x, 0), 1))
+      for (let i = 0; i < out.length; i++) {
+        out[i] = byte(a[4 * i]!) | (byte(a[4 * i + 1]!) << 8) | (byte(a[4 * i + 2]!) << 16) | (byte(a[4 * i + 3]!) << 24)
+      }
+      return out
+    }
 
     // ---- Shape / detach --------------------------------------------------
     case 'reshape':
