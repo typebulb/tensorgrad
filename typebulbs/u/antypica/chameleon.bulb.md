@@ -8,8 +8,8 @@ name: Chameleon
 ```tsx
 import { App, Component, a, button, canvas, div, h1, img, p, path, polygon, rect, span, svg } from "domeleon"
 import {
-  Module, compileForward, checkWebGPU, Conv2d, Linear, init,
-  conv2d, maxPool2d, relu, sin, greater, where, mul, add,
+  Module, compileForward, checkWebGPU, Conv2d, Linear, init, capture,
+  conv2d, maxPool2d, relu, sin, greater, where, mul, add, clamp,
   narrow, concat, reshape, permute, randn, ones, zeros,
   type Tensor, type CompiledForward,
 } from "tensorgrad"
@@ -61,8 +61,14 @@ async function cachedFetch(url: string): Promise<ArrayBuffer> {
 
 // ============================================================================
 // The model — same fields (and so same tensorgrad param names) as the other
-// Cells-to-Pixels bulbs. Init is irrelevant: the imported weights are
-// uploaded before any run.
+// Cells-to-Pixels bulbs. Init is irrelevant: everything here, the frame
+// constants included, is uploaded before any run.
+//
+// The three constant tensors are parameters rather than per-run inputs on
+// purpose. An input is re-sent (and structure-cloned across the worker
+// boundary) on every single run; `coords` alone is 2.4MB, which is more bytes
+// per frame than the state and the image put together. As params they're
+// uploaded once and then just sit in their GPU buffers.
 // ============================================================================
 class NCAModel extends Module {
   w1 = new Conv2d(4 * C, FC, 1, { init: init.zeros() })
@@ -71,6 +77,15 @@ class NCAModel extends Module {
   s2 = new Linear(H, H, { init: init.zeros() })
   s3 = new Linear(H, H, { init: init.zeros() })
   sOut = new Linear(H, 4, { init: init.zeros() })
+  filters: Tensor                           // perception kernels [4C, 1, 3, 3]
+  bilin: Tensor                             // bilinear tent bank [C·S², 1, 3, 3]
+  coords: Tensor                            // sub-cell coord features [GGH, 4]
+  constructor() {
+    super()
+    this.filters = this.param([4 * C, 1, 3, 3], { init: init.zeros() })
+    this.bilin = this.param([C * S * S, 1, 3, 3], { init: init.zeros() })
+    this.coords = this.param([GGH, 4], { init: init.zeros() })
+  }
 }
 
 // ============================================================================
@@ -83,6 +98,10 @@ class NCAModel extends Module {
 //     Conv2d weight is [C, FC] — transpose.
 //   lppn.net.*: torch Linear [out, in]; tensorgrad Linear is [in, out] (x@W)
 //     — transpose all four.
+// The SIREN's ω is folded into the three hidden layers here rather than
+// applied in the graph: sin(ω·(xW + b)) is sin(x·(ωW) + ωb), and a scalar
+// multiply over [147456, 64] is a full 75MB pass on the GPU for arithmetic
+// that costs nothing at import.
 // ============================================================================
 type TheirTensor = { shape: number[]; dtype: string; data64: string }
 
@@ -97,6 +116,7 @@ function importModel(src: Record<string, TheirTensor>): Record<string, Float32Ar
     for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i)
     return new Float32Array(u8.buffer)
   }
+  const scale = (a: Float32Array, k: number) => { for (let i = 0; i < a.length; i++) a[i]! *= k; return a }
   const w1t = dec("nca.w1.weight", FC, 4 * C)
   const w1 = new Float32Array(FC * 4 * C)
   for (let o = 0; o < FC; o++)
@@ -118,17 +138,25 @@ function importModel(src: Record<string, TheirTensor>): Record<string, Float32Ar
   }
   return {
     "w1.W": w1, "w1.b": dec("nca.w1.bias", FC), "w2.W": w2,
-    "s1.W": lin("lppn.net.0.linear.weight", SIN, H), "s1.b": dec("lppn.net.0.linear.bias", H),
-    "s2.W": lin("lppn.net.1.linear.weight", H, H), "s2.b": dec("lppn.net.1.linear.bias", H),
-    "s3.W": lin("lppn.net.2.linear.weight", H, H), "s3.b": dec("lppn.net.2.linear.bias", H),
+    "s1.W": scale(lin("lppn.net.0.linear.weight", SIN, H), OMEGA), "s1.b": scale(dec("lppn.net.0.linear.bias", H), OMEGA),
+    "s2.W": scale(lin("lppn.net.1.linear.weight", H, H), OMEGA), "s2.b": scale(dec("lppn.net.1.linear.bias", H), OMEGA),
+    "s3.W": scale(lin("lppn.net.2.linear.weight", H, H), OMEGA), "s3.b": scale(dec("lppn.net.2.linear.bias", H), OMEGA),
     "sOut.W": lin("lppn.net.3.weight", H, 4), "sOut.b": dec("lppn.net.3.bias", 4),
+    "filters": FILTERS, "bilin": BILIN, "coords": COORDS,
   }
 }
 
 // ============================================================================
-// Graphs — the CA step and SIREN decode, verbatim from the reference:
-// circular perception padding, Bernoulli-0.5 update mask, pre×post alive
-// gating (the torch training semantics).
+// The graph — CA step and SIREN decode, verbatim from the reference: circular
+// perception padding, Bernoulli-0.5 update mask, pre×post alive gating (the
+// torch training semantics).
+//
+// Both live in ONE compiled forward. Two separately compiled graphs means two
+// workers, two GPU devices and so two round trips per frame: the state has to
+// come back to the CPU and go straight out again just to cross from one device
+// to the other, and each `run` pays its own submit-and-map latency. Fused, the
+// state never leaves the GPU mid-frame; the new state rides home as a capture
+// alongside the image.
 // ============================================================================
 const alive = (s: Tensor) =>
   greater(maxPool2d(narrow(s, 1, 3, 1), 3, { stride: 1, padding: 1 }), 0.1)
@@ -141,9 +169,9 @@ function circularPad1(s: Tensor): Tensor {
   return concat([narrow(px, 2, G - 1, 1), px, narrow(px, 2, 0, 1)], 2)
 }
 
-function ncaStep(m: NCAModel, s: Tensor, filters: Tensor): Tensor {
+function ncaStep(m: NCAModel, s: Tensor): Tensor {
   const pre = alive(s)
-  const z = conv2d(circularPad1(s), filters, { padding: 0, groups: C })   // [1, 4C, G, G]
+  const z = conv2d(circularPad1(s), m.filters, { padding: 0, groups: C })  // [1, 4C, G, G]
   const ds = m.w2.fwd(relu(m.w1.fwd(z)))
   const mask = greater(randn([1, 1, G, G]), 0)          // Bernoulli(0.5)
   const s2 = where(mask, add(s, ds), s)
@@ -151,36 +179,40 @@ function ncaStep(m: NCAModel, s: Tensor, filters: Tensor): Tensor {
   return mul(s2, mul(boolToF32(pre, G), boolToF32(post, G)))
 }
 
-// exact bilinear ×S upsample of `ch` channels via a depthwise tent conv +
-// depth-to-space (ch=1 reuses it for the alpha)
-function bilinearUp(x: Tensor, w: Tensor, ch: number): Tensor {
+// exact bilinear ×S upsample of `ch` channels via a depthwise tent conv, with
+// the depth-to-space shuffle landing straight in the SIREN's [pixel, channel]
+// row order — the same permute either way, so laying out the rows here saves
+// transposing all 36 feature planes again downstream
+function bilinearRows(x: Tensor, w: Tensor, ch: number): Tensor {
   const shifted = conv2d(x, w, { padding: 1, groups: ch })   // [1, ch·S², G, G]
   const t = reshape(shifted, [1, ch, S, S, G, G])
-  return reshape(permute(t, [0, 1, 4, 2, 5, 3]), [1, ch, GH, GH])
+  return reshape(permute(t, [0, 4, 2, 5, 3, 1]), [GGH, ch])  // [1, G, S, G, S, ch]
 }
 
 // the Cells2Pixels decoder, alive-gated the AUTHORS' renderer's way: the alpha
 // channel is bilinearly upsampled to render res and maxpooled over 3×3 RENDER
-// pixels (a smooth, sub-cell-accurate silhouette).
-function decode(m: NCAModel, s: Tensor, bilin: Tensor, bilin1: Tensor, coords: Tensor): Tensor {
-  const up = bilinearUp(s, bilin, C)
-  const feats = concat([coords, up], 1)                          // [1, 4+C, GH, GH]
-  const rows = reshape(permute(feats, [0, 2, 3, 1]), [GGH, SIN])
-  let h = sin(mul(m.s1.fwd(rows), OMEGA))
-  h = sin(mul(m.s2.fwd(h), OMEGA))
-  h = sin(mul(m.s3.fwd(h), OMEGA))
-  const img = permute(reshape(m.sOut.fwd(h), [1, GH, GH, 4]), [0, 3, 1, 2])
-  const aUp = bilinearUp(narrow(s, 1, 3, 1), bilin1, 1)          // [1,1,GH,GH]
+// pixels (a smooth, sub-cell-accurate silhouette). That upsampled alpha is
+// column 3 of `up` — the C-channel upsample already computed it, so there's no
+// second pass over the alpha plane.
+function decode(m: NCAModel, s: Tensor): Tensor {
+  const up = bilinearRows(s, m.bilin, C)                         // [GGH, C]
+  let h = sin(m.s1.fwd(concat([m.coords, up], 1)))               // ω is in the weights
+  h = sin(m.s2.fwd(h))
+  h = sin(m.s3.fwd(h))
+  const img = m.sOut.fwd(h)                                      // [GGH, 4], interleaved RGBA
+  const aUp = reshape(narrow(up, 1, 3, 1), [1, 1, GH, GH])
   const mask = greater(maxPool2d(aUp, 3, { stride: 1, padding: 1 }), 0.1)
-  return mul(img, boolToF32(mask, GH))
+  return mul(img, reshape(boolToF32(mask, GH), [GGH, 1]))
 }
 
-function demoFn(m: NCAModel, { state, filters }: { state: Tensor; filters: Tensor }) {
-  return ncaStep(m, state, filters)
-}
-
-function renderFn(m: NCAModel, { state, bilin, bilin1, coords }: { state: Tensor; bilin: Tensor; bilin1: Tensor; coords: Tensor }) {
-  return decode(m, state, bilin, bilin1, coords)
+// One frame: advance the CA (unless `advance` is 0 — a repaint of a state the
+// pointer just scratched), clamp, hand the new state back as a capture, decode.
+// The clamp is the box the training-time overflow penalty (weight 100) kept the
+// state in, so it's a near-no-op while healthy; it rides along on the GPU
+// rather than costing the CPU a pass over 295k floats every frame.
+function frameFn(m: NCAModel, { state, advance }: { state: Tensor; advance: Tensor }) {
+  const stepped = clamp(ncaStep(m, state), -1, 1)
+  return decode(m, capture("state", where(greater(advance, 0), stepped, state)))
 }
 
 // ============================================================================
@@ -207,9 +239,9 @@ const W1D = [
   [0, 0.875, 0.125],
   [0, 0.625, 0.375],
 ]
-const makeBilin = (ch: number) => {
-  const a = new Float32Array(ch * S * S * 9)            // [ch·S², 1, 3, 3]
-  for (let c = 0; c < ch; c++)
+const BILIN = (() => {
+  const a = new Float32Array(C * S * S * 9)             // [C·S², 1, 3, 3]
+  for (let c = 0; c < C; c++)
     for (let dy = 0; dy < S; dy++)
       for (let dx = 0; dx < S; dx++) {
         const off = (c * S * S + dy * S + dx) * 9
@@ -218,26 +250,27 @@ const makeBilin = (ch: number) => {
             a[off + ky * 3 + kx] = W1D[dy]![ky]! * W1D[dx]![kx]!
       }
   return a
-}
-const BILIN = makeBilin(C)
-const BILIN1 = makeBilin(1)
+})()
 
 // sub-cell coord features [sin(πy), sin(πx), cos(πy), cos(πx)] per render
-// pixel — the reference's num_frequencies=1 encoding, periodic per 4×4 tile
-const COORDS1 = (() => {
-  const a = new Float32Array(4 * GGH)
+// pixel — the reference's num_frequencies=1 encoding, periodic per 4×4 tile.
+// Row-major [GGH, 4]: the layout the SIREN consumes.
+const COORDS = (() => {
+  const a = new Float32Array(GGH * 4)
   const f = [-0.75, -0.25, 0.25, 0.75]
   for (let y = 0; y < GH; y++)
     for (let x = 0; x < GH; x++) {
-      const i = y * GH + x
+      const i = (y * GH + x) * 4
       const cy = f[y % S]! * Math.PI, cx = f[x % S]! * Math.PI
       a[i] = Math.sin(cy)
-      a[GGH + i] = Math.sin(cx)
-      a[2 * GGH + i] = Math.cos(cy)
-      a[3 * GGH + i] = Math.cos(cx)
+      a[i + 1] = Math.sin(cx)
+      a[i + 2] = Math.cos(cy)
+      a[i + 3] = Math.cos(cx)
     }
   return a
 })()
+
+const ADVANCE = new Float32Array([1]), HOLD = new Float32Array([0])
 
 // the paper's seed: all zeros except channels 3..C = 1 at the grid center
 const SEED = (() => {
@@ -262,9 +295,8 @@ const aliveCount = (s: Float32Array) => {
 }
 
 // ============================================================================
-// Root — the whole app in one component: the two compiled forwards, the
-// imported weights, the frame loop, and the view. No training machinery
-// anywhere.
+// Root — the whole app in one component: the compiled forward, the imported
+// weights, the frame loop, and the view. No training machinery anywhere.
 // ============================================================================
 const icon = (...kids: any[]) => svg({ class: "ico", viewBox: "0 0 24 24", fill: "currentColor" }, ...kids)
 const ICON = {
@@ -276,15 +308,14 @@ const ICON = {
 class Root extends Component {
   status = "starting…"
   paused = false
-  #step: CompiledForward | null = null
-  #render: CompiledForward | null = null
-  #state: Float32Array | null = null
+  #frame?: CompiledForward
+  #state?: Float32Array
   #token = 0
-  #canvas: HTMLCanvasElement | null = null
-  #ctx: CanvasRenderingContext2D | null = null
-  #img: ImageData | null = null
-  #cellsCtx: CanvasRenderingContext2D | null = null
-  #cellsImg: ImageData | null = null
+  #canvas?: HTMLCanvasElement
+  #ctx?: CanvasRenderingContext2D
+  #img?: ImageData
+  #cellsCtx?: CanvasRenderingContext2D
+  #cellsImg?: ImageData
   #painting = false
   #pendingCarves: [number, number][] = []     // carves racing an in-flight step
   #renderBusy = false
@@ -319,21 +350,16 @@ class Root extends Component {
       return
     }
     this.#setStatus("compiling WGSL kernels…")
-    this.#step = await compileForward({
-      model: new NCAModel(), forward: demoFn,
-      inputs: { state: [1, C, G, G], filters: [4 * C, 1, 3, 3] },
-    })
-    this.#render = await compileForward({
-      model: new NCAModel(), forward: renderFn,
-      inputs: { state: [1, C, G, G], bilin: [C * S * S, 1, 3, 3], bilin1: [S * S, 1, 3, 3], coords: [1, 4, GH, GH] },
+    this.#frame = await compileForward({
+      model: new NCAModel(), forward: frameFn,
+      inputs: { state: [1, C, G, G], advance: [1] },
     })
     this.#setStatus("fetching the authors' trained chameleon…")
     try {
       const buf = await cachedFetch(MODEL_URL)
       const src = JSON.parse(new TextDecoder().decode(buf)) as Record<string, TheirTensor>
       const params = importModel(src)
-      await this.#step.uploadParams(params)
-      await this.#render.uploadParams(params)
+      await this.#frame.uploadParams(params)
       this.reseed()
       slog(`loaded chameleon (${Object.keys(params).length} tensors)`)
       this.#setStatus("growing the chameleon — scratch it!")
@@ -362,38 +388,22 @@ class Root extends Component {
     while (token === this.#token) {
       if (!this.paused && this.#state) {
         this.#pendingCarves.length = 0                   // from here, carves race the step
-        const r = await this.#step!.run({ state: this.#state, filters: FILTERS })
+        const r = await this.#frame!.run({ state: this.#state, advance: ADVANCE })
         if (token !== this.#token) return
         if (r.kind === "completed") {
-          const next = r.output as Float32Array
+          const next = r.captures.get("state") as Float32Array
           for (const [cx, cy] of this.#pendingCarves) carveDisc(next, cx, cy, DAMAGE_R)
           this.#pendingCarves.length = 0
-          this.#state = this.#stabilize(next) ? SEED.slice() : next
-        }
-        const rr = await this.#render!.run({ state: this.#state!, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 })
-        if (token !== this.#token) return
-        if (rr.kind === "completed") {
-          this.#paintRender(rr.output as Float32Array)
-          this.#paintCells(this.#state!)
+          const n = aliveCount(next)
+          this.#state = (n === 0 || n > GG * 0.6) ? SEED.slice() : next
+          this.#paintRender(r.output as Float32Array)
+          this.#paintCells(next)   // not #state: on a reseed frame, both canvases show the frame that was decoded
         }
         frames++
         if (frames % 300 === 0) slog(`t=${frames} alive=${aliveCount(this.#state!)}`)
       }
       await nextFrame()
     }
-  }
-
-  // demo-time stabilizers: clamp the state into [-1,1] — the box the
-  // training-time overflow penalty (weight 100) kept it in, so this is a
-  // near-no-op while healthy — and reseed on death or runaway growth.
-  #stabilize(s: Float32Array): boolean {
-    for (let i = 0; i < STATE_LEN; i++) {
-      const v = s[i]!
-      if (v > 1) s[i] = 1
-      else if (v < -1) s[i] = -1
-    }
-    const n = aliveCount(s)
-    return n === 0 || n > GG * 0.6
   }
 
   #damageAt(e: PointerEvent) {
@@ -407,32 +417,47 @@ class Root extends Component {
     this.#renderDamaged()
   }
 
-  // paused pokes still repaint: one render pass on demand
+  // paused pokes still repaint: one decode of the scratched state, the CA held
+  // still. While running the loop is already about to repaint, so leave it be
+  // rather than racing a second full frame in against it.
   #renderDamaged() {
-    if (this.#renderBusy || !this.#render || !this.#state) return
+    if (!this.paused || this.#renderBusy || !this.#frame || !this.#state) return
     this.#renderBusy = true
-    this.#render.run({ state: this.#state, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 }).then(r => {
+    this.#frame.run({ state: this.#state, advance: HOLD }).then(r => {
       this.#renderBusy = false
       if (r.kind === "completed") this.#paintRender(r.output as Float32Array)
     })
   }
 
-  #paintRender(arr: Float32Array) { if (this.#ctx) this.#blit(arr, this.#img!, this.#ctx, GGH) }
-  #paintCells(arr: Float32Array) { if (this.#cellsCtx) this.#blit(arr, this.#cellsImg!, this.#cellsCtx, GG) }
+  // [GGH, 4] premultiplied RGBA straight off the GPU: un-premultiply RGB with
+  // capped gain, straight alpha, composites onto the themed page background
+  #paintRender(arr: Float32Array) {
+    if (!this.#ctx) return
+    const d = this.#img!.data
+    for (let j = 0; j < GGH * 4; j += 4) {
+      const a = clamp01(arr[j + 3]!)
+      const ia = a > 0.01 ? 1 / Math.max(a, 0.2) : 0
+      d[j] = clamp01(arr[j]! * ia) * 255
+      d[j + 1] = clamp01(arr[j + 1]! * ia) * 255
+      d[j + 2] = clamp01(arr[j + 2]! * ia) * 255
+      d[j + 3] = a * 255
+    }
+    this.#ctx.putImageData(this.#img!, 0, 0)
+  }
 
-  // premultiplied CHW RGBA → ImageData: un-premultiply RGB with capped gain,
-  // straight alpha, composites onto the themed page background
-  #blit(arr: Float32Array, img: ImageData, ctx: CanvasRenderingContext2D, n: number) {
-    const d = img.data
-    for (let i = 0; i < n; i++) {
-      const a = clamp01(arr[3 * n + i]!)
+  // the cell grid stays planar CHW at 96² — same un-premultiply, strided reads
+  #paintCells(arr: Float32Array) {
+    if (!this.#cellsCtx) return
+    const d = this.#cellsImg!.data
+    for (let i = 0; i < GG; i++) {
+      const a = clamp01(arr[3 * GG + i]!)
       const ia = a > 0.01 ? 1 / Math.max(a, 0.2) : 0
       d[i * 4] = clamp01(arr[i]! * ia) * 255
-      d[i * 4 + 1] = clamp01(arr[n + i]! * ia) * 255
-      d[i * 4 + 2] = clamp01(arr[2 * n + i]! * ia) * 255
+      d[i * 4 + 1] = clamp01(arr[GG + i]! * ia) * 255
+      d[i * 4 + 2] = clamp01(arr[2 * GG + i]! * ia) * 255
       d[i * 4 + 3] = a * 255
     }
-    ctx.putImageData(img, 0, 0)
+    this.#cellsCtx.putImageData(this.#cellsImg!, 0, 0)
   }
 
   #setStatus(s: string) { this.status = s; this.update() }
@@ -464,10 +489,10 @@ class Root extends Component {
         ),
       ),
       div({ class: "stage-box" },
-        canvas({ class: "grid", key: "grid", onMounted: (el: Element) => this.boot(el as HTMLCanvasElement) }),
+        canvas({ class: "grid", key: "grid", ariaLabel: "chameleon", onMounted: (el: Element) => this.boot(el as HTMLCanvasElement) }),
         div({ class: "strip" },
           div({ class: "thumb-box" },
-            canvas({ class: "thumb cells", key: "cells", onMounted: (el: Element) => this.bootCells(el as HTMLCanvasElement) }),
+            canvas({ class: "thumb cells", key: "cells", ariaLabel: "cells", onMounted: (el: Element) => this.bootCells(el as HTMLCanvasElement) }),
             span({ class: "thumb-label" }, `cells ${G}²`),
           ),
           span({ class: "strip-arrow" }, "→"),
@@ -596,7 +621,7 @@ img.thumb { box-sizing: border-box; padding: 16.667%; }
 {
   "description": "A neural cellular automaton grows a chameleon from one cell on your GPU, using weights from the paper “From Cells to Pixels”. Scratch it and it heals.",
   "dependencies": {
-    "tensorgrad": "^0.4.6",
+    "tensorgrad": "^0.4.8",
     "domeleon": "^0.6.3"
   }
 }
