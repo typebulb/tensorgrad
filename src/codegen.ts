@@ -6,7 +6,7 @@
 // kernels), which is fine for our static-shape model and gives the WGSL
 // compiler full freedom to specialize.
 
-import type { Graph, OpNode, Tensor, Shape } from './ir.js'
+import type { Graph, OpNode, Tensor, Shape, UnaryExprKind } from './ir.js'
 import type { BufferPlan } from './buffers.js'
 import { shapeSize } from './shape.js'
 
@@ -153,6 +153,70 @@ function batchIndex(name: string, perSlice: number, batch: number, builtin: 'gid
   }
 }
 
+/** WGSL has no erf intrinsic — the A&S 7.1.26 rational-poly approx, max abs error ~1.5e-7.
+ *  Emitted by any kernel whose body uses `erf_approx`, standalone or fused. */
+const ERF_HELPER = `
+fn erf_approx(x : f32) -> f32 {
+  let s = sign(x);
+  let ax = abs(x);
+  let t = 1.0 / (1.0 + 0.3275911 * ax);
+  let p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+  return s * (1.0 - p * exp(-ax * ax));
+}
+`
+const unaryPreamble = (kind?: UnaryExprKind) => kind === 'erf' ? ERF_HELPER : ''
+
+/** WGSL for one unary kind applied to `x`. `x` is substituted exactly once, so no operand
+ *  is evaluated twice, but it is NOT parenthesized here — pass a bare identifier, or wrap a
+ *  compound expression yourself (`-x` and `0.5 * x` would otherwise mis-bind). The single
+ *  source shared by the standalone unary kernels and the GEMM epilogue, so a fused
+ *  activation cannot drift from its unfused twin. */
+function unaryExpr(kind: UnaryExprKind, x: string): string {
+  switch (kind) {
+    case 'sqrt': return `sqrt(${x})`
+    case 'rsqrt': return `1.0 / sqrt(${x})`
+    case 'log': return `log(${x})`
+    case 'exp': return `exp(${x})`
+    case 'relu': return `max(${x}, 0.0)`
+    case 'neg': return `-${x}`
+    case 'abs': return `abs(${x})`
+    case 'tanh': return `tanh(${x})`
+    case 'sin': return `sin(${x})`
+    case 'cos': return `cos(${x})`
+    case 'erf': return `erf_approx(${x})`
+    // tanh identity for numerical stability: sigmoid(x) = 0.5 + 0.5 * tanh(0.5x)
+    case 'sigmoid': return `0.5 + 0.5 * tanh(0.5 * ${x})`
+  }
+}
+
+/** Read-binding declarations plus the output, numbered in one sequence. Generated from the
+ *  same list the KernelSpec's `bindings` comes from, so a fused kernel's extra operand
+ *  cannot land on a different index than the runtime binds it to. */
+const bindingDecls = (reads: readonly string[], outName: string) => [
+  ...reads.map((n, i) => `@group(0) @binding(${i}) var<storage, read> ${n} : array<f32>;`),
+  `@group(0) @binding(${reads.length}) var<storage, read_write> ${outName} : array<f32>;`,
+].join('\n')
+
+/** The fused epilogue of a `matmul` or `conv2d` op (see src/fuse.ts): a bias added and one
+ *  activation applied to each accumulator in registers, at the store, instead of two more
+ *  full-tensor round-trips. Inert when the op carries neither — `store` is the identity and
+ *  there is no extra binding, so the WGSL is byte-identical to what the kernel emitted
+ *  epilogue existed, which is what keeps the phone-checked conv kernels valid.
+ *
+ *  `biasIdx` is WGSL for which bias element an output wants, and differs per kernel because
+ *  the bias broadcasts along a different axis in each: a matmul's is per output COLUMN
+ *  (`n`), a conv's is per output CHANNEL — `cOut_` in the naive kernel, `g * cOutPerG + m`
+ *  in the tiled one, whose M axis is the channel within a group. It must name variables the
+ *  caller has in scope at its store. */
+function fusedEpilogue(bias: number | undefined, act: UnaryExprKind | undefined, biasIdx: string) {
+  const withBias = (acc: string) => bias !== undefined ? `(${acc} + bias[${biasIdx}])` : acc
+  return {
+    reads: bias !== undefined ? ['bias'] : [],
+    preamble: unaryPreamble(act),
+    store: (acc: string) => act ? unaryExpr(act, withBias(acc)) : withBias(acc),
+  }
+}
+
 /** Generate a KernelSpec per compute op in graph.ops (in dispatch order). */
 export function emitKernels(graph: Graph, plan: BufferPlan): KernelSpec[] {
   const out: KernelSpec[] = []
@@ -279,31 +343,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const out = tof(op.out)
       const a = tof(op.a)
       const total = shapeSize(out.shape)
-      const expr =
-        op.kind === 'sqrt'    ? 'sqrt(x)' :
-        op.kind === 'rsqrt'   ? '1.0 / sqrt(x)' :
-        op.kind === 'log'     ? 'log(x)' :
-        op.kind === 'exp'     ? 'exp(x)' :
-        op.kind === 'relu'    ? 'max(x, 0.0)' :
-        op.kind === 'neg'     ? '-x' :
-        op.kind === 'abs'     ? 'abs(x)' :
-        op.kind === 'tanh'    ? 'tanh(x)' :
-        op.kind === 'sin'     ? 'sin(x)' :
-        op.kind === 'cos'     ? 'cos(x)' :
-        op.kind === 'erf'     ? 'erf_approx(x)' :
-        // tanh identity for numerical stability: sigmoid(x) = 0.5 + 0.5 * tanh(0.5x)
-        /* sigmoid */           '0.5 + 0.5 * tanh(0.5 * x)'
-      // WGSL has no erf intrinsic — emit the A&S 7.1.26 rational-poly approx
-      // (max abs error ~1.5e-7) as a helper. Empty for every other unary.
-      const preamble = op.kind === 'erf' ? `
-fn erf_approx(x : f32) -> f32 {
-  let s = sign(x);
-  let ax = abs(x);
-  let t = 1.0 / (1.0 + 0.3275911 * ax);
-  let p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-  return s * (1.0 - p * exp(-ax * ax));
-}
-` : ''
+      const expr = unaryExpr(op.kind, 'x')
+      const preamble = unaryPreamble(op.kind)
       const wgsl = `${preamble}
 @group(0) @binding(0) var<storage, read> a : array<${wgslDtype(a.dtype)}>;
 @group(0) @binding(1) var<storage, read_write> out : array<${wgslDtype(out.dtype)}>;
@@ -645,13 +686,15 @@ ${outDimDecls}
       // workgroups (SIREN dW 193 → 117 ms/step; xf-small dW likewise) —
       // 16× less traffic beats occupancy. Naive form kept as reference.
       const tileable = K % TILE === 0 && M >= TILE && N >= TILE
+      // Bias / activation folded into the store when a rewrite pass fused them (src/fuse.ts).
+      // `bindings` and the WGSL's binding numbers both come from `epi.reads`.
+      const epi = fusedEpilogue(op.bias, op.act, 'n')
+      const mmBindings = [buf(op.a), buf(op.b), ...(op.bias !== undefined ? [buf(op.bias)] : []), buf(op.out)]
       if (total < 32768 && K >= 256 && !tileable) {
         const mnIdx = batchIndex('mn', M * N, batch, 'wid')
-        const wgsl = `
+        const wgsl = `${epi.preamble}
 var<workgroup> partial : array<f32, ${WG_SIZE}>;
-@group(0) @binding(0) var<storage, read> a : array<f32>;
-@group(0) @binding(1) var<storage, read> b : array<f32>;
-@group(0) @binding(2) var<storage, read_write> c : array<f32>;
+${bindingDecls(['a', 'b', ...epi.reads], 'c')}
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
   // One workgroup per output element. wid is workgroup-uniform, so the
@@ -665,25 +708,23 @@ ${mnIdx.wgsl}
     s = s + a[aBase + k] * b[k * ${N}u + n];
   }
 ${emitWorkgroupReduce('partial', 's')}
-  if (lid == 0u) { c[${mnIdx.outIdx}] = partial[0]; }
+  if (lid == 0u) { c[${mnIdx.outIdx}] = ${epi.store('partial[0]')}; }
 }`.trim()
         return {
-          opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
+          opIndex, opKind: op.kind, wgsl, bindings: mmBindings,
           ...mnIdx.spec, workgroupSize: WG_SIZE,
         }
       }
       if (tileable) {
-        const tiled = emitTiledMatmul(batch, M, K, N, false)
+        const tiled = emitTiledMatmul(batch, M, K, N, false, epi)
         return {
-          opIndex, opKind: op.kind, wgsl: tiled.wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
+          opIndex, opKind: op.kind, wgsl: tiled.wgsl, bindings: mmBindings,
           ...tiled.spec, workgroupSize: WG_SIZE,
         }
       }
       const mnIdx = batchIndex('mn', M * N, batch, 'gid')
-      const wgsl = `
-@group(0) @binding(0) var<storage, read> a : array<f32>;
-@group(0) @binding(1) var<storage, read> b : array<f32>;
-@group(0) @binding(2) var<storage, read_write> c : array<f32>;
+      const wgsl = `${epi.preamble}
+${bindingDecls(['a', 'b', ...epi.reads], 'c')}
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 ${mnIdx.wgsl}
@@ -694,10 +735,10 @@ ${mnIdx.wgsl}
   for (var k : u32 = 0u; k < ${K}u; k = k + 1u) {
     s = s + a[aBase + k] * b[k * ${N}u + n];
   }
-  c[${mnIdx.outIdx}] = s;
+  c[${mnIdx.outIdx}] = ${epi.store('s')};
 }`.trim()
       return {
-        opIndex, opKind: op.kind, wgsl, bindings: [buf(op.a), buf(op.b), buf(op.out)],
+        opIndex, opKind: op.kind, wgsl, bindings: mmBindings,
         ...mnIdx.spec, workgroupSize: WG_SIZE,
       }
     }
@@ -1063,18 +1104,22 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       const [, cIn, H, W] = input.shape
       const [cOut, cInPerG, kH, kW] = weight.shape
       const cOutPerG = cOut! / op.groups
-      const tiledFwd = emitTiledConv('fwd', convDims(input.shape, weight.shape, out.shape, op))
+      // The bias is per output channel. In the tiled kernel M is the channel WITHIN a group
+      // and `g` is the group, so the global channel is g * cOutPerG + m; the naive kernel
+      // decodes the global channel directly as `cOut_`.
+      const convBindings = [buf(op.input), buf(op.weight), ...(op.bias !== undefined ? [buf(op.bias)] : []), buf(op.out)]
+      const tiledEpi = fusedEpilogue(op.bias, op.act, `g * ${cOutPerG}u + m`)
+      const tiledFwd = emitTiledConv('fwd', convDims(input.shape, weight.shape, out.shape, op), tiledEpi)
       if (tiledFwd) {
         return {
-          opIndex, opKind: op.kind, wgsl: tiledFwd.wgsl, bindings: [buf(op.input), buf(op.weight), buf(op.out)],
+          opIndex, opKind: op.kind, wgsl: tiledFwd.wgsl, bindings: convBindings,
           ...tiledFwd.spec, workgroupSize: WG_SIZE,
         }
       }
+      const naiveEpi = fusedEpilogue(op.bias, op.act, 'cOut_')
       const idx = gridIndex4d(out.shape as [number, number, number, number], ['b', 'cOut_', 'h_out', 'w_out'])
-      const wgsl = `
-@group(0) @binding(0) var<storage, read> input : array<f32>;
-@group(0) @binding(1) var<storage, read> weight : array<f32>;
-@group(0) @binding(2) var<storage, read_write> out : array<f32>;
+      const wgsl = `${naiveEpi.preamble}
+${bindingDecls(['input', 'weight', ...naiveEpi.reads], 'out')}
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 ${idx.wgsl}
@@ -1096,10 +1141,10 @@ ${idx.wgsl}
       }
     }
   }
-  out[${idx.outIdx}] = s;
+  out[${idx.outIdx}] = ${naiveEpi.store('s')};
 }`.trim()
       return {
-        opIndex, opKind: op.kind, wgsl, bindings: [buf(op.input), buf(op.weight), buf(op.out)],
+        opIndex, opKind: op.kind, wgsl, bindings: convBindings,
         ...idx.spec, workgroupSize: WG_SIZE,
       }
     }
@@ -1373,6 +1418,11 @@ type TiledGemm = {
   a: string; b: string; c: string
   /** Stage B with consecutive threads walking k instead of n — for a B contiguous along k. */
   bAlongK?: boolean
+  /** Fused epilogue: extra read binding names, declared between B and `out`, and a transform
+   *  applied to each accumulator at the store, where `n` is in scope. Only matmul passes one
+   *  (src/fuse.ts); with none, the emitted WGSL is byte-identical to the pre-epilogue
+   *  template, which is what lets the conv family's phone-checked kernels stay untouched. */
+  epilogue?: { reads: readonly string[]; preamble: string; store: (acc: string) => string }
   /** A tile grid smaller than this returns null, so the caller's other paths take over. */
   minGrid?: number
 }
@@ -1429,12 +1479,11 @@ function emitTiledGemm(g: TiledGemm): { wgsl: string; spec: { threads: number; d
     return `    { let bk = ${bk}; let bn = ${bn}; let k = k0 + bk; let n = n0 + bn; var v : f32 = 0.0; ${g.b} Btile[bk * ${TILE_N}u + bn] = v; }`
   })
   const accs = range(TM).flatMap(i => range(TN).map(j => `acc${i}${j}`))
-  const wgsl = `
+  const store = g.epilogue ? g.epilogue.store : (acc: string) => acc
+  const wgsl = `${g.epilogue?.preamble ?? ''}
 var<workgroup> Atile : array<f32, ${TILE_M * TILE}>;
 var<workgroup> Btile : array<f32, ${TILE * TILE_N}>;
-@group(0) @binding(0) var<storage, read> ${g.names[0]} : array<f32>;
-@group(0) @binding(1) var<storage, read> ${g.names[1]} : array<f32>;
-@group(0) @binding(2) var<storage, read_write> out : array<f32>;
+${bindingDecls([g.names[0], g.names[1], ...(g.epilogue?.reads ?? [])], 'out')}
 @compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) lid : u32) {
   // One workgroup per ${TILE_M}×${TILE_N} output tile, ${TM}×${TN} outputs per thread. wid is
@@ -1457,7 +1506,7 @@ ${range(TM).flatMap(i => range(TN).map(j => `      acc${i}${j} = fma(a${i}, b${j
     workgroupBarrier();
   }
 ${range(TM).flatMap(i => range(TN).map(j =>
-    `  { let m = m0 + row + ${i * TILE}u; let n = n0 + col + ${j * TILE}u; if (m < ${M}u && n < ${N}u) { out[${g.c}] = acc${i}${j}; } }`)).join('\n')}
+    `  { let m = m0 + row + ${i * TILE}u; let n = n0 + col + ${j * TILE}u; if (m < ${M}u && n < ${N}u) { out[${g.c}] = ${store(`acc${i}${j}`)}; } }`)).join('\n')}
 }`.trim()
   return { wgsl, spec: idx.spec }
 }
@@ -1465,9 +1514,9 @@ ${range(TM).flatMap(i => range(TN).map(j =>
 /** matmul on the tiled template: A and B read flat, `bi` addressing the batch slice of A
  *  and — when B is batched too — of B. Non-null by construction: the callers' `tileable`
  *  gate is exactly the K % TILE test, and matmul sets no grid floor. */
-function emitTiledMatmul(batch: number, M: number, K: number, N: number, batched: boolean) {
+function emitTiledMatmul(batch: number, M: number, K: number, N: number, batched: boolean, epilogue?: TiledGemm['epilogue']) {
   return emitTiledGemm({
-    M, N, K, z: batch, names: ['a', 'b'], prologue: '',
+    M, N, K, z: batch, names: ['a', 'b'], prologue: '', ...(epilogue ? { epilogue } : {}),
     a: `if (m < ${M}u) { v = a[bi * ${M * K}u + m * ${K}u + k]; }`,
     b: `if (n < ${N}u) { v = b[${batched ? `bi * ${K * N}u + ` : ''}k * ${N}u + n]; }`,
     c: `bi * ${M * N}u + m * ${N}u + n`,
@@ -1533,7 +1582,7 @@ function convDims(
  *  by conv-tiled-validate): this alone took the step 404 → 221 ms; conv family 254 → 66 ms
  *  of GPU time, the VGG 3×3 layers at 3.3-4.4 TFLOP/s, that weight-grad 89 → 16 ms. */
 function emitTiledConv(
-  kind: 'fwd' | 'dx' | 'dw', d: ConvDims,
+  kind: 'fwd' | 'dx' | 'dw', d: ConvDims, epilogue?: TiledGemm['epilogue'],
 ): { wgsl: string; spec: { threads: number; dispatchZ?: number } } | null {
   const { B, cIn, H, W, cOut, cInPerG, kH, kW, Hout, Wout, sH, sW, pH, pW, groups } = d
   const cOutPerG = cOut / groups
@@ -1588,7 +1637,13 @@ function emitTiledConv(
   // [16,8,3,3] grad was 5 workgroups over K = 12544). Regrow's [32,256,1,1] still won at
   // 32, so that is the floor; below it the reduce/naive paths take over. Split-K would
   // remove the cliff — Performance.md §Phase 7 names it as the next lever.
-  return emitTiledGemm({ M, N, K, z, ...gemms[kind], ...(kind === 'dw' ? { bAlongK: true, minGrid: 32 } : {}) })
+  // Only the forward has a bias / activation to fold; the two gradient kinds pass none, so
+  // their WGSL is byte-identical to Phase 7's and their phone check still stands.
+  return emitTiledGemm({
+    M, N, K, z, ...gemms[kind],
+    ...(kind === 'fwd' && epilogue ? { epilogue } : {}),
+    ...(kind === 'dw' ? { bAlongK: true, minGrid: 32 } : {}),
+  })
 }
 
 /** Decompose a flat thread index `i` into 4 row-major named axes — emits

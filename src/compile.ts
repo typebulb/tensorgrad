@@ -17,6 +17,7 @@ import type { Tensor, Shape, Dtype } from './ir.js'
 import { traceFn, tensorInput } from './trace.js'
 import { appendGrad, type GradResult } from './grad.js'
 import { eliminateDeadCode } from './dce.js'
+import { fuseMatmulEpilogue } from './fuse.js'
 import {
   appendAdam, wireAdamConfig,
   type AdamConfig, type AdamWConfig, type AdamResult,
@@ -487,6 +488,11 @@ async function buildTrainingIR<M extends Module, I extends InputDecls>(
   // tensors out of the renumbering entirely. Handles taken before the pass
   // (param grads, the loss, materialized param tensors) are re-resolved
   // through the returned id map.
+  // Fusion first, so the GEMMs whose bias it absorbed are orphaned for this sweep to
+  // collect. After appendGrad, so the consumer counts include backward: the bias still
+  // folds here (no VJP reads a matmul's output); an activation does not, because its own
+  // VJP reads its input. src/fuse.ts has the argument.
+  fuseMatmulEpilogue(graph)
   const idMap = eliminateDeadCode(graph, Object.values(gradOut.paramGrads).map(t => t.id))
   const paramGrads = remapTensorRecord(gradOut.paramGrads, idMap)
   const paramTensors = remapTensorRecord(materialized.tensors, idMap)
@@ -531,6 +537,9 @@ async function buildForwardIR<M extends Module>(
   const { graph, materialized } = traceModule(model, forward, decls)
   // Forward graphs get the same sweep: user forwards can compute values that
   // never reach the output (config-driven branches, debug leftovers).
+  // Fusion first, for the same reason as above. This is the path where the activation
+  // fold also fires: with no backward, nothing else reads the value the unary consumed.
+  fuseMatmulEpilogue(graph)
   eliminateDeadCode(graph)
   await yieldToUI()
   const outputTensor = graph.tensors[graph.outputs[0]!]!

@@ -14,27 +14,7 @@ import {
   type Tensor, type CompiledTraining, type CompiledForward, type LR,
 } from "tensorgrad"
 
-// ============================================================================
-// "From Cells to Pixels" (cells2pixels.github.io) live in the browser on
-// WebGPU: a Growing Neural Cellular Automaton grows a donut from one seed cell
-// and regrows it when you bite it. Each cell holds a C-dim latent; a shared NCA
-// update rule runs the G² lattice, and a SIREN decoder paints it up to a GH²
-// RGBA image — the visible donut. The raw cell channels are latent, not color.
-//
-// Loss is the paper's stack: masked L2 + L1 on the render, a shape loss on the
-// alpha/alive mask, LPIPS(VGG16) on a padding crop (random 3-of-4 channels),
-// and a ×100 overflow penalty. Two non-obvious pieces:
-//   • per-param gradient normalization on the NCA only (not the SIREN) is what
-//     makes L1 safe on a CA (tensorgrad's `normalizeGrads`).
-//   • LPIPS-VGG16 weights ride in as frozen INPUTS so DCE prunes their gradient
-//     kernels; the forward is validated against torch to 8 decimals.
-//
-// Proof of concept, so it diverges from the paper for browser speed: mini scale
-// (G=32/K=24/S=4, not G=96/8×) and a single 1500-step run (not 5×4000 rounds
-// with pool flushes) — enough for a stable donut, not their fine detail. The
-// donut's center is a HOLE, so the paper's seed-at-center breaks; placeSeed
-// relocates the seed onto the ring.
-// ============================================================================
+// A Growing NCA + SIREN decoder, after "From Cells to Pixels" (see notes.md).
 const C = 32, FC = 256                     // cell channels, NCA hidden dim
 const G = 32                               // cell lattice (paper: 96)
 const B = 8                                // batch
@@ -52,18 +32,23 @@ const GG = G * G, STATE_LEN = C * GG, GGH = GH * GH
 const SIN = 4 + C                          // SIREN input: 4 sub-cell coords + C latent
 const DAMAGE_R = 3                         // scratch radius in cells (display only, never trained)
 const CIRCULAR = true                      // toroidal perception padding
+const ALPHA_EPS = 0.01, GAIN_FLOOR = 0.2   // display un-premultiply: under EPS is transparent, gain caps at 1/FLOOR
 
 const R2 = "https://assets.typebulb.com"               // hosted assets (published fallback)
 const LPIPS_PATH = "weights/lpips-vgg16.safetensors"   // local repo copy (~59MB)
 const LPIPS_URL = `${R2}/weights/lpips-vgg16.safetensors`
-const TRAINED_DIR = "typebulbs-tentative/regrow"
-const TRAINED_PATH = `${TRAINED_DIR}/donut.safetensors`
+const TRAINED_PATH = "typebulbs-tentative/regrow/donut.safetensors"
 const TRAINED_URL = `${R2}/regrow/donut.safetensors`
 
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms))
 const nextFrame = () => new Promise(res => requestAnimationFrame(res))
 const clamp01 = (v: number) => v < 0 ? 0 : v > 1 ? 1 : v
 const slog = (s: string) => { if (tb.mode === "local") tb.log(s) }
+const tile = (t: Float32Array, n: number) => {
+  const out = new Float32Array(n * t.length)
+  for (let b = 0; b < n; b++) out.set(t, b * t.length)
+  return out
+}
 
 // seeded uniform(-bound, bound) for the SIREN init (paper: uniform draws)
 const uniformInit = (n: number, bound: number, seed: number) => {
@@ -96,8 +81,11 @@ const NCA_PARAMS = new Set(["w1.W", "w1.b", "w2.W"])
 // CA graphs: circular perception, Bernoulli-0.5 stochastic update, pre×post
 // alive gating (torch-parity semantics).
 // ============================================================================
-const alive = (s: Tensor) =>
-  greater(maxPool2d(narrow(s, 1, 3, 1), 3, { stride: 1, padding: 1 }), 0.1)
+// the paper's get_living_mask, at whichever resolution the alpha arrives in:
+// cells for the CA rule, render pixels for the decoder's gate
+const livingMask = (a: Tensor) =>
+  greater(maxPool2d(a, 3, { stride: 1, padding: 1 }), 0.1)
+const alive = (s: Tensor) => livingMask(narrow(s, 1, 3, 1))
 
 const boolToF32 = (m: Tensor, b: number, g: number) =>
   where(m, ones([b, 1, g, g]), zeros([b, 1, g, g]))
@@ -127,9 +115,9 @@ function bilinearUp(x: Tensor, w: Tensor, ch: number, b: number): Tensor {
 }
 
 // the paper's renderer: bilinear state + trig sub-cell coords → SIREN → RGBA,
-// gated by the RENDER-RES living mask (bilinear alpha, 3×3 maxpool over
-// render pixels, >0.1) — their get_living_mask(x_up). Also returns the raw
-// bilinear alpha (their x_up[:,3:4]) for the shape loss.
+// gated by the living mask at RENDER res, not cell res (their
+// get_living_mask(x_up)). Also returns the raw bilinear alpha (their
+// x_up[:,3:4]) for the shape loss.
 function decode(m: NCAModel, s: Tensor, bilin: Tensor, bilin1: Tensor, coords: Tensor, b: number): { rendered: Tensor; aUp: Tensor } {
   const up = bilinearUp(s, bilin, C, b)
   const feats = concat([coords, up], 1)
@@ -139,8 +127,7 @@ function decode(m: NCAModel, s: Tensor, bilin: Tensor, bilin1: Tensor, coords: T
   h = sin(mul(m.s3.fwd(h), OMEGA))
   const img = permute(reshape(m.sOut.fwd(h), [b, GH, GH, 4]), [0, 3, 1, 2])
   const aUp = bilinearUp(narrow(s, 1, 3, 1), bilin1, 1, b)
-  const mask = greater(maxPool2d(aUp, 3, { stride: 1, padding: 1 }), 0.1)
-  return { rendered: mul(img, where(mask, ones([b, 1, GH, GH]), zeros([b, 1, GH, GH]))), aUp }
+  return { rendered: mul(img, boolToF32(livingMask(aUp), b, GH)), aUp }
 }
 
 // ============================================================================
@@ -157,18 +144,19 @@ const VGG_PLAN: [string, number, boolean][] = [   // (name, outC, maxpool-before
   ["conv5_1", 512, true], ["conv5_2", 512, false], ["conv5_3", 512, false],
 ]
 const VGG_TAPS = new Set(["conv1_2", "conv2_2", "conv3_3", "conv4_3", "conv5_3"])
-const TAP_C = [64, 128, 256, 512, 512]
+const TAP_C = VGG_PLAN.filter(([name]) => VGG_TAPS.has(name)).map(([, c]) => c)
 
-const LP_SPEC: Record<string, number[]> = { lp_in_gain: [1, 3, 1, 1], lp_in_offset: [1, 3, 1, 1] }
-{
+const LP_SPEC: Record<string, number[]> = (() => {
+  const spec: Record<string, number[]> = { lp_in_gain: [1, 3, 1, 1], lp_in_offset: [1, 3, 1, 1] }
   let prevC = 3
   for (const [name, c] of VGG_PLAN) {
-    LP_SPEC[`lp_${name}_W`] = [c, prevC, 3, 3]
-    LP_SPEC[`lp_${name}_b`] = [1, c, 1, 1]
+    spec[`lp_${name}_W`] = [c, prevC, 3, 3]
+    spec[`lp_${name}_b`] = [1, c, 1, 1]
     prevC = c
   }
-  for (let k = 0; k < 5; k++) LP_SPEC[`lp_lin${k}`] = [1, TAP_C[k]!, 1, 1]
-}
+  TAP_C.forEach((c, k) => { spec[`lp_lin${k}`] = [1, c, 1, 1] })
+  return spec
+})()
 
 function vggTaps(rgb01: Tensor, inp: Record<string, Tensor>): Tensor[] {
   let h = sub(mul(rgb01, inp["lp_in_gain"]!), inp["lp_in_offset"]!)
@@ -186,14 +174,12 @@ function vggTaps(rgb01: Tensor, inp: Record<string, Tensor>): Tensor[] {
 function lpips(x: Tensor, y: Tensor, inp: Record<string, Tensor>): Tensor {
   const fx = vggTaps(x, inp), fy = vggTaps(y, inp)
   const unit = (f: Tensor) => tdiv(f, add(sqrt(sum(mul(f, f), 1, { keepDims: true })), 1e-10))
-  let total: Tensor | undefined
-  for (let k = 0; k < 5; k++) {
+  const terms = TAP_C.map((c, k) => {
     const d = sub(unit(fx[k]!), unit(fy[k]!))
     const w = mul(mul(d, d), inp[`lp_lin${k}`]!)
-    const s = mul(mean(w), TAP_C[k]!)      // mean over BCHW × C = channel-sum, batch+spatial mean
-    total = total ? add(total, s) : s
-  }
-  return total!
+    return mul(mean(w), c)                 // mean over BCHW × C = channel-sum, batch+spatial mean
+  })
+  return terms.reduce((a, b) => add(a, b))
 }
 
 // pick 3 of the 4 RGBA channels (random triplet per batch element, host-fed
@@ -226,7 +212,7 @@ function lossFn(m: NCAModel, inp: {
   const shapeL1 = mean(abs(shapeDiff))
   const lp = lpips(cropSelect(rendered, chnSel), cropSelect(targetHi, chnSel), inp)
   const over = mul(mean(abs(sub(s, clamp(s, -1, 1)))), 100)
-  return add(add(add(add(add(l2, l1), shapeL2), shapeL1), lp), over)
+  return [l1, shapeL2, shapeL1, lp, over].reduce((a, b) => add(a, b), l2)
 }
 
 // Pretrained mode never trains, but demo/render must attach to a CompiledTraining
@@ -234,8 +220,8 @@ function lossFn(m: NCAModel, inp: {
 // requires a loss. Compiling the real lossFn (VGG16-LPIPS twice + a K=24 rollout,
 // plus the whole backward pass) purely to throw it away is what pinned the GPU
 // process on load and froze even the host page. This stand-in touches every param
-// (one CA step + one decode) so none is DCE'd out of the shared buffer set, but
-// never goes near VGG16. It is only ever compiled, never stepped.
+// (one CA step + one decode) so none is DCE'd out of the shared buffer set. It is
+// only ever compiled, never stepped.
 function lossFnLight(m: NCAModel, { state, filters, bilin, bilin1, coords }: {
   state: Tensor; filters: Tensor; bilin: Tensor; bilin1: Tensor; coords: Tensor
 }) {
@@ -254,7 +240,7 @@ function demoFn(m: NCAModel, { state, filters }: { state: Tensor; filters: Tenso
 function toPixels(rendered: Tensor): Tensor {
   const rows = reshape(permute(rendered, [0, 2, 3, 1]), [GGH, 4])          // [1, 4, GH, GH] → [GGH, 4]
   const a = clamp(narrow(rows, 1, 3, 1), 0, 1)
-  const gain = where(greater(a, 0.01), tdiv(1, max(a, 0.2)), zeros([GGH, 1]))
+  const gain = where(greater(a, ALPHA_EPS), tdiv(1, max(a, GAIN_FLOOR)), zeros([GGH, 1]))
   return packRGBA8(concat([mul(narrow(rows, 1, 0, 3), gain), a], 1))        // [GGH] bytes
 }
 
@@ -262,6 +248,13 @@ function renderFn(m: NCAModel, { state, bilin, bilin1, coords }: { state: Tensor
   return toPixels(decode(m, state, bilin, bilin1, coords, 1).rendered)
 }
 type RenderForward = CompiledForward<NCAModel, { state: number[]; bilin: number[]; bilin1: number[]; coords: number[] }, "rgba8">
+
+// the input shapes both training graphs share (lossFnLight takes only these)
+const CA_INPUTS = {
+  state: [B, C, G, G], filters: [4 * C, 1, 3, 3],
+  bilin: [C * S * S, 1, 3, 3], bilin1: [S * S, 1, 3, 3],
+  coords: [B, 4, GH, GH],
+}
 
 // ============================================================================
 // Host-side constant tables: perception filters, ×S bilinear upsample kernels,
@@ -316,11 +309,8 @@ const COORDS1 = (() => {
     }
   return a
 })()
-const COORDS_B = (() => {
-  const a = new Float32Array(B * 4 * GGH)
-  for (let b = 0; b < B; b++) a.set(COORDS1, b * 4 * GGH)
-  return a
-})()
+const COORDS_B = tile(COORDS1, B)
+const RENDER_IN = { bilin: BILIN, bilin1: BILIN1, coords: COORDS1 }   // the render forward's constant inputs
 
 const makeSeedAt = (x: number, y: number) => {
   const a = new Float32Array(STATE_LEN)
@@ -336,7 +326,6 @@ let LO_TARGET: Float32Array | undefined     // S×S box-averaged target (drift p
 // the nearest solid pixel and log it.
 function placeSeed(lo: Float32Array) {
   const cx = G >> 1, cy = G >> 1
-  if (lo[3 * GG + cy * G + cx]! >= 0.95) { SEED = makeSeedAt(cx, cy); SEED_POS = [cx, cy]; return }
   let sx = cx, sy = cy, bestD = Infinity
   for (let y = 0; y < G; y++)
     for (let x = 0; x < G; x++)
@@ -344,7 +333,8 @@ function placeSeed(lo: Float32Array) {
         const d = (x - cx) ** 2 + (y - cy) ** 2
         if (d < bestD) { bestD = d; sx = x; sy = y }
       }
-  slog(`WARNING: target center is transparent — seed moved to (${sx},${sy}) (paper seeds dead center)`)
+  if (sx !== cx || sy !== cy)
+    slog(`WARNING: target center is transparent — seed moved to (${sx},${sy}) (paper seeds dead center)`)
   SEED = makeSeedAt(sx, sy)
   SEED_POS = [sx, sy]
 }
@@ -370,18 +360,27 @@ function sampleDistinct(out: Int32Array, n: number) {
   }
 }
 
-function carveDisc(s: Float32Array, off: number, cx: number, cy: number, r: number) {
+// the bite: scrub a disc of cells to zero across every channel
+function carve(s: Float32Array, cx: number, cy: number) {
+  const r = DAMAGE_R
   for (let y = Math.max(0, Math.floor(cy - r)); y <= Math.min(G - 1, Math.ceil(cy + r)); y++)
     for (let x = Math.max(0, Math.floor(cx - r)); x <= Math.min(G - 1, Math.ceil(cx + r)); x++) {
       if ((x - cx) ** 2 + (y - cy) ** 2 > r * r) continue
-      for (let c = 0; c < C; c++) s[off + c * GG + y * G + x] = 0
+      for (let c = 0; c < C; c++) s[c * GG + y * G + x] = 0
     }
 }
 
-function sliceL2(state: Float32Array, slice: number, tgt: Float32Array) {
-  const off = slice * STATE_LEN
+// a scratch that landed while a step was in flight would be clobbered by that
+// step's output, so re-apply the queue to it before it shows
+function replayCarves(queue: [number, number][], s: Float32Array) {
+  for (const [x, y] of queue) carve(s, x, y)
+  queue.length = 0
+}
+
+// mean squared error of a state's 4 visible channels against the lo-res target
+function rgbaMse(state: Float32Array, tgt: Float32Array) {
   let s = 0
-  for (let i = 0; i < 4 * GG; i++) { const d = state[off + i]! - tgt[i]!; s += d * d }
+  for (let i = 0; i < 4 * GG; i++) { const d = state[i]! - tgt[i]!; s += d * d }
   return s / (4 * GG)
 }
 
@@ -393,15 +392,11 @@ const aliveCount = (s: Float32Array, off = 0) => {
 const deadOrExploded = (alive: number, maxAbs: number) =>
   alive === 0 || alive > GG * 0.6 || maxAbs > 3
 
-// Procedurally generated target: a genuinely 3D donut, RAY-MARCHED — a real
-// torus SDF tilted back in Z, orthographic camera down -Z, so the hole reads
-// as an ellipse and the near rim actually OCCLUDES the far one. Shaded with a
-// warm key light (soft self-shadow + ambient occlusion so the hole reads deep),
-// a broad glaze sheen plus a tight specular glint, and a cool rim. Fully
-// procedural: no image, no three.js. Emits the same premultiplied CHW RGBA hi +
-// S×S box-averaged lo the PNG loader did. The donut's center is a HOLE
-// (transparent), so the paper's seed-at-center assumption breaks; placeSeed's
-// tripwire relocates the seed onto the ring.
+// The target, ray-marched from a torus SDF tilted back in Z under an
+// orthographic camera: shading a flat 2D donut would do, but a real march is
+// what makes the hole read as an ellipse and the near rim OCCLUDE the far one.
+// No image and no 3D library, so the bulb stays one file. Emits premultiplied
+// CHW RGBA at render res (hi) plus its S×S box-average at cell res (lo).
 async function loadTarget(): Promise<{ hi: Float32Array; lo: Float32Array }> {
   const INNER = GH - 2 * PADH
   const cx = GH / 2, cy = GH / 2
@@ -520,12 +515,6 @@ async function loadTarget(): Promise<{ hi: Float32Array; lo: Float32Array }> {
   return { hi, lo }
 }
 
-const tile = (t: Float32Array, n: number) => {
-  const out = new Float32Array(n * t.length)
-  for (let b = 0; b < n; b++) out.set(t, b * t.length)
-  return out
-}
-
 function saveSafetensors(record: Record<string, Float32Array>): Uint8Array {
   const names = Object.keys(record).sort()
   const header: Record<string, { dtype: string; shape: number[]; data_offsets: [number, number] }> = {}
@@ -549,8 +538,7 @@ function saveSafetensors(record: Record<string, Float32Array>): Uint8Array {
 }
 
 // ============================================================================
-// LPIPS-VGG16 weights (frozen). Local repo file for dev; the hosted copy
-// (streamed with a byte counter) for a published train, where there is no fs.
+// LPIPS-VGG16 weights (frozen), fetched once and reused for every train.
 // ============================================================================
 type Progress = (received: number, total: number) => void
 
@@ -575,41 +563,47 @@ async function readWithProgress(res: Response, onProgress?: Progress): Promise<A
   return out.buffer as ArrayBuffer
 }
 
+async function download(url: string, onProgress?: Progress): Promise<ArrayBuffer> {
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`)
+  return readWithProgress(res, onProgress)
+}
+
 // Fetch an asset once from the network, thereafter from CacheStorage — which
 // survives refreshes and (unlike the plain HTTP cache) isn't evicted for being
 // large. Without this, a refresh re-downloaded the ~59MB LPIPS every time.
 // Falls back to a plain download if the Cache API is unavailable.
 async function cachedFetch(url: string, onProgress?: Progress): Promise<ArrayBuffer> {
-  const download = async (): Promise<ArrayBuffer> => {
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`)
-    return readWithProgress(res, onProgress)
-  }
   try {
     const cache = await caches.open("tensorgrad-assets")
     const hit = await cache.match(url)
     if (hit) return hit.arrayBuffer()
-    const buf = await download()
+    const buf = await download(url, onProgress)
     try { await cache.put(url, new Response(buf)) } catch { /* caching is an optimization */ }
     return buf
   } catch {
-    return download()
+    return download(url, onProgress)
   }
+}
+
+// dev reads the repo copy; a published bulb has no filesystem, so it falls back
+// to the hosted one. `get` decides whether that fallback is cached.
+async function localOrHosted(path: string, url: string, get: (u: string) => Promise<ArrayBuffer>): Promise<ArrayBuffer> {
+  try {
+    const bytes = new Uint8Array(await tb.fs.readBytes(path))
+    slog(`loaded ${path}`)
+    return bytes.buffer as ArrayBuffer
+  } catch { /* absent locally — fall through to the hosted copy */ }
+  const buf = await get(url)
+  slog(`loaded ${url}`)
+  return buf
 }
 
 let LP: Record<string, Float32Array> = {}
 let lpipsPromise: Promise<void> | undefined
 function ensureLpips(onProgress?: Progress): Promise<void> {
   if (!lpipsPromise) lpipsPromise = (async () => {
-    let buf: ArrayBuffer
-    try {
-      const bytes = new Uint8Array(await tb.fs.readBytes(LPIPS_PATH))   // local repo copy (dev)
-      buf = bytes.buffer as ArrayBuffer
-    } catch {
-      // hosted copy (published), cached in CacheStorage so a refresh never
-      // re-downloads the ~59MB — the VGG16 LPIPS weights never change.
-      buf = await cachedFetch(LPIPS_URL, onProgress)
-    }
+    const buf = await localOrHosted(LPIPS_PATH, LPIPS_URL, u => cachedFetch(u, onProgress))
     const { tensors } = loadSafetensors(buf)
     const out: Record<string, Float32Array> = {
       lp_in_gain: tensors["in.gain"]!, lp_in_offset: tensors["in.offset"]!,
@@ -654,11 +648,8 @@ class Trainer extends Component {
   }
 
   // one full (re)compile: fresh model, optimizer moments, and LR schedule.
-  // Pretrained mode compiles a LIGHT training graph (no VGG16-LPIPS, no K=24
-  // rollout) whose only job is to own the shared param buffers the demo/render
-  // forwards attach to. The heavy lossFn graph is built only when the user
-  // actually trains — otherwise every load paid to compile a VGG16 graph it
-  // never ran, saturating the GPU and freezing the page (and the host UI).
+  // Only `train` builds the VGG16 graph; pretrained gets the stand-in (see
+  // lossFnLight), because compiling VGG16 on every load froze the page.
   async #compileFresh(): Promise<void> {
     this.#train?.destroy()
     this.#train = this.#infer = this.#render = undefined
@@ -669,26 +660,16 @@ class Trainer extends Component {
           loss: lossFn,
           optimizer: {
             kind: "adam", lr: makeLR(),
-            // the paper's normalize_model_grads: per-param grad normalization on
-            // the NCA only (the SIREN's grads are left raw). No global clipping.
+            // the paper's normalize_model_grads (see NCA_PARAMS); no global clipping
             normalizeGrads: (n) => NCA_PARAMS.has(n),
           },
-          inputs: {
-            state: [B, C, G, G], filters: [4 * C, 1, 3, 3],
-            bilin: [C * S * S, 1, 3, 3], bilin1: [S * S, 1, 3, 3],
-            coords: [B, 4, GH, GH], targetHi: [B, 4, GH, GH], chnSel: [B, 3, 4],
-            ...LP_SPEC,
-          },
+          inputs: { ...CA_INPUTS, targetHi: [B, 4, GH, GH], chnSel: [B, 3, 4], ...LP_SPEC },
         })
       : await compile({
           model: new NCAModel(),
           loss: lossFnLight,
           optimizer: { kind: "adam", lr: makeLR() },
-          inputs: {
-            state: [B, C, G, G], filters: [4 * C, 1, 3, 3],
-            bilin: [C * S * S, 1, 3, 3], bilin1: [S * S, 1, 3, 3],
-            coords: [B, 4, GH, GH],
-          },
+          inputs: CA_INPUTS,
         })
     this.#infer = await t.attach({
       forward: demoFn,
@@ -702,21 +683,12 @@ class Trainer extends Component {
     this.#train = t
   }
 
-  // load the trained checkpoint: local repo copy first (dev), hosted R2 copy
-  // second (published, where there is no local filesystem).
+  // load the trained checkpoint. Uncached, unlike the LPIPS weights: a
+  // re-published donut has to be picked up.
   async #loadWeights(): Promise<boolean> {
-    const upload = async (buf: ArrayBuffer) => this.#train!.uploadParams(loadSafetensors(buf).tensors)
     try {
-      const bytes = new Uint8Array(await tb.fs.readBytes(TRAINED_PATH))
-      await upload(bytes.buffer as ArrayBuffer)
-      slog(`loaded ${TRAINED_PATH}`)
-      return true
-    } catch { /* absent locally — fall through to the hosted copy */ }
-    try {
-      const res = await fetch(TRAINED_URL)
-      if (!res.ok) throw new Error(`${res.status}`)
-      await upload(await res.arrayBuffer())
-      slog(`loaded ${TRAINED_URL}`)
+      const buf = await localOrHosted(TRAINED_PATH, TRAINED_URL, download)
+      await this.#train!.uploadParams(loadSafetensors(buf).tensors)
       return true
     } catch { return false }
   }
@@ -730,7 +702,7 @@ class Trainer extends Component {
       return
     }
 
-    this.#setStatus(`generating the donut…`)
+    this.#setStatus("generating the donut…")
     let target: { hi: Float32Array; lo: Float32Array }
     try { target = await loadTarget() }
     catch (e) {
@@ -745,20 +717,21 @@ class Trainer extends Component {
     stage.showTarget(hi)
     const targetHi = tile(hi, B)
 
-    this.#setStatus(`compiling WGSL kernels (K=${K} rollout + SIREN + VGG16-LPIPS)…`)
+    this.#setStatus(this.mode === "train"
+      ? `compiling WGSL kernels (K=${K} rollout + SIREN + VGG16-LPIPS)…`
+      : "compiling WGSL kernels…")
     await this.#compileFresh()
     if (run !== this.#runId) return
 
-    // pretrained mode never auto-trains: load the checkpoint, or say there
-    // isn't one. Training only ever runs on an explicit `train` click.
+    // training only ever runs on an explicit `train` click, never on load
     if (this.mode === "pretrained") {
       if (await this.#loadWeights()) {
         if (run !== this.#runId) return
         this.lossHist = []
-        this.#setStatus(`ready: bite the donut and watch it regrow`)
+        this.#setStatus("ready: bite the donut and watch it regrow")
         stage.startDemo(this.#infer!, this.#render!)
       } else {
-        this.#setStatus(`no pretrained weights found. click “train” to grow one`)
+        this.#setStatus("no pretrained weights found. click “train” to grow one")
       }
       return
     }
@@ -771,13 +744,9 @@ class Trainer extends Component {
     })
     if (run !== this.#runId) return
 
-    // ------------------------------------------------------------------
-    // The training loop: one flat TRAIN_STEPS run of the paper's recipe. A
-    // seed is injected into batch slot 0 every INJECT_EVERY steps; uniform
-    // pool sampling, full-batch writeback. No damage, no grading, no rounds —
-    // one 1500-step pass gives a stable donut (more rounds only buy fine
-    // detail this proof of concept doesn't chase).
-    // ------------------------------------------------------------------
+    // The training loop: uniform pool sampling, full-batch writeback, and one
+    // flat pass. No damage, no grading, no rounds — the paper's extra rounds
+    // add fine detail this proof of concept doesn't chase.
     const state = new Float32Array(B * STATE_LEN)
     const chnSel = new Float32Array(B * 3 * 4)
     const idx = new Int32Array(B)
@@ -788,11 +757,10 @@ class Trainer extends Component {
     const viewState = new Float32Array(STATE_LEN)
     // pause = playground: scratches carve the view state, and while paused it
     // advances at frame rate under the current weights so wounds heal live.
-    // Carves that race an in-flight infer step are re-applied to its output.
     const viewCarves: [number, number][] = []
     stage.onTrainCarve = (x, y) => {
       if (!stage.paused) stage.togglePause()   // scratching mid-train drops into the paused playground
-      stage.carveInto(viewState, x, y)
+      carve(viewState, x, y)
       viewCarves.push([x, y])
       stage.paintCells(viewState)
     }
@@ -813,12 +781,12 @@ class Trainer extends Component {
           const dr = await this.#infer!.run({ state: viewState, filters: FILTERS })
           if (dr.kind === "completed") {
             const nx = dr.output as Float32Array
-            for (const [cx, cy] of viewCarves) stage.carveInto(nx, cx, cy)
+            replayCarves(viewCarves, nx)
             viewState.set(nx)
           }
           if (aliveCount(viewState) === 0) viewState.set(SEED)   // fully scrubbed: regrow
           stage.paintCells(viewState)
-          const rr = await this.#render!.run({ state: viewState, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 })
+          const rr = await this.#render!.run({ state: viewState, ...RENDER_IN })
           if (rr.kind === "completed") stage.paintRender(rr.output)
           await nextFrame()
         }
@@ -845,18 +813,14 @@ class Trainer extends Component {
         const fin = r.captures.get("final") as Float32Array
         for (let b = 0; b < B; b++) pool[idx[b]!]!.set(fin.subarray(b * STATE_LEN, (b + 1) * STATE_LEN))
         viewState.set(fin.subarray((B - 1) * STATE_LEN, B * STATE_LEN))
-        // a scratch that raced this in-flight step (auto-pausing) would be
-        // clobbered by the writeback above — re-apply it before it shows.
-        for (const [cx, cy] of viewCarves) stage.carveInto(viewState, cx, cy)
-        viewCarves.length = 0
+        replayCarves(viewCarves, viewState)   // the writeback above would clobber a racing scratch
         stage.paintCells(viewState)
-        const rr = await this.#render!.run({ state: viewState, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 })
+        const rr = await this.#render!.run({ state: viewState, ...RENDER_IN })
         if (rr.kind === "completed") stage.paintRender(rr.output)
         if (step % 10 === 0 || step === 1) {
-          let mx = 0, alive0 = 0
+          let mx = 0
           for (let i = 0; i < STATE_LEN; i++) { const v = Math.abs(fin[i]!); if (v > mx) mx = v }
-          for (let i = 0; i < GG; i++) if (fin[3 * GG + i]! > 0.1) alive0++
-          slog(`step ${step} loss ${loss.toExponential(4)} aliveSeed ${alive0} maxAbs ${mx.toFixed(3)} ms/step ${(stepMsAcc / Math.max(1, stepMsN)).toFixed(0)}`)
+          slog(`step ${step} loss ${loss.toExponential(4)} aliveSeed ${aliveCount(fin)} maxAbs ${mx.toFixed(3)} ms/step ${(stepMsAcc / Math.max(1, stepMsN)).toFixed(0)}`)
           stepMsAcc = 0; stepMsN = 0
           if (!Number.isNaN(ema)) this.lossHist.push(ema)
         }
@@ -872,7 +836,6 @@ class Trainer extends Component {
     stage.startDemo(this.#infer!, this.#render!)
   }
 
-  // download the current params and write them to the local checkpoint.
   async #saveWeights(): Promise<boolean> {
     if (!this.#train) return false
     try {
@@ -889,6 +852,11 @@ class Trainer extends Component {
 // ============================================================================
 // Stage — the three canvases (cells, painted hero, target) + the demo loop.
 // ============================================================================
+const sized2d = (cv: HTMLCanvasElement, n: number) => {
+  cv.width = cv.height = n
+  return cv.getContext("2d")!
+}
+
 class Stage extends Component {
   paused = false
   demoActive = false
@@ -909,9 +877,8 @@ class Stage extends Component {
 
   boot(cv: HTMLCanvasElement) {
     if (this.#canvas) return
-    cv.width = cv.height = GH
     this.#canvas = cv
-    this.#ctx = cv.getContext("2d")!
+    this.#ctx = sized2d(cv, GH)
     cv.addEventListener("pointerdown", e => {
       this.#painting = true
       cv.setPointerCapture(e.pointerId)
@@ -923,8 +890,7 @@ class Stage extends Component {
 
   bootCells(cv: HTMLCanvasElement) {
     if (this.#cellsCtx) return
-    cv.width = cv.height = G
-    this.#cellsCtx = cv.getContext("2d")!
+    this.#cellsCtx = sized2d(cv, G)
     this.#cellsImg = new ImageData(G, G)
   }
 
@@ -934,8 +900,7 @@ class Stage extends Component {
     return this.paused
   }
 
-  // the two left boxes are blank until the first frame paints; `live` gates a
-  // centered "loading…" overlay on them, removed the moment either one paints.
+  // false until the first frame paints, which can be a whole compile away
   get live() { return this.#live }
   #markLive() { if (!this.#live) { this.#live = true; this.update() } }
 
@@ -953,8 +918,7 @@ class Stage extends Component {
 
   bootTarget(cv: HTMLCanvasElement) {
     if (this.#tctx) return
-    cv.width = cv.height = GH
-    this.#tctx = cv.getContext("2d")!
+    this.#tctx = sized2d(cv, GH)
     this.#timg = new ImageData(GH, GH)
     if (this.#target) this.showTarget(this.#target)
   }
@@ -964,21 +928,18 @@ class Stage extends Component {
     if (this.#tctx) this.#blit(arr, this.#timg!, this.#tctx, GGH)
   }
 
+  // un-premultiply into ImageData's bytes: the CPU twin of toPixels' gain rule
   #blit(arr: Float32Array, img: ImageData, ctx: CanvasRenderingContext2D, n: number) {
-    this.#fill(arr, img, n)
-    ctx.putImageData(img, 0, 0)
-  }
-
-  #fill(arr: Float32Array, img: ImageData, n: number) {
     const d = img.data
     for (let i = 0; i < n; i++) {
       const a = clamp01(arr[3 * n + i]!)
-      const ia = a > 0.01 ? 1 / Math.max(a, 0.2) : 0
+      const ia = a > ALPHA_EPS ? 1 / Math.max(a, GAIN_FLOOR) : 0
       d[i * 4] = clamp01(arr[i]! * ia) * 255
       d[i * 4 + 1] = clamp01(arr[n + i]! * ia) * 255
       d[i * 4 + 2] = clamp01(arr[2 * n + i]! * ia) * 255
       d[i * 4 + 3] = a * 255
     }
+    ctx.putImageData(img, 0, 0)
   }
 
   async startDemo(infer: CompiledForward, render: RenderForward) {
@@ -991,7 +952,7 @@ class Stage extends Component {
     this.#renderDamaged = () => {
       if (!this.paused || renderBusy || token !== this.#demoToken) return
       renderBusy = true
-      render.run({ state: this.#state!, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 }).then(r => {
+      render.run({ state: this.#state!, ...RENDER_IN }).then(r => {
         renderBusy = false
         if (token === this.#demoToken && r.kind === "completed") this.paintRender(r.output)
       })
@@ -1005,18 +966,17 @@ class Stage extends Component {
         if (token !== this.#demoToken) return
         if (r.kind === "completed") {
           const next = r.output as Float32Array
-          for (const [cx, cy] of this.#pendingCarves) this.carveInto(next, cx, cy)
-          this.#pendingCarves.length = 0
+          replayCarves(this.#pendingCarves, next)
           this.#state = this.#stabilize(next) ? SEED.slice() : next
         }
-        const rr = await render.run({ state: this.#state!, bilin: BILIN, bilin1: BILIN1, coords: COORDS1 })
+        const rr = await render.run({ state: this.#state!, ...RENDER_IN })
         if (token !== this.#demoToken) return
         if (rr.kind === "completed") {
           this.paintRender(rr.output)
           this.paintCells(this.#state!)
         }
         frames++
-        if (frames % 60 === 0 && LO_TARGET) slog(`drift t=${frames} mse=${sliceL2(this.#state!, 0, LO_TARGET).toFixed(5)}`)
+        if (frames % 60 === 0 && LO_TARGET) slog(`drift t=${frames} mse=${rgbaMse(this.#state!, LO_TARGET).toFixed(5)}`)
       }
       await nextFrame()
     }
@@ -1064,11 +1024,9 @@ class Stage extends Component {
   testStats() { slog(`demo alive ${this.#aliveCount()} (demoActive ${this.demoActive})`) }
 
   #carve(x: number, y: number) {
-    this.carveInto(this.#state!, x, y)
+    carve(this.#state!, x, y)
     this.#pendingCarves.push([x, y])
   }
-
-  carveInto(s: Float32Array, x: number, y: number) { carveDisc(s, 0, x, y, DAMAGE_R) }
 
   #damageAt(e: PointerEvent) {
     const rect = this.#canvas!.getBoundingClientRect()
@@ -1237,9 +1195,9 @@ body { font-size: var(--text); }
   border-radius: 8px;
 }
 .pane.cells { image-rendering: pixelated; }
-/* the hero canvas: quiet prominence via a soft warm elevation shadow + a muted
-   accent-tinted edge, not a hard gold outline (which read as a stark alert). a
-   gentle hover deepens the tint — the "you can touch this one" cue on approach. */
+/* the hero canvas: quiet prominence via a soft elevation shadow + a muted
+   accent-tinted edge, not a hard accent outline (which read as a stark alert).
+   Hover deepens the tint: the "you can touch this one" cue on approach. */
 .pane.grid {
   touch-action: none;
   cursor: crosshair;
@@ -1284,14 +1242,47 @@ body { font-size: var(--text); }
 }
 ```
 
+**notes.md**
+
+````md
+## What this is
+
+"From Cells to Pixels" (cells2pixels.github.io) live in the browser on WebGPU. A Growing Neural
+Cellular Automaton grows a donut from one seed cell and regrows it when you bite it. Each cell
+holds a C-dim latent; a shared NCA update rule runs the G² lattice, and a SIREN decoder paints
+that up to a GH² RGBA image, which is the donut you see. The raw cell channels are latent, not
+color.
+
+## The loss
+
+The paper's stack, term for term: masked L2 + L1 on the render, a shape loss on the alpha/alive
+mask, LPIPS(VGG16) on a padding crop (a random 3 of the 4 channels), and a ×100 overflow penalty.
+Two pieces of it are not obvious:
+
+- Per-param gradient normalization on the NCA only, not the SIREN, is what makes L1 safe on a CA
+  (tensorgrad's `normalizeGrads`).
+- The LPIPS-VGG16 weights ride in as frozen inputs, so DCE prunes their gradient kernels. That
+  forward is validated against torch to 8 decimals.
+
+## Divergences from the paper
+
+This is a proof of concept, so it trades their fine detail for browser speed: mini scale
+(G=32/K=24/S=4, not G=96 at 8×), and a single 1500-step run rather than 5×4000 rounds with pool
+flushes. That is enough for a stable donut.
+
+The donut's center is a hole, which breaks the paper's seed-at-center assumption: a transparent
+seed pixel is dead, and death is absorbing, so nothing ever grows. `placeSeed` relocates the seed
+onto the ring and logs that it did.
+````
+
 **config.json**
 
 ```json
 {
   "description": "A neural cellular automaton grows a 3D donut from one cell, trained live on WebGPU with the Cells-to-Pixels recipe.",
   "dependencies": {
-    "tensorgrad": "^0.4.9",
-    "domeleon": "^0.6.3"
+    "tensorgrad": "^0.5.1",
+    "domeleon": "^0.6.6"
   }
 }
 ```

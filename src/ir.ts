@@ -71,6 +71,15 @@ export interface CallSite {
  * (with the exception of autograd-internal kinds like `*_grad`, `broadcast_to`,
  * `sum_to_shape` which are emitted by `appendGrad` but not user-facing).
  */
+/** Unary op kinds whose kernel body is one pure elementwise expression of its input, so
+ *  another kernel can apply the same expression to a value it already holds in a register.
+ *  `codegen.unaryExpr` is the single source of that expression, shared by the standalone
+ *  unary kernels and the GEMM epilogue. Composed activations (`gelu`, `silu`) are several
+ *  ops and are deliberately not here. */
+export type UnaryExprKind =
+  | 'sqrt' | 'rsqrt' | 'log' | 'exp' | 'relu' | 'neg' | 'abs'
+  | 'tanh' | 'sigmoid' | 'erf' | 'sin' | 'cos'
+
 export type OpNode =
   // ---- Leaves ----------------------------------------------------------------
   | { kind: 'param_input'; out: number; name: string }
@@ -130,7 +139,13 @@ export type OpNode =
   // ---- Linear algebra -----------------------------------------------------
   // Two kinds for two kernel shapes; public `matmul` dispatches on rhs rank.
   // Kept separate so autograd adjoint rules stay simple.
-  | { kind: 'matmul'; out: number; a: number; b: number }          // [..., M, K] · [K, N]
+  //
+  // `bias` and `act` are the fused epilogue (src/fuse.ts): a `[N]` bias added and one
+  // elementwise activation applied to each accumulator in registers, at the store. Never
+  // set by `matmul()` itself — a rewrite pass folds a following `add` / unary into the
+  // GEMM when their intermediates feed nothing else, which deletes a whole tensor
+  // round-trip per layer. Absent on every hand-built matmul, so readers may ignore both.
+  | { kind: 'matmul'; out: number; a: number; b: number; bias?: number; act?: UnaryExprKind }
   | { kind: 'matmul_batched'; out: number; a: number; b: number }  // [..., M, K] · [..., K, N]
 
   // ---- Indexing / casting --------------------------------------------------
@@ -226,6 +241,12 @@ export type OpNode =
       strideH: number; strideW: number
       padH: number; padW: number
       groups: number
+      /** Fused epilogue, same contract as `matmul`'s and set by the same pass (src/fuse.ts):
+       *  a per-output-channel bias — `[C_out]` worth of floats, indexed by the channel, not
+       *  the last axis — and one elementwise activation, both applied in registers at the
+       *  store. Never set by `conv2d()` itself. */
+      bias?: number
+      act?: UnaryExprKind
     }
   // dInput as transposed-conv of dy with weight. Implemented as a gather:
   // each input position sums contributions from every output whose receptive
@@ -367,8 +388,14 @@ export function remapOpInputs(op: OpNode, f: (id: number) => number): OpNode {
     case 'randn': return { ...op, seed: f(op.seed) }
     case 'add': case 'sub': case 'mul': case 'div': case 'min': case 'max':
     case 'less': case 'greater':
-    case 'matmul': case 'matmul_batched':
+    case 'matmul_batched':
       return { ...op, a: f(op.a), b: f(op.b) }
+    // Field order is binding order, and `bias` is optional: keep the key absent rather
+    // than undefined so `getOpInputs` reports two ids for an unfused matmul.
+    case 'matmul':
+      return op.bias === undefined
+        ? { ...op, a: f(op.a), b: f(op.b) }
+        : { ...op, a: f(op.a), b: f(op.b), bias: f(op.bias) }
     case 'mul_scalar': case 'add_scalar':
     case 'sqrt': case 'rsqrt': case 'log': case 'exp': case 'relu':
     case 'neg': case 'abs': case 'tanh': case 'sigmoid': case 'erf': case 'sin': case 'cos':
@@ -392,7 +419,12 @@ export function remapOpInputs(op: OpNode, f: (id: number) => number): OpNode {
         ...op, p: f(op.p), mNew: f(op.mNew), vNew: f(op.vNew), lrt: f(op.lrt),
         decayShrinkTensor: op.decayShrinkTensor !== null ? f(op.decayShrinkTensor) : null,
       }
-    case 'conv2d': return { ...op, input: f(op.input), weight: f(op.weight) }
+    // Field order is binding order, and `bias` stays absent rather than undefined so an
+    // unfused conv still reports exactly two inputs.
+    case 'conv2d':
+      return op.bias === undefined
+        ? { ...op, input: f(op.input), weight: f(op.weight) }
+        : { ...op, input: f(op.input), weight: f(op.weight), bias: f(op.bias) }
     case 'conv2d_input_grad': return { ...op, weight: f(op.weight), dy: f(op.dy) }
     case 'conv2d_weight_grad': return { ...op, input: f(op.input), dy: f(op.dy) }
     case 'max_pool_2d': return { ...op, input: f(op.input) }

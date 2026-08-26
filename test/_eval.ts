@@ -10,7 +10,33 @@
 // is doing something different from the spec, and one or the other is
 // wrong. Both should compute the same answer up to f32 precision.
 
-import type { Graph, OpNode, Shape } from '../src/ir.js'
+import type { Graph, OpNode, Shape, UnaryExprKind } from '../src/ir.js'
+
+/** Reference for one unary kind. The standalone unary ops and a matmul's fused `act` share
+ *  it, mirroring `codegen.unaryExpr` so the CPU and GPU forms cannot drift apart. */
+function unaryFn(kind: UnaryExprKind): (x: number) => number {
+  switch (kind) {
+    case 'sqrt': return Math.sqrt
+    case 'rsqrt': return (x: number) => 1 / Math.sqrt(x)
+    case 'log': return Math.log
+    case 'exp': return Math.exp
+    case 'relu': return (x: number) => Math.max(x, 0)
+    case 'neg': return (x: number) => -x
+    case 'abs': return Math.abs
+    case 'tanh': return Math.tanh
+    case 'sin': return Math.sin
+    case 'cos': return Math.cos
+    // erf via A&S 7.1.26 — matches the WGSL kernel exactly.
+    case 'erf': return (x: number) => {
+      const s = Math.sign(x), ax = Math.abs(x)
+      const t = 1 / (1 + 0.3275911 * ax)
+      const p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+      return s * (1 - p * Math.exp(-ax * ax))
+    }
+    // sigmoid via tanh identity — matches the WGSL kernel exactly.
+    case 'sigmoid': return (x: number) => 0.5 + 0.5 * Math.tanh(0.5 * x)
+  }
+}
 
 type Val = Float32Array | Int32Array
 
@@ -178,26 +204,7 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
     case 'cos': {
       const a = v(op.a) as Float32Array
       const out = new Float32Array(a.length)
-      const fn =
-        op.kind === 'sqrt'    ? Math.sqrt :
-        op.kind === 'rsqrt'   ? (x: number) => 1 / Math.sqrt(x) :
-        op.kind === 'log'     ? Math.log :
-        op.kind === 'exp'     ? Math.exp :
-        op.kind === 'relu'    ? (x: number) => Math.max(x, 0) :
-        op.kind === 'neg'     ? (x: number) => -x :
-        op.kind === 'abs'     ? Math.abs :
-        op.kind === 'tanh'    ? Math.tanh :
-        op.kind === 'sin'     ? Math.sin :
-        op.kind === 'cos'     ? Math.cos :
-        // erf via A&S 7.1.26 — matches the WGSL kernel exactly.
-        op.kind === 'erf'     ? (x: number) => {
-          const s = Math.sign(x), ax = Math.abs(x)
-          const t = 1 / (1 + 0.3275911 * ax)
-          const p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
-          return s * (1 - p * Math.exp(-ax * ax))
-        } :
-        /* sigmoid via tanh identity — matches the WGSL kernel exactly */
-                                (x: number) => 0.5 + 0.5 * Math.tanh(0.5 * x)
+      const fn = unaryFn(op.kind)
       for (let i = 0; i < a.length; i++) out[i] = fn(a[i]!)
       return out
     }
@@ -288,6 +295,10 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       const M = aShape[aShape.length - 2]!
       const batch = shapeSize(aShape) / (M * K)
       const out = new Float32Array(batch * M * N)
+      // Fused epilogue (src/fuse.ts): a [N] bias and one activation applied at the store.
+      // Both absent on an unfused matmul, which is every hand-built one.
+      const bias = op.bias !== undefined ? v(op.bias) as Float32Array : null
+      const act = op.act ? unaryFn(op.act) : null
       for (let bi = 0; bi < batch; bi++) {
         for (let m = 0; m < M; m++) {
           for (let n = 0; n < N; n++) {
@@ -295,7 +306,8 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
             for (let k = 0; k < K; k++) {
               s += a[bi * M * K + m * K + k]! * b[k * N + n]!
             }
-            out[bi * M * N + m * N + n] = s
+            if (bias) s += bias[n]!
+            out[bi * M * N + m * N + n] = act ? act(s) : s
           }
         }
       }
@@ -639,6 +651,10 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
       const [, , hOut, wOut] = outT.shape
       const out = new Float32Array(shapeSize(outT.shape))
       const B = outT.shape[0]!
+      // Fused epilogue (src/fuse.ts): a per-output-channel bias and one activation applied
+      // at the store. Both absent on an unfused conv.
+      const cBias = op.bias !== undefined ? vals.get(op.bias)! as Float32Array : null
+      const cAct = op.act ? unaryFn(op.act) : null
       for (let b = 0; b < B; b++) for (let co = 0; co < cOut!; co++) for (let ho = 0; ho < hOut!; ho++) for (let wo = 0; wo < wOut!; wo++) {
         const g = Math.floor(co / cOutPerG)
         let s = 0
@@ -653,7 +669,8 @@ function evalOp(op: OpNode, vals: Map<number, Val>, inputs: Record<string, Val>,
                * weight[co * cInPerG! * kH! * kW! + cl * kH! * kW! + kh * kW! + kw]!
           }
         }
-        out[b * cOut! * hOut! * wOut! + co * hOut! * wOut! + ho * wOut! + wo] = s
+        if (cBias) s += cBias[co]!
+        out[b * cOut! * hOut! * wOut! + co * hOut! * wOut! + ho * wOut! + wo] = cAct ? cAct(s) : s
       }
       return out
     }
